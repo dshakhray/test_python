@@ -1,0 +1,119 @@
+From 6101c754fcb7296978643b42e8e382aead7c627d Mon Sep 17 00:00:00 2001
+From: Don Dutile <ddutile@redhat.com>
+Date: Wed, 14 Sep 2016 19:06:09 -0400
+Subject: [infiniband] rdma/ocrdma: Export udp encapsulation capability
+
+Message-id: <1473879972-52932-2-git-send-email-ddutile@redhat.com>
+Patchwork-id: 157828
+O-Subject: [PATCH RHEL-7.3 1/4] RDMA/ocrdma: Export udp encapsulation capability
+Bugzilla: 1376120
+RH-Acked-by: Honggang Li <honli@redhat.com>
+RH-Acked-by: Jeremy McNicoll <jmcnicol@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+
+From: Somnath Kotur <somnath.kotur@avagotech.com>
+
+Add support to read device configuration and initialize port-immutables
+to report UDP-Encap flag during port query.
+
+Signed-off-by: Devesh Sharma <devesh.sharma@avagotech.com>
+Signed-off-by: Somnath Kotur <somnath.kotur@avagotech.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit e1614869d370d4d1599d771346d7da570f1d2bfa)
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1376120
+Brew build: https://brewweb.devel.redhat.com/taskinfo?taskID=11743901
+
+Signed-off-by: Donald Dutile <ddutile@redhat.com>
+Signed-off-by: Rafael Aquini <aquini@redhat.com>
+
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma.h b/drivers/infiniband/hw/ocrdma/ocrdma.h
+index 12503f1..b58833d 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma.h
++++ b/drivers/infiniband/hw/ocrdma/ocrdma.h
+@@ -114,6 +114,7 @@ struct ocrdma_dev_attr {
+  u8 local_ca_ack_delay;
+  u8 ird;
+  u8 num_ird_pages;
++ u8 udp_encap;
+ };
+ 
+ struct ocrdma_dma_mem {
+@@ -598,4 +599,10 @@ static inline u8 ocrdma_get_ae_link_state(u32 ae_state)
+  return ((ae_state & OCRDMA_AE_LSC_LS_MASK) >> OCRDMA_AE_LSC_LS_SHIFT);
+ }
+ 
++static inline bool ocrdma_is_udp_encap_supported(struct ocrdma_dev *dev)
++{
++ return (dev->attr.udp_encap & OCRDMA_L3_TYPE_IPV4) ||
++        (dev->attr.udp_encap & OCRDMA_L3_TYPE_IPV6);
++}
++
+ #endif
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_hw.c b/drivers/infiniband/hw/ocrdma/ocrdma_hw.c
+index aed902f..1862581 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_hw.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_hw.c
+@@ -1144,6 +1144,9 @@ static void ocrdma_get_attr(struct ocrdma_dev *dev,
+  attr->max_pd =
+      (rsp->max_pd_ca_ack_delay & OCRDMA_MBX_QUERY_CFG_MAX_PD_MASK) >>
+      OCRDMA_MBX_QUERY_CFG_MAX_PD_SHIFT;
++ attr->udp_encap = (rsp->max_pd_ca_ack_delay &
++      OCRDMA_MBX_QUERY_CFG_L3_TYPE_MASK) >>
++      OCRDMA_MBX_QUERY_CFG_L3_TYPE_SHIFT;
+  attr->max_dpp_pds =
+     (rsp->max_dpp_pds_credits & OCRDMA_MBX_QUERY_CFG_MAX_DPP_PDS_MASK) >>
+      OCRDMA_MBX_QUERY_CFG_MAX_DPP_PDS_OFFSET;
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_main.c b/drivers/infiniband/hw/ocrdma/ocrdma_main.c
+index ba05e49..2c0de37 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_main.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_main.c
+@@ -89,8 +89,10 @@ static int ocrdma_port_immutable(struct ib_device *ibdev, u8 port_num,
+             struct ib_port_immutable *immutable)
+ {
+  struct ib_port_attr attr;
++ struct ocrdma_dev *dev;
+  int err;
+ 
++ dev = get_ocrdma_dev(ibdev);
+  err = ocrdma_query_port(ibdev, port_num, &attr);
+  if (err)
+   return err;
+@@ -98,6 +100,8 @@ static int ocrdma_port_immutable(struct ib_device *ibdev, u8 port_num,
+  immutable->pkey_tbl_len = attr.pkey_tbl_len;
+  immutable->gid_tbl_len = attr.gid_tbl_len;
+  immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE;
++ if (ocrdma_is_udp_encap_supported(dev))
++  immutable->core_cap_flags |= RDMA_CORE_CAP_PROT_ROCE_UDP_ENCAP;
+  immutable->max_mad_size = IB_MGMT_MAD_SIZE;
+ 
+  return 0;
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_sli.h b/drivers/infiniband/hw/ocrdma/ocrdma_sli.h
+index 0ae025b..ce7bf51 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_sli.h
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_sli.h
+@@ -140,7 +140,11 @@ enum {
+  OCRDMA_DB_RQ_SHIFT  = 24
+ };
+ 
+-#define OCRDMA_ROUDP_FLAGS_SHIFT 0x03
++enum {
++ OCRDMA_L3_TYPE_IB_GRH   = 0x00,
++ OCRDMA_L3_TYPE_IPV4     = 0x01,
++ OCRDMA_L3_TYPE_IPV6     = 0x02
++};
+ 
+ #define OCRDMA_DB_CQ_RING_ID_MASK       0x3FF /* bits 0 - 9 */
+ #define OCRDMA_DB_CQ_RING_ID_EXT_MASK  0x0C00 /* bits 10-11 of qid at 12-11 */
+@@ -546,7 +550,8 @@ enum {
+  OCRDMA_MBX_QUERY_CFG_CA_ACK_DELAY_SHIFT  = 8,
+  OCRDMA_MBX_QUERY_CFG_CA_ACK_DELAY_MASK  = 0xFF <<
+     OCRDMA_MBX_QUERY_CFG_CA_ACK_DELAY_SHIFT,
+-
++ OCRDMA_MBX_QUERY_CFG_L3_TYPE_SHIFT  = 3,
++ OCRDMA_MBX_QUERY_CFG_L3_TYPE_MASK  = 0x18,
+  OCRDMA_MBX_QUERY_CFG_MAX_SEND_SGE_SHIFT  = 0,
+  OCRDMA_MBX_QUERY_CFG_MAX_SEND_SGE_MASK  = 0xFFFF,
+  OCRDMA_MBX_QUERY_CFG_MAX_RECV_SGE_SHIFT = 16,
+-- 
+1.7.1

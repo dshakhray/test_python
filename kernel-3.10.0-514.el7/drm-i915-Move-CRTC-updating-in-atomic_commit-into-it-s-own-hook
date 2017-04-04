@@ -1,0 +1,171 @@
+From 3e3a5138de5dab9981c58f8ae1250faa3b9d3c61 Mon Sep 17 00:00:00 2001
+From: Lyude Paul <cpaul@redhat.com>
+Date: Thu, 15 Sep 2016 17:56:48 -0400
+Subject: [drm] i915: Move CRTC updating in atomic_commit into it's own hook
+
+Message-id: <1473962216-29060-8-git-send-email-cpaul@redhat.com>
+Patchwork-id: 157885
+O-Subject: [RHEL7.3][RESEND PATCH v2 07/15] drm/i915: Move CRTC updating in atomic_commit into it's own hook
+Bugzilla: 1341633 1355776
+RH-Acked-by: Adam Jackson <ajax@redhat.com>
+RH-Acked-by: Rob Clark <rclark@redhat.com>
+
+From: Lyude Paul <cpaul@redhat.com>
+
+Upstream: since drm-intel-next-2016-09-02
+
+commit 896e5bb022bce64e29ce2e1b2fc2a7476d311a15
+
+Author: Lyude <cpaul@redhat.com>
+Date:   Wed Aug 24 07:48:09 2016 +0200
+
+    drm/i915: Move CRTC updating in atomic_commit into it's own hook
+
+    Since we have to write ddb allocations at the same time as we do other
+    plane updates, we're going to need to be able to control the order in
+    which we execute modesets on each pipe. The easiest way to do this is to
+    just factor this section of intel_atomic_commit_tail()
+    (intel_atomic_commit() for stable branches) into it's own function, and
+    add an appropriate display function hook for it.
+
+    Based off of Matt Rope's suggestions
+
+    Changes since v1:
+     - Drop pipe_config->base.active check in intel_update_crtcs() since we
+       check that before calling the function
+
+    Signed-off-by: Lyude <cpaul@redhat.com>
+    Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+    [omitting CC for stable, since this patch will need to be changed for
+    such backports first]
+    Cc: Ville Syrjl <ville.syrjala@linux.intel.com>
+    Cc: Daniel Vetter <daniel.vetter@intel.com>
+    Cc: Radhakrishna Sripada <radhakrishna.sripada@intel.com>
+    Cc: Hans de Goede <hdegoede@redhat.com>
+
+    Signed-off-by: Lyude <cpaul@redhat.com>
+    Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1471961565-28540-1-git-send-email-cpaul@redhat.com
+
+RHBZ: 1341633
+RHBZ: 1355776
+Signed-off-by: Lyude Paul <cpaul@redhat.com>
+Signed-off-by: Lyude <cpaul@redhat.com>
+Signed-off-by: Rafael Aquini <aquini@redhat.com>
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index edca39b..9831594 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -659,6 +659,8 @@ struct drm_i915_display_funcs {
+       struct intel_crtc_state *crtc_state);
+  void (*crtc_enable)(struct drm_crtc *crtc);
+  void (*crtc_disable)(struct drm_crtc *crtc);
++ void (*update_crtcs)(struct drm_atomic_state *state,
++        unsigned int *crtc_vblank_mask);
+  void (*audio_codec_enable)(struct drm_connector *connector,
+        struct intel_encoder *encoder,
+        const struct drm_display_mode *adjusted_mode);
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index bfc7d38..30d4a70 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -13486,6 +13486,51 @@ static bool needs_vblank_wait(struct intel_crtc_state *crtc_state)
+  return false;
+ }
+ 
++static void intel_update_crtc(struct drm_crtc *crtc,
++         struct drm_atomic_state *state,
++         struct drm_crtc_state *old_crtc_state,
++         unsigned int *crtc_vblank_mask)
++{
++ struct drm_device *dev = crtc->dev;
++ struct drm_i915_private *dev_priv = to_i915(dev);
++ struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++ struct intel_crtc_state *pipe_config = to_intel_crtc_state(crtc->state);
++ bool modeset = needs_modeset(crtc->state);
++ bool update_pipe = !modeset && pipe_config->update_pipe;
++
++ if (modeset) {
++  update_scanline_offset(intel_crtc);
++  dev_priv->display.crtc_enable(crtc);
++ } else {
++  intel_pre_plane_update(to_intel_crtc_state(old_crtc_state));
++ }
++
++ if (intel_crtc->atomic.update_fbc)
++  intel_fbc_enable(intel_crtc);
++
++ if (crtc->state->planes_changed || update_pipe)
++  drm_atomic_helper_commit_planes_on_crtc(old_crtc_state);
++
++ if (needs_vblank_wait(pipe_config))
++  *crtc_vblank_mask |= drm_crtc_mask(crtc);
++}
++
++static void intel_update_crtcs(struct drm_atomic_state *state,
++          unsigned int *crtc_vblank_mask)
++{
++ struct drm_crtc *crtc;
++ struct drm_crtc_state *old_crtc_state;
++ int i;
++
++ for_each_crtc_in_state(state, crtc, old_crtc_state, i) {
++  if (!crtc->state->active)
++   continue;
++
++  intel_update_crtc(crtc, state, old_crtc_state,
++      crtc_vblank_mask);
++ }
++}
++
+ /**
+  * intel_atomic_commit - commit validated state object
+  * @dev: DRM device
+@@ -13592,34 +13637,9 @@ static int intel_atomic_commit(struct drm_device *dev,
+  }
+ 
+  /* Now enable the clocks, plane, pipe, and connectors that we set up. */
+- for_each_crtc_in_state(state, crtc, crtc_state, i) {
+-  struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+-  bool modeset = needs_modeset(crtc->state);
+-  struct intel_crtc_state *pipe_config =
+-   to_intel_crtc_state(crtc->state);
+-  bool update_pipe = !modeset && pipe_config->update_pipe;
+-
+-  if (modeset && crtc->state->active) {
+-   update_scanline_offset(to_intel_crtc(crtc));
+-   dev_priv->display.crtc_enable(crtc);
+-  }
+-
+-  if (!modeset)
+-   intel_pre_plane_update(to_intel_crtc_state(crtc_state));
+-
+-  if (crtc->state->active && intel_crtc->atomic.update_fbc)
+-   intel_fbc_enable(intel_crtc);
+-
+-  if (crtc->state->active &&
+-      (crtc->state->planes_changed || update_pipe))
+-   drm_atomic_helper_commit_planes_on_crtc(crtc_state);
+-
+-  if (pipe_config->base.active && needs_vblank_wait(pipe_config))
+-   crtc_vblank_mask |= 1 << i;
+- }
++ dev_priv->display.update_crtcs(state, &crtc_vblank_mask);
+ 
+  /* FIXME: add subpixel order */
+-
+  if (!state->legacy_cursor_update)
+   intel_atomic_wait_for_vblanks(dev, dev_priv, crtc_vblank_mask);
+ 
+@@ -14979,6 +14999,8 @@ static void intel_init_display(struct drm_device *dev)
+   dev_priv->display.crtc_disable = i9xx_crtc_disable;
+  }
+ 
++ dev_priv->display.update_crtcs = intel_update_crtcs;
++
+  /* Returns the core display clock speed */
+  if (IS_SKYLAKE(dev) || IS_KABYLAKE(dev))
+   dev_priv->display.get_display_clock_speed =
+-- 
+1.7.1

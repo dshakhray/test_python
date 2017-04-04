@@ -1,0 +1,89 @@
+From 5f1535d3f0f798043add83dad3c7e3d42cc448b7 Mon Sep 17 00:00:00 2001
+From: Benjamin Coddington <bcodding@redhat.com>
+Date: Wed, 31 Aug 2016 15:20:25 -0400
+Subject: [fs] Fix NULL pointer dereference in bl_free_device()
+
+Message-id: <b6d39fb6964dc17fcdc94b6da45b86776afb3a41.1472656591.git.bcodding@redhat.com>
+Patchwork-id: 157493
+O-Subject: [RHEL7 PATCH fs 4/4] Fix NULL pointer dereference in bl_free_device().
+Bugzilla: 1356796
+RH-Acked-by: Jeff Layton <jlayton@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Artem Savkov <asavkov@redhat.com>
+
+When bl_parse_deviceid() fails in bl_alloc_deviceid_node() on
+blkdev_get_by_*() step we get an pnfs_block_dev struct that is
+uninitialized except for bdev field which is set to whatever error
+blkdev_get_by_*() returns.  bl_free_device() then tries to call
+blkdev_put() if bdev is not 0 resulting in a wrong pointer dereference.
+
+Fixing this by setting bdev in struct pnfs_block_dev only if we didn't
+get an error from blkdev_get_by_*().
+
+Signed-off-by: Artem Savkov <asavkov@redhat.com>
+Reviewed-by: Benjamin Coddington <bcodding@redhat.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream-id: 297fae4d0bee5d683533f3324baf1b363e7b48bf
+Brew: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11678252
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1356796
+Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+Signed-off-by: Rafael Aquini <aquini@redhat.com>
+
+diff --git a/fs/nfs/blocklayout/dev.c b/fs/nfs/blocklayout/dev.c
+index 436bb30..3afd55a 100644
+--- a/fs/nfs/blocklayout/dev.c
++++ b/fs/nfs/blocklayout/dev.c
+@@ -224,18 +224,20 @@ bl_parse_simple(struct nfs_server *server, struct pnfs_block_dev *d,
+   struct pnfs_block_volume *volumes, int idx, gfp_t gfp_mask)
+ {
+  struct pnfs_block_volume *v = &volumes[idx];
++ struct block_device *bdev;
+  dev_t dev;
+ 
+  dev = bl_resolve_deviceid(server, v, gfp_mask);
+  if (!dev)
+   return -EIO;
+ 
+- d->bdev = blkdev_get_by_dev(dev, FMODE_READ | FMODE_WRITE, NULL);
+- if (IS_ERR(d->bdev)) {
++ bdev = blkdev_get_by_dev(dev, FMODE_READ | FMODE_WRITE, NULL);
++ if (IS_ERR(bdev)) {
+   printk(KERN_WARNING "pNFS: failed to open device %d:%d (%ld)\n",
+-   MAJOR(dev), MINOR(dev), PTR_ERR(d->bdev));
+-  return PTR_ERR(d->bdev);
++   MAJOR(dev), MINOR(dev), PTR_ERR(bdev));
++  return PTR_ERR(bdev);
+  }
++ d->bdev = bdev;
+ 
+ 
+  d->len = i_size_read(d->bdev->bd_inode);
+@@ -339,17 +341,19 @@ bl_parse_scsi(struct nfs_server *server, struct pnfs_block_dev *d,
+   struct pnfs_block_volume *volumes, int idx, gfp_t gfp_mask)
+ {
+  struct pnfs_block_volume *v = &volumes[idx];
++ struct block_device *bdev;
+  const struct pr_ops *ops;
+  int error;
+ 
+  if (!bl_validate_designator(v))
+   return -EINVAL;
+ 
+- d->bdev = bl_open_dm_mpath_udev_path(v);
+- if (IS_ERR(d->bdev))
+-  d->bdev = bl_open_udev_path(v);
+- if (IS_ERR(d->bdev))
+-  return PTR_ERR(d->bdev);
++ bdev = bl_open_dm_mpath_udev_path(v);
++ if (IS_ERR(bdev))
++  bdev = bl_open_udev_path(v);
++ if (IS_ERR(bdev))
++  return PTR_ERR(bdev);
++ d->bdev = bdev;
+ 
+  d->len = i_size_read(d->bdev->bd_inode);
+  d->map = bl_map_simple;
+-- 
+1.7.1

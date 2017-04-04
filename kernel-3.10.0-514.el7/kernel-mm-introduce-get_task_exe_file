@@ -1,0 +1,106 @@
+From 79030b46fe968830a57d486f9dd5343f1cafb595 Mon Sep 17 00:00:00 2001
+From: Richard Guy Briggs <rgb@redhat.com>
+Date: Sat, 17 Sep 2016 23:42:18 -0400
+Subject: [kernel] mm: introduce get_task_exe_file
+
+Message-id: <aff948fdb7bc0dfa4c54731cb27a48408e0b3d5a.1473974354.git.rgb@redhat.com>
+Patchwork-id: 157923
+O-Subject: [RHEL7 PATCH V2 3/4] mm: introduce get_task_exe_file
+Bugzilla: 1374478
+RH-Acked-by: Herton R. Krzesinski <herton@redhat.com>
+RH-Acked-by: Eric W. Biederman <ebiederm@redhat.com>
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+RH-Acked-by: Paul Moore <pmoore@redhat.com>
+
+From: Mateusz Guzik <mguzik@redhat.com>
+
+For more convenient access if one has a pointer to the task.
+
+As a minor nit take advantage of the fact that only task lock + rcu are
+needed to safely grab ->exe_file. This saves mm refcount dance.
+
+Use the helper in proc_exe_link.
+
+Signed-off-by: Mateusz Guzik <mguzik@redhat.com>
+Acked-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Acked-by: Richard Guy Briggs <rgb@redhat.com>
+Cc: <stable@vger.kernel.org> # 4.3.x
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit cd81a9170e69e018bbaba547c1fd85a585f5697a)
+
+Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+Signed-off-by: Rafael Aquini <aquini@redhat.com>
+
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index cc42707..20086fe 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -1607,18 +1607,13 @@ static const struct file_operations proc_pid_set_comm_operations = {
+ static int proc_exe_link(struct dentry *dentry, struct path *exe_path)
+ {
+  struct task_struct *task;
+- struct mm_struct *mm;
+  struct file *exe_file;
+ 
+  task = get_proc_task(dentry->d_inode);
+  if (!task)
+   return -ENOENT;
+- mm = get_task_mm(task);
++ exe_file = get_task_exe_file(task);
+  put_task_struct(task);
+- if (!mm)
+-  return -ENOENT;
+- exe_file = get_mm_exe_file(mm);
+- mmput(mm);
+  if (exe_file) {
+   *exe_path = exe_file->f_path;
+   path_get(&exe_file->f_path);
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 10bc9a8..3b39764 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1902,6 +1902,7 @@ extern void mm_drop_all_locks(struct mm_struct *mm);
+ 
+ extern void set_mm_exe_file(struct mm_struct *mm, struct file *new_exe_file);
+ extern struct file *get_mm_exe_file(struct mm_struct *mm);
++extern struct file *get_task_exe_file(struct task_struct *task);
+ 
+ extern int may_expand_vm(struct mm_struct *mm, unsigned long npages);
+ extern int install_special_mapping(struct mm_struct *mm,
+diff --git a/kernel/fork.c b/kernel/fork.c
+index cb8343b..72a4813 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -724,6 +724,29 @@ struct file *get_mm_exe_file(struct mm_struct *mm)
+ }
+ 
+ /**
++ * get_task_exe_file - acquire a reference to the task's executable file
++ *
++ * Returns %NULL if task's mm (if any) has no associated executable file or
++ * this is a kernel thread with borrowed mm (see the comment above get_task_mm).
++ * User must release file via fput().
++ */
++struct file *get_task_exe_file(struct task_struct *task)
++{
++ struct file *exe_file = NULL;
++ struct mm_struct *mm;
++
++ task_lock(task);
++ mm = task->mm;
++ if (mm) {
++  if (!(task->flags & PF_KTHREAD))
++   exe_file = get_mm_exe_file(mm);
++ }
++ task_unlock(task);
++ return exe_file;
++}
++EXPORT_SYMBOL(get_task_exe_file);
++
++/**
+  * get_task_mm - acquire a reference to the task's mm
+  *
+  * Returns %NULL if the task has no mm.  Checks PF_KTHREAD (meaning
+-- 
+1.7.1

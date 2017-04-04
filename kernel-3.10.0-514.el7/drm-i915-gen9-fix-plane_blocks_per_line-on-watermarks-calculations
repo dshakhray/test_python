@@ -1,0 +1,112 @@
+From ce2e6d91bde90dc379f8f7ad9f1297bb69a4cdf4 Mon Sep 17 00:00:00 2001
+From: Lyude Paul <cpaul@redhat.com>
+Date: Thu, 15 Sep 2016 17:56:53 -0400
+Subject: [drm] i915/gen9: fix plane_blocks_per_line on watermarks calculations
+
+Message-id: <1473962216-29060-13-git-send-email-cpaul@redhat.com>
+Patchwork-id: 157890
+O-Subject: [RHEL7.3][RESEND PATCH v2 12/15] drm/i915/gen9: fix plane_blocks_per_line on watermarks calculations
+Bugzilla: 1341633 1355776
+RH-Acked-by: Adam Jackson <ajax@redhat.com>
+RH-Acked-by: Rob Clark <rclark@redhat.com>
+
+From: Lyude Paul <cpaul@redhat.com>
+
+Upstream status: posted
+
+ drm/i915/gen9: fix plane_blocks_per_line on watermarks calculations
+ Author: Paulo Zanoni <paulo.r.zanoni@intel.com>
+
+ The confusing thing is that plane_blocks_per_line is listed as part of
+ the method 2 calculation but is also used for other things. We
+ calculated it in two different places and different ways: one inside
+ skl_wm_method2() and the other inside skl_compute_plane_wm(). The
+ skl_wm_method2() implementation is the one that matches the
+ specification.
+
+ With this patch we fix the skl_compute_plane_wm() calculation and just
+ pass it as a parameter to skl_wm_method2(). We also take care to not
+ modify the value of plane_bytes_per_line since we're going to rely on
+ it having a correct value in later patches.
+
+ This should affect the watermarks for Linear and Y-tiled.
+
+ Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+
+RHBZ: 1341633
+RHBZ: 1355776
+Signed-off-by: Lyude Paul <cpaul@redhat.com>
+Signed-off-by: Lyude <cpaul@redhat.com>
+Signed-off-by: Rafael Aquini <aquini@redhat.com>
+
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 6bf150e..3d4b468 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3282,30 +3282,14 @@ static uint32_t skl_wm_method1(uint32_t pixel_rate, uint8_t cpp, uint32_t latenc
+ }
+ 
+ static uint32_t skl_wm_method2(uint32_t pixel_rate, uint32_t pipe_htotal,
+-          uint32_t horiz_pixels, uint8_t cpp,
+-          uint64_t tiling, uint32_t latency,
+-          uint32_t y_min_scanlines)
++          uint32_t latency, uint32_t plane_blocks_per_line)
+ {
+  uint32_t ret;
+- uint32_t plane_bytes_per_line, plane_blocks_per_line;
+  uint32_t wm_intermediate_val;
+ 
+  if (latency == 0)
+   return UINT_MAX;
+ 
+- plane_bytes_per_line = horiz_pixels * cpp;
+-
+- if (tiling == I915_FORMAT_MOD_Y_TILED ||
+-     tiling == I915_FORMAT_MOD_Yf_TILED) {
+-  plane_bytes_per_line *= y_min_scanlines;
+-  plane_blocks_per_line = DIV_ROUND_UP(plane_bytes_per_line, 512);
+-  plane_blocks_per_line /= y_min_scanlines;
+- } else if (tiling == DRM_FORMAT_MOD_NONE) {
+-  plane_blocks_per_line = DIV_ROUND_UP(plane_bytes_per_line, 512) + 1;
+- } else {
+-  plane_blocks_per_line = DIV_ROUND_UP(plane_bytes_per_line, 512);
+- }
+-
+  wm_intermediate_val = latency * pixel_rate;
+  ret = DIV_ROUND_UP(wm_intermediate_val, pipe_htotal * 1000) *
+     plane_blocks_per_line;
+@@ -3367,18 +3351,25 @@ static int skl_compute_plane_wm(const struct drm_i915_private *dev_priv,
+   y_min_scanlines = 4;
+  }
+ 
++ plane_bytes_per_line = width * cpp;
++ if (fb->modifier[0] == I915_FORMAT_MOD_Y_TILED ||
++     fb->modifier[0] == I915_FORMAT_MOD_Yf_TILED) {
++  plane_blocks_per_line =
++        DIV_ROUND_UP(plane_bytes_per_line * y_min_scanlines, 512);
++  plane_blocks_per_line /= y_min_scanlines;
++ } else if (fb->modifier[0] == DRM_FORMAT_MOD_NONE) {
++  plane_blocks_per_line = DIV_ROUND_UP(plane_bytes_per_line, 512)
++     + 1;
++ } else {
++  plane_blocks_per_line = DIV_ROUND_UP(plane_bytes_per_line, 512);
++ }
++
+  method1 = skl_wm_method1(skl_pipe_pixel_rate(cstate),
+      cpp, latency);
+  method2 = skl_wm_method2(skl_pipe_pixel_rate(cstate),
+      cstate->base.adjusted_mode.crtc_htotal,
+-     width,
+-     cpp,
+-     fb->modifier[0],
+      latency,
+-     y_min_scanlines);
+-
+- plane_bytes_per_line = width * cpp;
+- plane_blocks_per_line = DIV_ROUND_UP(plane_bytes_per_line, 512);
++     plane_blocks_per_line);
+ 
+  if (fb->modifier[0] == I915_FORMAT_MOD_Y_TILED ||
+      fb->modifier[0] == I915_FORMAT_MOD_Yf_TILED) {
+-- 
+1.7.1

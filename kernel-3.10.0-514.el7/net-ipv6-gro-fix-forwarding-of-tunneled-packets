@@ -1,0 +1,98 @@
+From 74a78b72ecbfa2e87128137db7676ff986265994 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Wed, 14 Sep 2016 14:57:33 -0400
+Subject: [net] ipv6: gro: fix forwarding of tunneled packets
+
+Message-id: <f4b26f1497ff79eda0e5eb49b653b16687edb12f.1473865026.git.jbenc@redhat.com>
+Patchwork-id: 157818
+O-Subject: [RHEL7.3 net] ipv6: gro: fix forwarding of tunneled packets
+Bugzilla: 1375438
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jakub Sitnicki <jkbs@redhat.com>
+RH-Acked-by: Eric Garver <egarver@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Xin Long <lxin@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1375438
+Build: cross compiled on wsfd-netdev-buildsys.ntdv.lab.eng.bos.redhat.com
+Tested: using the reproducer described in bugzilla
+Upstream: partial backport of feec0cb3f20b
+
+This is a partial backport of the commit below. We don't want to bring in
+the full commit at this point, as it adds a new feature (GRO support for
+SIT). We need the first part, though, as it fixes GRO not only for SIT but
+also for other tunnels, most importantly GRE.
+
+Without this patch, we see crashes and almost 100% packet drops when
+bridging or forwarding GRE tunneled IPv6 traffic with GRO enabled.
+
+commit feec0cb3f20b837f8ca36e974267918d7a4497f8
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Mon Oct 19 20:40:17 2015 -0700
+
+    ipv6: gro: support sit protocol
+
+    Tom Herbert added SIT support to GRO with commit
+    19424e052fb4 ("sit: Add gro callbacks to sit_offload"),
+    later reverted by Herbert Xu.
+
+    The problem came because Tom patch was building GRO
+    packets without proper meta data : If packets were locally
+    delivered, we would not care.
+
+    But if packets needed to be forwarded, GSO engine was not
+    able to segment individual segments.
+
+    With the following patch, we correctly set skb->encapsulation
+    and inner network header. We also update gso_type.
+
+    Tested:
+
+    Server :
+    netserver
+    modprobe dummy
+    ifconfig dummy0 8.0.0.1 netmask 255.255.255.0 up
+    arp -s 8.0.0.100 4e:32:51:04:47:e5
+    iptables -I INPUT -s 10.246.7.151 -j TEE --gateway 8.0.0.100
+    ifconfig sixtofour0
+    sixtofour0 Link encap:IPv6-in-IPv4
+              inet6 addr: 2002:af6:798::1/128 Scope:Global
+              inet6 addr: 2002:af6:798::/128 Scope:Global
+              UP RUNNING NOARP  MTU:1480  Metric:1
+              RX packets:411169 errors:0 dropped:0 overruns:0 frame:0
+              TX packets:409414 errors:0 dropped:0 overruns:0 carrier:0
+              collisions:0 txqueuelen:0
+              RX bytes:20319631739 (20.3 GB)  TX bytes:29529556 (29.5 MB)
+
+    Client :
+    netperf -H 2002:af6:798::1 -l 1000 &
+
+    Checked on server traffic copied on dummy0 and verify segments were
+    properly rebuilt, with proper IP headers, TCP checksums...
+
+    tcpdump on eth0 shows proper GRO aggregation takes place.
+
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Acked-by: Tom Herbert <tom@herbertland.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Rafael Aquini <aquini@redhat.com>
+
+diff --git a/net/ipv6/ip6_offload.c b/net/ipv6/ip6_offload.c
+index 74a14e1..0dd6ffe 100644
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@ -247,6 +247,9 @@ static int ipv6_gro_complete(struct sk_buff *skb, int nhoff)
+  struct ipv6hdr *iph = (struct ipv6hdr *)(skb->data + nhoff);
+  int err = -ENOSYS;
+ 
++ if (skb->encapsulation)
++  skb_set_inner_network_header(skb, nhoff);
++
+  iph->payload_len = htons(skb->len - nhoff - sizeof(*iph));
+ 
+  rcu_read_lock();
+-- 
+1.7.1
