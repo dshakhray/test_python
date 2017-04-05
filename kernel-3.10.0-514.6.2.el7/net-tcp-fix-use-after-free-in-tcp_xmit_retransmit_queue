@@ -1,0 +1,75 @@
+From e338dc7e64c6069f0488048b8a09737f1124df74 Mon Sep 17 00:00:00 2001
+From: Mateusz Guzik <mguzik@redhat.com>
+Date: Thu, 20 Oct 2016 18:04:26 -0400
+Subject: [net] tcp: fix use after free in tcp_xmit_retransmit_queue()
+
+Message-id: <1476986666-20222-1-git-send-email-mguzik@redhat.com>
+Patchwork-id: 159457
+O-Subject: [RHEL7 PATCH] tcp: fix use after free in tcp_xmit_retransmit_queue()
+Bugzilla: 1379531
+Z-Bugzilla: 1379530
+CVE: CVE-2016-6828
+RH-Acked-by: Jonathan Toppins <jtoppins@redhat.com>
+RH-Acked-by: Eric Garver <egarver@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1379531
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=11913180
+CVE: CVE-2016-6828
+Tested: by me
+
+Upstream:
+commit bb1fceca22492109be12640d49f5ea5a544c6bb4
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Wed Aug 17 05:56:26 2016 -0700
+
+    tcp: fix use after free in tcp_xmit_retransmit_queue()
+
+    When tcp_sendmsg() allocates a fresh and empty skb, it puts it at the
+    tail of the write queue using tcp_add_write_queue_tail()
+
+    Then it attempts to copy user data into this fresh skb.
+
+    If the copy fails, we undo the work and remove the fresh skb.
+
+    Unfortunately, this undo lacks the change done to tp->highest_sack and
+    we can leave a dangling pointer (to a freed skb)
+
+    Later, tcp_xmit_retransmit_queue() can dereference this pointer and
+    access freed memory. For regular kernels where memory is not unmapped,
+    this might cause SACK bugs because tcp_highest_sack_seq() is buggy,
+    returning garbage instead of tp->snd_nxt, but with various debug
+    features like CONFIG_DEBUG_PAGEALLOC, this can crash the kernel.
+
+    This bug was found by Marco Grassi thanks to syzkaller.
+
+    Fixes: 6859d49475d4 ("[TCP]: Abstract tp->highest_sack accessing & point to next skb")
+    Reported-by: Marco Grassi <marco.gra@gmail.com>
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Cc: Ilpo Jarvinen <ilpo.jarvinen@helsinki.fi>
+    Cc: Yuchung Cheng <ycheng@google.com>
+    Cc: Neal Cardwell <ncardwell@google.com>
+    Acked-by: Neal Cardwell <ncardwell@google.com>
+    Reviewed-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Mateusz Guzik <mguzik@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Frantisek Hrbata <fhrbata@hrbata.com>
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index bbddf56..b72becc 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1438,6 +1438,8 @@ static inline void tcp_check_send_head(struct sock *sk, struct sk_buff *skb_unli
+ {
+  if (sk->sk_send_head == skb_unlinked)
+   sk->sk_send_head = NULL;
++ if (tcp_sk(sk)->highest_sack == skb_unlinked)
++  tcp_sk(sk)->highest_sack = NULL;
+ }
+ 
+ static inline void tcp_init_send_head(struct sock *sk)
+-- 
+1.7.1

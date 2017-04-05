@@ -1,0 +1,75 @@
+From 81f6cc0d249f476bee6eceee52cc304c9d0ab3c3 Mon Sep 17 00:00:00 2001
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Tue, 1 Nov 2016 15:30:40 -0400
+Subject: [netdrv] netvsc: fix incorrect receive checksum offloading
+
+Message-id: <1478014240-21182-1-git-send-email-vkuznets@redhat.com>
+Patchwork-id: 160189
+O-Subject: [RHEL7.4 KERNEL PATCH] netvsc: fix incorrect receive checksum offloading
+Bugzilla: 1388702
+Z-Bugzilla: 1391617
+RH-Acked-by: Cathy Avery <cavery@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1388702
+Brew: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11993769
+Tested: with 'netem corrupt' on WS2016 guest by me
+
+Upstream commit e52fed7177f74382f742c27de2cc5314790aebb6
+Author: Stephen Hemminger <sthemmin@microsoft.com>
+Date:   Sun Oct 23 21:32:47 2016 -0700
+
+    netvsc: fix incorrect receive checksum offloading
+
+    The Hyper-V netvsc driver was looking at the incorrect status bits
+    in the checksum info. It was setting the receive checksum unnecessary
+    flag based on the IP header checksum being correct. The checksum
+    flag is skb is about TCP and UDP checksum status. Because of this
+    bug, any packet received with bad TCP checksum would be passed
+    up the stack and to the application causing data corruption.
+    The problem is reproducible via netcat and netem.
+
+    This had a side effect of not doing receive checksum offload
+    on IPv6. The driver was also also always doing checksum offload
+    independent of the checksum setting done via ethtool.
+
+    Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: Frantisek Hrbata <fhrbata@hrbata.com>
+
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index 1ddab01..d93b641 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -628,15 +628,18 @@ static struct sk_buff *netvsc_alloc_recv_skb(struct net_device *net,
+         packet->total_data_buflen);
+ 
+  skb->protocol = eth_type_trans(skb, net);
+- if (csum_info) {
+-  /* We only look at the IP checksum here.
+-   * Should we be dropping the packet if checksum
+-   * failed? How do we deal with other checksums - TCP/UDP?
+-   */
+-  if (csum_info->receive.ip_checksum_succeeded)
++
++ /* skb is already created with CHECKSUM_NONE */
++ skb_checksum_none_assert(skb);
++
++ /*
++  * In Linux, the IP checksum is always checked.
++  * Do L4 checksum offload if enabled and present.
++  */
++ if (csum_info && (net->features & NETIF_F_RXCSUM)) {
++  if (csum_info->receive.tcp_checksum_succeeded ||
++      csum_info->receive.udp_checksum_succeeded)
+    skb->ip_summed = CHECKSUM_UNNECESSARY;
+-  else
+-   skb->ip_summed = CHECKSUM_NONE;
+  }
+ 
+  if (vlan_tci & VLAN_TAG_PRESENT)
+-- 
+1.7.1

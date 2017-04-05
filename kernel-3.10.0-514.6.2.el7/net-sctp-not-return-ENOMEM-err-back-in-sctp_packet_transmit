@@ -1,0 +1,149 @@
+From 3564b396df14769b91671b73850135c99ec24885 Mon Sep 17 00:00:00 2001
+From: Xin Long <lxin@redhat.com>
+Date: Wed, 28 Sep 2016 12:00:45 -0400
+Subject: [net] sctp: not return ENOMEM err back in sctp_packet_transmit
+
+Message-id: <01dfed5292ad66bc3daaf586e4fcfe3b79ebfe91.1475063952.git.lxin@redhat.com>
+Patchwork-id: 158416
+O-Subject: [RHEL7.4 net PATCH 6/6] sctp: not return ENOMEM err back in sctp_packet_transmit
+Bugzilla: 1371362
+Z-Bugzilla: 1392025
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Marcelo Leitner <mleitner@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Eric Garver <egarver@redhat.com>
+RH-Acked-by: Paolo Abeni <pabeni@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1371362
+Upstream Status: net-next.git commit 41001fa
+
+commit 41001faf95faaff7c4f4f93c6bb544ee227ad0cc
+Author: Xin Long <lucien.xin@gmail.com>
+Date:   Wed Sep 14 02:04:23 2016 +0800
+
+    sctp: not return ENOMEM err back in sctp_packet_transmit
+
+    As David and Marcelo's suggestion, ENOMEM err shouldn't return back to
+    user in transmit path. Instead, sctp's retransmit would take care of
+    the chunks that fail to send because of ENOMEM.
+
+    This patch is only to do some release job when alloc_skb fails, not to
+    return ENOMEM back any more.
+
+    Besides, it also cleans up sctp_packet_transmit's err path, and fixes
+    some issues in err path:
+
+     - It didn't free the head skb in nomem: path.
+     - No need to check nskb in no_route: path.
+     - It should goto err: path if alloc_skb fails for head.
+     - Not all the NOMEMs should free nskb.
+
+    Signed-off-by: Xin Long <lucien.xin@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Frantisek Hrbata <fhrbata@hrbata.com>
+
+diff --git a/net/sctp/output.c b/net/sctp/output.c
+index 140d378..a778e2d 100644
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@ -449,14 +449,14 @@ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
+     * time. Application may notice this error.
+     */
+    pr_err_once("Trying to GSO but underlying device doesn't support it.");
+-   goto nomem;
++   goto err;
+   }
+  } else {
+   pkt_size = packet->size;
+  }
+  head = alloc_skb(pkt_size + MAX_HEADER, gfp);
+  if (!head)
+-  goto nomem;
++  goto err;
+  if (gso) {
+   NAPI_GRO_CB(head)->last = head;
+   skb_shinfo(head)->gso_type = sk->sk_gso_type;
+@@ -477,8 +477,12 @@ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
+   }
+  }
+  dst = dst_clone(tp->dst);
+- if (!dst)
+-  goto no_route;
++ if (!dst) {
++  if (asoc)
++   IP_INC_STATS(sock_net(asoc->base.sk),
++         IPSTATS_MIB_OUTNOROUTES);
++  goto nodst;
++ }
+  skb_dst_set(head, dst);
+ 
+  /* Build the SCTP header.  */
+@@ -629,8 +633,10 @@ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
+   if (!gso)
+    break;
+ 
+-  if (skb_gro_receive(&head, nskb))
++  if (skb_gro_receive(&head, nskb)) {
++   kfree_skb(nskb);
+    goto nomem;
++  }
+   nskb = NULL;
+   if (WARN_ON_ONCE(skb_shinfo(head)->gso_segs >=
+      sk->sk_gso_max_segs))
+@@ -723,18 +729,13 @@ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
+  }
+  head->ignore_df = packet->ipfragok;
+  tp->af_specific->sctp_xmit(head, tp);
++ goto out;
+ 
+-out:
+- sctp_packet_reset(packet);
+- return err;
+-no_route:
+- kfree_skb(head);
+- if (nskb != head)
+-  kfree_skb(nskb);
+-
+- if (asoc)
+-  IP_INC_STATS(sock_net(asoc->base.sk), IPSTATS_MIB_OUTNOROUTES);
++nomem:
++ if (packet->auth && list_empty(&packet->auth->list))
++  sctp_chunk_free(packet->auth);
+ 
++nodst:
+  /* FIXME: Returning the 'err' will effect all the associations
+   * associated with a socket, although only one of the paths of the
+   * association is unreachable.
+@@ -743,22 +744,18 @@ no_route:
+   * required.
+   */
+   /* err = -EHOSTUNREACH; */
+-err:
+- /* Control chunks are unreliable so just drop them.  DATA chunks
+-  * will get resent or dropped later.
+-  */
++ kfree_skb(head);
+ 
++err:
+  list_for_each_entry_safe(chunk, tmp, &packet->chunk_list, list) {
+   list_del_init(&chunk->list);
+   if (!sctp_chunk_is_data(chunk))
+    sctp_chunk_free(chunk);
+  }
+- goto out;
+-nomem:
+- if (packet->auth && list_empty(&packet->auth->list))
+-  sctp_chunk_free(packet->auth);
+- err = -ENOMEM;
+- goto err;
++
++out:
++ sctp_packet_reset(packet);
++ return err;
+ }
+ 
+ /********************************************************************
+-- 
+1.7.1

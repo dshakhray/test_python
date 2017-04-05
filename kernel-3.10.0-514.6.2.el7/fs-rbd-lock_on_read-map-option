@@ -1,0 +1,96 @@
+From 62b4d7207b95a0104577434da782c8fcd6a5855c Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <idryomov@redhat.com>
+Date: Mon, 17 Oct 2016 08:53:02 -0400
+Subject: [fs] rbd: lock_on_read map option
+
+Message-id: <1476694384-21682-2-git-send-email-idryomov@redhat.com>
+Patchwork-id: 158988
+O-Subject: [RHEL7.4 fs PATCH 1/3] rbd: lock_on_read map option
+Bugzilla: 1378186
+Z-Bugzilla: 1393485
+RH-Acked-by: Jeremy McNicoll <jmcnicol@redhat.com>
+RH-Acked-by: Mike Christie <mchristi@redhat.com>
+RH-Acked-by: Sage Weil <sweil@redhat.com>
+
+From: Ilya Dryomov <idryomov@gmail.com>
+
+Add a per-device option to acquire exclusive lock on reads (in addition
+to writes and discards).  The use case is iSCSI, where it will be used
+to prevent execution of stale writes after the implicit failover.
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Tested-by: Mike Christie <mchristi@redhat.com>
+(cherry picked from commit 80de19122866d0a65f741e7ff2d5d20842d22d6b)
+Signed-off-by: Frantisek Hrbata <fhrbata@hrbata.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index c99beff..a2f32de 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -779,6 +779,7 @@ enum {
+  /* string args above */
+  Opt_read_only,
+  Opt_read_write,
++ Opt_lock_on_read,
+  Opt_err
+ };
+ 
+@@ -790,16 +791,19 @@ static match_table_t rbd_opts_tokens = {
+  {Opt_read_only, "ro"},  /* Alternate spelling */
+  {Opt_read_write, "read_write"},
+  {Opt_read_write, "rw"},  /* Alternate spelling */
++ {Opt_lock_on_read, "lock_on_read"},
+  {Opt_err, NULL}
+ };
+ 
+ struct rbd_options {
+  int queue_depth;
+  bool read_only;
++ bool lock_on_read;
+ };
+ 
+ #define RBD_QUEUE_DEPTH_DEFAULT BLKDEV_MAX_RQ
+ #define RBD_READ_ONLY_DEFAULT false
++#define RBD_LOCK_ON_READ_DEFAULT false
+ 
+ static int parse_rbd_opts_token(char *c, void *private)
+ {
+@@ -835,6 +839,9 @@ static int parse_rbd_opts_token(char *c, void *private)
+  case Opt_read_write:
+   rbd_opts->read_only = false;
+   break;
++ case Opt_lock_on_read:
++  rbd_opts->lock_on_read = true;
++  break;
+  default:
+   /* libceph prints "bad option" msg */
+   return -EINVAL;
+@@ -4148,7 +4155,7 @@ static void rbd_queue_workfn(struct work_struct *work)
+  u64 length = blk_rq_bytes(rq);
+  enum obj_operation_type op_type;
+  u64 mapping_size;
+- bool must_be_locked = false;
++ bool must_be_locked;
+  int result;
+ 
+  if (rq->cmd_type != REQ_TYPE_FS) {
+@@ -4211,6 +4218,9 @@ static void rbd_queue_workfn(struct work_struct *work)
+   snapc = rbd_dev->header.snapc;
+   ceph_get_snap_context(snapc);
+   must_be_locked = rbd_is_lock_supported(rbd_dev);
++ } else {
++  must_be_locked = rbd_dev->opts->lock_on_read &&
++     rbd_is_lock_supported(rbd_dev);
+  }
+  up_read(&rbd_dev->header_rwsem);
+ 
+@@ -5846,6 +5856,7 @@ static int rbd_add_parse_args(const char *buf,
+ 
+  rbd_opts->read_only = RBD_READ_ONLY_DEFAULT;
+  rbd_opts->queue_depth = RBD_QUEUE_DEPTH_DEFAULT;
++ rbd_opts->lock_on_read = RBD_LOCK_ON_READ_DEFAULT;
+ 
+  copts = ceph_parse_options(options, mon_addrs,
+      mon_addrs + mon_addrs_size - 1,
+-- 
+1.7.1

@@ -1,0 +1,269 @@
+From 234913e04db65d9444285418a8cf7e2e6e058e6d Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 24 Oct 2016 16:05:20 -0400
+Subject: [fs] cifs: make share unaccessible at root level mountable
+
+Message-id: <1477325124-19979-2-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 159557
+O-Subject: [RHEL7 PATCH fs 1/5] [bz1302329]fs/cifs: make share unaccessible at root level mountable
+Bugzilla: 1302329
+Z-Bugzilla: 1400055
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Aurelien Aptel <aaptel@suse.com>
+
+Fixes: bz 1302329
+
+if, when mounting //HOST/share/sub/dir/foo we can query /sub/dir/foo but
+not any of the path components above:
+
+- store the /sub/dir/foo prefix in the cifs super_block info
+- in the superblock, set root dentry to the subpath dentry (instead of
+  the share root)
+- set a flag in the superblock to remember it
+- use prefixpath when building path from a dentry
+
+fixes bso#8950
+
+Signed-off-by: Aurelien Aptel <aaptel@suse.com>
+CC: Stable <stable@vger.kernel.org>
+Reviewed-by: Pavel Shilovsky <pshilovsky@samba.org>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit a6b5058fafdf508904bbf16c29b24042cef3c496)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+Signed-off-by: Frantisek Hrbata <fhrbata@hrbata.com>
+
+diff --git a/fs/cifs/cifs_fs_sb.h b/fs/cifs/cifs_fs_sb.h
+index 3182273..1418daa 100644
+--- a/fs/cifs/cifs_fs_sb.h
++++ b/fs/cifs/cifs_fs_sb.h
+@@ -46,6 +46,9 @@
+ #define CIFS_MOUNT_CIFS_BACKUPUID 0x200000 /* backup intent bit for a user */
+ #define CIFS_MOUNT_CIFS_BACKUPGID 0x400000 /* backup intent bit for a group */
+ #define CIFS_MOUNT_MAP_SFM_CHR 0x800000 /* SFM/MAC mapping for illegal chars */
++#define CIFS_MOUNT_USE_PREFIX_PATH 0x1000000 /* make subpath with unaccessible
++           * root mountable
++           */
+ 
+ struct cifs_sb_info {
+  struct rb_root tlink_tree;
+@@ -67,5 +70,6 @@ struct cifs_sb_info {
+  struct backing_dev_info bdi;
+  struct delayed_work prune_tlinks;
+  struct rcu_head rcu;
++ char *prepath;
+ };
+ #endif    /* _CIFS_FS_SB_H */
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+index 35e18fc..79c6909 100644
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -687,6 +687,14 @@ cifs_do_mount(struct file_system_type *fs_type,
+   goto out_cifs_sb;
+  }
+ 
++ if (volume_info->prepath) {
++  cifs_sb->prepath = kstrdup(volume_info->prepath, GFP_KERNEL);
++  if (cifs_sb->prepath == NULL) {
++   root = ERR_PTR(-ENOMEM);
++   goto out_cifs_sb;
++  }
++ }
++
+  cifs_setup_cifs_sb(volume_info, cifs_sb);
+ 
+  rc = cifs_mount(cifs_sb, volume_info);
+@@ -725,7 +733,11 @@ cifs_do_mount(struct file_system_type *fs_type,
+   sb->s_flags |= MS_ACTIVE;
+  }
+ 
+- root = cifs_get_root(volume_info, sb);
++ if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
++  root = dget(sb->s_root);
++ else
++  root = cifs_get_root(volume_info, sb);
++
+  if (IS_ERR(root))
+   goto out_super;
+ 
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 31e4b98..3fdc63c 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -3540,6 +3540,44 @@ cifs_get_volume_info(char *mount_data, const char *devname)
+  return volume_info;
+ }
+ 
++static int
++cifs_are_all_path_components_accessible(struct TCP_Server_Info *server,
++     unsigned int xid,
++     struct cifs_tcon *tcon,
++     struct cifs_sb_info *cifs_sb,
++     char *full_path)
++{
++ int rc;
++ char *s;
++ char sep, tmp;
++
++ sep = CIFS_DIR_SEP(cifs_sb);
++ s = full_path;
++
++ rc = server->ops->is_path_accessible(xid, tcon, cifs_sb, "");
++ while (rc == 0) {
++  /* skip separators */
++  while (*s == sep)
++   s++;
++  if (!*s)
++   break;
++  /* next separator */
++  while (*s && *s != sep)
++   s++;
++
++  /*
++   * temporarily null-terminate the path at the end of
++   * the current component
++   */
++  tmp = *s;
++  *s = 0;
++  rc = server->ops->is_path_accessible(xid, tcon, cifs_sb,
++           full_path);
++  *s = tmp;
++ }
++ return rc;
++}
++
+ int
+ cifs_mount(struct cifs_sb_info *cifs_sb, struct smb_vol *volume_info)
+ {
+@@ -3677,6 +3715,16 @@ remote_path_check:
+    kfree(full_path);
+    goto mount_fail_check;
+   }
++
++  rc = cifs_are_all_path_components_accessible(server,
++            xid, tcon, cifs_sb,
++            full_path);
++  if (rc != 0) {
++   cifs_dbg(VFS, "cannot query dirs between root and final path, "
++     "enabling CIFS_MOUNT_USE_PREFIX_PATH\n");
++   cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
++   rc = 0;
++  }
+   kfree(full_path);
+  }
+ 
+@@ -3946,6 +3994,7 @@ cifs_umount(struct cifs_sb_info *cifs_sb)
+ 
+  bdi_destroy(&cifs_sb->bdi);
+  kfree(cifs_sb->mountdata);
++ kfree(cifs_sb->prepath);
+  call_rcu(&cifs_sb->rcu, delayed_free);
+ }
+ 
+diff --git a/fs/cifs/dir.c b/fs/cifs/dir.c
+index 5089e42..26a3b38 100644
+--- a/fs/cifs/dir.c
++++ b/fs/cifs/dir.c
+@@ -84,6 +84,7 @@ build_path_from_dentry(struct dentry *direntry)
+  struct dentry *temp;
+  int namelen;
+  int dfsplen;
++ int pplen = 0;
+  char *full_path;
+  char dirsep;
+  struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
+@@ -95,8 +96,12 @@ build_path_from_dentry(struct dentry *direntry)
+   dfsplen = strnlen(tcon->treeName, MAX_TREE_SIZE + 1);
+  else
+   dfsplen = 0;
++
++ if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
++  pplen = cifs_sb->prepath ? strlen(cifs_sb->prepath) + 1 : 0;
++
+ cifs_bp_rename_retry:
+- namelen = dfsplen;
++ namelen = dfsplen + pplen;
+  seq = read_seqbegin(&rename_lock);
+  rcu_read_lock();
+  for (temp = direntry; !IS_ROOT(temp);) {
+@@ -137,7 +142,7 @@ cifs_bp_rename_retry:
+   }
+  }
+  rcu_read_unlock();
+- if (namelen != dfsplen || read_seqretry(&rename_lock, seq)) {
++ if (namelen != dfsplen + pplen || read_seqretry(&rename_lock, seq)) {
+   cifs_dbg(FYI, "did not end path lookup where expected. namelen=%ddfsplen=%d\n",
+     namelen, dfsplen);
+   /* presumably this is only possible if racing with a rename
+@@ -153,6 +158,17 @@ cifs_bp_rename_retry:
+     those safely to '/' if any are found in the middle of the prepath */
+  /* BB test paths to Windows with '/' in the midst of prepath */
+ 
++ if (pplen) {
++  int i;
++
++  cifs_dbg(FYI, "using cifs_sb prepath <%s>\n", cifs_sb->prepath);
++  memcpy(full_path+dfsplen+1, cifs_sb->prepath, pplen-1);
++  full_path[dfsplen] = '\\';
++  for (i = 0; i < pplen-1; i++)
++   if (full_path[dfsplen+1+i] == '/')
++    full_path[dfsplen+1+i] = CIFS_DIR_SEP(cifs_sb);
++ }
++
+  if (dfsplen) {
+   strncpy(full_path, tcon->treeName, dfsplen);
+   if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS) {
+diff --git a/fs/cifs/inode.c b/fs/cifs/inode.c
+index 3aba214..a8010b9 100644
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -1005,10 +1005,26 @@ struct inode *cifs_root_iget(struct super_block *sb)
+  struct inode *inode = NULL;
+  long rc;
+  struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
++ char *path = NULL;
++ int len;
++
++ if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
++     && cifs_sb->prepath) {
++  len = strlen(cifs_sb->prepath);
++  path = kzalloc(len + 2 /* leading sep + null */, GFP_KERNEL);
++  if (path == NULL)
++   return ERR_PTR(-ENOMEM);
++  path[0] = '/';
++  memcpy(path+1, cifs_sb->prepath, len);
++ } else {
++  path = kstrdup("", GFP_KERNEL);
++  if (path == NULL)
++   return ERR_PTR(-ENOMEM);
++ }
+ 
+  xid = get_xid();
+  if (tcon->unix_ext) {
+-  rc = cifs_get_inode_info_unix(&inode, "", sb, xid);
++  rc = cifs_get_inode_info_unix(&inode, path, sb, xid);
+   /* some servers mistakenly claim POSIX support */
+   if (rc != -EOPNOTSUPP)
+    goto iget_no_retry;
+@@ -1016,7 +1032,8 @@ struct inode *cifs_root_iget(struct super_block *sb)
+   tcon->unix_ext = false;
+  }
+ 
+- rc = cifs_get_inode_info(&inode, "", NULL, sb, xid, NULL);
++ convert_delimiter(path, CIFS_DIR_SEP(cifs_sb));
++ rc = cifs_get_inode_info(&inode, path, NULL, sb, xid, NULL);
+ 
+ iget_no_retry:
+  if (!inode) {
+@@ -1045,6 +1062,7 @@ iget_no_retry:
+  }
+ 
+ out:
++ kfree(path);
+  /* can not call macro free_xid here since in a void func
+   * TODO: This is no longer true
+   */
+-- 
+1.7.1
