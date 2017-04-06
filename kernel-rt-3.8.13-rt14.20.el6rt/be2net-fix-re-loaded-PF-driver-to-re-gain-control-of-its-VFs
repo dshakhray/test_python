@@ -1,0 +1,380 @@
+From 0cadc7ac1b453d45307041aa3caeb064d84283e4 Mon Sep 17 00:00:00 2001
+From: Sathya Perla <sathya.perla@emulex.com>
+Date: Sun, 3 Feb 2013 20:30:11 +0000
+Subject: [PATCH 802/858] be2net: fix re-loaded PF driver to re-gain control of
+ its VFs
+
+Currently, when the PF driver is unloaded and re-loaded while VFs are attached
+to VMs, it loses control of its VFs.
+
+The PF driver now uses the newly defined/created GET_IFACE_LIST cmd
+(available in FW ver >= 4.6) to query the if_id of the VFs
+(enabled in its previous life). The PF driver then uses the if_id for
+further VF configuration.
+
+The GET_IFACE_MAC_LIST cmd has also implemented in BE3 FW for PF to
+query pmac-ids used by its VFs.
+
+Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4c876616298f8b07614892ac7aa82c768e435fda)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/ethernet/emulex/benet/be_cmds.c |  33 ++++++
+ drivers/net/ethernet/emulex/benet/be_cmds.h |  20 ++++
+ drivers/net/ethernet/emulex/benet/be_main.c | 164 +++++++++++++++++-----------
+ 3 files changed, 153 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.c b/drivers/net/ethernet/emulex/benet/be_cmds.c
+index 8a250c3..8b04880 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -3138,6 +3138,39 @@ err:
+  return status;
+ }
+ 
++int be_cmd_get_if_id(struct be_adapter *adapter, struct be_vf_cfg *vf_cfg,
++       int vf_num)
++{
++ struct be_mcc_wrb *wrb;
++ struct be_cmd_req_get_iface_list *req;
++ struct be_cmd_resp_get_iface_list *resp;
++ int status;
++
++ spin_lock_bh(&adapter->mcc_lock);
++
++ wrb = wrb_from_mccq(adapter);
++ if (!wrb) {
++  status = -EBUSY;
++  goto err;
++ }
++ req = embedded_payload(wrb);
++
++ be_wrb_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_COMMON,
++          OPCODE_COMMON_GET_IFACE_LIST, sizeof(*resp),
++          wrb, NULL);
++ req->hdr.domain = vf_num + 1;
++
++ status = be_mcc_notify_wait(adapter);
++ if (!status) {
++  resp = (struct be_cmd_resp_get_iface_list *)req;
++  vf_cfg->if_handle = le32_to_cpu(resp->if_desc.if_id);
++ }
++
++err:
++ spin_unlock_bh(&adapter->mcc_lock);
++ return status;
++}
++
+ /* Uses sync mcc */
+ int be_cmd_enable_vf(struct be_adapter *adapter, u8 domain)
+ {
+diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.h b/drivers/net/ethernet/emulex/benet/be_cmds.h
+index d6552e1..9697086 100644
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.h
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.h
+@@ -203,6 +203,7 @@ struct be_mcc_mailbox {
+ #define OPCODE_COMMON_GET_FN_PRIVILEGES   170
+ #define OPCODE_COMMON_READ_OBJECT   171
+ #define OPCODE_COMMON_WRITE_OBJECT   172
++#define OPCODE_COMMON_GET_IFACE_LIST   194
+ #define OPCODE_COMMON_ENABLE_DISABLE_VF   196
+ 
+ #define OPCODE_ETH_RSS_CONFIG    1
+@@ -1795,6 +1796,23 @@ static inline bool check_privilege(struct be_adapter *adapter, u32 flags)
+  return flags & adapter->cmd_privileges ? true : false;
+ }
+ 
++/************** Get IFACE LIST *******************/
++struct be_if_desc {
++ u32 if_id;
++ u32 cap_flags;
++ u32 en_flags;
++};
++
++struct be_cmd_req_get_iface_list {
++ struct be_cmd_req_hdr hdr;
++};
++
++struct be_cmd_resp_get_iface_list {
++ struct be_cmd_req_hdr hdr;
++ u32 if_cnt;
++ struct be_if_desc if_desc;
++};
++
+ extern int be_pci_fnum_get(struct be_adapter *adapter);
+ extern int be_fw_wait_ready(struct be_adapter *adapter);
+ extern int be_cmd_mac_addr_query(struct be_adapter *adapter, u8 *mac_addr,
+@@ -1917,4 +1935,6 @@ extern int be_cmd_get_profile_config(struct be_adapter *adapter, u32 *cap_flags,
+ 
+ extern int be_cmd_set_profile_config(struct be_adapter *adapter, u32 bps,
+          u8 domain);
++extern int be_cmd_get_if_id(struct be_adapter *adapter,
++       struct be_vf_cfg *vf_cfg, int vf_num);
+ extern int be_cmd_enable_vf(struct be_adapter *adapter, u8 domain);
+diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
+index 4d6f3c5..3860888 100644
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -2597,7 +2597,7 @@ static int be_setup_wol(struct be_adapter *adapter, bool enable)
+  * These addresses are programmed in the ASIC by the PF and the VF driver
+  * queries for the MAC address during its probe.
+  */
+-static inline int be_vf_eth_addr_config(struct be_adapter *adapter)
++static int be_vf_eth_addr_config(struct be_adapter *adapter)
+ {
+  u32 vf;
+  int status = 0;
+@@ -2626,13 +2626,34 @@ static inline int be_vf_eth_addr_config(struct be_adapter *adapter)
+  return status;
+ }
+ 
++static int be_vfs_mac_query(struct be_adapter *adapter)
++{
++ int status, vf;
++ u8 mac[ETH_ALEN];
++ struct be_vf_cfg *vf_cfg;
++ bool active;
++
++ for_all_vfs(adapter, vf_cfg, vf) {
++  be_cmd_get_mac_from_list(adapter, mac, &active,
++      &vf_cfg->pmac_id, 0);
++
++  status = be_cmd_mac_addr_query(adapter, mac, false,
++            vf_cfg->if_handle, 0);
++  if (status)
++   return status;
++  memcpy(vf_cfg->mac_addr, mac, ETH_ALEN);
++ }
++ return 0;
++}
++
+ static void be_vf_clear(struct be_adapter *adapter)
+ {
+  struct be_vf_cfg *vf_cfg;
+  u32 vf;
+ 
+  if (be_find_vfs(adapter, ASSIGNED)) {
+-  dev_warn(&adapter->pdev->dev, "VFs are assigned to VMs\n");
++  dev_warn(&adapter->pdev->dev,
++    "VFs are assigned to VMs: not disabling VFs\n");
+   goto done;
+  }
+ 
+@@ -2681,21 +2702,29 @@ static int be_clear(struct be_adapter *adapter)
+  return 0;
+ }
+ 
+-static void be_get_vf_if_cap_flags(struct be_adapter *adapter,
+-       u32 *cap_flags, u8 domain)
++static int be_vfs_if_create(struct be_adapter *adapter)
+ {
+- bool profile_present = false;
++ struct be_vf_cfg *vf_cfg;
++ u32 cap_flags, en_flags, vf;
+  int status;
+ 
+- if (lancer_chip(adapter)) {
+-  status = be_cmd_get_profile_config(adapter, cap_flags, domain);
+-  if (!status)
+-   profile_present = true;
+- }
++ cap_flags = BE_IF_FLAGS_UNTAGGED | BE_IF_FLAGS_BROADCAST |
++      BE_IF_FLAGS_MULTICAST;
+ 
+- if (!profile_present)
+-  *cap_flags = BE_IF_FLAGS_UNTAGGED | BE_IF_FLAGS_BROADCAST |
+-        BE_IF_FLAGS_MULTICAST;
++ for_all_vfs(adapter, vf_cfg, vf) {
++  if (!BE3_chip(adapter))
++   be_cmd_get_profile_config(adapter, &cap_flags, vf + 1);
++
++  /* If a FW profile exists, then cap_flags are updated */
++  en_flags = cap_flags & (BE_IF_FLAGS_UNTAGGED |
++      BE_IF_FLAGS_BROADCAST | BE_IF_FLAGS_MULTICAST);
++  status = be_cmd_if_create(adapter, cap_flags, en_flags,
++       &vf_cfg->if_handle, vf + 1);
++  if (status)
++   goto err;
++ }
++err:
++ return status;
+ }
+ 
+ static int be_vf_setup_init(struct be_adapter *adapter)
+@@ -2718,65 +2747,70 @@ static int be_vf_setup_init(struct be_adapter *adapter)
+ static int be_vf_setup(struct be_adapter *adapter)
+ {
+  struct be_vf_cfg *vf_cfg;
+- struct device *dev = &adapter->pdev->dev;
+- u32 cap_flags, en_flags, vf;
+  u16 def_vlan, lnk_speed;
+- int status, enabled_vfs;
+-
+- enabled_vfs = be_find_vfs(adapter, ENABLED);
+- if (enabled_vfs) {
+-  dev_warn(dev, "%d VFs are already enabled\n", enabled_vfs);
+-  dev_warn(dev, "Ignoring num_vfs=%d setting\n", num_vfs);
+-  return 0;
+- }
+-
+- if (num_vfs > adapter->dev_num_vfs) {
+-  dev_warn(dev, "Device supports %d VFs and not %d\n",
+-    adapter->dev_num_vfs, num_vfs);
+-  num_vfs = adapter->dev_num_vfs;
+- }
++ int status, old_vfs, vf;
++ struct device *dev = &adapter->pdev->dev;
+ 
+- status = pci_enable_sriov(adapter->pdev, num_vfs);
+- if (!status) {
+-  adapter->num_vfs = num_vfs;
++ old_vfs = be_find_vfs(adapter, ENABLED);
++ if (old_vfs) {
++  dev_info(dev, "%d VFs are already enabled\n", old_vfs);
++  if (old_vfs != num_vfs)
++   dev_warn(dev, "Ignoring num_vfs=%d setting\n", num_vfs);
++  adapter->num_vfs = old_vfs;
+  } else {
+-  /* Platform doesn't support SRIOV though device supports it */
+-  dev_warn(dev, "SRIOV enable failed\n");
+-  return 0;
++  if (num_vfs > adapter->dev_num_vfs)
++   dev_info(dev, "Device supports %d VFs and not %d\n",
++     adapter->dev_num_vfs, num_vfs);
++  adapter->num_vfs = min_t(u16, num_vfs, adapter->dev_num_vfs);
++
++  status = pci_enable_sriov(adapter->pdev, num_vfs);
++  if (status) {
++   dev_err(dev, "SRIOV enable failed\n");
++   adapter->num_vfs = 0;
++   return 0;
++  }
+  }
+ 
+  status = be_vf_setup_init(adapter);
+  if (status)
+   goto err;
+ 
+- for_all_vfs(adapter, vf_cfg, vf) {
+-  be_get_vf_if_cap_flags(adapter, &cap_flags, vf + 1);
+-
+-  en_flags = cap_flags & (BE_IF_FLAGS_UNTAGGED |
+-     BE_IF_FLAGS_BROADCAST |
+-     BE_IF_FLAGS_MULTICAST);
+-
+-  status = be_cmd_if_create(adapter, cap_flags, en_flags,
+-       &vf_cfg->if_handle, vf + 1);
++ if (old_vfs) {
++  for_all_vfs(adapter, vf_cfg, vf) {
++   status = be_cmd_get_if_id(adapter, vf_cfg, vf);
++   if (status)
++    goto err;
++  }
++ } else {
++  status = be_vfs_if_create(adapter);
+   if (status)
+    goto err;
+  }
+ 
+- if (!enabled_vfs) {
++ if (old_vfs) {
++  status = be_vfs_mac_query(adapter);
++  if (status)
++   goto err;
++ } else {
+   status = be_vf_eth_addr_config(adapter);
+   if (status)
+    goto err;
+  }
+ 
+  for_all_vfs(adapter, vf_cfg, vf) {
+-  lnk_speed = 1000;
+-  status = be_cmd_set_qos(adapter, lnk_speed, vf + 1);
+-  if (status)
+-   goto err;
+-  vf_cfg->tx_rate = lnk_speed * 10;
++  /* BE3 FW, by default, caps VF TX-rate to 100mbps.
++   * Allow full available bandwidth
++   */
++  if (BE3_chip(adapter) && !old_vfs)
++   be_cmd_set_qos(adapter, 1000, vf+1);
++
++  status = be_cmd_link_status_query(adapter, &lnk_speed,
++        NULL, vf + 1);
++  if (!status)
++   vf_cfg->tx_rate = lnk_speed;
+ 
+   status = be_cmd_get_hsw_config(adapter, &def_vlan,
+-    vf + 1, vf_cfg->if_handle);
++            vf + 1, vf_cfg->if_handle);
+   if (status)
+    goto err;
+   vf_cfg->def_vid = def_vlan;
+@@ -2785,6 +2819,8 @@ static int be_vf_setup(struct be_adapter *adapter)
+  }
+  return 0;
+ err:
++ dev_err(dev, "VF setup failed\n");
++ be_vf_clear(adapter);
+  return status;
+ }
+ 
+@@ -2838,12 +2874,12 @@ static int be_get_mac_addr(struct be_adapter *adapter, u8 *mac, u32 if_handle,
+ 
+ static void be_get_resources(struct be_adapter *adapter)
+ {
+- int status;
++ u16 dev_num_vfs;
++ int pos, status;
+  bool profile_present = false;
+ 
+- if (lancer_chip(adapter)) {
++ if (!BEx_chip(adapter)) {
+   status = be_cmd_get_func_config(adapter);
+-
+   if (!status)
+    profile_present = true;
+  }
+@@ -2899,13 +2935,21 @@ static void be_get_resources(struct be_adapter *adapter)
+   if (adapter->function_caps & BE_FUNCTION_CAPS_RSS)
+    adapter->if_cap_flags |= BE_IF_FLAGS_RSS;
+  }
++
++ pos = pci_find_ext_capability(adapter->pdev, PCI_EXT_CAP_ID_SRIOV);
++ if (pos) {
++  pci_read_config_word(adapter->pdev, pos + PCI_SRIOV_TOTAL_VF,
++         &dev_num_vfs);
++  if (BE3_chip(adapter))
++   dev_num_vfs = min_t(u16, dev_num_vfs, MAX_VFS);
++  adapter->dev_num_vfs = dev_num_vfs;
++ }
+ }
+ 
+ /* Routine to query per function resource limits */
+ static int be_get_config(struct be_adapter *adapter)
+ {
+- int pos, status;
+- u16 dev_num_vfs;
++ int status;
+ 
+  status = be_cmd_query_fw_cfg(adapter, &adapter->port_num,
+          &adapter->function_mode,
+@@ -2923,14 +2967,6 @@ static int be_get_config(struct be_adapter *adapter)
+   goto err;
+  }
+ 
+- pos = pci_find_ext_capability(adapter->pdev, PCI_EXT_CAP_ID_SRIOV);
+- if (pos) {
+-  pci_read_config_word(adapter->pdev, pos + PCI_SRIOV_TOTAL_VF,
+-         &dev_num_vfs);
+-  if (!lancer_chip(adapter))
+-   dev_num_vfs = min_t(u16, dev_num_vfs, MAX_VFS);
+-  adapter->dev_num_vfs = dev_num_vfs;
+- }
+ err:
+  return status;
+ }
+-- 
+1.8.3.1

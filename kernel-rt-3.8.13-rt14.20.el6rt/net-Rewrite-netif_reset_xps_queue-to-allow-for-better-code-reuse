@@ -1,0 +1,114 @@
+From 8b6e49d8acce3d8eaa015e3726d920368df7986f Mon Sep 17 00:00:00 2001
+From: Alexander Duyck <alexander.h.duyck@intel.com>
+Date: Thu, 10 Jan 2013 08:57:17 +0000
+Subject: [PATCH 771/858] net: Rewrite netif_reset_xps_queue to allow for
+ better code reuse
+
+This patch does a minor refactor on netif_reset_xps_queue to address a few
+items I noticed.
+
+First is the fact that we are doing removal of queues in both
+netif_reset_xps_queue and netif_set_xps_queue.  Since there is no need to
+have the code in two places I am pushing it out into a separate function
+and will come back in another patch and reuse the code in
+netif_set_xps_queue.
+
+The second item this change addresses is the fact that the Tx queues were
+not getting their numa_node value cleared as a part of the XPS queue reset.
+This patch resolves that by resetting the numa_node value if the dev_maps
+value is set.
+
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 10cdc3f3cd541bfeaaf1c6e1710b1500ca19aa7f)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ net/core/dev.c | 56 +++++++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 33 insertions(+), 23 deletions(-)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 39c8a61..ff6fc69 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1863,45 +1863,55 @@ static DEFINE_MUTEX(xps_map_mutex);
+ #define xmap_dereference(P)  \
+  rcu_dereference_protected((P), lockdep_is_held(&xps_map_mutex))
+ 
+-void netif_reset_xps_queue(struct net_device *dev, u16 index)
++static struct xps_map *remove_xps_queue(struct xps_dev_maps *dev_maps,
++     int cpu, u16 index)
+ {
+- struct xps_dev_maps *dev_maps;
+- struct xps_map *map;
+- int i, pos, nonempty = 0;
+-
+- mutex_lock(&xps_map_mutex);
+- dev_maps = xmap_dereference(dev->xps_maps);
+-
+- if (!dev_maps)
+-  goto out_no_maps;
++ struct xps_map *map = NULL;
++ int pos;
+ 
+- for_each_possible_cpu(i) {
+-  map = xmap_dereference(dev_maps->cpu_map[i]);
+-  if (!map)
+-   continue;
+-
+-  for (pos = 0; pos < map->len; pos++)
+-   if (map->queues[pos] == index)
+-    break;
++ if (dev_maps)
++  map = xmap_dereference(dev_maps->cpu_map[cpu]);
+ 
+-  if (pos < map->len) {
++ for (pos = 0; map && pos < map->len; pos++) {
++  if (map->queues[pos] == index) {
+    if (map->len > 1) {
+     map->queues[pos] = map->queues[--map->len];
+    } else {
+-    RCU_INIT_POINTER(dev_maps->cpu_map[i], NULL);
++    RCU_INIT_POINTER(dev_maps->cpu_map[cpu], NULL);
+     kfree_rcu(map, rcu);
+     map = NULL;
+    }
++   break;
+   }
+-  if (map)
+-   nonempty = 1;
+  }
+ 
+- if (!nonempty) {
++ return map;
++}
++
++void netif_reset_xps_queue(struct net_device *dev, u16 index)
++{
++ struct xps_dev_maps *dev_maps;
++ int cpu;
++ bool active = false;
++
++ mutex_lock(&xps_map_mutex);
++ dev_maps = xmap_dereference(dev->xps_maps);
++
++ if (!dev_maps)
++  goto out_no_maps;
++
++ for_each_possible_cpu(cpu) {
++  if (remove_xps_queue(dev_maps, cpu, index))
++   active = true;
++ }
++
++ if (!active) {
+   RCU_INIT_POINTER(dev->xps_maps, NULL);
+   kfree_rcu(dev_maps, rcu);
+  }
+ 
++ netdev_queue_numa_node_write(netdev_get_tx_queue(dev, index),
++         NUMA_NO_NODE);
+ out_no_maps:
+  mutex_unlock(&xps_map_mutex);
+ }
+-- 
+1.8.3.1

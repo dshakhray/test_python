@@ -1,0 +1,81 @@
+From 0e3d208e7701eefeb64108757f30dce4a4c754a8 Mon Sep 17 00:00:00 2001
+From: xunleer <xunleer.li@huawei.com>
+Date: Tue, 5 Mar 2013 07:44:20 +0000
+Subject: [PATCH 789/858] ixgbevf: don't release the soft entries
+
+When the ixgbevf driver is opened the request to allocate MSIX irq
+vectors may fail.  In that case the driver will call ixgbevf_down()
+which will call ixgbevf_irq_disable() to clear the HW interrupt
+registers and calls synchronize_irq() using the msix_entries pointer in
+the adapter structure.  However, when the function to request the MSIX
+irq vectors failed it had already freed the msix_entries which causes
+an OOPs from using the NULL pointer in synchronize_irq().
+
+The calls to pci_disable_msix() and to free the msix_entries memory
+should not occur if device open fails.  Instead they should be called
+during device driver removal to balance with the call to
+pci_enable_msix() and the call to allocate msix_entries memory
+during the device probe and driver load.
+
+Signed-off-by: Li Xun <xunleer.li@huawei.com>
+Signed-off-by: Greg Rose <gregory.v.rose@intel.com>
+Tested-by: Sibai Li <sibai.li@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit a1f6c6b147cc5e83ec36dab8370bd5ec5fa1def6)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c | 24 +++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+index c3db6cd..2b6cb5c 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+@@ -944,9 +944,17 @@ free_queue_irqs:
+   free_irq(adapter->msix_entries[vector].vector,
+     adapter->q_vector[vector]);
+  }
+- pci_disable_msix(adapter->pdev);
+- kfree(adapter->msix_entries);
+- adapter->msix_entries = NULL;
++ /* This failure is non-recoverable - it indicates the system is
++  * out of MSIX vector resources and the VF driver cannot run
++  * without them.  Set the number of msix vectors to zero
++  * indicating that not enough can be allocated.  The error
++  * will be returned to the user indicating device open failed.
++  * Any further attempts to force the driver to open will also
++  * fail.  The only way to recover is to unload the driver and
++  * reload it again.  If the system has recovered some MSIX
++  * vectors then it may succeed.
++  */
++ adapter->num_msix_vectors = 0;
+  return err;
+ }
+ 
+@@ -2572,6 +2580,15 @@ static int ixgbevf_open(struct net_device *netdev)
+  struct ixgbe_hw *hw = &adapter->hw;
+  int err;
+ 
++ /* A previous failure to open the device because of a lack of
++  * available MSIX vector resources may have reset the number
++  * of msix vectors variable to zero.  The only way to recover
++  * is to unload/reload the driver and hope that the system has
++  * been able to recover some MSIX vector resources.
++  */
++ if (!adapter->num_msix_vectors)
++  return -ENOMEM;
++
+  /* disallow open during test */
+  if (test_bit(__IXGBEVF_TESTING, &adapter->state))
+   return -EBUSY;
+@@ -2628,7 +2645,6 @@ static int ixgbevf_open(struct net_device *netdev)
+ 
+ err_req_irq:
+  ixgbevf_down(adapter);
+- ixgbevf_free_irq(adapter);
+ err_setup_rx:
+  ixgbevf_free_all_rx_resources(adapter);
+ err_setup_tx:
+-- 
+1.8.3.1

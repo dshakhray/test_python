@@ -1,0 +1,46 @@
+From 585200d240823914214f966bd8167db58e9a5995 Mon Sep 17 00:00:00 2001
+From: Trond Myklebust <Trond.Myklebust@netapp.com>
+Date: Wed, 22 May 2013 12:57:24 -0400
+Subject: [PATCH 853/858] SUNRPC: Prevent an rpc_task wakeup race
+
+commit a3c3cac5d31879cd9ae2de7874dc6544ca704aec upstream
+
+The lockless RPC_IS_QUEUED() test in __rpc_execute means that we need to
+be careful about ordering the calls to rpc_test_and_set_running(task) and
+rpc_clear_queued(task). If we get the order wrong, then we may end up
+testing the RPC_TASK_RUNNING flag after __rpc_execute() has looped
+and changed the state of the rpc_task.
+
+Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+Cc: stable@vger.kernel.org
+Cherry-picked-for: v3.8-rt
+Signed-off-by: John Kacur <jkacur@redhat.com>
+---
+ net/sunrpc/sched.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/net/sunrpc/sched.c b/net/sunrpc/sched.c
+index f8529fc..5356b12 100644
+--- a/net/sunrpc/sched.c
++++ b/net/sunrpc/sched.c
+@@ -324,11 +324,17 @@ EXPORT_SYMBOL_GPL(__rpc_wait_for_completion_task);
+  * Note: If the task is ASYNC, and is being made runnable after sitting on an
+  * rpc_wait_queue, this must be called with the queue spinlock held to protect
+  * the wait queue operation.
++ * Note the ordering of rpc_test_and_set_running() and rpc_clear_queued(),
++ * which is needed to ensure that __rpc_execute() doesn't loop (due to the
++ * lockless RPC_IS_QUEUED() test) before we've had a chance to test
++ * the RPC_TASK_RUNNING flag.
+  */
+ static void rpc_make_runnable(struct rpc_task *task)
+ {
++ bool need_wakeup = !rpc_test_and_set_running(task);
++
+  rpc_clear_queued(task);
+- if (rpc_test_and_set_running(task))
++ if (!need_wakeup)
+   return;
+  if (RPC_IS_ASYNC(task)) {
+   INIT_WORK(&task->u.tk_work, rpc_async_schedule);
+-- 
+1.8.3.1

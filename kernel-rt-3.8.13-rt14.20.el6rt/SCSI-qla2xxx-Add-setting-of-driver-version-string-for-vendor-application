@@ -1,0 +1,145 @@
+From 23afb4d13271daaac9193eb30729b7f5e705aa07 Mon Sep 17 00:00:00 2001
+From: Joe Carnuccio <joe.carnuccio@qlogic.com>
+Date: Fri, 8 Feb 2013 01:58:00 -0500
+Subject: [PATCH 365/858] [SCSI] qla2xxx: Add setting of driver version string
+ for vendor application.
+
+Signed-off-by: Joe Carnuccio <joe.carnuccio@qlogic.com>
+Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit 3a11711ad00caebee07e262d188cea66f3473c38)
+
+Signed-off-by: Clark Williams <williams@redhat.com>
+Signed-off-by: John Kacur <jkacur@redhat.com>
+---
+ drivers/scsi/qla2xxx/qla_dbg.c  |  2 +-
+ drivers/scsi/qla2xxx/qla_def.h  |  2 ++
+ drivers/scsi/qla2xxx/qla_gbl.h  |  3 +++
+ drivers/scsi/qla2xxx/qla_init.c |  2 ++
+ drivers/scsi/qla2xxx/qla_mbx.c  | 58 +++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/scsi/qla2xxx/qla_dbg.c b/drivers/scsi/qla2xxx/qla_dbg.c
+index 4e58001..69d7a85 100644
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@ -12,7 +12,7 @@
+  * |             Level            |   Last Value Used  |     Holes |
+  * ----------------------------------------------------------------------
+  * | Module Init and Probe        |       0x0126       | 0x4b,0xba,0xfa |
+- * | Mailbox commands             |       0x1154       | 0x111a-0x111b  |
++ * | Mailbox commands             |       0x1158       | 0x111a-0x111b  |
+  * |                              |                    | 0x112c-0x112e  |
+  * |                              |                    | 0x113a         |
+  * | Device Discovery             |       0x2087       | 0x2020-0x2022, |
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 6550653..992e240 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -863,6 +863,8 @@ typedef struct {
+ #define MBX_1  BIT_1
+ #define MBX_0  BIT_0
+ 
++#define RNID_TYPE_SET_VERSION 0x9
++
+ /*
+  * Firmware state codes from get firmware state mailbox command
+  */
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index b67f74a..617771b 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -358,6 +358,9 @@ extern int
+ qla2x00_disable_fce_trace(scsi_qla_host_t *, uint64_t *, uint64_t *);
+ 
+ extern int
++qla2x00_set_driver_version(scsi_qla_host_t *, char *);
++
++extern int
+ qla2x00_read_sfp(scsi_qla_host_t *, dma_addr_t, uint8_t *,
+  uint16_t, uint16_t, uint16_t, uint16_t);
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index edb4f8e..891b8f1 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -619,6 +619,8 @@ qla2x00_initialize_adapter(scsi_qla_host_t *vha)
+  if (IS_QLA24XX_TYPE(ha) || IS_QLA25XX(ha))
+   qla24xx_read_fcp_prio_cfg(vha);
+ 
++ qla2x00_set_driver_version(vha, QLA2XXX_VERSION);
++
+  return (rval);
+ }
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index dc0fe52..281947e 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -3867,6 +3867,64 @@ qla81xx_restart_mpi_firmware(scsi_qla_host_t *vha)
+ }
+ 
+ int
++qla2x00_set_driver_version(scsi_qla_host_t *vha, char *version)
++{
++ int rval;
++ mbx_cmd_t mc;
++ mbx_cmd_t *mcp = &mc;
++ int len;
++ uint16_t dwlen;
++ uint8_t *str;
++ dma_addr_t str_dma;
++ struct qla_hw_data *ha = vha->hw;
++
++ if (!IS_FWI2_CAPABLE(ha) || IS_QLA82XX(ha))
++  return QLA_FUNCTION_FAILED;
++
++ ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1155,
++     "Entered %s.\n", __func__);
++
++ str = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL, &str_dma);
++ if (!str) {
++  ql_log(ql_log_warn, vha, 0x1156,
++      "Failed to allocate driver version param.\n");
++  return QLA_MEMORY_ALLOC_FAILED;
++ }
++
++ memcpy(str, "\x7\x3\x11\x0", 4);
++ dwlen = str[0];
++ len = dwlen * sizeof(uint32_t) - 4;
++ memset(str + 4, 0, len);
++ if (len > strlen(version))
++  len = strlen(version);
++ memcpy(str + 4, version, len);
++
++ mcp->mb[0] = MBC_SET_RNID_PARAMS;
++ mcp->mb[1] = RNID_TYPE_SET_VERSION << 8 | dwlen;
++ mcp->mb[2] = MSW(LSD(str_dma));
++ mcp->mb[3] = LSW(LSD(str_dma));
++ mcp->mb[6] = MSW(MSD(str_dma));
++ mcp->mb[7] = LSW(MSD(str_dma));
++ mcp->out_mb = MBX_7|MBX_6|MBX_3|MBX_2|MBX_1|MBX_0;
++ mcp->in_mb = MBX_0;
++ mcp->tov = MBX_TOV_SECONDS;
++ mcp->flags = 0;
++ rval = qla2x00_mailbox_command(vha, mcp);
++
++ if (rval != QLA_SUCCESS) {
++  ql_dbg(ql_dbg_mbx, vha, 0x1157,
++      "Failed=%x mb[0]=%x.\n", rval, mcp->mb[0]);
++ } else {
++  ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1158,
++      "Done %s.\n", __func__);
++ }
++
++ dma_pool_free(ha->s_dma_pool, str, str_dma);
++
++ return rval;
++}
++
++int
+ qla2x00_read_sfp(scsi_qla_host_t *vha, dma_addr_t sfp_dma, uint8_t *sfp,
+  uint16_t dev, uint16_t off, uint16_t len, uint16_t opt)
+ {
+-- 
+1.8.3.1

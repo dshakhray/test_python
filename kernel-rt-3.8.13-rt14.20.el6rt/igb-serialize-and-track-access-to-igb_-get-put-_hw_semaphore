@@ -1,0 +1,85 @@
+From 52ffd81b94c5d8fbf758e21e29d178e1fccbcfe0 Mon Sep 17 00:00:00 2001
+From: "Luis Claudio R. Goncalves" <lgoncalv@redhat.com>
+Date: Fri, 16 Aug 2013 09:13:16 -0300
+Subject: [PATCH 856/858] igb: serialize and track access to
+ igb_{get,put}_hw_semaphore
+
+Bugzilla: 976912
+
+Sebastian Andrzej Siewior suggested a clever alternative to the solution
+proposed on commit "3f07b93 igb: minimize busy loop on igb_get_hw_semaphore".
+
+Use the existing locking API (namely rt mutexes) to track down who holds the
+HW semaphore, and benefit of the Priority Inheritance mechanism to minimize
+or even mitigate the issue.
+
+The remaining issue is that this specific semaphore can be held by the hardware
+itself and, in that case, we could have the hardware holding the semaphore and
+a thread holding the lock, while spinning on a busy loop, waiting for the
+semaphore. In order to mitigate that, the solution proposed on commit 3f07b93
+was kept in place.
+
+Signed-off-by: Luis Claudio R. Goncalves <lgoncalv@redhat.com>
+---
+ drivers/net/ethernet/intel/igb/e1000_hw.h  | 1 +
+ drivers/net/ethernet/intel/igb/e1000_mac.c | 5 +++++
+ drivers/net/ethernet/intel/igb/igb_main.c  | 2 ++
+ 3 files changed, 8 insertions(+)
+
+diff --git a/drivers/net/ethernet/intel/igb/e1000_hw.h b/drivers/net/ethernet/intel/igb/e1000_hw.h
+index 0d5cf9c..6549999 100644
+--- a/drivers/net/ethernet/intel/igb/e1000_hw.h
++++ b/drivers/net/ethernet/intel/igb/e1000_hw.h
+@@ -551,6 +551,7 @@ struct e1000_hw {
+  u16 vendor_id;
+ 
+  u8  revision_id;
++ spinlock_t hwsem_lock;
+ };
+ 
+ extern struct net_device *igb_get_hw_dev(struct e1000_hw *hw);
+diff --git a/drivers/net/ethernet/intel/igb/e1000_mac.c b/drivers/net/ethernet/intel/igb/e1000_mac.c
+index ec0be87..8024572 100644
+--- a/drivers/net/ethernet/intel/igb/e1000_mac.c
++++ b/drivers/net/ethernet/intel/igb/e1000_mac.c
+@@ -1219,6 +1219,8 @@ s32 igb_get_hw_semaphore(struct e1000_hw *hw)
+  s32 timeout = hw->nvm.word_size + 1;
+  s32 i = 0;
+ 
++ spin_lock(&hw->hwsem_lock);
++
+  /* Get the SW semaphore */
+  while (i < timeout) {
+   swsm = rd32(E1000_SWSM);
+@@ -1256,6 +1258,8 @@ s32 igb_get_hw_semaphore(struct e1000_hw *hw)
+  }
+ 
+ out:
++ if (ret_val)
++  spin_unlock(&hw->hwsem_lock);
+  return ret_val;
+ }
+ 
+@@ -1274,6 +1278,7 @@ void igb_put_hw_semaphore(struct e1000_hw *hw)
+  swsm &= ~(E1000_SWSM_SMBI | E1000_SWSM_SWESMBI);
+ 
+  wr32(E1000_SWSM, swsm);
++ spin_unlock(&hw->hwsem_lock);
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index 64f7529..f1a12d8 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -2645,6 +2645,8 @@ static int igb_sw_init(struct igb_adapter *adapter)
+  adapter->min_frame_size = ETH_ZLEN + ETH_FCS_LEN;
+ 
+  spin_lock_init(&adapter->stats64_lock);
++ spin_lock_init(&hw->hwsem_lock);
++
+ #ifdef CONFIG_PCI_IOV
+  switch (hw->mac.type) {
+  case e1000_82576:
+-- 
+1.8.3.1

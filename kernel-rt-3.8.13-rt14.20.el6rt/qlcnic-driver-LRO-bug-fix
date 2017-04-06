@@ -1,0 +1,88 @@
+From 4b07433bb534f913098e7a49b74c27693815135c Mon Sep 17 00:00:00 2001
+From: Manish chopra <manish.chopra@qlogic.com>
+Date: Wed, 30 Jan 2013 12:47:15 +0000
+Subject: [PATCH 444/858] qlcnic: driver LRO bug fix
+
+o ipv4 address was not getting programmed properly because of
+  improper byte order conversion
+
+Signed-off-by: Manish chopra <manish.chopra@qlogic.com>
+Signed-off-by: Jitendra Kalsaria <jitendra.kalsaria@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 283c1c687051241e644af57bef7b6532cd65118a)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c | 18 +++++++++++++++---
+ drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c      |  6 ++++--
+ 2 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+index 1e81e94..65233c8 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+@@ -1399,7 +1399,7 @@ void qlcnic_83xx_config_ipaddr(struct qlcnic_adapter *adapter, __be32 ip,
+           int mode)
+ {
+  int err;
+- u32 temp;
++ u32 temp, temp_ip;
+  struct qlcnic_cmd_args cmd;
+ 
+  qlcnic_alloc_mbx_args(&cmd, adapter, QLCNIC_CMD_CONFIGURE_IP_ADDR);
+@@ -1410,8 +1410,17 @@ void qlcnic_83xx_config_ipaddr(struct qlcnic_adapter *adapter, __be32 ip,
+   temp = adapter->recv_ctx->context_id << 16;
+   cmd.req.arg[1] = 2 | temp;
+  }
+- cmd.req.arg[2] = ntohl(ip);
+ 
++ /*
++  * Adapter needs IP address in network byte order.
++  * But hardware mailbox registers go through writel(), hence IP address
++  * gets swapped on big endian architecture.
++  * To negate swapping of writel() on big endian architecture
++  * use swab32(value).
++  */
++
++ temp_ip = swab32(ntohl(ip));
++ memcpy(&cmd.req.arg[2], &temp_ip, sizeof(u32));
+  err = qlcnic_issue_cmd(adapter, &cmd);
+  if (err != QLCNIC_RCODE_SUCCESS)
+   dev_err(&adapter->netdev->dev,
+@@ -1425,13 +1434,16 @@ int qlcnic_83xx_config_hw_lro(struct qlcnic_adapter *adapter, int mode)
+  int err;
+  u32 temp, arg1;
+  struct qlcnic_cmd_args cmd;
++ int lro_bit_mask;
++
++ lro_bit_mask = (mode ? (BIT_0 | BIT_1 | BIT_2 | BIT_3) : 0);
+ 
+  if (adapter->recv_ctx->state == QLCNIC_HOST_CTX_STATE_FREED)
+   return 0;
+ 
+  qlcnic_alloc_mbx_args(&cmd, adapter, QLCNIC_CMD_CONFIGURE_HW_LRO);
+  temp = adapter->recv_ctx->context_id << 16;
+- arg1 = (mode ? (BIT_0 | BIT_1 | BIT_3) : 0) | temp;
++ arg1 = lro_bit_mask | temp;
+  cmd.req.arg[1] = arg1;
+ 
+  err = qlcnic_issue_cmd(adapter, &cmd);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
+index 6c6ecfc..4e4ebaf 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
+@@ -958,8 +958,10 @@ int qlcnic_set_features(struct net_device *netdev, netdev_features_t features)
+  if (qlcnic_config_hw_lro(adapter, hw_lro))
+   return -EIO;
+ 
+- if ((hw_lro == 0) && qlcnic_send_lro_cleanup(adapter))
+-  return -EIO;
++ if (!hw_lro && qlcnic_82xx_check(adapter)) {
++  if (qlcnic_send_lro_cleanup(adapter))
++   return -EIO;
++ }
+ 
+  return 0;
+ }
+-- 
+1.8.3.1

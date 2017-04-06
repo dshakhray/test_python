@@ -1,0 +1,181 @@
+From f1add3878c5e827ec55167143d491b16d5b6efcd Mon Sep 17 00:00:00 2001
+From: Alexander Duyck <alexander.h.duyck@intel.com>
+Date: Wed, 16 Jan 2013 01:35:35 +0000
+Subject: [PATCH 768/858] ixgbe: Define FCoE and Flow director limits much
+ sooner to allow for changes
+
+Instead of adjusting the FCoE and Flow director limits based on the number
+of CPUs we can define them much sooner.  This allows the user to come
+through later and adjust them once we have updated the code to support the
+set_channels ethtool operation.
+
+I am still allowing for FCoE and RSS queues to be separated if the number
+queues is less than the number of CPUs.  This essentially treats the two
+groupings like they are two separate traffic classes.
+
+In addition I am changing the initialization to use the MAX_TX/RX_QUEUES
+defines instead of trying to compute the value as it will be possible in
+upcoming patches for the user to request the maximum number of queues.
+
+I have also updated things so that the upper limit on queues is exactly 63
+instead of allowing it to go up to 64.  The reason for this change is to
+address the fact thqt the driver only supports up to 63 queue vectors since
+the hardware supports 64 MSI-X vectors, but one must be reserved for "other"
+causes.
+
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit d3cb98691f9c8a6804897421d115b88026a562fa)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/ethernet/intel/ixgbe/ixgbe.h      | 11 +++-----
+ drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c  |  7 +-----
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c | 36 +++++++++++----------------
+ 3 files changed, 19 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+index d268c7b..4a2831c 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -278,15 +278,10 @@ enum ixgbe_ring_f_enum {
+ 
+ #define IXGBE_MAX_RSS_INDICES  16
+ #define IXGBE_MAX_VMDQ_INDICES 64
+-#define IXGBE_MAX_FDIR_INDICES 64
+-#ifdef IXGBE_FCOE
++#define IXGBE_MAX_FDIR_INDICES 63 /* based on q_vector limit */
+ #define IXGBE_MAX_FCOE_INDICES  8
+-#define MAX_RX_QUEUES (IXGBE_MAX_FDIR_INDICES + IXGBE_MAX_FCOE_INDICES)
+-#define MAX_TX_QUEUES (IXGBE_MAX_FDIR_INDICES + IXGBE_MAX_FCOE_INDICES)
+-#else
+-#define MAX_RX_QUEUES IXGBE_MAX_FDIR_INDICES
+-#define MAX_TX_QUEUES IXGBE_MAX_FDIR_INDICES
+-#endif /* IXGBE_FCOE */
++#define MAX_RX_QUEUES (IXGBE_MAX_FDIR_INDICES + 1)
++#define MAX_TX_QUEUES (IXGBE_MAX_FDIR_INDICES + 1)
+ struct ixgbe_ring_feature {
+  u16 limit; /* upper limit on feature indices */
+  u16 indices; /* current value of indices */
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
+index 9ffa330..9fafa38 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
+@@ -386,7 +386,6 @@ static bool ixgbe_set_dcb_sriov_queues(struct ixgbe_adapter *adapter)
+   fcoe = &adapter->ring_feature[RING_F_FCOE];
+ 
+   /* limit ourselves based on feature limits */
+-  fcoe_i = min_t(u16, fcoe_i, num_online_cpus());
+   fcoe_i = min_t(u16, fcoe_i, fcoe->limit);
+ 
+   if (fcoe_i) {
+@@ -562,9 +561,6 @@ static bool ixgbe_set_sriov_queues(struct ixgbe_adapter *adapter)
+   fcoe_i = min_t(u16, fcoe_i, fcoe->limit);
+ 
+   if (vmdq_i > 1 && fcoe_i) {
+-   /* reserve no more than number of CPUs */
+-   fcoe_i = min_t(u16, fcoe_i, num_online_cpus());
+-
+    /* alloc queues for FCoE separately */
+    fcoe->indices = fcoe_i;
+    fcoe->offset = vmdq_i * rss_i;
+@@ -623,8 +619,7 @@ static bool ixgbe_set_rss_queues(struct ixgbe_adapter *adapter)
+  if (rss_i > 1 && adapter->atr_sample_rate) {
+   f = &adapter->ring_feature[RING_F_FDIR];
+ 
+-  f->indices = min_t(u16, num_online_cpus(), f->limit);
+-  rss_i = max_t(u16, rss_i, f->indices);
++  rss_i = f->indices = f->limit;
+ 
+   if (!(adapter->flags & IXGBE_FLAG_FDIR_PERFECT_CAPABLE))
+    adapter->flags |= IXGBE_FLAG_FDIR_HASH_CAPABLE;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 4939a36..506fba0 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -4475,7 +4475,7 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter)
+ {
+  struct ixgbe_hw *hw = &adapter->hw;
+  struct pci_dev *pdev = adapter->pdev;
+- unsigned int rss;
++ unsigned int rss, fdir;
+  u32 fwsm;
+ #ifdef CONFIG_IXGBE_DCB
+  int j;
+@@ -4495,9 +4495,10 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter)
+  adapter->ring_feature[RING_F_RSS].limit = rss;
+  adapter->flags2 |= IXGBE_FLAG2_RSC_CAPABLE;
+  adapter->flags2 |= IXGBE_FLAG2_RSC_ENABLED;
+- adapter->ring_feature[RING_F_FDIR].limit = IXGBE_MAX_FDIR_INDICES;
+  adapter->max_q_vectors = MAX_Q_VECTORS_82599;
+  adapter->atr_sample_rate = 20;
++ fdir = min_t(int, IXGBE_MAX_FDIR_INDICES, num_online_cpus());
++ adapter->ring_feature[RING_F_FDIR].limit = fdir;
+  adapter->fdir_pballoc = IXGBE_FDIR_PBALLOC_64K;
+ #ifdef CONFIG_IXGBE_DCA
+  adapter->flags |= IXGBE_FLAG_DCA_CAPABLE;
+@@ -7240,9 +7241,8 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+  const struct ixgbe_info *ii = ixgbe_info_tbl[ent->driver_data];
+  static int cards_found;
+  int i, err, pci_using_dac;
++ unsigned int indices = MAX_TX_QUEUES;
+  u8 part_str[IXGBE_PBANUM_LENGTH];
+- unsigned int indices = num_possible_cpus();
+- unsigned int dcb_max = 0;
+ #ifdef IXGBE_FCOE
+  u16 device_caps;
+ #endif
+@@ -7291,25 +7291,15 @@ static int ixgbe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+  pci_set_master(pdev);
+  pci_save_state(pdev);
+ 
++ if (ii->mac == ixgbe_mac_82598EB) {
+ #ifdef CONFIG_IXGBE_DCB
+- if (ii->mac == ixgbe_mac_82598EB)
+-  dcb_max = min_t(unsigned int, indices * MAX_TRAFFIC_CLASS,
+-    IXGBE_MAX_RSS_INDICES);
+- else
+-  dcb_max = min_t(unsigned int, indices * MAX_TRAFFIC_CLASS,
+-    IXGBE_MAX_FDIR_INDICES);
++  /* 8 TC w/ 4 queues per TC */
++  indices = 4 * MAX_TRAFFIC_CLASS;
++#else
++  indices = IXGBE_MAX_RSS_INDICES;
+ #endif
++ }
+ 
+- if (ii->mac == ixgbe_mac_82598EB)
+-  indices = min_t(unsigned int, indices, IXGBE_MAX_RSS_INDICES);
+- else
+-  indices = min_t(unsigned int, indices, IXGBE_MAX_FDIR_INDICES);
+-
+-#ifdef IXGBE_FCOE
+- indices += min_t(unsigned int, num_possible_cpus(),
+-    IXGBE_MAX_FCOE_INDICES);
+-#endif
+- indices = max_t(unsigned int, dcb_max, indices);
+  netdev = alloc_etherdev_mq(sizeof(struct ixgbe_adapter), indices);
+  if (!netdev) {
+   err = -ENOMEM;
+@@ -7464,13 +7454,17 @@ skip_sriov:
+ 
+ #ifdef IXGBE_FCOE
+  if (adapter->flags & IXGBE_FLAG_FCOE_CAPABLE) {
++  unsigned int fcoe_l;
++
+   if (hw->mac.ops.get_device_caps) {
+    hw->mac.ops.get_device_caps(hw, &device_caps);
+    if (device_caps & IXGBE_DEVICE_CAPS_FCOE_OFFLOADS)
+     adapter->flags &= ~IXGBE_FLAG_FCOE_CAPABLE;
+   }
+ 
+-  adapter->ring_feature[RING_F_FCOE].limit = IXGBE_FCRETA_SIZE;
++
++  fcoe_l = min_t(int, IXGBE_FCRETA_SIZE, num_online_cpus());
++  adapter->ring_feature[RING_F_FCOE].limit = fcoe_l;
+ 
+   netdev->features |= NETIF_F_FSO |
+         NETIF_F_FCOE_CRC;
+-- 
+1.8.3.1
