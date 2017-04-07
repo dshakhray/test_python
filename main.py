@@ -87,11 +87,13 @@ def download_patches_from_redhat():
             logger.info('Required re-authorize on the Red Hat account')
             driver = log_in()
             driver.get(url)
+            time.sleep(5)
             patch = driver.find_elements_by_tag_name("body")[0].text
 
-        f = open('%s/%s.patch' % (KERNEL_VER, patch_name), 'w')
-        f.write(patch.encode('utf-8'))
-        f.close()
+        if patch:
+            f = open('%s/%s.patch' % (KERNEL_VER, patch_name), 'w')
+            f.write(patch.encode('utf-8'))
+            f.close()
 
         counter_created_file += 1
         if not counter_created_file % 50:
