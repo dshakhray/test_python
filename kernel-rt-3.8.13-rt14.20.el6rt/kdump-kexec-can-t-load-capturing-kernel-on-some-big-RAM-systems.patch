@@ -1,0 +1,76 @@
+From b936afeccaa13305f2450996d32b90bce4f07d52 Mon Sep 17 00:00:00 2001
+From: Vitaly Mayatskikh <vmayatsk@redhat.com>
+Date: Tue, 11 Jun 2013 10:01:36 -0300
+Subject: [PATCH 399/858] [kdump] kexec can't load capturing kernel on some big
+ RAM systems
+
+commit 11c1102fafb760c53dc558a222315c696a8be015 rhel6
+
+Bugzilla: 820427
+
+Message-id: <87wruth9z2.wl%vmayatsk@redhat.com>
+Patchwork-id: 25695
+O-Subject: [RHEL-6 patch] bz580843: kexec can't load capturing kernel on some
+ big RAM systems
+Bugzilla: 580843
+RH-Acked-by: Amerigo Wang <amwang@redhat.com>
+
+Description:
+============
+RHEL-6 on x86-64 systems with large RAM (starting somewhere in between
+16-32G) is not able to load kdump kernel when crashkernel=auto option
+is specified. "Auto" policy tries to reserve too much memory, but
+there are limitations in kernel and /sbin/kexec:
+
+1. Kernel uses relocations of type X86_64_32S, which requires all
+addresses to be in first 2G. When reserved area is too large, it is
+placed partially or fully outside of first 2 gigs.
+
+2. /sbin/kexec wants to load bzImage and initrd below 896M.
+
+Ideally, kdump kernel should be started in 64-bit mode, but this
+requires large amount of work, so this not a choice for Beta2.
+
+I suggest to use temporary workaround: reserve 128M for dump capturing
+environment + some memory to track memory pages (automatically
+calculated using ratio 1:8192). 128M seems to be enough for kdump, I
+checked it on several large memory systems (32G, 64G and 96G).
+
+The ratio is lower than it can be (~1:32000), but I decided to protect
+against possible unexpected memory consumers.
+
+Upstream status:
+================
+No "crashkernel=auto" upstream.
+
+Test status:
+============
+Tested on large memory systems (largest was with 96G), works
+good. Previously they failed to load kdump kernel.
+
+Signed-off-by: Aristeu Rozanski <arozansk@redhat.com>
+Signed-off-by: Luis Claudio R. Goncalves <lgoncalv@redhat.com>
+---
+ kernel/kexec.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/kexec.c b/kernel/kexec.c
+index 5592d7f..14f101b 100644
+--- a/kernel/kexec.c
++++ b/kernel/kexec.c
+@@ -1374,10 +1374,9 @@ unsigned long long __init arch_default_crash_size(unsigned long long total_size)
+   return 0;
+  else {
+ #ifdef CONFIG_64BIT
+-  if (total_size > (1ULL<<37)) /* 128G */
+-   return KEXEC_AUTO_RESERVED_SIZE
+-    * ((1ULL<<37) / KEXEC_AUTO_THRESHOLD);
+-  return 1ULL<<ilog2(roundup(total_size/32, 1ULL<<21));
++  return KEXEC_AUTO_RESERVED_SIZE +
++   roundup((total_size - KEXEC_AUTO_RESERVED_SIZE)
++    / (1ULL<<23), 1ULL<<20); /* 1:8192 */
+ #else
+   return KEXEC_AUTO_RESERVED_SIZE;
+ #endif
+-- 
+1.8.3.1

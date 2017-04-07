@@ -1,0 +1,115 @@
+From 2b92c45199d61f3818733c74615e350b4554bc2d Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Wed, 13 Feb 2013 12:00:11 +0000
+Subject: [PATCH 462/858] bridge: Verify that a vlan is allowed to egress on
+ given port
+
+When bridge forwards a frame, make sure that a frame is allowed
+to egress on that port.
+
+Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 85f46c6baef1486ce20e13dd7cdea5dd15be2a90)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ net/bridge/br_forward.c |  1 +
+ net/bridge/br_input.c   | 10 ++++++++++
+ net/bridge/br_private.h | 10 ++++++++++
+ net/bridge/br_vlan.c    | 20 ++++++++++++++++++++
+ 4 files changed, 41 insertions(+)
+
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+index 02015a5..35b0671 100644
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -31,6 +31,7 @@ static inline int should_deliver(const struct net_bridge_port *p,
+      const struct sk_buff *skb)
+ {
+  return (((p->flags & BR_HAIRPIN_MODE) || skb->dev != p->dev) &&
++  br_allowed_egress(p->br, nbp_get_vlan_info(p), skb) &&
+   p->state == BR_STATE_FORWARDING);
+ }
+ 
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index 4ef3f6b..787d7da 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -35,6 +35,16 @@ static int br_pass_frame_up(struct sk_buff *skb)
+  brstats->rx_bytes += skb->len;
+  u64_stats_update_end(&brstats->syncp);
+ 
++ /* Bridge is just like any other port.  Make sure the
++  * packet is allowed except in promisc modue when someone
++  * may be running packet capture.
++  */
++ if (!(brdev->flags & IFF_PROMISC) &&
++     !br_allowed_egress(br, br_get_vlan_info(br), skb)) {
++  kfree_skb(skb);
++  return NET_RX_DROP;
++ }
++
+  indev = skb->dev;
+  skb->dev = brdev;
+ 
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 381a60d..cafeabe 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -557,6 +557,9 @@ static inline void br_mdb_uninit(void)
+ #ifdef CONFIG_BRIDGE_VLAN_FILTERING
+ extern bool br_allowed_ingress(struct net_bridge *br, struct net_port_vlans *v,
+           struct sk_buff *skb);
++extern bool br_allowed_egress(struct net_bridge *br,
++         const struct net_port_vlans *v,
++         const struct sk_buff *skb);
+ extern int br_vlan_add(struct net_bridge *br, u16 vid);
+ extern int br_vlan_delete(struct net_bridge *br, u16 vid);
+ extern void br_vlan_flush(struct net_bridge *br);
+@@ -601,6 +604,13 @@ static inline bool br_allowed_ingress(struct net_bridge *br,
+  return true;
+ }
+ 
++static inline bool br_allowed_egress(struct net_bridge *br,
++         const struct net_port_vlans *v,
++         const struct sk_buff *skb)
++{
++ return true;
++}
++
+ static inline int br_vlan_add(struct net_bridge *br, u16 vid)
+ {
+  return -EOPNOTSUPP;
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index 8b4bcd8..d8690bf 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -89,6 +89,26 @@ bool br_allowed_ingress(struct net_bridge *br, struct net_port_vlans *v,
+  return false;
+ }
+ 
++/* Called under RCU. */
++bool br_allowed_egress(struct net_bridge *br,
++         const struct net_port_vlans *v,
++         const struct sk_buff *skb)
++{
++ u16 vid;
++
++ if (!br->vlan_enabled)
++  return true;
++
++ if (!v)
++  return false;
++
++ br_vlan_get_tag(skb, &vid);
++ if (test_bit(vid, v->vlan_bitmap))
++  return true;
++
++ return false;
++}
++
+ /* Must be protected by RTNL */
+ int br_vlan_add(struct net_bridge *br, u16 vid)
+ {
+-- 
+1.8.3.1

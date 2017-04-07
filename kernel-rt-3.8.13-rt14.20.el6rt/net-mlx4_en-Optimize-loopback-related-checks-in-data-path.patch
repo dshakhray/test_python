@@ -1,0 +1,218 @@
+From 74e9e469bab76b8cab0f08e75261a611af003baf Mon Sep 17 00:00:00 2001
+From: Yan Burman <yanb@mellanox.com>
+Date: Thu, 7 Feb 2013 02:25:19 +0000
+Subject: [PATCH 498/858] net/mlx4_en: Optimize loopback related checks in data
+ path
+
+Currently there are relatively complex conditional checks in the fast path,
+for TX loopback enabling and resulting RX filter logic.
+Move elaborate if's out of data path, replace them with a single flag
+for each state and update that state from appropriate places.
+Also, in native (non SRIOV) mode and not in loopback or in selftest,
+there is no need to try and filter out packets that HW loopback-ed,
+as in native mode we do not loopback packets anymore.
+
+Signed-off-by: Yan Burman <yanb@mellanox.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 79aeaccd915c527a75f2cb01682eab160bed4f48)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/ethernet/mellanox/mlx4/en_main.c     | 22 +++++++++++++
+ drivers/net/ethernet/mellanox/mlx4/en_netdev.c   |  4 +++
+ drivers/net/ethernet/mellanox/mlx4/en_rx.c       | 39 +++++++++++++-----------
+ drivers/net/ethernet/mellanox/mlx4/en_selftest.c |  3 ++
+ drivers/net/ethernet/mellanox/mlx4/en_tx.c       |  2 +-
+ drivers/net/ethernet/mellanox/mlx4/mlx4_en.h     | 16 ++++++++--
+ 6 files changed, 65 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_main.c b/drivers/net/ethernet/mellanox/mlx4/en_main.c
+index f3c7961..e3c3d12 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_main.c
+@@ -95,6 +95,28 @@ int en_print(const char *level, const struct mlx4_en_priv *priv,
+  return i;
+ }
+ 
++void mlx4_en_update_loopback_state(struct net_device *dev,
++       netdev_features_t features)
++{
++ struct mlx4_en_priv *priv = netdev_priv(dev);
++
++ priv->flags &= ~(MLX4_EN_FLAG_RX_FILTER_NEEDED|
++   MLX4_EN_FLAG_ENABLE_HW_LOOPBACK);
++
++ /* Drop the packet if SRIOV is not enabled
++  * and not performing the selftest or flb disabled
++  */
++ if (mlx4_is_mfunc(priv->mdev->dev) &&
++     !(features & NETIF_F_LOOPBACK) && !priv->validate_loopback)
++  priv->flags |= MLX4_EN_FLAG_RX_FILTER_NEEDED;
++
++ /* Set dmac in Tx WQE if we are in SRIOV mode or if loopback selftest
++  * is requested
++  */
++ if (mlx4_is_mfunc(priv->mdev->dev) || priv->validate_loopback)
++  priv->flags |= MLX4_EN_FLAG_ENABLE_HW_LOOPBACK;
++}
++
+ static int mlx4_en_get_profile(struct mlx4_en_dev *mdev)
+ {
+  struct mlx4_en_profile *params = &mdev->profile;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index ff36c53..59bc49f 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -1526,6 +1526,8 @@ static int mlx4_en_set_features(struct net_device *netdev,
+   priv->ctrl_flags &=
+    cpu_to_be32(~MLX4_WQE_CTRL_FORCE_LOOPBACK);
+ 
++ mlx4_en_update_loopback_state(netdev, features);
++
+  return 0;
+ 
+ }
+@@ -1694,6 +1696,8 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
+  en_warn(priv, "Using %d TX rings\n", prof->tx_ring_num);
+  en_warn(priv, "Using %d RX rings\n", prof->rx_ring_num);
+ 
++ mlx4_en_update_loopback_state(priv->dev, priv->dev->features);
++
+  /* Configure port */
+  mlx4_en_calc_rx_buf(dev);
+  err = mlx4_SET_PORT_general(mdev->dev, priv->port,
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index fed26d8..ed214d0 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -563,9 +563,6 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
+  unsigned int length;
+  int polled = 0;
+  int ip_summed;
+- struct ethhdr *ethh;
+- dma_addr_t dma;
+- u64 s_mac;
+  int factor = priv->cqe_factor;
+ 
+  if (!priv->port_up)
+@@ -603,21 +600,27 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
+    goto next;
+   }
+ 
+-  /* Get pointer to first fragment since we haven't skb yet and
+-   * cast it to ethhdr struct */
+-  dma = be64_to_cpu(rx_desc->data[0].addr);
+-  dma_sync_single_for_cpu(priv->ddev, dma, sizeof(*ethh),
+-     DMA_FROM_DEVICE);
+-  ethh = (struct ethhdr *)(page_address(frags[0].page) +
+-      frags[0].offset);
+-  s_mac = mlx4_en_mac_to_u64(ethh->h_source);
+-
+-  /* If source MAC is equal to our own MAC and not performing
+-   * the selftest or flb disabled - drop the packet */
+-  if (s_mac == priv->mac &&
+-      !((dev->features & NETIF_F_LOOPBACK) ||
+-        priv->validate_loopback))
+-   goto next;
++  /* Check if we need to drop the packet if SRIOV is not enabled
++   * and not performing the selftest or flb disabled
++   */
++  if (priv->flags & MLX4_EN_FLAG_RX_FILTER_NEEDED) {
++   struct ethhdr *ethh;
++   dma_addr_t dma;
++   u64 s_mac;
++   /* Get pointer to first fragment since we haven't
++    * skb yet and cast it to ethhdr struct
++    */
++   dma = be64_to_cpu(rx_desc->data[0].addr);
++   dma_sync_single_for_cpu(priv->ddev, dma, sizeof(*ethh),
++      DMA_FROM_DEVICE);
++   ethh = (struct ethhdr *)(page_address(frags[0].page) +
++       frags[0].offset);
++
++   /* Drop the packet, since HW loopback-ed it */
++   s_mac = mlx4_en_mac_to_u64(ethh->h_source);
++   if (s_mac == priv->mac)
++    goto next;
++  }
+ 
+   /*
+    * Packet is OK - process it.
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_selftest.c b/drivers/net/ethernet/mellanox/mlx4/en_selftest.c
+index bf2e5d3..3488c6d 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_selftest.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_selftest.c
+@@ -87,6 +87,8 @@ static int mlx4_en_test_loopback(struct mlx4_en_priv *priv)
+         priv->loopback_ok = 0;
+  priv->validate_loopback = 1;
+ 
++ mlx4_en_update_loopback_state(priv->dev, priv->dev->features);
++
+  /* xmit */
+  if (mlx4_en_test_loopback_xmit(priv)) {
+   en_err(priv, "Transmitting loopback packet failed\n");
+@@ -107,6 +109,7 @@ static int mlx4_en_test_loopback(struct mlx4_en_priv *priv)
+ mlx4_en_test_loopback_exit:
+ 
+  priv->validate_loopback = 0;
++ mlx4_en_update_loopback_state(priv->dev, priv->dev->features);
+  return !loopback_ok;
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index 6771b69..d26b94a 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -630,7 +630,7 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
+   ring->tx_csum++;
+  }
+ 
+- if (mlx4_is_mfunc(mdev->dev) || priv->validate_loopback) {
++ if (priv->flags & MLX4_EN_FLAG_ENABLE_HW_LOOPBACK) {
+   /* Copy dst mac address to wqe. This allows loopback in eSwitch,
+    * so that VFs and PF can communicate with each other
+    */
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 8d54412..f7f2244 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -431,6 +431,17 @@ struct ethtool_flow_id {
+  u64 id;
+ };
+ 
++enum {
++ MLX4_EN_FLAG_PROMISC  = (1 << 0),
++ MLX4_EN_FLAG_MC_PROMISC  = (1 << 1),
++ /* whether we need to enable hardware loopback by putting dmac
++  * in Tx WQE
++  */
++ MLX4_EN_FLAG_ENABLE_HW_LOOPBACK = (1 << 2),
++ /* whether we need to drop packets that hardware loopback-ed */
++ MLX4_EN_FLAG_RX_FILTER_NEEDED = (1 << 3)
++};
++
+ struct mlx4_en_priv {
+  struct mlx4_en_dev *mdev;
+  struct mlx4_en_port_profile *prof;
+@@ -478,8 +489,6 @@ struct mlx4_en_priv {
+  struct mlx4_en_rss_map rss_map;
+  __be32 ctrl_flags;
+  u32 flags;
+-#define MLX4_EN_FLAG_PROMISC 0x1
+-#define MLX4_EN_FLAG_MC_PROMISC 0x2
+  u8 num_tx_rings_p_up;
+  u32 tx_ring_num;
+  u32 rx_ring_num;
+@@ -531,6 +540,9 @@ enum mlx4_en_wol {
+ 
+ #define MLX4_EN_WOL_DO_MODIFY (1ULL << 63)
+ 
++void mlx4_en_update_loopback_state(struct net_device *dev,
++       netdev_features_t features);
++
+ void mlx4_en_destroy_netdev(struct net_device *dev);
+ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
+    struct mlx4_en_port_profile *prof);
+-- 
+1.8.3.1

@@ -1,0 +1,52 @@
+From eb23ef95226c49c5adbeacc190406d7b3febfd18 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <amirv@mellanox.com>
+Date: Thu, 24 Jan 2013 01:54:18 +0000
+Subject: [PATCH 641/858] net/mlx4_en: Fix a race when closing TX queue
+
+There is a possible race where the TX completion handler can clean the
+entire TX queue between the decision that the queue is full and actually
+closing it. To avoid this situation, check again if the queue is really
+full, if not, reopen the transmit and continue with sending the packet.
+
+CC: Eric Dumazet <edumazet@google.com>
+
+Signed-off-by: Yevgeny Petrilin <yevgenyp@mellanox.com>
+Signed-off-by: Eugenia Emantayev <eugenia@mellanox.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7225922558f04f25a22683ce08454dae8dd4b9f4)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/ethernet/mellanox/mlx4/en_tx.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index aad45fd..49308cc 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -590,7 +590,21 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
+   netif_tx_stop_queue(ring->tx_queue);
+   priv->port_stats.queue_stopped++;
+ 
+-  return NETDEV_TX_BUSY;
++  /* If queue was emptied after the if, and before the
++   * stop_queue - need to wake the queue, or else it will remain
++   * stopped forever.
++   * Need a memory barrier to make sure ring->cons was not
++   * updated before queue was stopped.
++   */
++  wmb();
++
++  if (unlikely(((int)(ring->prod - ring->cons)) <=
++        ring->size - HEADROOM - MAX_DESC_TXBBS)) {
++   netif_tx_wake_queue(ring->tx_queue);
++   priv->port_stats.wake_queue++;
++  } else {
++   return NETDEV_TX_BUSY;
++  }
+  }
+ 
+  /* Track current inflight packets for performance analysis */
+-- 
+1.8.3.1

@@ -1,0 +1,228 @@
+From 63a7dcce0a78afea3a55dee71da180aaba1ddf5f Mon Sep 17 00:00:00 2001
+From: Yan Burman <yanb@mellanox.com>
+Date: Thu, 7 Feb 2013 02:25:25 +0000
+Subject: [PATCH 516/858] net/mlx4_en: Manage hash of MAC addresses per port
+
+As a preparation step for supporting multiple unicast addresses, store MAC addresses in hash table.
+Remove the radix tree for MAC addresses per QP, as it's not in use.
+
+Signed-off-by: Yan Burman <yanb@mellanox.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c07cb4b0ab78f279ea94c3b4661cad86eb02a5d9)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/ethernet/mellanox/mlx4/en_netdev.c | 87 ++++++++++++++++----------
+ drivers/net/ethernet/mellanox/mlx4/en_rx.c     | 23 +++++--
+ drivers/net/ethernet/mellanox/mlx4/mlx4_en.h   |  7 ++-
+ 3 files changed, 79 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index a6faa3e..4bb3cf5 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -545,13 +545,10 @@ static int mlx4_en_get_qp(struct mlx4_en_priv *priv)
+  memcpy(entry->mac, priv->dev->dev_addr, sizeof(entry->mac));
+  entry->reg_id = reg_id;
+ 
+- err = radix_tree_insert(&priv->mac_tree, *qpn, entry);
+- if (err)
+-  goto insert_err;
+- return 0;
++ hlist_add_head_rcu(&entry->hlist,
++      &priv->mac_hash[entry->mac[MLX4_EN_MAC_HASH_IDX]]);
+ 
+-insert_err:
+- kfree(entry);
++ return 0;
+ 
+ alloc_err:
+  mlx4_en_uc_steer_release(priv, priv->dev->dev_addr, *qpn, reg_id);
+@@ -568,7 +565,6 @@ static void mlx4_en_put_qp(struct mlx4_en_priv *priv)
+ {
+  struct mlx4_en_dev *mdev = priv->mdev;
+  struct mlx4_dev *dev = mdev->dev;
+- struct mlx4_mac_entry *entry;
+  int qpn = priv->base_qpn;
+  u64 mac = mlx4_en_mac_to_u64(priv->dev->dev_addr);
+ 
+@@ -577,15 +573,26 @@ static void mlx4_en_put_qp(struct mlx4_en_priv *priv)
+  mlx4_unregister_mac(dev, priv->port, mac);
+ 
+  if (dev->caps.steering_mode != MLX4_STEERING_MODE_A0) {
+-  entry = radix_tree_lookup(&priv->mac_tree, qpn);
+-  if (entry) {
+-   en_dbg(DRV, priv, "Releasing qp: port %d, MAC %pM, qpn %d\n",
+-          priv->port, entry->mac, qpn);
+-   mlx4_en_uc_steer_release(priv, entry->mac,
+-       qpn, entry->reg_id);
+-   mlx4_qp_release_range(dev, qpn, 1);
+-   radix_tree_delete(&priv->mac_tree, qpn);
+-   kfree(entry);
++  struct mlx4_mac_entry *entry;
++  struct hlist_node *n, *tmp;
++  struct hlist_head *bucket;
++  unsigned int mac_hash;
++
++  mac_hash = priv->dev->dev_addr[MLX4_EN_MAC_HASH_IDX];
++  bucket = &priv->mac_hash[mac_hash];
++  hlist_for_each_entry_safe(entry, n, tmp, bucket, hlist) {
++   if (ether_addr_equal_64bits(entry->mac,
++          priv->dev->dev_addr)) {
++    en_dbg(DRV, priv, "Releasing qp: port %d, MAC %pM, qpn %d\n",
++           priv->port, priv->dev->dev_addr, qpn);
++    mlx4_en_uc_steer_release(priv, entry->mac,
++        qpn, entry->reg_id);
++    mlx4_qp_release_range(dev, qpn, 1);
++
++    hlist_del_rcu(&entry->hlist);
++    kfree_rcu(entry, rcu);
++    break;
++   }
+   }
+  }
+ }
+@@ -595,26 +602,38 @@ static int mlx4_en_replace_mac(struct mlx4_en_priv *priv, int qpn,
+ {
+  struct mlx4_en_dev *mdev = priv->mdev;
+  struct mlx4_dev *dev = mdev->dev;
+- struct mlx4_mac_entry *entry;
+  int err = 0;
+  u64 new_mac_u64 = mlx4_en_mac_to_u64(new_mac);
+ 
+  if (dev->caps.steering_mode != MLX4_STEERING_MODE_A0) {
+-  u64 prev_mac_u64;
+-
+-  entry = radix_tree_lookup(&priv->mac_tree, qpn);
+-  if (!entry)
+-   return -EINVAL;
+-  prev_mac_u64 = mlx4_en_mac_to_u64(entry->mac);
+-  mlx4_en_uc_steer_release(priv, entry->mac,
+-      qpn, entry->reg_id);
+-  mlx4_unregister_mac(dev, priv->port, prev_mac_u64);
+-  memcpy(entry->mac, new_mac, ETH_ALEN);
+-  entry->reg_id = 0;
+-  mlx4_register_mac(dev, priv->port, new_mac_u64);
+-  err = mlx4_en_uc_steer_add(priv, new_mac,
+-        &qpn, &entry->reg_id);
+-  return err;
++  struct hlist_head *bucket;
++  unsigned int mac_hash;
++  struct mlx4_mac_entry *entry;
++  struct hlist_node *n, *tmp;
++  u64 prev_mac_u64 = mlx4_en_mac_to_u64(prev_mac);
++
++  bucket = &priv->mac_hash[prev_mac[MLX4_EN_MAC_HASH_IDX]];
++  hlist_for_each_entry_safe(entry, n, tmp, bucket, hlist) {
++   if (ether_addr_equal_64bits(entry->mac, prev_mac)) {
++    mlx4_en_uc_steer_release(priv, entry->mac,
++        qpn, entry->reg_id);
++    mlx4_unregister_mac(dev, priv->port,
++          prev_mac_u64);
++    hlist_del_rcu(&entry->hlist);
++    synchronize_rcu();
++    memcpy(entry->mac, new_mac, ETH_ALEN);
++    entry->reg_id = 0;
++    mac_hash = new_mac[MLX4_EN_MAC_HASH_IDX];
++    hlist_add_head_rcu(&entry->hlist,
++         &priv->mac_hash[mac_hash]);
++    mlx4_register_mac(dev, priv->port, new_mac_u64);
++    err = mlx4_en_uc_steer_add(priv, new_mac,
++          &qpn,
++          &entry->reg_id);
++    return err;
++   }
++  }
++  return -EINVAL;
+  }
+ 
+  return __mlx4_replace_mac(dev, priv->port, qpn, new_mac_u64);
+@@ -1801,6 +1820,7 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
+ {
+  struct net_device *dev;
+  struct mlx4_en_priv *priv;
++ int i;
+  int err;
+ 
+  dev = alloc_etherdev_mqs(sizeof(struct mlx4_en_priv),
+@@ -1859,7 +1879,8 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
+   dev->dcbnl_ops = &mlx4_en_dcbnl_ops;
+ #endif
+ 
+- INIT_RADIX_TREE(&priv->mac_tree, GFP_KERNEL);
++ for (i = 0; i < MLX4_EN_MAC_HASH_SIZE; ++i)
++  INIT_HLIST_HEAD(&priv->mac_hash[i]);
+ 
+  /* Query for default mac and max mtu */
+  priv->max_mtu = mdev->dev->caps.eth_mtu_cap[priv->port];
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 2e7f5bb..91bb8e1 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -615,10 +615,25 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
+    ethh = (struct ethhdr *)(page_address(frags[0].page) +
+        frags[0].offset);
+ 
+-   /* Drop the packet, since HW loopback-ed it */
+-   if (ether_addr_equal_64bits(dev->dev_addr,
+-          ethh->h_source))
+-    goto next;
++   if (is_multicast_ether_addr(ethh->h_dest)) {
++    struct mlx4_mac_entry *entry;
++    struct hlist_node *n;
++    struct hlist_head *bucket;
++    unsigned int mac_hash;
++
++    /* Drop the packet, since HW loopback-ed it */
++    mac_hash = ethh->h_source[MLX4_EN_MAC_HASH_IDX];
++    bucket = &priv->mac_hash[mac_hash];
++    rcu_read_lock();
++    hlist_for_each_entry_rcu(entry, n, bucket, hlist) {
++     if (ether_addr_equal_64bits(entry->mac,
++            ethh->h_source)) {
++      rcu_read_unlock();
++      goto next;
++     }
++    }
++    rcu_read_unlock();
++   }
+   }
+ 
+   /*
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 47c9876..0ff99e0 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -442,6 +442,9 @@ enum {
+  MLX4_EN_FLAG_RX_FILTER_NEEDED = (1 << 3)
+ };
+ 
++#define MLX4_EN_MAC_HASH_SIZE (1 << BITS_PER_BYTE)
++#define MLX4_EN_MAC_HASH_IDX 5
++
+ struct mlx4_en_priv {
+  struct mlx4_en_dev *mdev;
+  struct mlx4_en_port_profile *prof;
+@@ -521,7 +524,7 @@ struct mlx4_en_priv {
+  bool wol;
+  struct device *ddev;
+  int base_tx_qpn;
+- struct radix_tree_root mac_tree;
++ struct hlist_head mac_hash[MLX4_EN_MAC_HASH_SIZE];
+ 
+ #ifdef CONFIG_MLX4_EN_DCB
+  struct ieee_ets ets;
+@@ -542,8 +545,10 @@ enum mlx4_en_wol {
+ };
+ 
+ struct mlx4_mac_entry {
++ struct hlist_node hlist;
+  unsigned char mac[ETH_ALEN + 2];
+  u64 reg_id;
++ struct rcu_head rcu;
+ };
+ 
+ #define MLX4_EN_WOL_DO_MODIFY (1ULL << 63)
+-- 
+1.8.3.1

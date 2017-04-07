@@ -1,0 +1,137 @@
+From 27c6b71f28af885496f86273865f1c0d9b704bb7 Mon Sep 17 00:00:00 2001
+From: James Smart <james.smart@emulex.com>
+Date: Thu, 3 Jan 2013 15:43:11 -0500
+Subject: [PATCH 326/858] [SCSI] lpfc 8.3.37: Fixed ELS_REC received on the
+ unsolicited receive queue
+
+Signed-off-by: James Smart <james.smart@emulex.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit 303f2f9c5e86f00ca98b942498297f5758e302c1)
+
+Signed-off-by: Clark Williams <williams@redhat.com>
+Signed-off-by: John Kacur <jkacur@redhat.com>
+---
+ drivers/scsi/lpfc/lpfc_els.c | 18 ++++++++++++++++--
+ drivers/scsi/lpfc/lpfc_hw.h  |  2 ++
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/scsi/lpfc/lpfc_els.c b/drivers/scsi/lpfc/lpfc_els.c
+index b9440de..f0e2fae 100644
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -6517,7 +6517,8 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+  struct lpfc_nodelist *ndlp;
+  struct ls_rjt stat;
+  uint32_t *payload;
+- uint32_t cmd, did, newnode, rjt_err = 0;
++ uint32_t cmd, did, newnode;
++ uint8_t rjt_exp, rjt_err = 0;
+  IOCB_t *icmd = &elsiocb->iocb;
+ 
+  if (!vport || !(elsiocb->context2))
+@@ -6606,12 +6607,14 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+   /* If Nport discovery is delayed, reject PLOGIs */
+   if (vport->fc_flag & FC_DISC_DELAYED) {
+    rjt_err = LSRJT_UNABLE_TPC;
++   rjt_exp = LSEXP_NOTHING_MORE;
+    break;
+   }
+   if (vport->port_state < LPFC_DISC_AUTH) {
+    if (!(phba->pport->fc_flag & FC_PT2PT) ||
+     (phba->pport->fc_flag & FC_PT2PT_PLOGI)) {
+     rjt_err = LSRJT_UNABLE_TPC;
++    rjt_exp = LSEXP_NOTHING_MORE;
+     break;
+    }
+    /* We get here, and drop thru, if we are PT2PT with
+@@ -6648,6 +6651,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+   lpfc_send_els_event(vport, ndlp, payload);
+   if (vport->port_state < LPFC_DISC_AUTH) {
+    rjt_err = LSRJT_UNABLE_TPC;
++   rjt_exp = LSEXP_NOTHING_MORE;
+    break;
+   }
+   lpfc_disc_state_machine(vport, ndlp, elsiocb, NLP_EVT_RCV_LOGO);
+@@ -6661,6 +6665,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+   lpfc_send_els_event(vport, ndlp, payload);
+   if (vport->port_state < LPFC_DISC_AUTH) {
+    rjt_err = LSRJT_UNABLE_TPC;
++   rjt_exp = LSEXP_NOTHING_MORE;
+    break;
+   }
+   lpfc_disc_state_machine(vport, ndlp, elsiocb, NLP_EVT_RCV_PRLO);
+@@ -6680,6 +6685,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+   phba->fc_stat.elsRcvADISC++;
+   if (vport->port_state < LPFC_DISC_AUTH) {
+    rjt_err = LSRJT_UNABLE_TPC;
++   rjt_exp = LSEXP_NOTHING_MORE;
+    break;
+   }
+   lpfc_disc_state_machine(vport, ndlp, elsiocb,
+@@ -6693,6 +6699,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+   phba->fc_stat.elsRcvPDISC++;
+   if (vport->port_state < LPFC_DISC_AUTH) {
+    rjt_err = LSRJT_UNABLE_TPC;
++   rjt_exp = LSEXP_NOTHING_MORE;
+    break;
+   }
+   lpfc_disc_state_machine(vport, ndlp, elsiocb,
+@@ -6730,6 +6737,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+   phba->fc_stat.elsRcvPRLI++;
+   if (vport->port_state < LPFC_DISC_AUTH) {
+    rjt_err = LSRJT_UNABLE_TPC;
++   rjt_exp = LSEXP_NOTHING_MORE;
+    break;
+   }
+   lpfc_disc_state_machine(vport, ndlp, elsiocb, NLP_EVT_RCV_PRLI);
+@@ -6813,6 +6821,11 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+   if (newnode)
+    lpfc_nlp_put(ndlp);
+   break;
++ case ELS_CMD_REC:
++   /* receive this due to exchange closed */
++   rjt_err = LSRJT_UNABLE_TPC;
++   rjt_exp = LSEXP_INVALID_OX_RX;
++  break;
+  default:
+   lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_UNSOL,
+    "RCV ELS cmd:     cmd:x%x did:x%x/ste:x%x",
+@@ -6820,6 +6833,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+ 
+   /* Unsupported ELS command, reject */
+   rjt_err = LSRJT_CMD_UNSUPPORTED;
++  rjt_exp = LSEXP_NOTHING_MORE;
+ 
+   /* Unknown ELS command <elsCmd> received from NPORT <did> */
+   lpfc_printf_vlog(vport, KERN_ERR, LOG_ELS,
+@@ -6834,7 +6848,7 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+  if (rjt_err) {
+   memset(&stat, 0, sizeof(stat));
+   stat.un.b.lsRjtRsnCode = rjt_err;
+-  stat.un.b.lsRjtRsnCodeExp = LSEXP_NOTHING_MORE;
++  stat.un.b.lsRjtRsnCodeExp = rjt_exp;
+   lpfc_els_rsp_reject(vport, stat.un.lsRjtError, elsiocb, ndlp,
+    NULL);
+  }
+diff --git a/drivers/scsi/lpfc/lpfc_hw.h b/drivers/scsi/lpfc/lpfc_hw.h
+index 7398ca8..e8c4760 100644
+--- a/drivers/scsi/lpfc/lpfc_hw.h
++++ b/drivers/scsi/lpfc/lpfc_hw.h
+@@ -538,6 +538,7 @@ struct fc_vft_header {
+ #define ELS_CMD_ECHO      0x10000000
+ #define ELS_CMD_TEST      0x11000000
+ #define ELS_CMD_RRQ       0x12000000
++#define ELS_CMD_REC       0x13000000
+ #define ELS_CMD_PRLI      0x20100014
+ #define ELS_CMD_PRLO      0x21100014
+ #define ELS_CMD_PRLO_ACC  0x02100014
+@@ -574,6 +575,7 @@ struct fc_vft_header {
+ #define ELS_CMD_ECHO      0x10
+ #define ELS_CMD_TEST      0x11
+ #define ELS_CMD_RRQ       0x12
++#define ELS_CMD_REC       0x13
+ #define ELS_CMD_PRLI      0x14001020
+ #define ELS_CMD_PRLO      0x14001021
+ #define ELS_CMD_PRLO_ACC  0x14001002
+-- 
+1.8.3.1

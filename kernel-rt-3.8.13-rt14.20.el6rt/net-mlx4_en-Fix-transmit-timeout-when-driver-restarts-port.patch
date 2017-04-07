@@ -1,0 +1,136 @@
+From 7504d4e50c7c3a0d837fa7a7a0141e9c1fc95617 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <amirv@mellanox.com>
+Date: Wed, 30 Jan 2013 23:07:11 +0000
+Subject: [PATCH 508/858] net/mlx4_en: Fix transmit timeout when driver
+ restarts port
+
+Under heavy CPU load, changing, ring size/mtu/etc. could result in transmit
+timeout, since stop-start port might take more than 10 seconds.
+Calling netif_detach_device to prevent tx queue transmit timeout.
+
+netif_detach_device() is not called under ndo_stop, because netif_carrier_off
+will prevent the timeout, and device should not be marked as not present, or
+else user won't be able to start it later on.
+
+CC: Ben Hutchings <bhutchings@solarflare.com>
+Signed-off-by: Eugenia Emantayev <eugenia@mellanox.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3484aac16149636f0ba5b5b0789a2918c682db7e)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/ethernet/mellanox/mlx4/en_ethtool.c |  6 +++---
+ drivers/net/ethernet/mellanox/mlx4/en_netdev.c  | 14 ++++++++++----
+ drivers/net/ethernet/mellanox/mlx4/mlx4_en.h    |  2 +-
+ 3 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+index 738e95d..911d488 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+@@ -496,7 +496,7 @@ static int mlx4_en_set_ringparam(struct net_device *dev,
+  mutex_lock(&mdev->state_lock);
+  if (priv->port_up) {
+   port_up = 1;
+-  mlx4_en_stop_port(dev);
++  mlx4_en_stop_port(dev, 1);
+  }
+ 
+  mlx4_en_free_resources(priv);
+@@ -591,7 +591,7 @@ static int mlx4_en_set_rxfh_indir(struct net_device *dev,
+  mutex_lock(&mdev->state_lock);
+  if (priv->port_up) {
+   port_up = 1;
+-  mlx4_en_stop_port(dev);
++  mlx4_en_stop_port(dev, 1);
+  }
+ 
+  priv->prof->rss_rings = rss_rings;
+@@ -1096,7 +1096,7 @@ static int mlx4_en_set_channels(struct net_device *dev,
+  mutex_lock(&mdev->state_lock);
+  if (priv->port_up) {
+   port_up = 1;
+-  mlx4_en_stop_port(dev);
++  mlx4_en_stop_port(dev, 1);
+  }
+ 
+  mlx4_en_free_resources(priv);
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index e1b79c2..2632f1b 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -1187,6 +1187,8 @@ int mlx4_en_start_port(struct net_device *dev)
+ 
+  priv->port_up = true;
+  netif_tx_start_all_queues(dev);
++ netif_device_attach(dev);
++
+  return 0;
+ 
+ tx_err:
+@@ -1209,7 +1211,7 @@ cq_err:
+ }
+ 
+ 
+-void mlx4_en_stop_port(struct net_device *dev)
++void mlx4_en_stop_port(struct net_device *dev, int detach)
+ {
+  struct mlx4_en_priv *priv = netdev_priv(dev);
+  struct mlx4_en_dev *mdev = priv->mdev;
+@@ -1225,9 +1227,13 @@ void mlx4_en_stop_port(struct net_device *dev)
+ 
+  /* Synchronize with tx routine */
+  netif_tx_lock_bh(dev);
++ if (detach)
++  netif_device_detach(dev);
+  netif_tx_stop_all_queues(dev);
+  netif_tx_unlock_bh(dev);
+ 
++ netif_tx_disable(dev);
++
+  /* Set port as not active */
+  priv->port_up = false;
+ 
+@@ -1306,7 +1312,7 @@ static void mlx4_en_restart(struct work_struct *work)
+ 
+  mutex_lock(&mdev->state_lock);
+  if (priv->port_up) {
+-  mlx4_en_stop_port(dev);
++  mlx4_en_stop_port(dev, 1);
+   for (i = 0; i < priv->tx_ring_num; i++)
+    netdev_tx_reset_queue(priv->tx_ring[i].tx_queue);
+   if (mlx4_en_start_port(dev))
+@@ -1378,7 +1384,7 @@ static int mlx4_en_close(struct net_device *dev)
+ 
+  mutex_lock(&mdev->state_lock);
+ 
+- mlx4_en_stop_port(dev);
++ mlx4_en_stop_port(dev, 0);
+  netif_carrier_off(dev);
+ 
+  mutex_unlock(&mdev->state_lock);
+@@ -1518,7 +1524,7 @@ static int mlx4_en_change_mtu(struct net_device *dev, int new_mtu)
+     * the port */
+    en_dbg(DRV, priv, "Change MTU called with card down!?\n");
+   } else {
+-   mlx4_en_stop_port(dev);
++   mlx4_en_stop_port(dev, 1);
+    err = mlx4_en_start_port(dev);
+    if (err) {
+     en_err(priv, "Failed restarting port:%d\n",
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 2e0845a..696dcf3 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -551,7 +551,7 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
+    struct mlx4_en_port_profile *prof);
+ 
+ int mlx4_en_start_port(struct net_device *dev);
+-void mlx4_en_stop_port(struct net_device *dev);
++void mlx4_en_stop_port(struct net_device *dev, int detach);
+ 
+ void mlx4_en_free_resources(struct mlx4_en_priv *priv);
+ int mlx4_en_alloc_resources(struct mlx4_en_priv *priv);
+-- 
+1.8.3.1

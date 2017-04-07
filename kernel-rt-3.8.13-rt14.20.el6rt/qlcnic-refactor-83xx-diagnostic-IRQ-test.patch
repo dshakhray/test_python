@@ -1,0 +1,163 @@
+From 754f62c1a1af8a41d89ad4dadf061324735170bb Mon Sep 17 00:00:00 2001
+From: Jitendra Kalsaria <jitendra.kalsaria@qlogic.com>
+Date: Sat, 9 Feb 2013 09:29:52 +0000
+Subject: [PATCH 456/858] qlcnic: refactor 83xx diagnostic IRQ test
+
+Cleanly separate 83xx diagnostic IRQ test from 82xx
+
+Signed-off-by: Jitendra Kalsaria <jitendra.kalsaria@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 58ead415a1a7d6800ed4eb3eeed12daedc27ffe6)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ .../net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c    | 48 ++++++++++++++++------
+ .../net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h    |  3 +-
+ .../net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c    | 24 +++++------
+ 3 files changed, 48 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+index 3d48131..36c1474 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+@@ -2744,25 +2744,37 @@ int qlcnic_83xx_get_registers(struct qlcnic_adapter *adapter, u32 *regs_buff)
+  return i;
+ }
+ 
+-int qlcnic_83xx_interrupt_test(struct qlcnic_adapter *adapter,
+-          struct qlcnic_cmd_args *cmd)
++int qlcnic_83xx_interrupt_test(struct net_device *netdev)
+ {
+- u8 val;
+- int ret;
++ struct qlcnic_adapter *adapter = netdev_priv(netdev);
++ struct qlcnic_hardware_context *ahw = adapter->ahw;
++ struct qlcnic_cmd_args cmd;
+  u32 data;
+  u16 intrpt_id, id;
++ u8 val;
++ int ret, max_sds_rings = adapter->max_sds_rings;
++
++ if (test_and_set_bit(__QLCNIC_RESETTING, &adapter->state))
++  return -EIO;
++
++ ret = qlcnic_83xx_diag_alloc_res(netdev, QLCNIC_INTERRUPT_TEST);
++ if (ret)
++  goto fail_diag_irq;
++
++ ahw->diag_cnt = 0;
++ qlcnic_alloc_mbx_args(&cmd, adapter, QLCNIC_CMD_INTRPT_TEST);
+ 
+  if (adapter->flags & QLCNIC_MSIX_ENABLED)
+-  intrpt_id = adapter->ahw->intr_tbl[0].id;
++  intrpt_id = ahw->intr_tbl[0].id;
+  else
+-  intrpt_id = QLCRDX(adapter->ahw, QLCNIC_DEF_INT_ID);
++  intrpt_id = QLCRDX(ahw, QLCNIC_DEF_INT_ID);
+ 
+- cmd->req.arg[1] = 1;
+- cmd->req.arg[2] = intrpt_id;
+- cmd->req.arg[3] = BIT_0;
++ cmd.req.arg[1] = 1;
++ cmd.req.arg[2] = intrpt_id;
++ cmd.req.arg[3] = BIT_0;
+ 
+- ret = qlcnic_issue_cmd(adapter, cmd);
+- data = cmd->rsp.arg[2];
++ ret = qlcnic_issue_cmd(adapter, &cmd);
++ data = cmd.rsp.arg[2];
+  id = LSW(data);
+  val = LSB(MSW(data));
+  if (id != intrpt_id)
+@@ -2770,9 +2782,21 @@ int qlcnic_83xx_interrupt_test(struct qlcnic_adapter *adapter,
+     "Interrupt generated: 0x%x, requested:0x%x\n",
+     id, intrpt_id);
+  if (val)
+-  dev_info(&adapter->pdev->dev,
++  dev_err(&adapter->pdev->dev,
+     "Interrupt test error: 0x%x\n", val);
++ if (ret)
++  goto done;
++
++ msleep(20);
++ ret = !ahw->diag_cnt;
+ 
++done:
++ qlcnic_free_mbx_args(&cmd);
++ qlcnic_83xx_diag_free_res(netdev, max_sds_rings);
++
++fail_diag_irq:
++ adapter->max_sds_rings = max_sds_rings;
++ clear_bit(__QLCNIC_RESETTING, &adapter->state);
+  return ret;
+ }
+ 
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+index 87f2e08..f60e28a 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+@@ -429,7 +429,6 @@ int qlcnic_83xx_reg_test(struct qlcnic_adapter *);
+ int qlcnic_83xx_get_regs_len(struct qlcnic_adapter *);
+ int qlcnic_83xx_get_registers(struct qlcnic_adapter *, u32 *);
+ int qlcnic_83xx_loopback_test(struct net_device *, u8);
+-int qlcnic_83xx_interrupt_test(struct qlcnic_adapter *,
+-          struct qlcnic_cmd_args *);
++int qlcnic_83xx_interrupt_test(struct net_device *);
+ int qlcnic_83xx_flash_test(struct qlcnic_adapter *);
+ #endif
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+index 58e2554..5641f8e 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+@@ -823,38 +823,36 @@ static int qlcnic_get_sset_count(struct net_device *dev, int sset)
+ static int qlcnic_irq_test(struct net_device *netdev)
+ {
+  struct qlcnic_adapter *adapter = netdev_priv(netdev);
+- int max_sds_rings = adapter->max_sds_rings;
+- int ret;
++ struct qlcnic_hardware_context *ahw = adapter->ahw;
+  struct qlcnic_cmd_args cmd;
++ int ret, max_sds_rings = adapter->max_sds_rings;
++
++ if (qlcnic_83xx_check(adapter))
++  return qlcnic_83xx_interrupt_test(netdev);
+ 
+  if (test_and_set_bit(__QLCNIC_RESETTING, &adapter->state))
+   return -EIO;
+ 
+  ret = qlcnic_diag_alloc_res(netdev, QLCNIC_INTERRUPT_TEST);
+  if (ret)
+-  goto clear_it;
++  goto clear_diag_irq;
+ 
+- adapter->ahw->diag_cnt = 0;
++ ahw->diag_cnt = 0;
+  qlcnic_alloc_mbx_args(&cmd, adapter, QLCNIC_CMD_INTRPT_TEST);
+ 
+- if (qlcnic_83xx_check(adapter)) {
+-  ret = qlcnic_83xx_interrupt_test(adapter, &cmd);
+- } else {
+-  cmd.req.arg[1] = adapter->ahw->pci_func;
+-  ret = qlcnic_issue_cmd(adapter, &cmd);
+- }
+-
++ cmd.req.arg[1] = ahw->pci_func;
++ ret = qlcnic_issue_cmd(adapter, &cmd);
+  if (ret)
+   goto done;
+ 
+  usleep_range(1000, 12000);
+- ret = !adapter->ahw->diag_cnt;
++ ret = !ahw->diag_cnt;
+ 
+ done:
+  qlcnic_free_mbx_args(&cmd);
+  qlcnic_diag_free_res(netdev, max_sds_rings);
+ 
+-clear_it:
++clear_diag_irq:
+  adapter->max_sds_rings = max_sds_rings;
+  clear_bit(__QLCNIC_RESETTING, &adapter->state);
+  return ret;
+-- 
+1.8.3.1

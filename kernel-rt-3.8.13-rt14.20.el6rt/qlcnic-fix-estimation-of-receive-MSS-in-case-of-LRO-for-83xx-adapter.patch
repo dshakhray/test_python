@@ -1,0 +1,122 @@
+From ce79b014b68ae4976a1324f1b50c96a4b4fd5da3 Mon Sep 17 00:00:00 2001
+From: Shahed Shaikh <shahed.shaikh@qlogic.com>
+Date: Mon, 18 Feb 2013 12:06:16 +0000
+Subject: [PATCH 543/858] qlcnic: fix estimation of receive MSS in case of LRO
+ for 83xx adapter
+
+Set gso_size to MSS obtained from adapter to avoid incorrect estimation
+of receive MSS, which would lead to delayed ACKs in some traffic patterns
+
+Example:
+Send two or three packets and wait for ack and only then send
+remaining packets.
+
+Signed-off-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+Signed-off-by: Jitendra Kalsaria <jitendra.kalsaria@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 99e8587900a3d32b1eaa3a92da90b49e9d4ff765)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ .../net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h    |  1 +
+ drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c     | 13 +++++++++++-
+ drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c   | 24 ++++++++++++++--------
+ 3 files changed, 29 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+index 127fa27..61f81f6 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+@@ -223,6 +223,7 @@ struct qlc_83xx_idc {
+ #define QLC_83XX_GET_LSO_CAPABILITY(val)  (val & 0x40)
+ #define QLC_83XX_GET_HW_LRO_CAPABILITY(val)  (val & 0x400)
+ #define QLC_83XX_GET_VLAN_ALIGN_CAPABILITY(val) (val & 0x4000)
++#define QLC_83XX_GET_FW_LRO_MSS_CAPABILITY(val) (val & 0x20000)
+ #define QLC_83XX_VIRTUAL_NIC_MODE   0xFF
+ #define QLC_83XX_DEFAULT_MODE    0x0
+ #define QLCNIC_BRDTYPE_83XX_10G   0x0083
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+index 662292d..2990f45 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+@@ -88,6 +88,8 @@
+ #define qlcnic_get_lro_sts_mss(sts_data1)  \
+  ((sts_data1 >> 32) & 0x0FFFF)
+ 
++#define qlcnic_83xx_get_lro_sts_mss(sts) ((sts) & 0xffff)
++
+ /* opcode field in status_desc */
+ #define QLCNIC_SYN_OFFLOAD 0x03
+ #define QLCNIC_RXPKT_DESC   0x04
+@@ -1423,7 +1425,7 @@ qlcnic_83xx_process_lro(struct qlcnic_adapter *adapter,
+  bool push;
+  int l2_hdr_offset, l4_hdr_offset;
+  int index;
+- u16 lro_length, length, data_offset;
++ u16 lro_length, length, data_offset, gso_size;
+  u16 vid = 0xffff;
+ 
+  if (unlikely(ring > adapter->max_rds_rings))
+@@ -1478,6 +1480,15 @@ qlcnic_83xx_process_lro(struct qlcnic_adapter *adapter,
+  th->psh = push;
+  length = skb->len;
+ 
++ if (adapter->flags & QLCNIC_FW_LRO_MSS_CAP) {
++  gso_size = qlcnic_83xx_get_lro_sts_mss(sts_data[0]);
++  skb_shinfo(skb)->gso_size = gso_size;
++  if (skb->protocol == htons(ETH_P_IPV6))
++   skb_shinfo(skb)->gso_type = SKB_GSO_TCPV6;
++  else
++   skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4;
++ }
++
+  if (vid != 0xffff)
+   __vlan_hwaccel_put_tag(skb, vid);
+ 
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index acac71e..20e3e2b 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -1339,11 +1339,24 @@ qlcnic_free_irq(struct qlcnic_adapter *adapter)
+  }
+ }
+ 
++static void qlcnic_get_lro_mss_capability(struct qlcnic_adapter *adapter)
++{
++ u32 capab = 0;
++
++ if (qlcnic_82xx_check(adapter)) {
++  if (adapter->ahw->capabilities2 &
++      QLCNIC_FW_CAPABILITY_2_LRO_MAX_TCP_SEG)
++   adapter->flags |= QLCNIC_FW_LRO_MSS_CAP;
++ } else {
++  capab = adapter->ahw->capabilities;
++  if (QLC_83XX_GET_FW_LRO_MSS_CAPABILITY(capab))
++   adapter->flags |= QLCNIC_FW_LRO_MSS_CAP;
++ }
++}
++
+ int __qlcnic_up(struct qlcnic_adapter *adapter, struct net_device *netdev)
+ {
+  int ring;
+- u32 capab2;
+-
+  struct qlcnic_host_rds_ring *rds_ring;
+ 
+  if (adapter->is_up != QLCNIC_ADAPTER_UP_MAGIC)
+@@ -1353,12 +1366,7 @@ int __qlcnic_up(struct qlcnic_adapter *adapter, struct net_device *netdev)
+   return 0;
+  if (qlcnic_set_eswitch_port_config(adapter))
+   return -EIO;
+-
+- if (adapter->ahw->capabilities & QLCNIC_FW_CAPABILITY_MORE_CAPS) {
+-  capab2 = QLCRD32(adapter, CRB_FW_CAPABILITIES_2);
+-  if (capab2 & QLCNIC_FW_CAPABILITY_2_LRO_MAX_TCP_SEG)
+-   adapter->flags |= QLCNIC_FW_LRO_MSS_CAP;
+- }
++ qlcnic_get_lro_mss_capability(adapter);
+ 
+  if (qlcnic_fw_create_ctx(adapter))
+   return -EIO;
+-- 
+1.8.3.1

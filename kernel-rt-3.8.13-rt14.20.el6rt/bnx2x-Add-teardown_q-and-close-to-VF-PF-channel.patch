@@ -1,0 +1,212 @@
+From 40c991dcc22ac2187f75a00157bba42a309cb8de Mon Sep 17 00:00:00 2001
+From: Ariel Elior <ariele@broadcom.com>
+Date: Tue, 1 Jan 2013 05:22:28 +0000
+Subject: [PATCH 559/858] bnx2x: Add teardown_q and close to VF <-> PF channel
+
+When a VF is being closed its queues are released via
+the 'teardown_q' and the VF itself is closed with
+'close'. These are essentially the unload counterparts of
+'init' and 'setup_q' from the load flow.
+
+Signed-off-by: Ariel Elior <ariele@broadcom.com>
+Signed-off-by: Eilon Greenstein <eilong@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9b176b6b63ed07472c26b6833a0ac23b373e6bf8)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x.h      |  2 +
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c  |  9 ++-
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c | 85 ++++++++++++++++++++++++
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h | 18 +++++
+ 4 files changed, 112 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
+index 5c64d1d..82c6233 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
+@@ -2225,7 +2225,9 @@ int bnx2x_send_msg2pf(struct bnx2x *bp, u8 *done, dma_addr_t msg_mapping);
+ int bnx2x_vfpf_acquire(struct bnx2x *bp, u8 tx_count, u8 rx_count);
+ int bnx2x_vfpf_release(struct bnx2x *bp);
+ int bnx2x_vfpf_init(struct bnx2x *bp);
++void bnx2x_vfpf_close_vf(struct bnx2x *bp);
+ int bnx2x_vfpf_setup_q(struct bnx2x *bp, int fp_idx);
++int bnx2x_vfpf_teardown_queue(struct bnx2x *bp, int qidx);
+ int bnx2x_vfpf_set_mac(struct bnx2x *bp);
+ int bnx2x_nic_load_analyze_req(struct bnx2x *bp, u32 load_code);
+ /* Congestion management fairness mode */
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+index eb99817..749054a 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+@@ -2814,8 +2814,13 @@ int bnx2x_nic_unload(struct bnx2x *bp, int unload_mode, bool keep_link)
+  /* wait till consumers catch up with producers in all queues */
+  bnx2x_drain_tx_queues(bp);
+ 
+- /* Cleanup the chip if needed */
+- if (unload_mode != UNLOAD_RECOVERY)
++ /* if VF indicate to PF this function is going down (PF will delete sp
++  * elements and clear initializations
++  */
++ if (IS_VF(bp))
++  bnx2x_vfpf_close_vf(bp);
++ else if (unload_mode != UNLOAD_RECOVERY)
++  /* if this is a normal/close unload need to clean up chip*/
+   bnx2x_chip_cleanup(bp, unload_mode, keep_link);
+  else {
+   /* Send the UNLOAD_REQUEST to the MCP */
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+index 18225de..d2819b4 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -13512,6 +13512,55 @@ int bnx2x_vfpf_init(struct bnx2x *bp)
+  return 0;
+ }
+ 
++/* CLOSE VF - opposite to INIT_VF */
++void bnx2x_vfpf_close_vf(struct bnx2x *bp)
++{
++ struct vfpf_close_tlv *req = &bp->vf2pf_mbox->req.close;
++ struct pfvf_general_resp_tlv *resp = &bp->vf2pf_mbox->resp.general_resp;
++ int i, rc;
++ u32 vf_id;
++
++ /* If we haven't got a valid VF id, there is no sense to
++  * continue with sending messages
++  */
++ if (bnx2x_get_vf_id(bp, &vf_id))
++  goto free_irq;
++
++ /* Close the queues */
++ for_each_queue(bp, i)
++  bnx2x_vfpf_teardown_queue(bp, i);
++
++ /* clear mailbox and prep first tlv */
++ bnx2x_vfpf_prep(bp, &req->first_tlv, CHANNEL_TLV_CLOSE, sizeof(*req));
++
++ req->vf_id = vf_id;
++
++ /* add list termination tlv */
++ bnx2x_add_tlv(bp, req, req->first_tlv.tl.length, CHANNEL_TLV_LIST_END,
++        sizeof(struct channel_list_end_tlv));
++
++ /* output tlvs list */
++ bnx2x_dp_tlv_list(bp, req);
++
++ rc = bnx2x_send_msg2pf(bp, &resp->hdr.status, bp->vf2pf_mbox_mapping);
++
++ if (rc)
++  BNX2X_ERR("Sending CLOSE failed. rc was: %d\n", rc);
++
++ else if (resp->hdr.status != PFVF_STATUS_SUCCESS)
++  BNX2X_ERR("Sending CLOSE failed: pf response was %d\n",
++     resp->hdr.status);
++
++free_irq:
++ /* Disable HW interrupts, NAPI */
++ bnx2x_netif_stop(bp, 0);
++ /* Delete all NAPI objects */
++ bnx2x_del_all_napi(bp);
++
++ /* Release IRQs */
++ bnx2x_free_irq(bp);
++}
++
+ /* ask the pf to open a queue for the vf */
+ int bnx2x_vfpf_setup_q(struct bnx2x *bp, int fp_idx)
+ {
+@@ -13592,6 +13641,42 @@ int bnx2x_vfpf_setup_q(struct bnx2x *bp, int fp_idx)
+  return rc;
+ }
+ 
++int bnx2x_vfpf_teardown_queue(struct bnx2x *bp, int qidx)
++{
++ struct vfpf_q_op_tlv *req = &bp->vf2pf_mbox->req.q_op;
++ struct pfvf_general_resp_tlv *resp = &bp->vf2pf_mbox->resp.general_resp;
++ int rc;
++
++ /* clear mailbox and prep first tlv */
++ bnx2x_vfpf_prep(bp, &req->first_tlv, CHANNEL_TLV_TEARDOWN_Q,
++   sizeof(*req));
++
++ req->vf_qid = qidx;
++
++ /* add list termination tlv */
++ bnx2x_add_tlv(bp, req, req->first_tlv.tl.length, CHANNEL_TLV_LIST_END,
++        sizeof(struct channel_list_end_tlv));
++
++ /* output tlvs list */
++ bnx2x_dp_tlv_list(bp, req);
++
++ rc = bnx2x_send_msg2pf(bp, &resp->hdr.status, bp->vf2pf_mbox_mapping);
++
++ if (rc) {
++  BNX2X_ERR("Sending TEARDOWN for queue %d failed: %d\n", qidx,
++     rc);
++  return rc;
++ }
++
++ if (resp->hdr.status != PFVF_STATUS_SUCCESS) {
++  BNX2X_ERR("TEARDOWN for queue %d failed: %d\n", qidx,
++     resp->hdr.status);
++  return -EINVAL;
++ }
++
++ return 0;
++}
++
+ /* request pf to add a mac for the vf */
+ int bnx2x_vfpf_set_mac(struct bnx2x *bp)
+ {
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h
+index 12889f0..ed4a618 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h
+@@ -111,6 +111,13 @@ struct vfpf_acquire_tlv {
+  aligned_u64 bulletin_addr;
+ };
+ 
++/* simple operation request on queue */
++struct vfpf_q_op_tlv {
++ struct vfpf_first_tlv first_tlv;
++ u8 vf_qid;
++ u8 padding[3];
++};
++
+ /* acquire response tlv - carries the allocated resources */
+ struct pfvf_acquire_resp_tlv {
+  struct pfvf_tlv hdr;
+@@ -247,6 +254,13 @@ struct vfpf_set_q_filters_tlv {
+  u32 rx_mask; /* see mask constants at the top of the file */
+ };
+ 
++/* close VF (disable VF) */
++struct vfpf_close_tlv {
++ struct vfpf_first_tlv   first_tlv;
++ u16   vf_id;  /* for debug */
++ u8 padding[2];
++};
++
+ /* release the VF's acquired resources */
+ struct vfpf_release_tlv {
+  struct vfpf_first_tlv first_tlv;
+@@ -262,6 +276,8 @@ union vfpf_tlvs {
+  struct vfpf_first_tlv  first_tlv;
+  struct vfpf_acquire_tlv  acquire;
+  struct vfpf_init_tlv  init;
++ struct vfpf_close_tlv  close;
++ struct vfpf_q_op_tlv  q_op;
+  struct vfpf_setup_q_tlv  setup_q;
+  struct vfpf_set_q_filters_tlv set_q_filters;
+  struct vfpf_release_tlv         release;
+@@ -284,6 +300,8 @@ enum channel_tlvs {
+  CHANNEL_TLV_INIT,
+  CHANNEL_TLV_SETUP_Q,
+  CHANNEL_TLV_SET_Q_FILTERS,
++ CHANNEL_TLV_TEARDOWN_Q,
++ CHANNEL_TLV_CLOSE,
+  CHANNEL_TLV_RELEASE,
+  CHANNEL_TLV_LIST_END,
+  CHANNEL_TLV_MAX
+-- 
+1.8.3.1

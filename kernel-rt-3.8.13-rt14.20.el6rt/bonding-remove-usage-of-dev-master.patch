@@ -1,0 +1,454 @@
+From fd5746a6c539cd05384583deb089698a89cb29bf Mon Sep 17 00:00:00 2001
+From: Jiri Pirko <jiri@resnulli.us>
+Date: Thu, 3 Jan 2013 22:49:01 +0000
+Subject: [PATCH 480/858] bonding: remove usage of dev->master
+
+Benefit from new upper dev list and free bonding from dev->master usage.
+
+Signed-off-by: Jiri Pirko <jiri@resnulli.us>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 471cb5a33dcbd7c529684a2ac7ba4451414ee4a7)
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+---
+ drivers/net/bonding/bond_3ad.c  | 30 ++++++-------
+ drivers/net/bonding/bond_alb.c  |  6 +--
+ drivers/net/bonding/bond_main.c | 94 ++++++++++++++++++++++++-----------------
+ drivers/net/bonding/bonding.h   | 14 +++---
+ net/core/rtnetlink.c            |  1 +
+ 5 files changed, 81 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/net/bonding/bond_3ad.c b/drivers/net/bonding/bond_3ad.c
+index a030e63..84fabd6 100644
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@ -1127,7 +1127,7 @@ static void ad_rx_machine(struct lacpdu *lacpdu, struct port *port)
+     // INFO_RECEIVED_LOOPBACK_FRAMES
+     pr_err("%s: An illegal loopback occurred on adapter (%s).\n"
+            "Check the configuration to verify that all adapters are connected to 802.3ad compliant switch ports\n",
+-           port->slave->dev->master->name, port->slave->dev->name);
++           port->slave->bond->dev->name, port->slave->dev->name);
+     return;
+    }
+    __update_selected(lacpdu, port);
+@@ -1306,7 +1306,7 @@ static void ad_port_selection_logic(struct port *port)
+   }
+   if (!curr_port) { // meaning: the port was related to an aggregator but was not on the aggregator port list
+    pr_warning("%s: Warning: Port %d (on %s) was related to aggregator %d but was not on its port list\n",
+-       port->slave->dev->master->name,
++       port->slave->bond->dev->name,
+        port->actor_port_number,
+        port->slave->dev->name,
+        port->aggregator->aggregator_identifier);
+@@ -1386,7 +1386,7 @@ static void ad_port_selection_logic(struct port *port)
+      port->aggregator->aggregator_identifier);
+   } else {
+    pr_err("%s: Port %d (on %s) did not find a suitable aggregator\n",
+-          port->slave->dev->master->name,
++          port->slave->bond->dev->name,
+           port->actor_port_number, port->slave->dev->name);
+   }
+  }
+@@ -1463,7 +1463,7 @@ static struct aggregator *ad_agg_selection_test(struct aggregator *best,
+ 
+  default:
+   pr_warning("%s: Impossible agg select mode %d\n",
+-      curr->slave->dev->master->name,
++      curr->slave->bond->dev->name,
+       __get_agg_selection_mode(curr->lag_ports));
+   break;
+  }
+@@ -1571,7 +1571,7 @@ static void ad_agg_selection_logic(struct aggregator *agg)
+   // check if any partner replys
+   if (best->is_individual) {
+    pr_warning("%s: Warning: No 802.3ad response from the link partner for any adapters in the bond\n",
+-       best->slave ? best->slave->dev->master->name : "NULL");
++       best->slave ? best->slave->bond->dev->name : "NULL");
+   }
+ 
+   best->is_active = 1;
+@@ -1898,7 +1898,7 @@ int bond_3ad_bind_slave(struct slave *slave)
+ 
+  if (bond == NULL) {
+   pr_err("%s: The slave %s is not attached to its bond\n",
+-         slave->dev->master->name, slave->dev->name);
++         slave->bond->dev->name, slave->dev->name);
+   return -1;
+  }
+ 
+@@ -1973,7 +1973,7 @@ void bond_3ad_unbind_slave(struct slave *slave)
+  // if slave is null, the whole port is not initialized
+  if (!port->slave) {
+   pr_warning("Warning: %s: Trying to unbind an uninitialized port on %s\n",
+-      slave->dev->master->name, slave->dev->name);
++      slave->bond->dev->name, slave->dev->name);
+   return;
+  }
+ 
+@@ -2009,7 +2009,7 @@ void bond_3ad_unbind_slave(struct slave *slave)
+ 
+     if ((new_aggregator->lag_ports == port) && new_aggregator->is_active) {
+      pr_info("%s: Removing an active aggregator\n",
+-      aggregator->slave->dev->master->name);
++      aggregator->slave->bond->dev->name);
+      // select new active aggregator
+       select_new_active_agg = 1;
+     }
+@@ -2040,7 +2040,7 @@ void bond_3ad_unbind_slave(struct slave *slave)
+      ad_agg_selection_logic(__get_first_agg(port));
+    } else {
+     pr_warning("%s: Warning: unbinding aggregator, and could not find a new aggregator for its ports\n",
+-        slave->dev->master->name);
++        slave->bond->dev->name);
+    }
+   } else { // in case that the only port related to this aggregator is the one we want to remove
+    select_new_active_agg = aggregator->is_active;
+@@ -2048,7 +2048,7 @@ void bond_3ad_unbind_slave(struct slave *slave)
+    ad_clear_agg(aggregator);
+    if (select_new_active_agg) {
+     pr_info("%s: Removing an active aggregator\n",
+-     slave->dev->master->name);
++     slave->bond->dev->name);
+     // select new active aggregator
+     ad_agg_selection_logic(__get_first_agg(port));
+    }
+@@ -2076,7 +2076,7 @@ void bond_3ad_unbind_slave(struct slave *slave)
+      ad_clear_agg(temp_aggregator);
+      if (select_new_active_agg) {
+       pr_info("%s: Removing an active aggregator\n",
+-       slave->dev->master->name);
++       slave->bond->dev->name);
+       // select new active aggregator
+       ad_agg_selection_logic(__get_first_agg(port));
+      }
+@@ -2184,7 +2184,7 @@ static int bond_3ad_rx_indication(struct lacpdu *lacpdu, struct slave *slave, u1
+ 
+   if (!port->slave) {
+    pr_warning("%s: Warning: port of slave %s is uninitialized\n",
+-       slave->dev->name, slave->dev->master->name);
++       slave->dev->name, slave->bond->dev->name);
+    return ret;
+   }
+ 
+@@ -2240,7 +2240,7 @@ void bond_3ad_adapter_speed_changed(struct slave *slave)
+  // if slave is null, the whole port is not initialized
+  if (!port->slave) {
+   pr_warning("Warning: %s: speed changed for uninitialized port on %s\n",
+-      slave->dev->master->name, slave->dev->name);
++      slave->bond->dev->name, slave->dev->name);
+   return;
+  }
+ 
+@@ -2268,7 +2268,7 @@ void bond_3ad_adapter_duplex_changed(struct slave *slave)
+  // if slave is null, the whole port is not initialized
+  if (!port->slave) {
+   pr_warning("%s: Warning: duplex changed for uninitialized port on %s\n",
+-      slave->dev->master->name, slave->dev->name);
++      slave->bond->dev->name, slave->dev->name);
+   return;
+  }
+ 
+@@ -2297,7 +2297,7 @@ void bond_3ad_handle_link_change(struct slave *slave, char link)
+  // if slave is null, the whole port is not initialized
+  if (!port->slave) {
+   pr_warning("Warning: %s: link status changed for uninitialized port on %s\n",
+-      slave->dev->master->name, slave->dev->name);
++      slave->bond->dev->name, slave->dev->name);
+   return;
+  }
+ 
+diff --git a/drivers/net/bonding/bond_alb.c b/drivers/net/bonding/bond_alb.c
+index 7c9d136..f5e0527 100644
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@ -507,7 +507,7 @@ static void rlb_update_client(struct rlb_client_info *client_info)
+      client_info->mac_dst);
+   if (!skb) {
+    pr_err("%s: Error: failed to create an ARP packet\n",
+-          client_info->slave->dev->master->name);
++          client_info->slave->bond->dev->name);
+    continue;
+   }
+ 
+@@ -517,7 +517,7 @@ static void rlb_update_client(struct rlb_client_info *client_info)
+    skb = vlan_put_tag(skb, client_info->vlan_id);
+    if (!skb) {
+     pr_err("%s: Error: failed to insert VLAN tag\n",
+-           client_info->slave->dev->master->name);
++           client_info->slave->bond->dev->name);
+     continue;
+    }
+   }
+@@ -1043,7 +1043,7 @@ static int alb_set_slave_mac_addr(struct slave *slave, u8 addr[])
+  if (dev_set_mac_address(dev, &s_addr)) {
+   pr_err("%s: Error: dev_set_mac_address of dev %s failed!\n"
+          "ALB mode requires that the base driver support setting the hw address also when the network device's interface is open\n",
+-         dev->master->name, dev->name);
++         slave->bond->dev->name, dev->name);
+   return -EOPNOTSUPP;
+  }
+  return 0;
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 045dc53..fbd34b8 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -746,11 +746,9 @@ static void __bond_resend_igmp_join_requests(struct net_device *dev)
+ {
+  struct in_device *in_dev;
+ 
+- rcu_read_lock();
+  in_dev = __in_dev_get_rcu(dev);
+  if (in_dev)
+   ip_mc_rejoin_groups(in_dev);
+- rcu_read_unlock();
+ }
+ 
+ /*
+@@ -760,9 +758,10 @@ static void __bond_resend_igmp_join_requests(struct net_device *dev)
+  */
+ static void bond_resend_igmp_join_requests(struct bonding *bond)
+ {
+- struct net_device *bond_dev, *vlan_dev, *master_dev;
++ struct net_device *bond_dev, *vlan_dev, *upper_dev;
+  struct vlan_entry *vlan;
+ 
++ rcu_read_lock();
+  read_lock(&bond->lock);
+ 
+  bond_dev = bond->dev;
+@@ -774,18 +773,14 @@ static void bond_resend_igmp_join_requests(struct bonding *bond)
+   * if bond is enslaved to a bridge,
+   * then rejoin all groups on its master
+   */
+- master_dev = bond_dev->master;
+- if (master_dev)
+-  if ((master_dev->priv_flags & IFF_EBRIDGE)
+-   && (bond_dev->priv_flags & IFF_BRIDGE_PORT))
+-   __bond_resend_igmp_join_requests(master_dev);
++ upper_dev = netdev_master_upper_dev_get_rcu(bond_dev);
++ if (upper_dev && upper_dev->priv_flags & IFF_EBRIDGE)
++  __bond_resend_igmp_join_requests(upper_dev);
+ 
+  /* rejoin all groups on vlan devices */
+  list_for_each_entry(vlan, &bond->vlan_list, vlan_list) {
+-  rcu_read_lock();
+   vlan_dev = __vlan_find_dev_deep(bond_dev,
+       vlan->vlan_id);
+-  rcu_read_unlock();
+   if (vlan_dev)
+    __bond_resend_igmp_join_requests(vlan_dev);
+  }
+@@ -794,13 +789,16 @@ static void bond_resend_igmp_join_requests(struct bonding *bond)
+   queue_delayed_work(bond->wq, &bond->mcast_work, HZ/5);
+ 
+  read_unlock(&bond->lock);
++ rcu_read_unlock();
+ }
+ 
+ static void bond_resend_igmp_join_requests_delayed(struct work_struct *work)
+ {
+  struct bonding *bond = container_of(work, struct bonding,
+          mcast_work.work);
++ rcu_read_lock();
+  bond_resend_igmp_join_requests(bond);
++ rcu_read_unlock();
+ }
+ 
+ /*
+@@ -1493,6 +1491,27 @@ static rx_handler_result_t bond_handle_frame(struct sk_buff **pskb)
+  return ret;
+ }
+ 
++static int bond_master_upper_dev_link(struct net_device *bond_dev,
++          struct net_device *slave_dev)
++{
++ int err;
++
++ err = netdev_master_upper_dev_link(slave_dev, bond_dev);
++ if (err)
++  return err;
++ slave_dev->flags |= IFF_SLAVE;
++ rtmsg_ifinfo(RTM_NEWLINK, slave_dev, IFF_SLAVE);
++ return 0;
++}
++
++static void bond_upper_dev_unlink(struct net_device *bond_dev,
++      struct net_device *slave_dev)
++{
++ netdev_upper_dev_unlink(slave_dev, bond_dev);
++ slave_dev->flags &= ~IFF_SLAVE;
++ rtmsg_ifinfo(RTM_NEWLINK, slave_dev, IFF_SLAVE);
++}
++
+ /* enslave device <slave> to bond device <master> */
+ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev)
+ {
+@@ -1655,9 +1674,9 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev)
+   }
+  }
+ 
+- res = netdev_set_bond_master(slave_dev, bond_dev);
++ res = bond_master_upper_dev_link(bond_dev, slave_dev);
+  if (res) {
+-  pr_debug("Error %d calling netdev_set_bond_master\n", res);
++  pr_debug("Error %d calling bond_master_upper_dev_link\n", res);
+   goto err_restore_mac;
+  }
+ 
+@@ -1892,7 +1911,7 @@ err_close:
+  dev_close(slave_dev);
+ 
+ err_unset_master:
+- netdev_set_bond_master(slave_dev, NULL);
++ bond_upper_dev_unlink(bond_dev, slave_dev);
+ 
+ err_restore_mac:
+  if (!bond->params.fail_over_mac) {
+@@ -1937,7 +1956,7 @@ int bond_release(struct net_device *bond_dev, struct net_device *slave_dev)
+ 
+  /* slave is not a slave or master is not master of this slave */
+  if (!(slave_dev->flags & IFF_SLAVE) ||
+-     (slave_dev->master != bond_dev)) {
++     !netdev_has_upper_dev(slave_dev, bond_dev)) {
+   pr_err("%s: Error: cannot release %s.\n",
+          bond_dev->name, slave_dev->name);
+   return -EINVAL;
+@@ -2081,7 +2100,7 @@ int bond_release(struct net_device *bond_dev, struct net_device *slave_dev)
+   netif_addr_unlock_bh(bond_dev);
+  }
+ 
+- netdev_set_bond_master(slave_dev, NULL);
++ bond_upper_dev_unlink(bond_dev, slave_dev);
+ 
+  slave_disable_netpoll(slave);
+ 
+@@ -2196,7 +2215,7 @@ static int bond_release_all(struct net_device *bond_dev)
+    netif_addr_unlock_bh(bond_dev);
+   }
+ 
+-  netdev_set_bond_master(slave_dev, NULL);
++  bond_upper_dev_unlink(bond_dev, slave_dev);
+ 
+   slave_disable_netpoll(slave);
+ 
+@@ -2260,8 +2279,9 @@ static int bond_ioctl_change_active(struct net_device *bond_dev, struct net_devi
+  if (!USES_PRIMARY(bond->params.mode))
+   return -EINVAL;
+ 
+- /* Verify that master_dev is indeed the master of slave_dev */
+- if (!(slave_dev->flags & IFF_SLAVE) || (slave_dev->master != bond_dev))
++ /* Verify that bond_dev is indeed the master of slave_dev */
++ if (!(slave_dev->flags & IFF_SLAVE) ||
++     !netdev_has_upper_dev(slave_dev, bond_dev))
+   return -EINVAL;
+ 
+  read_lock(&bond->lock);
+@@ -3257,36 +3277,32 @@ static int bond_master_netdev_event(unsigned long event,
+ static int bond_slave_netdev_event(unsigned long event,
+        struct net_device *slave_dev)
+ {
+- struct net_device *bond_dev = slave_dev->master;
+- struct bonding *bond = netdev_priv(bond_dev);
+- struct slave *slave = NULL;
++ struct slave *slave = bond_slave_get_rtnl(slave_dev);
++ struct bonding *bond = slave->bond;
++ struct net_device *bond_dev = slave->bond->dev;
++ u32 old_speed;
++ u8 old_duplex;
+ 
+  switch (event) {
+  case NETDEV_UNREGISTER:
+-  if (bond_dev) {
+-   if (bond->setup_by_slave)
+-    bond_release_and_destroy(bond_dev, slave_dev);
+-   else
+-    bond_release(bond_dev, slave_dev);
+-  }
++  if (bond->setup_by_slave)
++   bond_release_and_destroy(bond_dev, slave_dev);
++  else
++   bond_release(bond_dev, slave_dev);
+   break;
+  case NETDEV_UP:
+  case NETDEV_CHANGE:
+-  slave = bond_get_slave_by_dev(bond, slave_dev);
+-  if (slave) {
+-   u32 old_speed = slave->speed;
+-   u8  old_duplex = slave->duplex;
++  old_speed = slave->speed;
++  old_duplex = slave->duplex;
+ 
+-   bond_update_speed_duplex(slave);
++  bond_update_speed_duplex(slave);
+ 
+-   if (bond->params.mode == BOND_MODE_8023AD) {
+-    if (old_speed != slave->speed)
+-     bond_3ad_adapter_speed_changed(slave);
+-    if (old_duplex != slave->duplex)
+-     bond_3ad_adapter_duplex_changed(slave);
+-   }
++  if (bond->params.mode == BOND_MODE_8023AD) {
++   if (old_speed != slave->speed)
++    bond_3ad_adapter_speed_changed(slave);
++   if (old_duplex != slave->duplex)
++    bond_3ad_adapter_duplex_changed(slave);
+   }
+-
+   break;
+  case NETDEV_DOWN:
+   /*
+diff --git a/drivers/net/bonding/bonding.h b/drivers/net/bonding/bonding.h
+index 21b68e5..0d282d2 100644
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@ -258,6 +258,9 @@ static inline bool bond_vlan_used(struct bonding *bond)
+ #define bond_slave_get_rcu(dev) \
+  ((struct slave *) rcu_dereference(dev->rx_handler_data))
+ 
++#define bond_slave_get_rtnl(dev) \
++ ((struct slave *) rtnl_dereference(dev->rx_handler_data))
++
+ /**
+  * Returns NULL if the net_device does not belong to any of the bond's slaves
+  *
+@@ -280,11 +283,9 @@ static inline struct slave *bond_get_slave_by_dev(struct bonding *bond,
+ 
+ static inline struct bonding *bond_get_bond_by_slave(struct slave *slave)
+ {
+- if (!slave || !slave->dev->master) {
++ if (!slave || !slave->bond)
+   return NULL;
+- }
+-
+- return netdev_priv(slave->dev->master);
++ return slave->bond;
+ }
+ 
+ static inline bool bond_is_lb(const struct bonding *bond)
+@@ -360,10 +361,9 @@ static inline void bond_netpoll_send_skb(const struct slave *slave,
+ 
+ static inline void bond_set_slave_inactive_flags(struct slave *slave)
+ {
+- struct bonding *bond = netdev_priv(slave->dev->master);
+- if (!bond_is_lb(bond))
++ if (!bond_is_lb(slave->bond))
+   bond_set_backup_slave(slave);
+- if (!bond->params.all_slaves_active)
++ if (!slave->bond->params.all_slaves_active)
+   slave->inactive = 1;
+ }
+ 
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index c570053..18c4847 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -1988,6 +1988,7 @@ errout:
+  if (err < 0)
+   rtnl_set_sk_err(net, RTNLGRP_LINK, err);
+ }
++EXPORT_SYMBOL(rtmsg_ifinfo);
+ 
+ static int nlmsg_populate_fdb_fill(struct sk_buff *skb,
+        struct net_device *dev,
+-- 
+1.8.3.1
