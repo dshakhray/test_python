@@ -89,7 +89,7 @@ def download_patches_from_redhat():
             driver.get(url)
             patch = driver.find_elements_by_tag_name("body")[0].text
 
-        f = open('%s/%s' % (KERNEL_VER, patch_name), 'w')
+        f = open('%s/%s.patch' % (KERNEL_VER, patch_name), 'w')
         f.write(patch.encode('utf-8'))
         f.close()
 
