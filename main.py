@@ -1,6 +1,6 @@
 #!/usr/lib/env python
 # -*- mode:python; coding:utf-8; -*-
-# log_inor: Darya Malyavkina <dmalyavkina@cloudlinux.com>
+# author: Darya Malyavkina <dmalyavkina@cloudlinux.com>
 # created: 2017-03-30
 # description:
 
@@ -29,7 +29,7 @@ def log_in():
     driver.find_element_by_id("password").send_keys("05Anivis+2592")
     driver.find_element_by_id("_eventId_submit").click()
     time.sleep(3)
-    logger.info('log_inorization succeeded in your account')
+    logger.info('Authorization succeeded in your account')
     return driver
 
 
@@ -95,9 +95,10 @@ def download_patches_from_redhat():
 
         counter_created_file += 1
         if not counter_created_file % 50:
-            msg = 'Created {} files. It remains to process {} files'.format(counter_created_file,
-                                                                            len(patches_list) - counter_created_file)
-            logger.info(msg)
+            remains_patches = len(patches_list) - counter_created_file
+            logger.info('Created {} files. '
+                        'It remains to process {} files'.format(counter_created_file,
+                                                                remains_patches))
 
 
 def get_update_patches_names():
@@ -140,6 +141,7 @@ def main():
     git_init()
     download_patches_from_redhat()
     push_changes()
+
 
 if __name__ == '__main__':
     main()
