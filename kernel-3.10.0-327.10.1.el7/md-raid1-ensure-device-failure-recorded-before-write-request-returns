@@ -1,0 +1,150 @@
+From 2474506ee6fc1ab493e2bcaa0ea5d956c01f4d04 Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Thu, 29 Oct 2015 20:15:51 +0100
+Subject: [md] raid1: ensure device failure recorded before write request returns
+
+Message-id: <1446149757-15426-2-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 126064
+O-Subject: [RHEL7.3 PATCH 1/7] md/raid1: ensure device failure recorded before write request returns.
+Bugzilla: 1267652
+Z-Bugzilla: 1279796
+RH-Acked-by: Xiao Ni <xni@redhat.com>
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Corinna Vinschen <vinschen@redhat.com>
+
+From: NeilBrown <neilb@suse.com>
+
+When a write to one of the legs of a RAID1 fails, the failure is
+recorded in the metadata of the other leg(s) so that after a restart
+the data on the failed drive wont be trusted even if that drive seems
+to be working again  (maybe a cable was unplugged).
+
+Similarly when we record a bad-block in response to a write failure,
+we must not let the write complete until the bad-block update is safe.
+
+Currently there is no interlock between the write request completing
+and the metadata update.  So it is possible that the write will
+complete, the app will confirm success in some way, and then the
+machine will crash before the metadata update completes.
+
+This is an extremely small hole for a racy to fit in, but it is
+theoretically possible and so should be closed.
+
+So:
+ - set MD_CHANGE_PENDING when requesting a metadata update for a
+   failed device, so we can know with certainty when it completes
+ - queue requests that experienced an error on a new queue which
+   is only processed after the metadata update completes
+ - call raid_end_bio_io() on bios in that queue when the time comes.
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+(cherry picked from commit 55ce74d4bfe1b9444436264c637f39a152d1e5ac)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index dc2ad43..66e54f3 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -8364,6 +8364,7 @@ int rdev_set_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
+   /* Make sure they get written out promptly */
+   sysfs_notify_dirent_safe(rdev->sysfs_state);
+   set_bit(MD_CHANGE_CLEAN, &rdev->mddev->flags);
++  set_bit(MD_CHANGE_PENDING, &rdev->mddev->flags);
+   md_wakeup_thread(rdev->mddev->thread);
+  }
+  return rv;
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index 33fc567..fdef873 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1494,6 +1494,7 @@ static void error(struct mddev *mddev, struct md_rdev *rdev)
+   */
+  set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+  set_bit(MD_CHANGE_DEVS, &mddev->flags);
++ set_bit(MD_CHANGE_PENDING, &mddev->flags);
+  printk(KERN_ALERT
+         "md/raid1:%s: Disk failure on %s, disabling device.\n"
+         "md/raid1:%s: Operation continuing on %d devices.\n",
+@@ -2274,6 +2275,7 @@ static void handle_sync_write_finished(struct r1conf *conf, struct r1bio *r1_bio
+ static void handle_write_finished(struct r1conf *conf, struct r1bio *r1_bio)
+ {
+  int m;
++ bool fail = false;
+  for (m = 0; m < conf->raid_disks * 2 ; m++)
+   if (r1_bio->bios[m] == IO_MADE_GOOD) {
+    struct md_rdev *rdev = conf->mirrors[m].rdev;
+@@ -2286,6 +2288,7 @@ static void handle_write_finished(struct r1conf *conf, struct r1bio *r1_bio)
+     * narrow down and record precise write
+     * errors.
+     */
++   fail = true;
+    if (!narrow_write_error(r1_bio, m)) {
+     md_error(conf->mddev,
+       conf->mirrors[m].rdev);
+@@ -2297,7 +2300,13 @@ static void handle_write_finished(struct r1conf *conf, struct r1bio *r1_bio)
+   }
+  if (test_bit(R1BIO_WriteError, &r1_bio->state))
+   close_write(r1_bio);
+- raid_end_bio_io(r1_bio);
++ if (fail) {
++  spin_lock_irq(&conf->device_lock);
++  list_add(&r1_bio->retry_list, &conf->bio_end_io_list);
++  spin_unlock_irq(&conf->device_lock);
++  md_wakeup_thread(conf->mddev->thread);
++ } else
++  raid_end_bio_io(r1_bio);
+ }
+ 
+ static void handle_read_error(struct r1conf *conf, struct r1bio *r1_bio)
+@@ -2401,6 +2410,23 @@ static void raid1d(struct md_thread *thread)
+ 
+  md_check_recovery(mddev);
+ 
++ if (!list_empty_careful(&conf->bio_end_io_list) &&
++     !test_bit(MD_CHANGE_PENDING, &mddev->flags)) {
++  LIST_HEAD(tmp);
++  spin_lock_irqsave(&conf->device_lock, flags);
++  if (!test_bit(MD_CHANGE_PENDING, &mddev->flags)) {
++   list_add(&tmp, &conf->bio_end_io_list);
++   list_del_init(&conf->bio_end_io_list);
++  }
++  spin_unlock_irqrestore(&conf->device_lock, flags);
++  while (!list_empty(&tmp)) {
++   r1_bio = list_first_entry(&conf->bio_end_io_list,
++        struct r1bio, retry_list);
++   list_del(&r1_bio->retry_list);
++   raid_end_bio_io(r1_bio);
++  }
++ }
++
+  blk_start_plug(&plug);
+  for (;;) {
+ 
+@@ -2802,6 +2828,7 @@ static struct r1conf *setup_conf(struct mddev *mddev)
+  conf->raid_disks = mddev->raid_disks;
+  conf->mddev = mddev;
+  INIT_LIST_HEAD(&conf->retry_list);
++ INIT_LIST_HEAD(&conf->bio_end_io_list);
+ 
+  spin_lock_init(&conf->resync_lock);
+  init_waitqueue_head(&conf->wait_barrier);
+diff --git a/drivers/md/raid1.h b/drivers/md/raid1.h
+index 14ebb28..c52d713 100644
+--- a/drivers/md/raid1.h
++++ b/drivers/md/raid1.h
+@@ -61,6 +61,11 @@ struct r1conf {
+   * block, or anything else.
+   */
+  struct list_head retry_list;
++ /* A separate list of r1bio which just need raid_end_bio_io called.
++  * This mustn't happen for writes which had any errors if the superblock
++  * needs to be written.
++  */
++ struct list_head bio_end_io_list;
+ 
+  /* queue pending writes to be submitted on unplug */
+  struct bio_list  pending_bio_list;
+-- 
+1.7.1

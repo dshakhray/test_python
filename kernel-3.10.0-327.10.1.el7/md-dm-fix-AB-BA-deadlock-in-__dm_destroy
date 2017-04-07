@@ -1,0 +1,78 @@
+From c79a32c9d9ebf15f4e4245d2ec540c34c5e585b4 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 17 Dec 2015 17:06:34 +0100
+Subject: [md] dm: fix AB-BA deadlock in __dm_destroy()
+
+Message-id: <1450371994-22174-1-git-send-email-snitzer@redhat.com>
+Patchwork-id: 130425
+O-Subject: [RHEL7.3 7.2.z PATCH] dm: fix AB-BA deadlock in __dm_destroy()
+Bugzilla: 1292481
+Z-Bugzilla: 1296566
+RH-Acked-by: Vivek Goyal <vgoyal@redhat.com>
+RH-Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+
+BZ: 1292481
+
+Upstream commit 2a708cff93f1845b9239bc7d6310aef54e716c6a
+Author: Junichi Nomura <j-nomura@ce.jp.nec.com>
+Date:   Thu Oct 1 08:31:51 2015 +0000
+
+    dm: fix AB-BA deadlock in __dm_destroy()
+
+    __dm_destroy() takes io_barrier SRCU lock (dm_get_live_table) and
+    suspend_lock in reverse order.  Doing so can cause AB-BA deadlock:
+
+      __dm_destroy                    dm_swap_table
+      ---------------------------------------------------
+                                      mutex_lock(suspend_lock)
+      dm_get_live_table()
+        srcu_read_lock(io_barrier)
+                                      dm_sync_table()
+                                        synchronize_srcu(io_barrier)
+                                          .. waiting for dm_put_live_table()
+      mutex_lock(suspend_lock)
+        .. waiting for suspend_lock
+
+    Fix this by taking the locks in proper order.
+
+    Signed-off-by: Jun'ichi Nomura <j-nomura@ce.jp.nec.com>
+    Fixes: ab7c7bb6f4ab ("dm: hold suspend_lock while suspending device during device deletion")
+    Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Cc: stable@vger.kernel.org
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index d244c09..b0a5495 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -3054,8 +3054,6 @@ static void __dm_destroy(struct mapped_device *md, bool wait)
+ 
+  might_sleep();
+ 
+- map = dm_get_live_table(md, &srcu_idx);
+-
+  spin_lock(&_minor_lock);
+  idr_replace(&_minor_idr, MINOR_ALLOCED, MINOR(disk_devt(dm_disk(md))));
+  set_bit(DMF_FREEING, &md->flags);
+@@ -3069,14 +3067,14 @@ static void __dm_destroy(struct mapped_device *md, bool wait)
+   * do not race with internal suspend.
+   */
+  mutex_lock(&md->suspend_lock);
++ map = dm_get_live_table(md, &srcu_idx);
+  if (!dm_suspended_md(md)) {
+   dm_table_presuspend_targets(map);
+   dm_table_postsuspend_targets(map);
+  }
+- mutex_unlock(&md->suspend_lock);
+-
+  /* dm_put_live_table must be before msleep, otherwise deadlock is possible */
+  dm_put_live_table(md, srcu_idx);
++ mutex_unlock(&md->suspend_lock);
+ 
+  /*
+   * Rare, but there may be I/O requests still going to complete,
+-- 
+1.7.1

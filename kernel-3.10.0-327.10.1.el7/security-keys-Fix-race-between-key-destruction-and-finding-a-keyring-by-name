@@ -1,0 +1,60 @@
+From 6e8101a02f0a8367309da99b385967f652c62365 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 20 Oct 2015 19:22:02 +0200
+Subject: [security] keys: Fix race between key destruction and finding a keyring by name
+
+Message-id: <20151020192202.10873.41262.stgit@warthog.procyon.org.uk>
+Patchwork-id: 125802
+O-Subject: [RHEL7 PATCH 1/3] KEYS: Fix race between key destruction and finding a keyring by name
+Bugzilla: 1273465
+Z-Bugzilla: 1275929
+CVE: CVE-2015-7872
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+There appears to be a race between:
+
+ (1) key_gc_unused_keys() which frees key->security and then calls
+     keyring_destroy() to unlink the name from the name list
+
+ (2) find_keyring_by_name() which calls key_permission(), thus accessing
+     key->security, on a key before checking to see whether the key usage is 0
+     (ie. the key is dead and might be cleaned up).
+
+Fix this by calling ->destroy() before cleaning up the core key data -
+including key->security.
+
+Reported-by: Petr Matousek <pmatouse@redhat.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+Original-commit: 94c4554ba07adbdde396748ee7ae01e86cf2d8d7
+RH-Bugzilla: 1273465
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/security/keys/gc.c b/security/keys/gc.c
+index 009d937..38676fa 100644
+--- a/security/keys/gc.c
++++ b/security/keys/gc.c
+@@ -143,6 +143,10 @@ static noinline void key_gc_unused_keys(struct list_head *keys)
+   kdebug("- %u", key->serial);
+   key_check(key);
+ 
++  /* Throw away the key data */
++  if (key->type->destroy)
++   key->type->destroy(key);
++
+   security_key_free(key);
+ 
+   /* deal with the user's key tracking and quota */
+@@ -157,10 +161,6 @@ static noinline void key_gc_unused_keys(struct list_head *keys)
+   if (test_bit(KEY_FLAG_INSTANTIATED, &key->flags))
+    atomic_dec(&key->user->nikeys);
+ 
+-  /* now throw away the key memory */
+-  if (key->type->destroy)
+-   key->type->destroy(key);
+-
+   key_user_put(key->user);
+ 
+   kfree(key->description);
+-- 
+1.7.1

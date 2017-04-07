@@ -1,0 +1,97 @@
+From aac6f49ee0c46e5345b52df9360e4d5001df680d Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Thu, 5 Nov 2015 16:22:25 +0100
+Subject: [x86] virt: guest to host DoS by triggering an infinite loop in microcode
+
+Message-id: <1446740545-8823-1-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 126312
+O-Subject: [RHEL7.3 PATCH] virt: guest to host DoS by triggering an infinite loop in microcode (CVE-2015-5307)
+Bugzilla: 1277561
+Z-Bugzilla: 1277560
+CVE: CVE-2015-5307
+RH-Acked-by: Laszlo Ersek <lersek@redhat.com>
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Marcel Apfelbaum <marcel@redhat.com>
+
+From: Eric Northup <digitaleric@google.com>
+
+It was found that a guest can DoS a host by triggering an infinite
+stream of "alignment check" (#AC) exceptions.  This causes the
+microcode to enter an infinite loop where the core never receives
+another interrupt.  The host kernel panics pretty quickly due to the
+effects.
+
+Signed-off-by: Eric Northup <digitaleric@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 5451d43..1806707 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -23,6 +23,7 @@
+ #define GP_VECTOR 13
+ #define PF_VECTOR 14
+ #define MF_VECTOR 16
++#define AC_VECTOR 17
+ #define MC_VECTOR 18
+ 
+ /* Select x86 specific features in <linux/kvm.h> */
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index da9e425..d31b0ff 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -1106,6 +1106,7 @@ static void init_vmcb(struct vcpu_svm *svm)
+  set_exception_intercept(svm, PF_VECTOR);
+  set_exception_intercept(svm, UD_VECTOR);
+  set_exception_intercept(svm, MC_VECTOR);
++ set_exception_intercept(svm, AC_VECTOR);
+ 
+  set_intercept(svm, INTERCEPT_INTR);
+  set_intercept(svm, INTERCEPT_NMI);
+@@ -1794,6 +1795,12 @@ static int ud_interception(struct vcpu_svm *svm)
+  return 1;
+ }
+ 
++static int ac_interception(struct vcpu_svm *svm)
++{
++ kvm_queue_exception_e(&svm->vcpu, AC_VECTOR, 0);
++ return 1;
++}
++
+ static void svm_fpu_activate(struct kvm_vcpu *vcpu)
+ {
+  struct vcpu_svm *svm = to_svm(vcpu);
+@@ -3360,6 +3367,7 @@ static int (*const svm_exit_handlers[])(struct vcpu_svm *svm) = {
+  [SVM_EXIT_EXCP_BASE + PF_VECTOR] = pf_interception,
+  [SVM_EXIT_EXCP_BASE + NM_VECTOR] = nm_interception,
+  [SVM_EXIT_EXCP_BASE + MC_VECTOR] = mc_interception,
++ [SVM_EXIT_EXCP_BASE + AC_VECTOR] = ac_interception,
+  [SVM_EXIT_INTR]    = intr_interception,
+  [SVM_EXIT_NMI]    = nmi_interception,
+  [SVM_EXIT_SMI]    = nop_on_interception,
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 5298e39..bcdc90d 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -1499,7 +1499,7 @@ static void update_exception_bitmap(struct kvm_vcpu *vcpu)
+  u32 eb;
+ 
+  eb = (1u << PF_VECTOR) | (1u << UD_VECTOR) | (1u << MC_VECTOR) |
+-      (1u << NM_VECTOR) | (1u << DB_VECTOR);
++      (1u << NM_VECTOR) | (1u << DB_VECTOR) | (1u << AC_VECTOR);
+  if ((vcpu->guest_debug &
+       (KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP)) ==
+      (KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP))
+@@ -4867,6 +4867,9 @@ static int handle_exception(struct kvm_vcpu *vcpu)
+   return handle_rmode_exception(vcpu, ex_no, error_code);
+ 
+  switch (ex_no) {
++ case AC_VECTOR:
++  kvm_queue_exception_e(vcpu, AC_VECTOR, error_code);
++  return 1;
+  case DB_VECTOR:
+   dr6 = vmcs_readl(EXIT_QUALIFICATION);
+   if (!(vcpu->guest_debug &
+-- 
+1.7.1

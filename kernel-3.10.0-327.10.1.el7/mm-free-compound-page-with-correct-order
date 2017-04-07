@@ -1,0 +1,69 @@
+From e95aaad86b41dbeb539b12d4e2025a163bb276eb Mon Sep 17 00:00:00 2001
+From: Andrea Arcangeli <aarcange@redhat.com>
+Date: Fri, 23 Oct 2015 19:35:38 -0400
+Subject: [mm] free compound page with correct order
+
+Message-id: <1445628938-30165-2-git-send-email-aarcange@redhat.com>
+Patchwork-id: 125884
+O-Subject: [RHEL7.2 PATCH 1/1] mm: free compound page with correct order
+Bugzilla: 1274867
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+From: Yu Zhao <yuzhao@google.com>
+
+Compound page should be freed by put_page() or free_pages() with correct
+order.  Not doing so will cause tail pages leaked.
+
+The compound order can be obtained by compound_order() or use
+HPAGE_PMD_ORDER in our case.  Some people would argue the latter is
+faster but I prefer the former which is more general.
+
+This bug was observed not just on our servers (the worst case we saw is
+11G leaked on a 48G machine) but also on our workstations running Ubuntu
+based distro.
+
+  $ cat /proc/vmstat  | grep thp_zero_page_alloc
+  thp_zero_page_alloc 55
+  thp_zero_page_alloc_failed 0
+
+This means there is (thp_zero_page_alloc - 1) * (2M - 4K) memory leaked.
+
+Fixes: 97ae17497e99 ("thp: implement refcounting for huge zero page")
+Signed-off-by: Yu Zhao <yuzhao@google.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Mel Gorman <mel@csn.ul.ie>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Bob Liu <lliubbo@gmail.com>
+Cc: <stable@vger.kernel.org> [3.8+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Signed-off-by: Rafael Aquini <aquini@redhat.com>
+
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index d824860..1a12ba5 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -193,7 +193,7 @@ retry:
+  preempt_disable();
+  if (cmpxchg(&huge_zero_page, NULL, zero_page)) {
+   preempt_enable();
+-  __free_page(zero_page);
++  __free_pages(zero_page, compound_order(zero_page));
+   goto retry;
+  }
+ 
+@@ -222,7 +222,7 @@ static int shrink_huge_zero_page(struct shrinker *shrink,
+  if (atomic_cmpxchg(&huge_zero_refcount, 1, 0) == 1) {
+   struct page *zero_page = xchg(&huge_zero_page, NULL);
+   BUG_ON(zero_page == NULL);
+-  __free_page(zero_page);
++  __free_pages(zero_page, compound_order(zero_page));
+  }
+ 
+  return 0;
+-- 
+1.7.1

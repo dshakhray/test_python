@@ -1,0 +1,85 @@
+From b856b651fdd25bcede5de2e8cd84ea4964b67d7b Mon Sep 17 00:00:00 2001
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Mon, 23 Nov 2015 15:39:26 +0100
+Subject: [scsi] scsi_sysfs: protect against double execution of __scsi_remove_device()
+
+Message-id: <1448293166-7280-1-git-send-email-vkuznets@redhat.com>
+Patchwork-id: 127532
+O-Subject: [RHEL7.3 KERNEL PATCH] scsi_sysfs: protect against double execution of __scsi_remove_device()
+Bugzilla: 1273723
+Z-Bugzilla: 1292075
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1273723
+Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=10135682
+Tested: Win2016TP3 Hyper-V guest by me
+
+Upstream commit be821fd8e62765de43cc4f0e2db363d0e30a7e9b (JB's scsi tree:
+    git://git.kernel.org/pub/scm/linux/kernel/git/jejb/scsi.git)
+Author: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date:   Thu Nov 19 14:02:19 2015 +0100
+
+    scsi_sysfs: protect against double execution of __scsi_remove_device()
+
+    On some host errors storvsc module tries to remove sdev by scheduling a job
+    which does the following:
+
+       sdev = scsi_device_lookup(wrk->host, 0, 0, wrk->lun);
+       if (sdev) {
+           scsi_remove_device(sdev);
+           scsi_device_put(sdev);
+       }
+
+    While this code seems correct the following crash is observed:
+
+     general protection fault: 0000 [#1] SMP DEBUG_PAGEALLOC
+     RIP: 0010:[<ffffffff81169979>]  [<ffffffff81169979>] bdi_destroy+0x39/0x220
+     ...
+     [<ffffffff814aecdc>] ? _raw_spin_unlock_irq+0x2c/0x40
+     [<ffffffff8127b7db>] blk_cleanup_queue+0x17b/0x270
+     [<ffffffffa00b54c4>] __scsi_remove_device+0x54/0xd0 [scsi_mod]
+     [<ffffffffa00b556b>] scsi_remove_device+0x2b/0x40 [scsi_mod]
+     [<ffffffffa00ec47d>] storvsc_remove_lun+0x3d/0x60 [hv_storvsc]
+     [<ffffffff81080791>] process_one_work+0x1b1/0x530
+     ...
+
+    The problem comes with the fact that many such jobs (for the same device)
+    are being scheduled simultaneously. While scsi_remove_device() uses
+    shost->scan_mutex and scsi_device_lookup() will fail for a device in
+    SDEV_DEL state there is no protection against someone who did
+    scsi_device_lookup() before we actually entered __scsi_remove_device(). So
+    the whole scenario looks like that: two callers do simultaneous (or
+    preemption happens) calls to scsi_device_lookup() ant these calls succeed
+    for both of them, after that they try doing scsi_remove_device().
+    shost->scan_mutex only serializes their calls to __scsi_remove_device()
+    and we end up doing the cleanup path twice.
+
+    Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/scsi/scsi_sysfs.c b/drivers/scsi/scsi_sysfs.c
+index a4def67..d153d40 100644
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@ -1144,6 +1144,14 @@ void __scsi_remove_device(struct scsi_device *sdev)
+ {
+  struct device *dev = &sdev->sdev_gendev;
+ 
++ /*
++  * This cleanup path is not reentrant and while it is impossible
++  * to get a new reference with scsi_device_get() someone can still
++  * hold a previously acquired one.
++  */
++ if (sdev->sdev_state == SDEV_DEL)
++  return;
++
+  if (sdev->is_visible) {
+   if (scsi_device_set_state(sdev, SDEV_CANCEL) != 0)
+    return;
+-- 
+1.7.1

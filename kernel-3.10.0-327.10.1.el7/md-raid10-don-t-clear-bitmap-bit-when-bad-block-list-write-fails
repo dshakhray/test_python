@@ -1,0 +1,104 @@
+From e85fab5d39d9602902338e3ab3e1187fa32bbad2 Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Thu, 29 Oct 2015 20:15:57 +0100
+Subject: [md] raid10: don't clear bitmap bit when bad-block-list write fails
+
+Message-id: <1446149757-15426-8-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 126068
+O-Subject: [RHEL7.3 PATCH 7/7] md/raid10: don't clear bitmap bit when bad-block-list write fails.
+Bugzilla: 1267652
+Z-Bugzilla: 1279796
+RH-Acked-by: Xiao Ni <xni@redhat.com>
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Corinna Vinschen <vinschen@redhat.com>
+
+From: NeilBrown <neilb@suse.com>
+
+When a write fails and a bad-block-list is present, we can
+update the bad-block-list instead of writing the data.  If
+this succeeds then it is OK clear the relevant bitmap-bit as
+no further 'sync' of the block is needed.
+
+However if writing the bad-block-list fails then we need to
+treat the write as failed and particularly must not clear
+the bitmap bit.  Otherwise the device can be re-added (after
+any hardware connection issues are resolved) and because the
+relevant bit in the bitmap is clear, that block will not be
+resynced.  This leads to data corruption.
+
+We already delay the final bio_endio() on the write until
+the bad-block-list is written so that when the write
+returns: either that data is safe, the bad-block record is
+safe, or the fact that the device is faulty is safe.
+However we *don't* delay the clearing of the bitmap, so the
+bitmap bit can be recorded as cleared before we know if the
+bad-block-list was written safely.
+
+So: delay that until the write really is safe.
+i.e. move the call to close_write() until just before
+calling bio_endio(), and recheck the 'is array degraded'
+status before making that call.
+
+This bug goes back to v3.1 when bad-block-lists were
+introduced, though it only affects arrays created with
+mdadm-3.3 or later as only those have bad-block lists.
+
+Backports will require at least
+Commit: 95af587e95aa ("md/raid10: ensure device failure recorded before write request returns.")
+as well.  I'll send that to 'stable' separately.
+
+Note that of the two tests of R10BIO_WriteError that this
+patch adds, the first is certain to fail and the second is
+certain to succeed.  However doing it this way makes the
+patch more obviously correct.  I will tidy the code up in a
+future merge window.
+
+Reported-by: Nate Dailey <nate.dailey@stratus.com>
+Fixes: bd870a16c594 ("md/raid10:  Handle write errors by updating badblock log.")
+Signed-off-by: NeilBrown <neilb@suse.com>
+(cherry picked from commit c340702ca26a628832fade4f133d8160a55c29cc)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 99e724e..f0c7f3b 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -2795,16 +2795,17 @@ static void handle_write_completed(struct r10conf *conf, struct r10bio *r10_bio)
+     rdev_dec_pending(rdev, conf->mddev);
+    }
+   }
+-  if (test_bit(R10BIO_WriteError,
+-        &r10_bio->state))
+-   close_write(r10_bio);
+   if (fail) {
+    spin_lock_irq(&conf->device_lock);
+    list_add(&r10_bio->retry_list, &conf->bio_end_io_list);
+    spin_unlock_irq(&conf->device_lock);
+    md_wakeup_thread(conf->mddev->thread);
+-  } else
++  } else {
++   if (test_bit(R10BIO_WriteError,
++         &r10_bio->state))
++    close_write(r10_bio);
+    raid_end_bio_io(r10_bio);
++  }
+  }
+ }
+ 
+@@ -2832,6 +2833,12 @@ static void raid10d(struct md_thread *thread)
+    r10_bio = list_first_entry(&tmp, struct r10bio,
+          retry_list);
+    list_del(&r10_bio->retry_list);
++   if (mddev->degraded)
++    set_bit(R10BIO_Degraded, &r10_bio->state);
++
++   if (test_bit(R10BIO_WriteError,
++         &r10_bio->state))
++    close_write(r10_bio);
+    raid_end_bio_io(r10_bio);
+   }
+  }
+-- 
+1.7.1

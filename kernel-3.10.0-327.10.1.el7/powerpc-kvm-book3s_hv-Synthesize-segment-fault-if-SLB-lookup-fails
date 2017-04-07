@@ -1,0 +1,118 @@
+From e5b14b7f3b372d4d5f2f7af1e7cf53ab7bb83dc0 Mon Sep 17 00:00:00 2001
+From: Thomas Huth <thuth@redhat.com>
+Date: Mon, 9 Nov 2015 13:52:45 +0100
+Subject: [powerpc] kvm: book3s_hv: Synthesize segment fault if SLB lookup fails
+
+Message-id: <1447077165-7085-1-git-send-email-thuth@redhat.com>
+Patchwork-id: 126354
+O-Subject: [RHEL7.3 kvm PATCH] KVM: PPC: Book3S HV: Synthesize segment fault if SLB lookup fails
+Bugzilla: 1269467
+Z-Bugzilla: 1281423
+RH-Acked-by: Laurent Vivier <lvivier@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+From: Paul Mackerras <paulus@ozlabs.org>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1269467
+Build Info: https://brewweb.devel.redhat.com/taskinfo?taskID=10047653
+Upstream Status: Not upstream yet, but should be soon (and since the
+    patch has been developped by the current KVM PPC maintainer (Paul
+    Mackerras), we don't expect any further troubles in the upstreaming
+    process)
+Tested: We've had a host kernel with this patch running for several
+    days and did not see any more guest crashes (see the BZ for details)
+
+This patch fixes random KVM guest crashes on powerpc that mainly occur
+when the host is under memory pressure.
+
+Author: Paul Mackerras <paulus@ozlabs.org>
+Date:   Tue Oct 27 16:13:56 2015 +1100
+
+    KVM: PPC: Book3S HV: Synthesize segment fault if SLB lookup fails
+
+    When handling a hypervisor data or instruction storage interrupt (HDSI
+    or HISI), we look up the SLB entry for the address being accessed in
+    order to translate the effective address to a virtual address which can
+    be looked up in the guest HPT.  This lookup can occasionally fail due
+    to the guest replacing an SLB entry without invalidating the evicted
+    SLB entry.  In this situation an ERAT (effective to real address
+    translation cache) entry can persist and be used by the hardware even
+    though there is no longer a corresponding SLB entry.
+
+    Previously we would just deliver a data or instruction storage interrupt
+    (DSI or ISI) to the guest in this case.  However, this is not correct
+    and has been observed to cause guests to crash, typically with a
+    data storage protection interrupt on a store to the vmemmap area.
+
+    Instead, what we do now is to synthesize a data or instruction segment
+    interrupt.  That should cause the guest to reload an appropriate entry
+    into the SLB and retry the faulting instruction.  If it still faults,
+    we should find an appropriate SLB entry next time and be able to handle
+    the fault.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index b1f9089..6ca1b3f 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -1917,7 +1917,8 @@ kvmppc_hdsi:
+  beq 3f
+  clrrdi r0, r4, 28
+  PPC_SLBFEE_DOT(R5, R0)  /* if so, look up SLB */
+- bne 1f   /* if no SLB entry found */
++ li r0, BOOK3S_INTERRUPT_DATA_SEGMENT
++ bne 7f   /* if no SLB entry found */
+ 4: std r4, VCPU_FAULT_DAR(r9)
+  stw r6, VCPU_FAULT_DSISR(r9)
+ 
+@@ -1936,14 +1937,15 @@ kvmppc_hdsi:
+  cmpdi r3, -2   /* MMIO emulation; need instr word */
+  beq 2f
+ 
+- /* Synthesize a DSI for the guest */
++ /* Synthesize a DSI (or DSegI) for the guest */
+  ld r4, VCPU_FAULT_DAR(r9)
+  mr r6, r3
+-1: mtspr SPRN_DAR, r4
++1: li r0, BOOK3S_INTERRUPT_DATA_STORAGE
+  mtspr SPRN_DSISR, r6
++7: mtspr SPRN_DAR, r4
+  mtspr SPRN_SRR0, r10
+  mtspr SPRN_SRR1, r11
+- li r10, BOOK3S_INTERRUPT_DATA_STORAGE
++ mr r10, r0
+  bl kvmppc_msr_interrupt
+ fast_interrupt_c_return:
+ 6: ld r7, VCPU_CTR(r9)
+@@ -1991,7 +1993,8 @@ kvmppc_hisi:
+  beq 3f
+  clrrdi r0, r10, 28
+  PPC_SLBFEE_DOT(R5, R0)  /* if so, look up SLB */
+- bne 1f   /* if no SLB entry found */
++ li r0, BOOK3S_INTERRUPT_INST_SEGMENT
++ bne 7f   /* if no SLB entry found */
+ 4:
+  /* Search the hash table. */
+  mr r3, r9   /* vcpu pointer */
+@@ -2008,11 +2011,12 @@ kvmppc_hisi:
+  cmpdi r3, -1   /* handle in kernel mode */
+  beq guest_exit_cont
+ 
+- /* Synthesize an ISI for the guest */
++ /* Synthesize an ISI (or ISegI) for the guest */
+  mr r11, r3
+-1: mtspr SPRN_SRR0, r10
++1: li r0, BOOK3S_INTERRUPT_INST_STORAGE
++7: mtspr SPRN_SRR0, r10
+  mtspr SPRN_SRR1, r11
+- li r10, BOOK3S_INTERRUPT_INST_STORAGE
++ mr r10, r0
+  bl kvmppc_msr_interrupt
+  b fast_interrupt_c_return
+ 
+-- 
+1.7.1

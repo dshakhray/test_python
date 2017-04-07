@@ -1,0 +1,86 @@
+From 49c4d9f5e552517a63413b17d6f21781fcaa578c Mon Sep 17 00:00:00 2001
+From: David Milburn <dmilburn@redhat.com>
+Date: Tue, 20 Oct 2015 15:09:48 +0200
+Subject: [block] nvme: Fix memory leak on retried commands
+
+Message-id: <1445353788-10443-1-git-send-email-dmilburn@redhat.com>
+Patchwork-id: 125797
+O-Subject: [RHEL7.3 PATCH] NVMe: Fix memory leak on retried commands
+Bugzilla: 1271860
+Z-Bugzilla: 1279792
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Corinna Vinschen <vinschen@redhat.com>
+
+commit 0dfc70c33409afc232ef0b9ec210535dfbf9bc61
+Author: Keith Busch <keith.busch@intel.com>
+Date:   Thu Oct 15 13:38:48 2015 -0600
+
+    NVMe: Fix memory leak on retried commands
+
+    Resources are reallocated for requeued commands, so unmap and release
+    the iod for the failed command.
+
+    It's a pretty bad memory leak and causes a kernel hang if you remove a
+    drive because of a busy dma pool. You'll get messages spewing like this:
+
+      nvme 0000:xx:xx.x: dma_pool_destroy prp list 256, ffff880420dec000 busy
+
+    and lock up pci and the driver since removal never completes while
+    holding a lock.
+
+    Cc: stable@vger.kernel.org
+    Cc: <stable@vger.kernel.org> # 4.0.x-
+    Signed-off-by: Keith Busch <keith.busch@intel.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/block/nvme-core.c b/drivers/block/nvme-core.c
+index 52b54f2..711d96a 100644
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@ -509,6 +509,7 @@ static void req_completion(struct nvme_queue *nvmeq, void *ctx,
+  struct nvme_iod *iod = ctx;
+  struct request *req = iod_get_private(iod);
+  struct nvme_cmd_info *cmd_rq = blk_mq_rq_to_pdu(req);
++ bool requeue = false;
+ 
+  u16 status = le16_to_cpup(&cqe->status) >> 1;
+ 
+@@ -517,12 +518,13 @@ static void req_completion(struct nvme_queue *nvmeq, void *ctx,
+       && (jiffies - req->start_time) < req->timeout) {
+    unsigned long flags;
+ 
++   requeue = true;
+    blk_mq_requeue_request(req);
+    spin_lock_irqsave(req->q->queue_lock, flags);
+    if (!blk_queue_stopped(req->q))
+     blk_mq_kick_requeue_list(req->q);
+    spin_unlock_irqrestore(req->q->queue_lock, flags);
+-   return;
++   goto release_iod;
+   }
+   req->errors = nvme_error_status(status);
+  } else
+@@ -533,6 +535,7 @@ static void req_completion(struct nvme_queue *nvmeq, void *ctx,
+    "completing aborted command with status:%04x\n",
+    status);
+ 
++ release_iod:
+  if (iod->nents) {
+   dma_unmap_sg(&nvmeq->dev->pci_dev->dev, iod->sg, iod->nents,
+    rq_data_dir(req) ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+@@ -542,7 +545,8 @@ static void req_completion(struct nvme_queue *nvmeq, void *ctx,
+  }
+  nvme_free_iod(nvmeq->dev, iod);
+ 
+- blk_mq_complete_request(req);
++ if (likely(!requeue))
++  blk_mq_complete_request(req);
+ }
+ 
+ /* length is in bytes.  gfp flags indicates whether we may sleep. */
+-- 
+1.7.1

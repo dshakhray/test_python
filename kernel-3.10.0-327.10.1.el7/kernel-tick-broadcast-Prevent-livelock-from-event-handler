@@ -1,0 +1,154 @@
+From 26f53866b5b9852b5be05303df5f8a7ef161317c Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Wed, 30 Sep 2015 17:52:35 +0200
+Subject: [kernel] tick: broadcast: Prevent livelock from event handler
+
+Message-id: <1443635555-6854-3-git-send-email-prarit@redhat.com>
+Patchwork-id: 125174
+O-Subject: [RHEL7.3 PATCH BZ 1265283 2/2] tick: broadcast: Prevent livelock from event handler
+Bugzilla: 1265283
+Z-Bugzilla: 1284043
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+
+Bugzilla: http://bugzilla.redhat.com/1265283
+
+Conflicts: dev->state and CLOCK_EVT_STATE_ONESHOT are dev->mode and
+CLOCK_EVT_MODE_ONESHOT in RHEL7.
+
+commit 2951d5c031a3aaefa31b688fbf229e75692f4786
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue May 5 10:00:13 2015 +0200
+
+    tick: broadcast: Prevent livelock from event handler
+
+    With the removal of the hrtimer softirq the switch to highres/nohz
+    mode happens in the tick interrupt. That leads to a livelock when the
+    per cpu event handler is directly called from the broadcast handler
+    under broadcast lock because broadcast lock needs to be taken for the
+    highres/nohz switch as well.
+
+    Solve this by calling the cpu local handler outside the broadcast_lock
+    held region.
+
+    Fixes: c6eb3f70d448 "hrtimer: Get rid of hrtimer softirq"
+    Reported-and-tested-by: Borislav Petkov <bp@alien8.de>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/kernel/time/tick-broadcast.c b/kernel/time/tick-broadcast.c
+index a219e68..9fde528 100644
+--- a/kernel/time/tick-broadcast.c
++++ b/kernel/time/tick-broadcast.c
+@@ -249,18 +249,18 @@ int tick_receive_broadcast(void)
+ /*
+  * Broadcast the event to the cpus, which are set in the mask (mangled).
+  */
+-static void tick_do_broadcast(struct cpumask *mask)
++static bool tick_do_broadcast(struct cpumask *mask)
+ {
+  int cpu = smp_processor_id();
+  struct tick_device *td;
++ bool local = false;
+ 
+  /*
+   * Check, if the current cpu is in the mask
+   */
+  if (cpumask_test_cpu(cpu, mask)) {
+   cpumask_clear_cpu(cpu, mask);
+-  td = &per_cpu(tick_cpu_device, cpu);
+-  td->evtdev->event_handler(td->evtdev);
++  local = true;
+  }
+ 
+  if (!cpumask_empty(mask)) {
+@@ -273,16 +273,17 @@ static void tick_do_broadcast(struct cpumask *mask)
+   td = &per_cpu(tick_cpu_device, cpumask_first(mask));
+   td->evtdev->broadcast(mask);
+  }
++ return local;
+ }
+ 
+ /*
+  * Periodic broadcast:
+  * - invoke the broadcast handlers
+  */
+-static void tick_do_periodic_broadcast(void)
++static bool tick_do_periodic_broadcast(void)
+ {
+  cpumask_and(tmpmask, cpu_online_mask, tick_broadcast_mask);
+- tick_do_broadcast(tmpmask);
++ return tick_do_broadcast(tmpmask);
+ }
+ 
+ /*
+@@ -290,34 +291,26 @@ static void tick_do_periodic_broadcast(void)
+  */
+ static void tick_handle_periodic_broadcast(struct clock_event_device *dev)
+ {
+- ktime_t next;
++ struct tick_device *td = this_cpu_ptr(&tick_cpu_device);
++ bool bc_local;
+ 
+  raw_spin_lock(&tick_broadcast_lock);
++ bc_local = tick_do_periodic_broadcast();
+ 
+- tick_do_periodic_broadcast();
++ if (dev->mode == CLOCK_EVT_MODE_ONESHOT) {
++  ktime_t next = ktime_add(dev->next_event, tick_period);
+ 
+- /*
+-  * The device is in periodic mode. No reprogramming necessary:
+-  */
+- if (dev->mode == CLOCK_EVT_MODE_PERIODIC)
+-  goto unlock;
++  clockevents_program_event(dev, next, true);
++ }
++ raw_spin_unlock(&tick_broadcast_lock);
+ 
+  /*
+-  * Setup the next period for devices, which do not have
+-  * periodic mode. We read dev->next_event first and add to it
+-  * when the event already expired. clockevents_program_event()
+-  * sets dev->next_event only when the event is really
+-  * programmed to the device.
++  * We run the handler of the local cpu after dropping
++  * tick_broadcast_lock because the handler might deadlock when
++  * trying to switch to oneshot mode.
+   */
+- for (next = dev->next_event; ;) {
+-  next = ktime_add(next, tick_period);
+-
+-  if (!clockevents_program_event(dev, next, false))
+-   goto unlock;
+-  tick_do_periodic_broadcast();
+- }
+-unlock:
+- raw_spin_unlock(&tick_broadcast_lock);
++ if (bc_local)
++  td->evtdev->event_handler(td->evtdev);
+ }
+ 
+ /*
+@@ -614,9 +607,13 @@ again:
+   cpumask_and(tmpmask, tmpmask, cpu_online_mask);
+ 
+  /*
+-  * Wakeup the cpus which have an expired event.
++  * Wakeup the cpus which have an expired event and handle the
++  * broadcast event of the local cpu.
+   */
+- tick_do_broadcast(tmpmask);
++ if (tick_do_broadcast(tmpmask)) {
++  td = this_cpu_ptr(&tick_cpu_device);
++  td->evtdev->event_handler(td->evtdev);
++ }
+ 
+  /*
+   * Two reasons for reprogram:
+-- 
+1.7.1

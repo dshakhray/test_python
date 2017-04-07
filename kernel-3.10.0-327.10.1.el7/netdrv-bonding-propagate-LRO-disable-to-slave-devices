@@ -1,0 +1,193 @@
+From 6fbd35d350a9642ab0d5cf1dd2c5682d25928294 Mon Sep 17 00:00:00 2001
+From: Jarod Wilson <jarod@redhat.com>
+Date: Mon, 7 Dec 2015 22:56:03 +0100
+Subject: [netdrv] bonding: propagate LRO disable to slave devices
+
+Message-id: <1449528963-35027-1-git-send-email-jarod@redhat.com>
+Patchwork-id: 128490
+O-Subject: [RHEL7 PATCH] net/bonding: propagate LRO disable to slave devices
+Bugzilla: 1266578
+Z-Bugzilla: 1292072
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1266578
+Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=10196408
+Testing: Set up a bridge on a bond on a bnx2x (LRO-supporting) NIC and
+checked LRO flags all the way down the stack.
+
+This is a RHEL-only patch, heavily inspired by upstream commit
+fbe168ba91f7c327856f205699404284c2f09e36 - "net: generic dev_disable_lro()
+stacked device handling". The upstream patch makes use of
+netdev_for_each_lower_dev() and the netdev adjacency code, which we don't
+have in RHEL7 yet, and adding it requires quite a few upstream patches. We
+do actually plan to add said code, via the RHEL7.3 common net backports
+tree, and I have done the work to backport the proper upstream fix, but
+that's not going to be in 7.3 for a while still, and even if it were in,
+the fix is far too invasive for the 7.2 z-stream request for this fix.
+That being the case, this is a short-term one-off patch, similar in nature
+to the same that we took into RHEL6.7 to fix the same problem. Further on
+down the road in 7.3 development, this should be reverted, and the full
+usptream fix taken in. This has been discussed with jbenc, and he agrees
+this is the way to go.
+
+So what are we actually doing here? We're simply making sure that LRO gets
+disabled down the stack for stacked device setups. The particular customer
+case involves virtual machines on a bridged interface on top of a bonded
+interface on top of NICs that support LRO. Bridges aren't compatible with
+LRO, so we need to make sure everything under the bridge gets LRO
+disabled, and this patch accomplishes that for the bond case. The upstream
+fix is more generic, and will solve this for all device types (bridge on
+top of a team device is the other use case that comes to mind), but this
+should satisfy the customer need for now.
+
+No kabi was harmed in the making of this patch, but the move of struct
+upper_dev is somewhat noteworthy. It existed in two places, which led to a
+compile failure when bonding.h was included in net/core/dev.c, so I just
+moved it where both dev.c and bonding could use it, and it'll disappear
+entirely later on when the full upstream fix comes in.
+
+[root@dell-pem520-03 ~]# brctl show
+bridge name bridge id  STP enabled interfaces
+br0  8000.5cf9dd9b2c70 yes  bond0
+
+[root@dell-pem520-03 ~]# cat /proc/net/bonding/bond0
+Ethernet Channel Bonding Driver: v3.7.1 (April 27, 2011)
+
+Bonding Mode: fault-tolerance (active-backup)
+Primary Slave: None
+Currently Active Slave: None
+MII Status: down
+MII Polling Interval (ms): 100
+Up Delay (ms): 0
+Down Delay (ms): 0
+
+Slave Interface: p3p2
+MII Status: down
+Speed: Unknown
+Duplex: Unknown
+Link Failure Count: 0
+Permanent HW addr: 5c:f9:dd:9b:2c:70
+Slave queue ID: 0
+
+Before patch:
+
+[root@dell-pem520-03 ~]# ethtool -k br0 |grep large
+large-receive-offload: off [fixed]
+[root@dell-pem520-03 ~]# ethtool -k bond0 |grep large
+large-receive-offload: on
+[root@dell-pem520-03 ~]# ethtool -k p3p2 |grep large
+large-receive-offload: on
+
+After patch:
+[root@dell-pem520-03 ~]# ethtool -k p3p2 |grep large
+large-receive-offload: off
+[root@dell-pem520-03 ~]# ethtool -k br0 |grep large
+large-receive-offload: off [fixed]
+[root@dell-pem520-03 ~]# ethtool -k bond0 |grep large
+large-receive-offload: off
+[root@dell-pem520-03 ~]# ethtool -k p3p2 |grep large
+large-receive-offload: off
+
+CC: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index c7f72e1..98bab44 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -1609,6 +1609,9 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev)
+  if (res)
+   goto err_detach;
+ 
++ if (!(bond_dev->features & NETIF_F_LRO))
++  dev_disable_lro(slave_dev);
++
+  res = netdev_rx_handler_register(slave_dev, bond_handle_frame,
+       new_slave);
+  if (res) {
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 341e858..32f930a 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -345,6 +345,14 @@ enum {
+  NAPI_STATE_EXT,  /* Extended napi_struct */
+ };
+ 
++struct netdev_upper {
++ struct net_device *dev;
++ bool master;
++ struct list_head list;
++ struct rcu_head rcu;
++ struct list_head search_list;
++};
++
+ enum gro_result {
+  GRO_MERGED,
+  GRO_MERGED_FREE,
+diff --git a/include/net/bonding.h b/include/net/bonding.h
+index c4cf753..3638ff2 100644
+--- a/include/net/bonding.h
++++ b/include/net/bonding.h
+@@ -236,14 +236,6 @@ struct bonding {
+  struct rtnl_link_stats64 bond_stats;
+ };
+ 
+-struct netdev_upper {
+-        struct net_device *dev;
+-        bool master;
+-        struct list_head list;
+-        struct rcu_head rcu;
+-        struct list_head search_list;
+-};
+-
+ #define bond_slave_get_rcu(dev) \
+  ((struct slave *) rcu_dereference(dev->rx_handler_data))
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+index f3c2ad6..bf0d851 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -133,6 +133,7 @@
+ #include <linux/hashtable.h>
+ #include <linux/vmalloc.h>
+ #include <linux/hrtimer.h>
++#include <net/bonding.h>
+ 
+ #include "net-sysfs.h"
+ 
+@@ -1460,6 +1461,15 @@ void dev_disable_lro(struct net_device *dev)
+ 
+  if (unlikely(dev->features & NETIF_F_LRO))
+   netdev_WARN(dev, "failed to disable LRO!\n");
++
++ /* if dev is a bond master, disable LRO for all its slaves */
++ if (netif_is_bond_master(dev)) {
++  struct bonding *bond = netdev_priv(dev);
++  struct list_head *iter;
++  struct slave *slave;
++  bond_for_each_slave(bond, slave, iter)
++   dev_disable_lro(slave->dev);
++ }
+ }
+ EXPORT_SYMBOL(dev_disable_lro);
+ 
+@@ -4491,14 +4501,6 @@ softnet_break:
+  goto out;
+ }
+ 
+-struct netdev_upper {
+- struct net_device *dev;
+- bool master;
+- struct list_head list;
+- struct rcu_head rcu;
+- struct list_head search_list;
+-};
+-
+ static void __append_search_uppers(struct list_head *search_list,
+        struct net_device *dev)
+ {
+-- 
+1.7.1
