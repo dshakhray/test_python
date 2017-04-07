@@ -1,0 +1,160 @@
+From 6362b6c627fa711aff60941573bc5b65adfb2507 Mon Sep 17 00:00:00 2001
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Tue, 11 Oct 2016 12:31:24 +0200
+Subject: [hv] kvp: add host negotiation timeout fuse
+
+Message-id: <1476189084-31150-1-git-send-email-vkuznets@redhat.com>
+Patchwork-id: 158747
+O-Subject: [RHEL7.2.z KERNEL PATCH BZ 1380305] Drivers: hv: kvp: add host negotiation timeout fuse
+Bugzilla: 1309368
+Z-Bugzilla: 1380305
+RH-Acked-by: Cathy Avery <cavery@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1380305
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=11875965
+Tested: WS2016TP5 guest by me, by QE
+
+RHEL 7.3 commit 6cc0f41869af80dc370bd3cda03af286d5ff621f
+Author: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date:   Mon Apr 25 16:39:18 2016 -0400
+
+    [hv] kvp: fix IP Failover
+
+There is a 60 second timeout on the host's side to get a reply from guest
+after sending ICMSGTYPE_NEGOTIATE message. In some cases (e.g. when the
+boot is slow because of a file system check or when we're booting a guest
+with very limited CPU resources) it takes more between hv_util kernel
+module load and hypervkvpd startup. We solved the issue in 7.3 by
+refactoring all three hv_util services we have but the amount of changes
+is not suitable for z-stream. Here is a 7.2.z version of the above
+mentioned commit from 7.3. It fixes KVP service only but hopefully this is
+going to be enough for 7.2.z.
+
+Compared to 7.3 the timeout is lowered to 55 seconds because of my recent
+discovery, see:
+http://driverdev.linuxdriverproject.org/pipermail/driverdev-devel/2016-October/095060.html
+We'll have to fix 7.3/7.4 eventually too but the fix is less important
+here as we switched to udev activation for all hyperv-daemons and it is
+unlikely that it'll take 60 seconds or more.
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+---
+ drivers/hv/hv_kvp.c       | 30 ++++++++++++++++++++++++++++++
+ drivers/hv/hyperv_vmbus.h |  5 +++++
+ 2 files changed, 35 insertions(+)
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/hv/hv_kvp.c b/drivers/hv/hv_kvp.c
+index afd8316..9311c79 100644
+--- a/drivers/hv/hv_kvp.c
++++ b/drivers/hv/hv_kvp.c
+@@ -28,6 +28,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/hyperv.h>
+ 
++#include "hyperv_vmbus.h"
+ 
+ /*
+  * Pre win8 version numbers used in ws2008 and ws 2008 r2 (win7)
+@@ -79,9 +80,11 @@ static void kvp_send_key(struct work_struct *dummy);
+ 
+ static void kvp_respond_to_host(struct hv_kvp_msg *msg, int error);
+ static void kvp_work_func(struct work_struct *dummy);
++static void kvp_host_handshake_func(struct work_struct *dummy);
+ static void kvp_register(int);
+ 
+ static DECLARE_DELAYED_WORK(kvp_work, kvp_work_func);
++static DECLARE_DELAYED_WORK(kvp_host_handshake_work, kvp_host_handshake_func);
+ static DECLARE_WORK(kvp_sendkey_work, kvp_send_key);
+ 
+ static struct cb_id kvp_id = { CN_KVP_IDX, CN_KVP_VAL };
+@@ -137,6 +140,12 @@ static void poll_channel(struct vmbus_channel *channel)
+   hv_kvp_onchannelcallback(channel);
+ }
+ 
++static void kvp_host_handshake_func(struct work_struct *dummy)
++{
++ kvp_transaction.active = false;
++ if (kvp_transaction.kvp_context)
++  poll_channel(kvp_transaction.kvp_context);
++}
+ 
+ static int kvp_handle_handshake(struct hv_kvp_msg *msg)
+ {
+@@ -165,6 +174,7 @@ static int kvp_handle_handshake(struct hv_kvp_msg *msg)
+   pr_info("KVP: user-mode registering done.\n");
+   kvp_register(dm_reg_value);
+   kvp_transaction.active = false;
++  cancel_delayed_work_sync(&kvp_host_handshake_work);
+   if (kvp_transaction.kvp_context)
+    poll_channel(kvp_transaction.kvp_context);
+  }
+@@ -611,6 +621,9 @@ void hv_kvp_onchannelcallback(void *context)
+  struct icmsg_negotiate *negop = NULL;
+  int util_fw_version;
+  int kvp_srv_version;
++ static enum {NEGO_NOT_STARTED,
++       NEGO_IN_PROGRESS,
++       NEGO_FINISHED} host_negotiatied = NEGO_NOT_STARTED;
+ 
+  if (kvp_transaction.active) {
+   /*
+@@ -618,8 +631,22 @@ void hv_kvp_onchannelcallback(void *context)
+    * the current transaction is complete.
+    */
+   kvp_transaction.kvp_context = context;
++
++  if (host_negotiatied == NEGO_NOT_STARTED) {
++   /*
++    * If userspace daemon is not connected and host is
++    * asking us to negotiate we need to delay to not
++    * lose messages. This is important for Failover IP
++    * setting.
++    */
++   host_negotiatied = NEGO_IN_PROGRESS;
++   schedule_delayed_work(&kvp_host_handshake_work,
++           HV_UTIL_NEGO_TIMEOUT * HZ);
++  }
++
+   return;
+  }
++ kvp_transaction.kvp_context = NULL;
+ 
+  vmbus_recvpacket(channel, recv_buffer, PAGE_SIZE * 4, &recvlen,
+     &requestid);
+@@ -689,6 +716,8 @@ void hv_kvp_onchannelcallback(void *context)
+   vmbus_sendpacket(channel, recv_buffer,
+            recvlen, requestid,
+            VM_PKT_DATA_INBAND, 0);
++
++  host_negotiatied = NEGO_FINISHED;
+  }
+ 
+ }
+@@ -717,6 +746,7 @@ hv_kvp_init(struct hv_util_service *srv)
+ void hv_kvp_deinit(void)
+ {
+  cn_del_callback(&kvp_id);
++ cancel_delayed_work_sync(&kvp_host_handshake_work);
+  cancel_delayed_work_sync(&kvp_work);
+  cancel_work_sync(&kvp_sendkey_work);
+ }
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index 7a18d55..d194a37 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -31,6 +31,11 @@
+ #include <linux/hyperv.h>
+ 
+ /*
++ * Timeout for guest-host handshake for services.
++ */
++#define HV_UTIL_NEGO_TIMEOUT 55
++
++/*
+  * The below CPUID leaves are present if VersionAndFeatures.HypervisorPresent
+  * is set by CPUID(HVCPUID_VERSION_FEATURES).
+  */
+-- 
+1.7.1

@@ -1,0 +1,83 @@
+From a5f471a036c4800bfff1a3f074488e6f548b5ddc Mon Sep 17 00:00:00 2001
+From: Herton R. Krzesinski <herton@redhat.com>
+Date: Wed, 18 May 2016 06:41:04 +0200
+Subject: [kernel] sched: Fix hrtimer_cancel()/rq->lock deadlock
+
+Message-id: <1463553686-8136-4-git-send-email-herton@redhat.com>
+Patchwork-id: 145566
+O-Subject: [RHEL7 PATCH 03/25] sched: Fix hrtimer_cancel()/rq->lock deadlock
+Bugzilla: 1336863
+Z-Bugzilla: 1370157
+RH-Acked-by: Jiri Olsa <jolsa@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1336863
+Upstream Status: commit 927b54f, linux-stable commit 9ca715c
+Build Info: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11035443
+Tested: kt1 (looking for consistent regressions) and with test case on the bug
+
+commit 9ca715c462018a8631240088dafa567bec6fe721
+Author: Ben Segall <bsegall@google.com>
+Date:   Wed Oct 16 11:16:22 2013 -0700
+
+    sched: Fix hrtimer_cancel()/rq->lock deadlock
+
+    commit 927b54fccbf04207ec92f669dce6806848cbec7d upstream.
+
+    __start_cfs_bandwidth calls hrtimer_cancel while holding rq->lock,
+    waiting for the hrtimer to finish. However, if sched_cfs_period_timer
+    runs for another loop iteration, the hrtimer can attempt to take
+    rq->lock, resulting in deadlock.
+
+    Fix this by ensuring that cfs_b->timer_active is cleared only if the
+    _latest_ call to do_sched_cfs_period_timer is returning as idle. Then
+    __start_cfs_bandwidth can just call hrtimer_try_to_cancel and wait for
+    that to succeed or timer_active == 1.
+
+    Signed-off-by: Ben Segall <bsegall@google.com>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: pjt@google.com
+    Link: http://lkml.kernel.org/r/20131016181622.22647.16643.stgit@sword-of-the-dawn.mtv.corp.google.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Cc: Chris J Arges <chris.j.arges@canonical.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Signed-off-by: Herton R. Krzesinski <herton@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 32ec7a5..44316bb 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3392,6 +3392,13 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun)
+  if (idle)
+   goto out_unlock;
+ 
++ /*
++  * if we have relooped after returning idle once, we need to update our
++  * status as actually running, so that other cpus doing
++  * __start_cfs_bandwidth will stop trying to cancel us.
++  */
++ cfs_b->timer_active = 1;
++
+  __refill_cfs_bandwidth_runtime(cfs_b);
+ 
+  if (!throttled) {
+@@ -3681,11 +3688,11 @@ void __start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+   * (timer_active==0 becomes visible before the hrtimer call-back
+   * terminates).  In either case we ensure that it's re-programmed
+   */
+- while (unlikely(hrtimer_active(&cfs_b->period_timer))) {
++ while (unlikely(hrtimer_active(&cfs_b->period_timer)) &&
++        hrtimer_try_to_cancel(&cfs_b->period_timer) < 0) {
++  /* bounce the lock to allow do_sched_cfs_period_timer to run */
+   raw_spin_unlock(&cfs_b->lock);
+-  /* ensure cfs_b->lock is available while we wait */
+-  hrtimer_cancel(&cfs_b->period_timer);
+-
++  cpu_relax();
+   raw_spin_lock(&cfs_b->lock);
+   /* if someone else restarted the timer then we're done */
+   if (cfs_b->timer_active)
+-- 
+1.7.1

@@ -1,0 +1,187 @@
+From cde22cfe641a116b060d612ba5a6b6b6e6d4dc1f Mon Sep 17 00:00:00 2001
+From: dvlasenk <dvlasenk@redhat.com>
+Date: Fri, 27 May 2016 15:13:25 +0200
+Subject: [x86] efi: Include a .bss section within the PE/COFF headers
+
+Message-id: <20160527151325.21349-1-dvlasenk@redhat.com>
+Patchwork-id: 148080
+O-Subject: [PATCH RHEL7 BZ 1335188] x86/efi: Include a .bss section within the PE/COFF headers
+Bugzilla: 1335188
+Z-Bugzilla: 1369472
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Jeremy McNicoll <jmcnicol@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+
+BZ:
+https://bugzilla.redhat.com/bugzilla/show_bug.cgi?id=1335188
+
+Brew build:
+https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11055415
+
+Upstream status of the patch:
+upstream commit c7fb93ec51d462ec3540a729ba446663c26a0505
+Author: Michael Brown <mbrown@fensystems.co.uk>
+Date:   Thu Jul 10 12:26:20 2014 +0100
+
+    x86/efi: Include a .bss section within the PE/COFF headers
+
+    The PE/COFF headers currently describe only the initialised-data
+    portions of the image, and result in no space being allocated for the
+    uninitialised-data portions.  Consequently, the EFI boot stub will end
+    up overwriting unexpected areas of memory, with unpredictable results.
+
+    Fix by including a .bss section in the PE/COFF headers (functionally
+    equivalent to the init_size field in the bzImage header).
+
+Test Status:
+Verified by the user. The system which exhibited the problem now boots
+successfully.
+
+Signed-off-by: Denys Vlasenko <dvlasenk@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/arch/x86/boot/header.S b/arch/x86/boot/header.S
+index ec3b8ba..04da6c2 100644
+--- a/arch/x86/boot/header.S
++++ b/arch/x86/boot/header.S
+@@ -91,10 +91,9 @@ bs_die:
+ 
+  .section ".bsdata", "a"
+ bugger_off_msg:
+- .ascii "Direct floppy boot is not supported. "
+- .ascii "Use a boot loader program instead.\r\n"
++ .ascii "Use a boot loader.\r\n"
+  .ascii "\n"
+- .ascii "Remove disk and press any key to reboot ...\r\n"
++ .ascii "Remove disk and press any key to reboot...\r\n"
+  .byte 0
+ 
+ #ifdef CONFIG_EFI_STUB
+@@ -108,7 +107,7 @@ coff_header:
+ #else
+  .word 0x8664    # x86-64
+ #endif
+- .word 3    # nr_sections
++ .word 4    # nr_sections
+  .long 0     # TimeDateStamp
+  .long 0    # PointerToSymbolTable
+  .long 1    # NumberOfSymbols
+@@ -250,6 +249,25 @@ section_table:
+  .word 0    # NumberOfLineNumbers
+  .long 0x60500020   # Characteristics (section flags)
+ 
++ #
++ # The offset & size fields are filled in by build.c.
++ #
++ .ascii ".bss"
++ .byte 0
++ .byte 0
++ .byte 0
++ .byte 0
++ .long 0
++ .long 0x0
++ .long 0    # Size of initialized data
++      # on disk
++ .long 0x0
++ .long 0    # PointerToRelocations
++ .long 0    # PointerToLineNumbers
++ .word 0    # NumberOfRelocations
++ .word 0    # NumberOfLineNumbers
++ .long 0xc8000080   # Characteristics (section flags)
++
+ #endif /* CONFIG_EFI_STUB */
+ 
+  # Kernel attributes; used by setup.  This is part 1 of the
+diff --git a/arch/x86/boot/tools/build.c b/arch/x86/boot/tools/build.c
+index 94c5446..e86d844 100644
+--- a/arch/x86/boot/tools/build.c
++++ b/arch/x86/boot/tools/build.c
+@@ -141,7 +141,7 @@ static void usage(void)
+ 
+ #ifdef CONFIG_EFI_STUB
+ 
+-static void update_pecoff_section_header(char *section_name, u32 offset, u32 size)
++static void update_pecoff_section_header_fields(char *section_name, u32 vma, u32 size, u32 datasz, u32 offset)
+ {
+  unsigned int pe_header;
+  unsigned short num_sections;
+@@ -162,10 +162,10 @@ static void update_pecoff_section_header(char *section_name, u32 offset, u32 siz
+    put_unaligned_le32(size, section + 0x8);
+ 
+    /* section header vma field */
+-   put_unaligned_le32(offset, section + 0xc);
++   put_unaligned_le32(vma, section + 0xc);
+ 
+    /* section header 'size of initialised data' field */
+-   put_unaligned_le32(size, section + 0x10);
++   put_unaligned_le32(datasz, section + 0x10);
+ 
+    /* section header 'file offset' field */
+    put_unaligned_le32(offset, section + 0x14);
+@@ -177,6 +177,11 @@ static void update_pecoff_section_header(char *section_name, u32 offset, u32 siz
+  }
+ }
+ 
++static void update_pecoff_section_header(char *section_name, u32 offset, u32 size)
++{
++ update_pecoff_section_header_fields(section_name, offset, size, size, offset);
++}
++
+ static void update_pecoff_setup_and_reloc(unsigned int size)
+ {
+  u32 setup_offset = 0x200;
+@@ -201,9 +206,6 @@ static void update_pecoff_text(unsigned int text_start, unsigned int file_sz)
+ 
+  pe_header = get_unaligned_le32(&buf[0x3c]);
+ 
+- /* Size of image */
+- put_unaligned_le32(file_sz, &buf[pe_header + 0x50]);
+-
+  /*
+   * Size of code: Subtract the size of the first sector (512 bytes)
+   * which includes the header.
+@@ -218,6 +220,22 @@ static void update_pecoff_text(unsigned int text_start, unsigned int file_sz)
+  update_pecoff_section_header(".text", text_start, text_sz);
+ }
+ 
++static void update_pecoff_bss(unsigned int file_sz, unsigned int init_sz)
++{
++ unsigned int pe_header;
++ unsigned int bss_sz = init_sz - file_sz;
++
++ pe_header = get_unaligned_le32(&buf[0x3c]);
++
++ /* Size of uninitialized data */
++ put_unaligned_le32(bss_sz, &buf[pe_header + 0x24]);
++
++ /* Size of image */
++ put_unaligned_le32(init_sz, &buf[pe_header + 0x50]);
++
++ update_pecoff_section_header_fields(".bss", file_sz, bss_sz, 0, 0);
++}
++
+ #endif /* CONFIG_EFI_STUB */
+ 
+ 
+@@ -260,7 +278,7 @@ static void parse_zoffset(char *fname)
+ 
+ int main(int argc, char ** argv)
+ {
+- unsigned int i, sz, setup_sectors;
++ unsigned int i, sz, setup_sectors, init_sz;
+  int c;
+  u32 sys_size;
+  struct stat sb;
+@@ -338,7 +356,9 @@ int main(int argc, char ** argv)
+  put_unaligned_le32(sys_size, &buf[0x1f4]);
+ 
+ #ifdef CONFIG_EFI_STUB
+- update_pecoff_text(setup_sectors * 512, sz + i + ((sys_size * 16) - sz));
++ update_pecoff_text(setup_sectors * 512, i + (sys_size * 16));
++ init_sz = get_unaligned_le32(&buf[0x260]);
++ update_pecoff_bss(i + (sys_size * 16), init_sz);
+ 
+ #ifdef CONFIG_X86_64 /* Yes, this is really how we defined it :( */
+  efi_stub_entry -= 0x200;
+-- 
+1.7.1

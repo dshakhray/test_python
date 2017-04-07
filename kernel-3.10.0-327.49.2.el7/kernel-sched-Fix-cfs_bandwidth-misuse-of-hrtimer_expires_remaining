@@ -1,0 +1,77 @@
+From e7d389ecc327d188e70b9747a24ab761029a4730 Mon Sep 17 00:00:00 2001
+From: Herton R. Krzesinski <herton@redhat.com>
+Date: Wed, 18 May 2016 06:41:03 +0200
+Subject: [kernel] sched: Fix cfs_bandwidth misuse of hrtimer_expires_remaining
+
+Message-id: <1463553686-8136-3-git-send-email-herton@redhat.com>
+Patchwork-id: 145567
+O-Subject: [RHEL7 PATCH 02/25] sched: Fix cfs_bandwidth misuse of hrtimer_expires_remaining
+Bugzilla: 1336863
+Z-Bugzilla: 1370157
+RH-Acked-by: Jiri Olsa <jolsa@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1336863
+Upstream Status: commit db06e78, linux-stable commit 373e0a5
+Build Info: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11035443
+Tested: kt1 (looking for consistent regressions) and with test case on the bug
+
+commit 373e0a593bd15df79e47158bd4628eb133d4da7d
+Author: Ben Segall <bsegall@google.com>
+Date:   Wed Oct 16 11:16:17 2013 -0700
+
+    sched: Fix cfs_bandwidth misuse of hrtimer_expires_remaining
+
+    commit db06e78cc13d70f10877e0557becc88ab3ad2be8 upstream.
+
+    hrtimer_expires_remaining does not take internal hrtimer locks and thus
+    must be guarded against concurrent __hrtimer_start_range_ns (but
+    returning HRTIMER_RESTART is safe). Use cfs_b->lock to make it safe.
+
+    Signed-off-by: Ben Segall <bsegall@google.com>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: pjt@google.com
+    Link: http://lkml.kernel.org/r/20131016181617.22647.73829.stgit@sword-of-the-dawn.mtv.corp.google.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Cc: Chris J Arges <chris.j.arges@canonical.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Signed-off-by: Herton R. Krzesinski <herton@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 57ceaed..32ec7a5 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3452,7 +3452,13 @@ static const u64 min_bandwidth_expiration = 2 * NSEC_PER_MSEC;
+ /* how long we wait to gather additional slack before distributing */
+ static const u64 cfs_bandwidth_slack_period = 5 * NSEC_PER_MSEC;
+ 
+-/* are we near the end of the current quota period? */
++/*
++ * Are we near the end of the current quota period?
++ *
++ * Requires cfs_b->lock for hrtimer_expires_remaining to be safe against the
++ * hrtimer base being cleared by __hrtimer_start_range_ns. In the case of
++ * migrate_hrtimers, base is never cleared, so we are fine.
++ */
+ static int runtime_refresh_within(struct cfs_bandwidth *cfs_b, u64 min_expire)
+ {
+  struct hrtimer *refresh_timer = &cfs_b->period_timer;
+@@ -3528,10 +3534,12 @@ static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
+  u64 expires;
+ 
+  /* confirm we're still not at a refresh boundary */
+- if (runtime_refresh_within(cfs_b, min_bandwidth_expiration))
++ raw_spin_lock(&cfs_b->lock);
++ if (runtime_refresh_within(cfs_b, min_bandwidth_expiration)) {
++  raw_spin_unlock(&cfs_b->lock);
+   return;
++ }
+ 
+- raw_spin_lock(&cfs_b->lock);
+  if (cfs_b->quota != RUNTIME_INF && cfs_b->runtime > slice) {
+   runtime = cfs_b->runtime;
+   cfs_b->runtime = 0;
+-- 
+1.7.1

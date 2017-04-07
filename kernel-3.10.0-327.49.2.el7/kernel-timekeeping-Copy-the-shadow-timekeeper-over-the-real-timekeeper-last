@@ -1,0 +1,91 @@
+From 555d6bae39a283f725ecf94e37e2c6446ab564f6 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 11 Nov 2016 12:55:28 +0100
+Subject: [kernel] timekeeping: Copy the shadow-timekeeper over the real timekeeper last
+
+Message-id: <1478868928-30002-1-git-send-email-prarit@redhat.com>
+Patchwork-id: 160325
+O-Subject: [RHEL7.4 PATCH BZ 1344747] timekeeping: Copy the shadow-timekeeper over the real timekeeper last
+Bugzilla: 1344747
+Z-Bugzilla: 1395576
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+RH-Acked-by: Jeremy McNicoll <jmcnicol@redhat.com>
+RH-Acked-by: David Arcari <darcari@redhat.com>
+RH-Acked-by: Herton R. Krzesinski <herton@redhat.com>
+
+Bugzilla: http://bugzilla.redhat.com/1344747
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=12066615
+
+Testing: RHEL7.2 and 7.3 fail about 1/500 leap second events using upstream's
+leap-a-day.c test utility.  With this patch I can do a century's worth of
+leap seconds (one every day) without a failure.  Tested successfully by me
+across a mix of systems in Beaker.
+
+Conflicts: minor diff conflict due to drift between upstream and RHEL7.
+
+commit 906c55579a6360dd9ef5a3101bb2e3ae396dfb97
+Author: John Stultz <john.stultz@linaro.org>
+Date:   Wed Jun 17 10:05:53 2015 -0700
+
+    timekeeping: Copy the shadow-timekeeper over the real timekeeper last
+
+    The fix in d151832650ed9 (time: Move clock_was_set_seq update
+    before updating shadow-timekeeper) was unfortunately incomplete.
+
+    The main gist of that change was to do the shadow-copy update
+    last, so that any state changes were properly duplicated, and
+    we wouldn't accidentally have stale data in the shadow.
+
+    Unfortunately in the main update_wall_time() logic, we update
+    use the shadow-timekeeper to calculate the next update values,
+    then while holding the lock, copy the shadow-timekeeper over,
+    then call timekeeping_update() to do some additional
+    bookkeeping, (skipping the shadow mirror). The bug with this is
+    the additional bookkeeping isn't all read-only, and some
+    changes timkeeper state. Thus we might then overwrite this state
+    change on the next update.
+
+    To avoid this problem, do the timekeeping_update() on the
+    shadow-timekeeper prior to copying the full state over to
+    the real-timekeeper.
+
+    This avoids problems with both the clock_was_set_seq and
+    next_leap_ktime being overwritten and possibly the
+    fast-timekeepers as well.
+
+    Many thanks to Prarit for his rigorous testing, which discovered
+    this problem, along with Prarit and Daniel's work validating this
+    fix.
+
+    Reported-by: Prarit Bhargava <prarit@redhat.com>
+    Tested-by: Prarit Bhargava <prarit@redhat.com>
+    Tested-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+    Signed-off-by: John Stultz <john.stultz@linaro.org>
+    Cc: Richard Cochran <richardcochran@gmail.com>
+    Cc: Jan Kara <jack@suse.cz>
+    Cc: Jiri Bohac <jbohac@suse.cz>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Link: http://lkml.kernel.org/r/1434560753-7441-1-git-send-email-john.stultz@linaro.org
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+Cc: Vitaly Kuznetsov <vkuznets@redhat.com>
+Cc: Herton R. Krzesinski <herton@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 9662d18..5115f30 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -1469,8 +1469,9 @@ void update_wall_time(void)
+   * memcpy under the timekeeper_seq against one before we start
+   * updating.
+   */
++ timekeeping_update(tk, clock_set);
+  memcpy(real_tk, tk, sizeof(*tk));
+- timekeeping_update(real_tk, clock_set);
++ /* The memcpy must come last. Do not put anything here! */
+  write_seqcount_end(&timekeeper_seq);
+ out:
+  raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
+-- 
+1.7.1

@@ -1,0 +1,141 @@
+From 32f12fbbd915bed871c55da1bfe8a597079a6bc4 Mon Sep 17 00:00:00 2001
+From: Phil Sutter <psutter@redhat.com>
+Date: Mon, 31 Oct 2016 21:49:12 +0100
+Subject: [lib] rhashtable: nft_hash: Remove rhashtable_remove_pprev()
+
+Message-id: <20161031214912.1487-3-psutter@redhat.com>
+Patchwork-id: 160175
+O-Subject: [RHEL7.2.z net 2/2] nft_hash: Remove rhashtable_remove_pprev()
+Bugzilla: 1238749
+Z-Bugzilla: 1382630
+RH-Acked-by: Eric Garver <egarver@redhat.com>
+RH-Acked-by: Paolo Abeni <pabeni@redhat.com>
+RH-Acked-by: Davide Caratti <dcaratti@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1382630
+Upstream Status: commit 897362e446436
+
+commit 897362e446436d245972e72c6bc5b33bd7a5c659
+Author: Thomas Graf <tgraf@suug.ch>
+Date:   Fri Jan 2 23:00:18 2015 +0100
+
+    nft_hash: Remove rhashtable_remove_pprev()
+
+    The removal function of nft_hash currently stores a reference to the
+    previous element during lookup which is used to optimize removal later
+    on. This was possible because a lock is held throughout calling
+    rhashtable_lookup() and rhashtable_remove().
+
+    With the introdution of deferred table resizing in parallel to lookups
+    and insertions, the nftables lock will no longer synchronize all
+    table mutations and the stored pprev may become invalid.
+
+    Removing this optimization makes removal slightly more expensive on
+    average but allows taking the resize cost out of the insert and
+    remove path.
+
+    Signed-off-by: Thomas Graf <tgraf@suug.ch>
+    Cc: netfilter-devel@vger.kernel.org
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Phil Sutter <psutter@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/include/linux/rhashtable.h b/include/linux/rhashtable.h
+index f5fda75..210c1fa 100644
+--- a/include/linux/rhashtable.h
++++ b/include/linux/rhashtable.h
+@@ -95,8 +95,6 @@ int rhashtable_init(struct rhashtable *ht, struct rhashtable_params *params);
+ 
+ void rhashtable_insert(struct rhashtable *ht, struct rhash_head *node);
+ bool rhashtable_remove(struct rhashtable *ht, struct rhash_head *node);
+-void rhashtable_remove_pprev(struct rhashtable *ht, struct rhash_head *obj,
+-        struct rhash_head __rcu **pprev);
+ 
+ bool rht_grow_above_75(const struct rhashtable *ht, size_t new_size);
+ bool rht_shrink_below_30(const struct rhashtable *ht, size_t new_size);
+diff --git a/lib/rhashtable.c b/lib/rhashtable.c
+index 75ca38f..dc4a1ab 100644
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@ -336,32 +336,6 @@ void rhashtable_insert(struct rhashtable *ht, struct rhash_head *obj)
+ EXPORT_SYMBOL_GPL(rhashtable_insert);
+ 
+ /**
+- * rhashtable_remove_pprev - remove object from hash table given previous element
+- * @ht:  hash table
+- * @obj: pointer to hash head inside object
+- * @pprev: pointer to previous element
+- *
+- * Identical to rhashtable_remove() but caller is alreayd aware of the element
+- * in front of the element to be deleted. This is in particular useful for
+- * deletion when combined with walking or lookup.
+- */
+-void rhashtable_remove_pprev(struct rhashtable *ht, struct rhash_head *obj,
+-        struct rhash_head __rcu **pprev)
+-{
+- struct bucket_table *tbl = rht_dereference(ht->tbl, ht);
+-
+- ASSERT_RHT_MUTEX(ht);
+-
+- RCU_INIT_POINTER(*pprev, obj->next);
+- ht->nelems--;
+-
+- if (ht->p.shrink_decision &&
+-     ht->p.shrink_decision(ht, tbl->size))
+-  rhashtable_shrink(ht);
+-}
+-EXPORT_SYMBOL_GPL(rhashtable_remove_pprev);
+-
+-/**
+  * rhashtable_remove - remove object from hash table
+  * @ht:  hash table
+  * @obj: pointer to hash head inside object
+@@ -394,7 +368,13 @@ bool rhashtable_remove(struct rhashtable *ht, struct rhash_head *obj)
+    continue;
+   }
+ 
+-  rhashtable_remove_pprev(ht, he, pprev);
++  RCU_INIT_POINTER(*pprev, he->next);
++  ht->nelems--;
++
++  if (ht->p.shrink_decision &&
++      ht->p.shrink_decision(ht, tbl->size))
++   rhashtable_shrink(ht);
++
+   return true;
+  }
+ 
+diff --git a/net/netfilter/nft_hash.c b/net/netfilter/nft_hash.c
+index bcee3ca..3428a7c 100644
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@ -83,15 +83,10 @@ static void nft_hash_remove(const struct nft_set *set,
+        const struct nft_set_elem *elem)
+ {
+  struct rhashtable *priv = nft_set_priv(set);
+- struct rhash_head *he, __rcu **pprev;
+-
+- pprev = elem->cookie;
+- he = rht_dereference((*pprev), priv);
+-
+- rhashtable_remove_pprev(priv, he, pprev);
+ 
++ rhashtable_remove(priv, elem->cookie);
+  synchronize_rcu();
+- kfree(he);
++ kfree(elem->cookie);
+ }
+ 
+ struct nft_compare_arg {
+@@ -105,7 +100,7 @@ static bool nft_hash_compare(void *ptr, void *arg)
+  struct nft_compare_arg *x = arg;
+ 
+  if (!nft_data_cmp(&he->key, &x->elem->key, x->set->klen)) {
+-  x->elem->cookie = &he->node;
++  x->elem->cookie = he;
+   x->elem->flags = 0;
+   if (x->set->flags & NFT_SET_MAP)
+    nft_data_copy(&x->elem->data, he->data);
+-- 
+1.7.1

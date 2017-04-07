@@ -1,0 +1,156 @@
+From 8347457daec74bcd3b29dc296a35f948ce242289 Mon Sep 17 00:00:00 2001
+From: Thomas Huth <thuth@redhat.com>
+Date: Thu, 1 Sep 2016 07:40:11 +0200
+Subject: [virtio] virtio_balloon: fix PFN format for virtio-1
+
+Message-id: <1472715611-32666-1-git-send-email-thuth@redhat.com>
+Patchwork-id: 157517
+O-Subject: [RHEL7.2.z virtio PATCH] virtio_balloon: fix PFN format for virtio-1
+Bugzilla: 1337945
+Z-Bugzilla: 1370192
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+RH-Acked-by: Laurent Vivier <lvivier@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1370192
+Upstream Status: b4d34037329f46ed818 and 21ba4174ef408fb0f648bb
+Build Info: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11686342
+Tested: I checked that the crash does not occur anymore with this patch applied
+
+For backporting patch 21ba4174ef408fb0f648bb to RHEL 7.2.z
+stream, this patch includes the changes from b4d34037329f46ed818
+("change stub of release_pages_by_pfn") as well to get the "vb"
+parameter of the release_pages_balloon() function. Since both
+patches did not apply directly without (contextual) conflicts, this
+is a merged and fixed version of the two original patches:
+
+commit b4d34037329f46ed818d3b0a6e1e23b9c8721f79
+Author: Denis V. Lunev <den@openvz.org>
+Date:   Thu Aug 20 00:49:48 2015 +0300
+
+    virtio_ballon: change stub of release_pages_by_pfn
+
+    and rename it to release_pages_balloon. The function originally takes
+    arrays of pfns and now it takes pointer to struct virtio_ballon.
+    This change is necessary to conditionally call adjust_managed_page_count
+    in the next patch.
+
+    Signed-off-by: Denis V. Lunev <den@openvz.org>
+    CC: Michael S. Tsirkin <mst@redhat.com>
+    Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+
+commit 21ba4174ef408fb0f648bbc163a99e66a9d03986
+Author: Michael S. Tsirkin <mst@redhat.com>
+Date:   Tue May 17 13:31:18 2016 +0300
+
+    virtio_balloon: fix PFN format for virtio-1
+
+    Everything should be LE when using virtio-1, but
+    the linux balloon driver does not seem to care about that.
+
+    Reported-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+    Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+    Tested-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+    Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+
+Signed-off-by: Thomas Huth <thuth@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+index ba5de3f..31ce807 100644
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -65,7 +65,7 @@ struct virtio_balloon {
+ 
+  /* The array of pfns we tell the Host about. */
+  unsigned int num_pfns;
+- u32 pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
++ __virtio32 pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
+ 
+  /* Memory statistics */
+  int need_stats_update;
+@@ -115,14 +115,16 @@ static void tell_host(struct virtio_balloon *vb, struct virtqueue *vq)
+  wait_event(vb->acked, virtqueue_get_buf(vq, &len));
+ }
+ 
+-static void set_page_pfns(u32 pfns[], struct page *page)
++static void set_page_pfns(struct virtio_balloon *vb,
++     __virtio32 pfns[], struct page *page)
+ {
+  unsigned int i;
+ 
+  /* Set balloon pfns pointing at this page.
+   * Note that the first pfn points at start of the page. */
+  for (i = 0; i < VIRTIO_BALLOON_PAGES_PER_PAGE; i++)
+-  pfns[i] = page_to_balloon_pfn(page) + i;
++  pfns[i] = cpu_to_virtio32(vb->vdev,
++       page_to_balloon_pfn(page) + i);
+ }
+ 
+ static void fill_balloon(struct virtio_balloon *vb, size_t num)
+@@ -145,7 +147,7 @@ static void fill_balloon(struct virtio_balloon *vb, size_t num)
+    msleep(200);
+    break;
+   }
+-  set_page_pfns(vb->pfns + vb->num_pfns, page);
++  set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
+   vb->num_pages += VIRTIO_BALLOON_PAGES_PER_PAGE;
+   totalram_pages--;
+  }
+@@ -156,13 +158,16 @@ static void fill_balloon(struct virtio_balloon *vb, size_t num)
+  mutex_unlock(&vb->balloon_lock);
+ }
+ 
+-static void release_pages_by_pfn(const u32 pfns[], unsigned int num)
++static void release_pages_balloon(struct virtio_balloon *vb)
+ {
+  unsigned int i;
++ struct page *page;
+ 
+  /* Find pfns pointing at start of each page, get pages and free them. */
+- for (i = 0; i < num; i += VIRTIO_BALLOON_PAGES_PER_PAGE) {
+-  balloon_page_free(balloon_pfn_to_page(pfns[i]));
++ for (i = 0; i < vb->num_pfns; i += VIRTIO_BALLOON_PAGES_PER_PAGE) {
++  page = balloon_pfn_to_page(virtio32_to_cpu(vb->vdev,
++          vb->pfns[i]));
++  balloon_page_free(page);
+   totalram_pages++;
+  }
+ }
+@@ -181,7 +186,7 @@ static void leak_balloon(struct virtio_balloon *vb, size_t num)
+   page = balloon_page_dequeue(vb_dev_info);
+   if (!page)
+    break;
+-  set_page_pfns(vb->pfns + vb->num_pfns, page);
++  set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
+   vb->num_pages -= VIRTIO_BALLOON_PAGES_PER_PAGE;
+  }
+ 
+@@ -193,7 +198,7 @@ static void leak_balloon(struct virtio_balloon *vb, size_t num)
+  if (vb->num_pfns != 0)
+   tell_host(vb, vb->deflate_vq);
+  mutex_unlock(&vb->balloon_lock);
+- release_pages_by_pfn(vb->pfns, vb->num_pfns);
++ release_pages_balloon(vb);
+ }
+ 
+ static inline void update_stat(struct virtio_balloon *vb, int idx,
+@@ -404,7 +409,7 @@ int virtballoon_migratepage(struct address_space *mapping,
+  vb_dev_info->isolated_pages--;
+  spin_unlock_irqrestore(&vb_dev_info->pages_lock, flags);
+  vb->num_pfns = VIRTIO_BALLOON_PAGES_PER_PAGE;
+- set_page_pfns(vb->pfns, newpage);
++ set_page_pfns(vb, vb->pfns, newpage);
+  tell_host(vb, vb->inflate_vq);
+ 
+  /*
+@@ -415,7 +420,7 @@ int virtballoon_migratepage(struct address_space *mapping,
+   */
+  balloon_page_delete(page);
+  vb->num_pfns = VIRTIO_BALLOON_PAGES_PER_PAGE;
+- set_page_pfns(vb->pfns, page);
++ set_page_pfns(vb, vb->pfns, page);
+  tell_host(vb, vb->deflate_vq);
+ 
+  mutex_unlock(&vb->balloon_lock);
+-- 
+1.7.1

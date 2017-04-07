@@ -1,0 +1,115 @@
+From 09ab10f326c6a8b5186d47ec2179ac83153e11fe Mon Sep 17 00:00:00 2001
+From: David Milburn <dmilburn@redhat.com>
+Date: Wed, 23 Nov 2016 19:10:52 +0100
+Subject: [nvme] host: Always use MSI/MSI-x interrupts
+
+Message-id: <1479928252-12701-1-git-send-email-dmilburn@redhat.com>
+Patchwork-id: 160836
+O-Subject: [RHEL7.2.z PATCH] NVMe: Always use MSI/MSI-x interrupts
+Bugzilla: 1334462
+Z-Bugzilla: 1396558
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Jeremy McNicoll <jmcnicol@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Cisco reports problems missing NVMe drives or possible panic on
+initialization when using legacy interrupts while loading driver.
+There have been similiar instances reported upstream and this
+patch has been back ported with the exception of the change to
+nvme_setup_io_queues() since RHEL7.2.z doesn't have upstream commit
+9a0be7abb62ff (nvme: refactor set queue count), and in nvme_dev_map()
+"goto unmap" instead of "goto disable" since RHEL7.2.z doesn't have
+upstream commit b00a726a9fd82 (nvme: Don't unmap controller registers
+on reset).
+
+https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=12139141
+
+They have verified a patched kernel, this resolves BZ 1396558.
+
+Please review and ACK.
+
+Thanks,
+David
+
+commit a5229050b69cfffb690b546c357ca5a60434c0c8
+Author: Keith Busch <keith.busch@intel.com>
+Date:   Fri Apr 8 16:09:10 2016 -0600
+
+    NVMe: Always use MSI/MSI-x interrupts
+
+    Multiple users have reported device initialization failure due the driver
+    not receiving legacy PCI interrupts. This is not unique to any particular
+    controller, but has been observed on multiple platforms.
+
+    There have been no issues reported or observed when with message signaled
+    interrupts, so this patch attempts to use MSI-x during initialization,
+    falling back to MSI. If that fails, legacy would become the default.
+
+    The setup_io_queues error handling had to change as a result: the admin
+    queue's msix_entry used to be initialized to the legacy IRQ. The case
+    where nr_io_queues is 0 would fail request_irq when setting up the admin
+    queue's interrupt since re-enabling MSI-x fails with 0 vectors, leaving
+    the admin queue's msix_entry invalid. Instead, return success immediately.
+
+    Reported-by: Tim Muhlemmer <muhlemmer@gmail.com>
+    Reported-by: Jon Derrick <jonathan.derrick@intel.com>
+    Signed-off-by: Keith Busch <keith.busch@intel.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: David Milburn <dmilburn@redhat.com>
+---
+ drivers/block/nvme-core.c | 22 ++++++++++++++--------
+ 1 file changed, 14 insertions(+), 8 deletions(-)
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/block/nvme-core.c b/drivers/block/nvme-core.c
+index 7711bc8..944ac1a 100644
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@ -2153,7 +2153,9 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
+   * If we enable msix early due to not intx, disable it again before
+   * setting up the full range we need.
+   */
+- if (!pdev->irq)
++ if (pdev->msi_enabled)
++  pci_disable_msi(pdev);
++ else if (pdev->msix_enabled)
+   pci_disable_msix(pdev);
+ 
+  vecs = nr_io_queues;
+@@ -2405,7 +2407,6 @@ static int nvme_dev_map(struct nvme_dev *dev)
+  if (pci_enable_device_mem(pdev))
+   return result;
+ 
+- dev->entry[0].vector = pdev->irq;
+  pci_set_master(pdev);
+  bars = pci_select_bars(pdev, IORESOURCE_MEM);
+  if (!bars)
+@@ -2428,13 +2429,18 @@ static int nvme_dev_map(struct nvme_dev *dev)
+  }
+ 
+  /*
+-  * Some devices don't advertse INTx interrupts, pre-enable a single
+-  * MSIX vec for setup. We'll adjust this later.
++  * Some devices and/or platforms don't advertise or work with INTx
++  * interrupts. Pre-enable a single MSIX or MSI vec for setup. We'll
++  * adjust this later.
+   */
+- if (!pdev->irq) {
+-  result = pci_enable_msix(pdev, dev->entry, 1);
+-  if (result < 0)
+-   goto unmap;
++ if (pci_enable_msix(pdev, dev->entry, 1)) {
++  pci_enable_msi(pdev);
++  dev->entry[0].vector = pdev->irq;
++ }
++
++ if (!dev->entry[0].vector) {
++  result = -ENODEV;
++  goto unmap;
+  }
+ 
+  cap = readq(&dev->bar->cap);
+-- 
+1.7.1

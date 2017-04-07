@@ -1,0 +1,202 @@
+From 14682f89d499d67b249475d6cca2719cbb778cdd Mon Sep 17 00:00:00 2001
+From: Xunlei Pang <xlpang@redhat.com>
+Date: Sat, 13 Aug 2016 08:21:08 +0200
+Subject: [kernel] sched/fair: Rework throttle_count sync
+
+Message-id: <1471076469-25972-4-git-send-email-xlpang@redhat.com>
+Patchwork-id: 156823
+O-Subject: [RHEL7.3 PATCH 3/4] sched/fair: Rework throttle_count sync
+Bugzilla: 1341003
+Z-Bugzilla: 1373820
+RH-Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+RH-Acked-by: Jiri Olsa <jolsa@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+Resolves:
+https://bugzilla.redhat.com/show_bug.cgi?id=1341003
+
+This is back ported from the following two upstream commits, I merged
+them together, because RHEL7 doesn't have post_init_entity_util_avg()
+in the first commit but some code structure reordering is needed by the
+second commit.
+
+The first upstream backport:
+commit 8663e24d56dc1f093232783c23ea17f2a6f61c03
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Wed Jun 22 14:58:02 2016 +0200
+
+    sched/fair: Reorder cgroup creation code
+
+    A future patch needs rq->lock held _after_ we link the task_group into
+    the hierarchy. In order to avoid taking every rq->lock twice, reorder
+    things a little and create online_fair_sched_group() to be called
+    after we link the task_group.
+
+    All this code is still ran from css_alloc() so css_online() isn't in
+    fact used for this.
+
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: bsegall@google.com
+    Cc: linux-kernel@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+The second upstream backport:
+commit 55e16d30bd99510900caec913c90f53bc2b35cba
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Wed Jun 22 15:14:26 2016 +0200
+
+    sched/fair: Rework throttle_count sync
+
+    Since we already take rq->lock when creating a cgroup, use it to also
+    sync the throttle_count and avoid the extra state and enqueue path
+    branch.
+
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: bsegall@google.com
+    Cc: linux-kernel@vger.kernel.org
+    [ Fixed build warning. ]
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+Signed-off-by: Xunlei Pang <xlpang@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index b8ab2b5..c6bdfc1 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7650,6 +7650,8 @@ void sched_online_group(struct task_group *tg, struct task_group *parent)
+  INIT_LIST_HEAD(&tg->children);
+  list_add_rcu(&tg->siblings, &parent->children);
+  spin_unlock_irqrestore(&task_group_lock, flags);
++
++ online_fair_sched_group(tg);
+ }
+ 
+ /* rcu callback to free various structures associated with a task group */
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 4ac05a3..797b904 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3558,26 +3558,6 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq)
+  if (!cfs_bandwidth_used())
+   return;
+ 
+- /* Synchronize hierarchical throttle counter: */
+- if (unlikely(!cfs_rq->throttle_uptodate)) {
+-  struct rq *rq = rq_of(cfs_rq);
+-  struct cfs_rq *pcfs_rq;
+-  struct task_group *tg;
+-
+-  cfs_rq->throttle_uptodate = 1;
+-
+-  /* Get closest up-to-date node, because leaves go first: */
+-  for (tg = cfs_rq->tg->parent; tg; tg = tg->parent) {
+-   pcfs_rq = tg->cfs_rq[cpu_of(rq)];
+-   if (pcfs_rq->throttle_uptodate)
+-    break;
+-  }
+-  if (tg) {
+-   cfs_rq->throttle_count = pcfs_rq->throttle_count;
+-   cfs_rq->throttled_clock_task = rq_clock_task(rq);
+-  }
+- }
+-
+  /* an active group must be handled by the update_curr()->put() path */
+  if (!cfs_rq->runtime_enabled || cfs_rq->curr)
+   return;
+@@ -3592,6 +3572,23 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq)
+   throttle_cfs_rq(cfs_rq);
+ }
+ 
++static void sync_throttle(struct task_group *tg, int cpu)
++{
++ struct cfs_rq *pcfs_rq, *cfs_rq;
++
++ if (!cfs_bandwidth_used())
++  return;
++
++ if (!tg->parent)
++  return;
++
++ cfs_rq = tg->cfs_rq[cpu];
++ pcfs_rq = tg->parent->cfs_rq[cpu];
++
++ cfs_rq->throttle_count = pcfs_rq->throttle_count;
++ pcfs_rq->throttled_clock_task = rq_clock_task(cpu_rq(cpu));
++}
++
+ /* conditionally throttle active cfs_rq's from put_prev_entity() */
+ static void check_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+@@ -3724,6 +3721,7 @@ static inline u64 cfs_rq_clock_task(struct cfs_rq *cfs_rq)
+ static void account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec) {}
+ static void check_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+ static void check_enqueue_throttle(struct cfs_rq *cfs_rq) {}
++static inline void sync_throttle(struct task_group *tg, int cpu) {}
+ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+ 
+ static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq)
+@@ -7340,6 +7338,22 @@ err:
+  return 0;
+ }
+ 
++void online_fair_sched_group(struct task_group *tg)
++{
++ struct sched_entity *se;
++ struct rq *rq;
++ int i;
++
++ for_each_possible_cpu(i) {
++  rq = cpu_rq(i);
++  se = tg->se[i];
++
++  raw_spin_lock_irq(&rq->lock);
++  sync_throttle(tg, i);
++  raw_spin_unlock_irq(&rq->lock);
++ }
++}
++
+ void unregister_fair_sched_group(struct task_group *tg, int cpu)
+ {
+  struct rq *rq = cpu_rq(cpu);
+@@ -7429,6 +7443,7 @@ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
+  return 1;
+ }
+ 
++void online_fair_sched_group(struct task_group *tg) { }
+ void unregister_fair_sched_group(struct task_group *tg, int cpu) { }
+ 
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index c93d774..eed371b 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -213,6 +213,7 @@ extern int tg_nop(struct task_group *tg, void *data);
+ 
+ extern void free_fair_sched_group(struct task_group *tg);
+ extern int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent);
++extern void online_fair_sched_group(struct task_group *tg);
+ extern void unregister_fair_sched_group(struct task_group *tg, int cpu);
+ extern void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
+    struct sched_entity *se, int cpu,
+@@ -326,7 +327,7 @@ struct cfs_rq {
+ 
+  u64 throttled_clock, throttled_clock_task;
+  u64 throttled_clock_task_time;
+- int throttled, throttle_count, throttle_uptodate;
++ int throttled, throttle_count;
+  struct list_head throttled_list;
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+-- 
+1.7.1

@@ -1,0 +1,98 @@
+From 9f24127587df6574e9ad2453852f82d5ae114a94 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Apr 2016 12:16:27 +0200
+Subject: [kernel] nohz: Fix !HIGH_RES_TIMERS hang
+
+Message-id: <1461845787-12387-1-git-send-email-prarit@redhat.com>
+Patchwork-id: 142458
+O-Subject: [RHEL7.3 PATCH BZ 1329357] nohz: Fix !HIGH_RES_TIMERS hang
+Bugzilla: 1329357
+Z-Bugzilla: 1375640
+RH-Acked-by: David Arcari <darcari@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Jeremy McNicoll <jmcnicol@redhat.com>
+
+Bugzilla: http://bugzilla.redhat.com/1329357
+
+This bug was an odd situation where a customer has disabled the high resolution
+timers with the "highres=off" kernel parameter.  This unfortunately caused
+the system to hit a BUG() call and stop booting.  It had previously worked in
+RHEL7.2.  After a quick investigation I found that the code was disabling
+interrupts in the highres=off case, and the issue was fixed upstream with
+the following commit:
+
+commit 6b442bc81337913eb775965a67ffdb8a36935422
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Thu May 7 14:35:59 2015 +0200
+
+    nohz: Fix !HIGH_RES_TIMERS hang
+
+    Simon Horman reported this crash on a system with
+    high-res timers disabled but nohz enabled:
+
+      > ------------[ cut here ]------------
+      > kernel BUG at kernel/irq_work.c:135!
+
+        BUG_ON(!irqs_disabled());
+
+    So something enabled interrupts in the periodic tick handling machinery,
+    and that code path indeed has a local_irq_disable()/enable pair in
+    tick_nohz_switch_to_nohz() which causes havoc. Fix it.
+
+    This patch also fixes a +nohz -hrtimers hang reported by Ingo Molnar.
+
+    Reported-by: Simon Horman <horms@verge.net.au>
+    Reported-by: Ingo Molnar <mingo@kernel.org>
+    Tested-by: Simon Horman <horms@verge.net.au>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: LAK <linux-arm-kernel@lists.infradead.org>
+    Cc: Magnus Damm <magnus.damm@gmail.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Link: http://lkml.kernel.org/r/alpine.DEB.2.11.1505071425520.4225@nanos
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+Successfully tested by myself and customer.
+
+Cc: Steve Best <sbest@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index 543d771..12287fc 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -946,11 +946,9 @@ static void tick_nohz_switch_to_nohz(void)
+  if (!tick_nohz_enabled)
+   return;
+ 
+- local_irq_disable();
+- if (tick_switch_to_oneshot(tick_nohz_handler)) {
+-  local_irq_enable();
++ if (tick_switch_to_oneshot(tick_nohz_handler))
+   return;
+- }
++
+  tick_nohz_active = 1;
+  ts->nohz_mode = NOHZ_MODE_LOWRES;
+ 
+@@ -965,7 +963,6 @@ static void tick_nohz_switch_to_nohz(void)
+  hrtimer_forward_now(&ts->sched_timer, tick_period);
+  hrtimer_set_expires(&ts->sched_timer, next);
+  tick_program_event(next, 1);
+- local_irq_enable();
+ }
+ 
+ /*
+@@ -1150,7 +1147,7 @@ void tick_oneshot_notify(void)
+  * Called cyclic from the hrtimer softirq (driven by the timer
+  * softirq) allow_nohz signals, that we can switch into low-res nohz
+  * mode, because high resolution timers are disabled (either compile
+- * or runtime).
++ * or runtime). Called with interrupts disabled.
+  */
+ int tick_check_oneshot_change(int allow_nohz)
+ {
+-- 
+1.7.1

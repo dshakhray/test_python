@@ -1,0 +1,111 @@
+From 6c0ffd058150f7f916681feb4cc14fb457e18ff5 Mon Sep 17 00:00:00 2001
+From: kamal heib <kheib@redhat.com>
+Date: Mon, 19 Oct 2015 17:29:57 +0200
+Subject: [netdrv] mlx5e: Disable VLAN filter in promiscuous mode
+
+Message-id: <1445275797-5037-1-git-send-email-kheib@redhat.com>
+Patchwork-id: 125782
+O-Subject: [RHEL7.3 PATCH] net/mlx5e: Disable VLAN filter in promiscuous mode
+Bugzilla: 1271846
+Z-Bugzilla: 1367506
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Doug Ledford <dledford@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+
+Bugzilla: http://bugzilla.redhat.com/1271846
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=9972995
+Tested in Mellanox lab
+
+Cherry picked from commit c07543431e9f3d126d083808efa0e76461d8833b
+Author: Achiad Shochat <achiad@mellanox.com>
+Date:   Thu Oct 8 15:26:18 2015 +0300
+
+    net/mlx5e: Disable VLAN filter in promiscuous mode
+
+    When the device was set to promiscuous mode, we didn't disable
+    VLAN filtering, which is wrong behaviour, fix that.
+
+    Now when the device is set to promiscuous mode RX packets
+    sent over any VLAN (or no VLAN tag at all) will be accepted.
+
+    Signed-off-by: Achiad Shochat <achiad@mellanox.com>
+    Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Kamal Heib <kheib@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_flow_table.c b/drivers/net/ethernet/mellanox/mlx5/core/en_flow_table.c
+index 120db80..6533f6a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_flow_table.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_flow_table.c
+@@ -498,26 +498,24 @@ static void mlx5e_del_vlan_rule(struct mlx5e_priv *priv,
+ 
+ void mlx5e_enable_vlan_filter(struct mlx5e_priv *priv)
+ {
+- WARN_ON(!mutex_is_locked(&priv->state_lock));
++ if (!priv->vlan.filter_disabled)
++  return;
+ 
+- if (priv->vlan.filter_disabled) {
+-  priv->vlan.filter_disabled = false;
+-  if (test_bit(MLX5E_STATE_OPENED, &priv->state))
+-   mlx5e_del_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_ANY_VID,
+-         0);
+- }
++ priv->vlan.filter_disabled = false;
++ if (priv->netdev->flags & IFF_PROMISC)
++  return;
++ mlx5e_del_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_ANY_VID, 0);
+ }
+ 
+ void mlx5e_disable_vlan_filter(struct mlx5e_priv *priv)
+ {
+- WARN_ON(!mutex_is_locked(&priv->state_lock));
++ if (priv->vlan.filter_disabled)
++  return;
+ 
+- if (!priv->vlan.filter_disabled) {
+-  priv->vlan.filter_disabled = true;
+-  if (test_bit(MLX5E_STATE_OPENED, &priv->state))
+-   mlx5e_add_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_ANY_VID,
+-         0);
+- }
++ priv->vlan.filter_disabled = true;
++ if (priv->netdev->flags & IFF_PROMISC)
++  return;
++ mlx5e_add_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_ANY_VID, 0);
+ }
+ 
+ int mlx5e_vlan_rx_add_vid(struct net_device *dev, __always_unused __be16 proto,
+@@ -679,8 +677,12 @@ void mlx5e_set_rx_mode_core(struct mlx5e_priv *priv)
+  bool enable_broadcast  = !ea->broadcast_enabled &&  broadcast_enabled;
+  bool disable_broadcast =  ea->broadcast_enabled && !broadcast_enabled;
+ 
+- if (enable_promisc)
++ if (enable_promisc) {
+   mlx5e_add_eth_addr_rule(priv, &ea->promisc, MLX5E_PROMISC);
++  if (!priv->vlan.filter_disabled)
++   mlx5e_add_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_ANY_VID,
++         0);
++ }
+  if (enable_allmulti)
+   mlx5e_add_eth_addr_rule(priv, &ea->allmulti, MLX5E_ALLMULTI);
+  if (enable_broadcast)
+@@ -692,8 +694,12 @@ void mlx5e_set_rx_mode_core(struct mlx5e_priv *priv)
+   mlx5e_del_eth_addr_from_flow_table(priv, &ea->broadcast);
+  if (disable_allmulti)
+   mlx5e_del_eth_addr_from_flow_table(priv, &ea->allmulti);
+- if (disable_promisc)
++ if (disable_promisc) {
++  if (!priv->vlan.filter_disabled)
++   mlx5e_del_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_ANY_VID,
++         0);
+   mlx5e_del_eth_addr_from_flow_table(priv, &ea->promisc);
++ }
+ 
+  ea->promisc_enabled   = promisc_enabled;
+  ea->allmulti_enabled  = allmulti_enabled;
+-- 
+1.7.1

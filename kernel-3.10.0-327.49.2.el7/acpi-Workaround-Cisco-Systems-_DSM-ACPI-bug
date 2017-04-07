@@ -1,0 +1,136 @@
+From e16cb4076065fa345145fb53728db044961f0b69 Mon Sep 17 00:00:00 2001
+From: Alexander Gordeev <agordeev@redhat.com>
+Date: Thu, 1 Sep 2016 12:44:19 +0200
+Subject: [acpi] Workaround Cisco Systems _DSM ACPI bug
+
+Message-id: <20160901124418.GA19955@localhost>
+Patchwork-id: 157520
+O-Subject: [RHEL7.2.z FIXUP PATCH BZ 1370183] acpi, Workaround Cisco Systems _DSM ACPI bug
+Bugzilla: 1311315
+Z-Bugzilla: 1370183
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+This is a trivial fuzz fixup of 7.3 commit c0c8d053
+to make it apply on 7.2.z.
+
+Bugzilla: http://bugzilla.redhat.com/1370183
+
+RHEL_only.
+
+The kernel uses _DSM data to determine alternative persistent device names for
+devices.  Cisco, in its comparing of RHEL7.2 to RHEL7.2 noticed that the device
+label files for their virtual devices was missing.
+
+ie) RHEL7.1:
+
+root@cisco-b200m4-01 rhel7]# !find
+find /sys -name label | xargs egrep ^
+/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/label: LSI3008 SAS
+Controller
+/sys/devices/pci0000:00/0000:00:02.0/label: Onboard IGD
+/sys/devices/pci0000:00/0000:00:02.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/0000:05:00.0/0000:06:00.0/label:
+cdn1
+/sys/devices/pci0000:00/0000:00:02.0/0000:02:00.0/0000:03:00.0/0000:04:00.0/0000:05:01.0/0000:07:00.0/label:
+cdn0
+
+   RHEL7.2:
+
+root@cisco-b200m4-01 rhel7]# !find
+find /sys -name label | xargs egrep ^
+/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/label: LSI3008 SAS
+Controller
+/sys/devices/pci0000:00/0000:00:02.0/label: Onboard IGD
+
+The ACPI 6.0 Specification says the following about the return value of the
+_DSM Method:
+
+"If Function Index is zero, the return is a buffer containing one bit for each
+function index, starting with zero. Bit 0 indicates whether there is support
+for any functions other than function 0 for the specified UUID and Revision ID.
+If set to zero, no functions are supported (other than function zero) for the
+specified UUID and Revision ID. If set to one, at least one additional function
+is supported.  For all other bits in the buffer, a bit is set to zero to
+indicate if that function index is not supported for the specific UUID and
+Revision ID. (For example, bit 1 set to 0 indicates that function index 1 is
+not supported for the specific UUID and Revision ID.) If the bit representing a
+particular function index would lie outside of the buffer, it should be assumed
+to be 0 (that is, not supported)."
+
+Dumping the _DSM in the ACPI SSDT for the 0000:06:00.0 device,
+
+If (LEqual (Arg0, ToUUID ("e5c937d0-3553-4d7a-9117-ea4d19c3434d") /* Device Labeling Interface */))
+{
+    If (LAnd (LEqual (Arg1, 0x02), LEqual (Arg2, 0x00)))
+    {
+ Return (Buffer (0x01)
+ {
+      0x80                                             /* . */
+ })
+    }
+    If (LAnd (LEqual (Arg1, 0x02), LEqual (Arg2, 0x07)))
+    {
+ Return (Package (0x02)
+ {
+     0x01,
+     Unicode (" cdn1                                                           ")
+ })
+    }
+
+Cisco boxes incorrectly return a buffer with 0x80 instead of 0x81.  This
+causes the Bit 0 check introduced in RHEL7.2 commit 63b26c4 ("[char] acpi:
+introduce helper interfaces for _DSM method") to fail and the value of
+acpi_check_dsm() is returned as false.  This, in turn, causes persistent
+device naming between RHEL7.1 and RHEL7.2 to fail on these machines.
+
+The fix should be that Cisco releases a new BIOS, however, we cannot
+break ethernet naming this way between minor releases.  This patch identifies
+a broken Cisco system, and works around the issue by changing the buffer value
+to 0x81.
+
+Successfully tested by me (testing on cisco-b200m4-01.rhts.eng.bos.redhat.com)
+RHEL7.1 and RHEL7.2 have the same label files and names.
+
+Signed-off-by: Prarit Bhargava <prarit@redhat.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+Cc: Jarod Wilson <jarod@redhat.com>
+Cc: mstowe@redhat.com
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+---
+ drivers/acpi/utils.c |   11 +++++++++++
+ 1 files changed, 11 insertions(+), 0 deletions(-)
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/acpi/utils.c b/drivers/acpi/utils.c
+index 86bd259..a4b7b63 100644
+--- a/drivers/acpi/utils.c
++++ b/drivers/acpi/utils.c
+@@ -30,6 +30,7 @@
+ #include <linux/types.h>
+ #include <linux/hardirq.h>
+ #include <linux/acpi.h>
++#include <linux/dmi.h>
+ #include <acpi/acpi_bus.h>
+ #include <acpi/acpi_drivers.h>
+ 
+@@ -647,6 +648,16 @@ bool acpi_check_dsm(acpi_handle handle, const u8 *uuid, int rev, u64 funcs)
+  ACPI_FREE(obj);
+ 
+  /*
++  * RHEL7: If this is a Cisco system and a mask of 0x80 is returned
++  * then set the value to 0x81 so the Bit 0 check passes.
++  */
++ if ((mask == 0x80) &&
++     dmi_match(DMI_BIOS_VENDOR, "Cisco Systems, Inc.")) {
++  acpi_handle_warn(handle, FW_WARN "Cisco Systems, Inc.: _DSM mask returns 0x80 but should return 0x81.  Please contact Cisco Systems, Inc. for a BIOS upgrade.\n");
++  mask = 0x81;
++ }
++
++ /*
+   * Bit 0 indicates whether there's support for any functions other than
+   * function 0 for the specified UUID and revision.
+   */
+-- 
+1.7.1

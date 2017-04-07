@@ -1,0 +1,94 @@
+From 92f81b04fd9335f26ea7cda72e6fad1bb15cf315 Mon Sep 17 00:00:00 2001
+From: Xunlei Pang <xlpang@redhat.com>
+Date: Sat, 13 Aug 2016 08:21:06 +0200
+Subject: [kernel] sched/fair: Initialize throttle_count for new task-groups lazily
+
+Message-id: <1471076469-25972-2-git-send-email-xlpang@redhat.com>
+Patchwork-id: 156821
+O-Subject: [RHEL7.3 PATCH 1/4] sched/fair: Initialize throttle_count for new task-groups lazily
+Bugzilla: 1341003
+Z-Bugzilla: 1373820
+RH-Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+RH-Acked-by: Jiri Olsa <jolsa@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+Resolves:
+https://bugzilla.redhat.com/show_bug.cgi?id=1341003
+
+This is back ported from upstream, and is 100% cleanly patched.
+This backport breaks KABI due to the addition of an extra member
+cfs_rq::throttle_uptodate, but fortunately it gets removed in the
+following backport "sched/fair: Rework throttle_count sync".
+
+commit 094f469172e00d6ab0a3130b0e01c83b3cf3a98d
+Author: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Date:   Thu Jun 16 15:57:01 2016 +0300
+
+    sched/fair: Initialize throttle_count for new task-groups lazily
+
+    Cgroup created inside throttled group must inherit current throttle_count.
+    Broken throttle_count allows to nominate throttled entries as a next buddy,
+    later this leads to null pointer dereference in pick_next_task_fair().
+
+    This patch initialize cfs_rq->throttle_count at first enqueue: laziness
+    allows to skip locking all rq at group creation. Lazy approach also allows
+    to skip full sub-tree scan at throttling hierarchy (not in this patch).
+
+    Signed-off-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: bsegall@google.com
+    Link: http://lkml.kernel.org/r/146608182119.21870.8439834428248129633.stgit@buzz
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+Signed-off-by: Xunlei Pang <xlpang@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index cea7e22..9210ffe 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3558,6 +3558,26 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq)
+  if (!cfs_bandwidth_used())
+   return;
+ 
++ /* Synchronize hierarchical throttle counter: */
++ if (unlikely(!cfs_rq->throttle_uptodate)) {
++  struct rq *rq = rq_of(cfs_rq);
++  struct cfs_rq *pcfs_rq;
++  struct task_group *tg;
++
++  cfs_rq->throttle_uptodate = 1;
++
++  /* Get closest up-to-date node, because leaves go first: */
++  for (tg = cfs_rq->tg->parent; tg; tg = tg->parent) {
++   pcfs_rq = tg->cfs_rq[cpu_of(rq)];
++   if (pcfs_rq->throttle_uptodate)
++    break;
++  }
++  if (tg) {
++   cfs_rq->throttle_count = pcfs_rq->throttle_count;
++   cfs_rq->throttled_clock_task = rq_clock_task(rq);
++  }
++ }
++
+  /* an active group must be handled by the update_curr()->put() path */
+  if (!cfs_rq->runtime_enabled || cfs_rq->curr)
+   return;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 4760b37..c93d774 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -326,7 +326,7 @@ struct cfs_rq {
+ 
+  u64 throttled_clock, throttled_clock_task;
+  u64 throttled_clock_task_time;
+- int throttled, throttle_count;
++ int throttled, throttle_count, throttle_uptodate;
+  struct list_head throttled_list;
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+-- 
+1.7.1

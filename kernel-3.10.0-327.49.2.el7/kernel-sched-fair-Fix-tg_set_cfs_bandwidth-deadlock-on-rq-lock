@@ -1,0 +1,133 @@
+From ed86cd429c2bf8abaf45eccc2eca4e08af8afda4 Mon Sep 17 00:00:00 2001
+From: Herton R. Krzesinski <herton@redhat.com>
+Date: Wed, 18 May 2016 06:41:06 +0200
+Subject: [kernel] sched/fair: Fix tg_set_cfs_bandwidth() deadlock on rq->lock
+
+Message-id: <1463553686-8136-6-git-send-email-herton@redhat.com>
+Patchwork-id: 145570
+O-Subject: [RHEL7 PATCH 05/25] sched/fair: Fix tg_set_cfs_bandwidth() deadlock on rq->lock
+Bugzilla: 1336863
+Z-Bugzilla: 1370157
+RH-Acked-by: Jiri Olsa <jolsa@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1336863
+Upstream Status: commit 09dc4ab
+Build Info: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11035443
+Tested: kt1 (looking for consistent regressions) and with test case on the bug
+
+commit 09dc4ab03936df5c5aa711d27c81283c6d09f495
+Author: Roman Gushchin <klamm@yandex-team.ru>
+Date:   Mon May 19 15:10:09 2014 +0400
+
+    sched/fair: Fix tg_set_cfs_bandwidth() deadlock on rq->lock
+
+    tg_set_cfs_bandwidth() sets cfs_b->timer_active to 0 to
+    force the period timer restart. It's not safe, because
+    can lead to deadlock, described in commit 927b54fccbf0:
+    "__start_cfs_bandwidth calls hrtimer_cancel while holding rq->lock,
+    waiting for the hrtimer to finish. However, if sched_cfs_period_timer
+    runs for another loop iteration, the hrtimer can attempt to take
+    rq->lock, resulting in deadlock."
+
+    Three CPUs must be involved:
+
+      CPU0               CPU1                         CPU2
+      take rq->lock      period timer fired
+      ...                take cfs_b lock
+      ...                ...                          tg_set_cfs_bandwidth()
+      throttle_cfs_rq()  release cfs_b lock           take cfs_b lock
+      ...                distribute_cfs_runtime()     timer_active = 0
+      take cfs_b->lock   wait for rq->lock            ...
+      __start_cfs_bandwidth()
+      {wait for timer callback
+       break if timer_active == 1}
+
+    So, CPU0 and CPU1 are deadlocked.
+
+    Instead of resetting cfs_b->timer_active, tg_set_cfs_bandwidth can
+    wait for period timer callbacks (ignoring cfs_b->timer_active) and
+    restart the timer explicitly.
+
+    Signed-off-by: Roman Gushchin <klamm@yandex-team.ru>
+    Reviewed-by: Ben Segall <bsegall@google.com>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Link: http://lkml.kernel.org/r/87wqdi9g8e.wl\%klamm@yandex-team.ru
+    Cc: pjt@google.com
+    Cc: chris.j.arges@canonical.com
+    Cc: gregkh@linuxfoundation.org
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+Signed-off-by: Herton R. Krzesinski <herton@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 54f54dd..50400d8 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8187,8 +8187,7 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+  /* restart the period timer (if active) to handle new period expiry */
+  if (runtime_enabled && cfs_b->timer_active) {
+   /* force a reprogram */
+-  cfs_b->timer_active = 0;
+-  __start_cfs_bandwidth(cfs_b);
++  __start_cfs_bandwidth(cfs_b, true);
+  }
+  raw_spin_unlock_irq(&cfs_b->lock);
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3e3ff30..d9ef561 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3101,7 +3101,7 @@ static int assign_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+    */
+   if (!cfs_b->timer_active) {
+    __refill_cfs_bandwidth_runtime(cfs_b);
+-   __start_cfs_bandwidth(cfs_b);
++   __start_cfs_bandwidth(cfs_b, false);
+   }
+ 
+   if (cfs_b->runtime > 0) {
+@@ -3280,7 +3280,7 @@ static void throttle_cfs_rq(struct cfs_rq *cfs_rq)
+  raw_spin_lock(&cfs_b->lock);
+  list_add_tail_rcu(&cfs_rq->throttled_list, &cfs_b->throttled_cfs_rq);
+  if (!cfs_b->timer_active)
+-  __start_cfs_bandwidth(cfs_b);
++  __start_cfs_bandwidth(cfs_b, false);
+  raw_spin_unlock(&cfs_b->lock);
+ }
+ 
+@@ -3680,7 +3680,7 @@ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ }
+ 
+ /* requires cfs_b->lock, may release to reprogram timer */
+-void __start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
++void __start_cfs_bandwidth(struct cfs_bandwidth *cfs_b, bool force)
+ {
+  /*
+   * The timer may be active because we're trying to set a new bandwidth
+@@ -3695,7 +3695,7 @@ void __start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+   cpu_relax();
+   raw_spin_lock(&cfs_b->lock);
+   /* if someone else restarted the timer then we're done */
+-  if (cfs_b->timer_active)
++  if (!force && cfs_b->timer_active)
+    return;
+  }
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 43d5174..e8d30c1 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -222,7 +222,7 @@ extern void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
+ extern int sched_group_set_shares(struct task_group *tg, unsigned long shares);
+ 
+ extern void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b);
+-extern void __start_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
++extern void __start_cfs_bandwidth(struct cfs_bandwidth *cfs_b, bool force);
+ extern void unthrottle_cfs_rq(struct cfs_rq *cfs_rq);
+ 
+ extern void free_rt_sched_group(struct task_group *tg);
+-- 
+1.7.1

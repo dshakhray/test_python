@@ -1,0 +1,113 @@
+From 708a885f5819d89ad0ee206ffd7f82cac7db03e7 Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Thu, 21 Jul 2016 14:19:02 +0200
+Subject: [fs] xfs: exclude never-released buffers from buftarg I/O accounting
+
+Message-id: <1469110743-62086-3-git-send-email-bfoster@redhat.com>
+Patchwork-id: 155809
+O-Subject: [PATCH RHEL7 2/3] xfs: exclude never-released buffers from buftarg I/O accounting
+Bugzilla: 1347744
+Z-Bugzilla: 1385030
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+RH-Acked-by: Carlos Maiolino <cmaiolino@redhat.com>
+
+commit c891c30a4dd1a236bb98630b35fc2769c5ce0d40
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Jul 20 11:13:43 2016 +1000
+
+    xfs: exclude never-released buffers from buftarg I/O accounting
+
+    The upcoming buftarg I/O accounting mechanism maintains a count of
+    all buffers that have undergone I/O in the current hold-release
+    cycle.  Certain buffers associated with core infrastructure (e.g.,
+    the xfs_mount superblock buffer, log buffers) are never released,
+    however. This means that accounting I/O submission on such buffers
+    elevates the buftarg count indefinitely and could lead to lockup on
+    unmount.
+
+    Define a new buffer flag to explicitly exclude buffers from buftarg
+    I/O accounting. Set the flag on the superblock and associated log
+    buffers.
+
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/fs/xfs/xfs_buf.c b/fs/xfs/xfs_buf.c
+index 5b86147..2007b47 100644
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -863,7 +863,8 @@ xfs_buf_get_uncached(
+  struct xfs_buf  *bp;
+  DEFINE_SINGLE_BUF_MAP(map, XFS_BUF_DADDR_NULL, numblks);
+ 
+- bp = _xfs_buf_alloc(target, &map, 1, 0);
++ /* flags might contain irrelevant bits, pass only what we care about */
++ bp = _xfs_buf_alloc(target, &map, 1, flags & XBF_NO_IOACCT);
+  if (unlikely(bp == NULL))
+   goto fail;
+ 
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index 9fa0fb5..1e451d7 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -41,6 +41,7 @@ typedef enum {
+ #define XBF_READ  (1 << 0) /* buffer intended for reading from device */
+ #define XBF_WRITE  (1 << 1) /* buffer intended for writing to device */
+ #define XBF_READ_AHEAD  (1 << 2) /* asynchronous read-ahead */
++#define XBF_NO_IOACCT  (1 << 3) /* bypass I/O accounting (non-LRU bufs) */
+ #define XBF_ASYNC  (1 << 4) /* initiator will not wait for completion */
+ #define XBF_DONE  (1 << 5) /* all pages in the buffer uptodate */
+ #define XBF_STALE  (1 << 6) /* buffer has been staled, do not find it */
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 3dfa2db..ff86f4a 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -1395,7 +1395,7 @@ xlog_alloc_log(
+   */
+  error = -ENOMEM;
+  bp = xfs_buf_alloc(mp->m_logdev_targp, XFS_BUF_DADDR_NULL,
+-      BTOBB(log->l_iclog_size), 0);
++      BTOBB(log->l_iclog_size), XBF_NO_IOACCT);
+  if (!bp)
+   goto out_free_log;
+ 
+@@ -1434,7 +1434,8 @@ xlog_alloc_log(
+   prev_iclog = iclog;
+ 
+   bp = xfs_buf_get_uncached(mp->m_logdev_targp,
+-      BTOBB(log->l_iclog_size), 0);
++       BTOBB(log->l_iclog_size),
++       XBF_NO_IOACCT);
+   if (!bp)
+    goto out_free_iclog;
+ 
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index 6f23fbd..22e2220 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -281,13 +281,15 @@ xfs_readsb(
+  buf_ops = NULL;
+ 
+  /*
+-  * Allocate a (locked) buffer to hold the superblock.
+-  * This will be kept around at all times to optimize
+-  * access to the superblock.
++  * Allocate a (locked) buffer to hold the superblock. This will be kept
++  * around at all times to optimize access to the superblock. Therefore,
++  * set XBF_NO_IOACCT to make sure it doesn't hold the buftarg count
++  * elevated.
+   */
+ reread:
+  error = xfs_buf_read_uncached(mp->m_ddev_targp, XFS_SB_DADDR,
+-       BTOBB(sector_size), 0, &bp, buf_ops);
++          BTOBB(sector_size), XBF_NO_IOACCT, &bp,
++          buf_ops);
+  if (error) {
+   if (loud)
+    xfs_warn(mp, "SB validate failed with error %d.", error);
+-- 
+1.7.1

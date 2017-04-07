@@ -1,0 +1,161 @@
+From 34a33ac7a86c12e89dc0ec5425bba455066e3cad Mon Sep 17 00:00:00 2001
+From: Don Dutile <ddutile@redhat.com>
+Date: Fri, 10 Jun 2016 22:15:57 +0200
+Subject: [include] net/mlx5e: Ethtool link speed setting fixes
+
+Message-id: <1465597803-11831-158-git-send-email-ddutile@redhat.com>
+Patchwork-id: 150523
+O-Subject: [PATCH RHEL-7.3 0157/1003] net/mlx5e: Ethtool link speed setting fixes
+Bugzilla: 1377871
+Z-Bugzilla: 1385479
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Laurence Oberman <loberman@redhat.com>
+
+From: Achiad Shochat <achiad@mellanox.com>
+
+- Port speed settings are applied by the device only upon
+  port admin status transition from DOWN to UP.
+  So we enforce this transition regardless of the port's
+  current operation state (which may be occasionally DOWN if
+  for example the network cable is disconnected).
+- Fix the PORT_UP/DOWN device interface enum
+- Set the local_port bit in the device PAOS register
+- EXPORT the PAOS (Port Administrative and Operational Status)
+  register set/query access functions.
+
+Signed-off-by: Achiad Shochat <achiad@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6fa1bcab6be6e9bd93f80e345c7e9a4ec7861df9)
+
+Signed-off-by: Donald Dutile <ddutile@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 3889384..dd8ce18 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -606,7 +606,7 @@ static int mlx5e_set_settings(struct net_device *netdev,
+  u32 link_modes;
+  u32 speed;
+  u32 eth_proto_cap, eth_proto_admin;
+- u8 port_status;
++ enum mlx5_port_status ps;
+  int err;
+ 
+  speed = ethtool_cmd_speed(cmd);
+@@ -640,24 +640,13 @@ static int mlx5e_set_settings(struct net_device *netdev,
+  if (link_modes == eth_proto_admin)
+   goto out;
+ 
+- err = mlx5_set_port_proto(mdev, link_modes, MLX5_PTYS_EN);
+- if (err) {
+-  netdev_err(netdev, "%s: set port eth proto admin failed: %d\n",
+-      __func__, err);
+-  goto out;
+- }
++ mlx5_query_port_admin_status(mdev, &ps);
++ if (ps == MLX5_PORT_UP)
++  mlx5_set_port_admin_status(mdev, MLX5_PORT_DOWN);
++ mlx5_set_port_proto(mdev, link_modes, MLX5_PTYS_EN);
++ if (ps == MLX5_PORT_UP)
++  mlx5_set_port_admin_status(mdev, MLX5_PORT_UP);
+ 
+- err = mlx5_query_port_status(mdev, &port_status);
+- if (err)
+-  goto out;
+-
+- if (port_status == MLX5_PORT_DOWN)
+-  return 0;
+-
+- err = mlx5_set_port_status(mdev, MLX5_PORT_DOWN);
+- if (err)
+-  goto out;
+- err = mlx5_set_port_status(mdev, MLX5_PORT_UP);
+ out:
+  return err;
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/port.c b/drivers/net/ethernet/mellanox/mlx5/core/port.c
+index 7014799..f8db52b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/port.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/port.c
+@@ -216,22 +216,25 @@ int mlx5_set_port_proto(struct mlx5_core_dev *dev, u32 proto_admin,
+ }
+ EXPORT_SYMBOL_GPL(mlx5_set_port_proto);
+ 
+-int mlx5_set_port_status(struct mlx5_core_dev *dev,
+-    enum mlx5_port_status status)
++int mlx5_set_port_admin_status(struct mlx5_core_dev *dev,
++          enum mlx5_port_status status)
+ {
+  u32 in[MLX5_ST_SZ_DW(paos_reg)];
+  u32 out[MLX5_ST_SZ_DW(paos_reg)];
+ 
+  memset(in, 0, sizeof(in));
+ 
++ MLX5_SET(paos_reg, in, local_port, 1);
+  MLX5_SET(paos_reg, in, admin_status, status);
+  MLX5_SET(paos_reg, in, ase, 1);
+ 
+  return mlx5_core_access_reg(dev, in, sizeof(in), out,
+         sizeof(out), MLX5_REG_PAOS, 0, 1);
+ }
++EXPORT_SYMBOL_GPL(mlx5_set_port_admin_status);
+ 
+-int mlx5_query_port_status(struct mlx5_core_dev *dev, u8 *status)
++int mlx5_query_port_admin_status(struct mlx5_core_dev *dev,
++     enum mlx5_port_status *status)
+ {
+  u32 in[MLX5_ST_SZ_DW(paos_reg)];
+  u32 out[MLX5_ST_SZ_DW(paos_reg)];
+@@ -239,14 +242,17 @@ int mlx5_query_port_status(struct mlx5_core_dev *dev, u8 *status)
+ 
+  memset(in, 0, sizeof(in));
+ 
++ MLX5_SET(paos_reg, in, local_port, 1);
++
+  err = mlx5_core_access_reg(dev, in, sizeof(in), out,
+        sizeof(out), MLX5_REG_PAOS, 0, 0);
+  if (err)
+   return err;
+ 
+- *status = MLX5_GET(paos_reg, out, oper_status);
++ *status = MLX5_GET(paos_reg, out, admin_status);
+  return err;
+ }
++EXPORT_SYMBOL_GPL(mlx5_query_port_admin_status);
+ 
+ static void mlx5_query_port_mtu(struct mlx5_core_dev *dev, int *admin_mtu,
+     int *max_mtu, int *oper_mtu, u8 port)
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 679d027..26b8ea7 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -151,8 +151,8 @@ enum mlx5_dev_event {
+ };
+ 
+ enum mlx5_port_status {
+- MLX5_PORT_UP        = 1 << 1,
+- MLX5_PORT_DOWN      = 1 << 2,
++ MLX5_PORT_UP        = 1,
++ MLX5_PORT_DOWN      = 2,
+ };
+ 
+ struct mlx5_uuar_info {
+@@ -752,9 +752,10 @@ int mlx5_query_port_proto_oper(struct mlx5_core_dev *dev,
+           u8 local_port);
+ int mlx5_set_port_proto(struct mlx5_core_dev *dev, u32 proto_admin,
+    int proto_mask);
+-int mlx5_set_port_status(struct mlx5_core_dev *dev,
+-    enum mlx5_port_status status);
+-int mlx5_query_port_status(struct mlx5_core_dev *dev, u8 *status);
++int mlx5_set_port_admin_status(struct mlx5_core_dev *dev,
++          enum mlx5_port_status status);
++int mlx5_query_port_admin_status(struct mlx5_core_dev *dev,
++     enum mlx5_port_status *status);
+ 
+ int mlx5_set_port_mtu(struct mlx5_core_dev *dev, int mtu, u8 port);
+ void mlx5_query_port_max_mtu(struct mlx5_core_dev *dev, int *max_mtu, u8 port);
+-- 
+1.7.1

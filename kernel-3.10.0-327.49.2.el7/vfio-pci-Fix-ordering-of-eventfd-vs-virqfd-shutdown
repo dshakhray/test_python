@@ -1,0 +1,60 @@
+From 1623af0a98e200b8791efeae47ee8eee173642bb Mon Sep 17 00:00:00 2001
+From: Alex Williamson <alex.williamson@redhat.com>
+Date: Sun, 30 Oct 2016 23:44:24 +0100
+Subject: [vfio] pci: Fix ordering of eventfd vs virqfd shutdown
+
+Message-id: <20161030234412.15363.67344.stgit@gimli.home>
+Patchwork-id: 160149
+O-Subject: [RHEL7.4 kernel PATCH] vfio/pci: Fix ordering of eventfd vs virqfd shutdown
+Bugzilla: 1322026
+Z-Bugzilla: 1391610
+RH-Acked-by: Auger Eric <eric.auger@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Laszlo Ersek <lersek@redhat.com>
+
+Bugzilla: 1322026
+Brew: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11981615
+Upstream: 956b56a984ddf10aa69b25318dc04430101beed6
+
+Both the INTx and MSI/X disable paths do an eventfd_ctx_put() for the
+trigger eventfd before calling vfio_virqfd_disable() any potential
+mask and unmask eventfds.  This opens a use-after-free race where an
+inopportune irqfd can reference the freed signalling eventfd.  Reorder
+to avoid this possibility.
+
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_intrs.c b/drivers/vfio/pci/vfio_pci_intrs.c
+index 8742222..af306d7 100644
+--- a/drivers/vfio/pci/vfio_pci_intrs.c
++++ b/drivers/vfio/pci/vfio_pci_intrs.c
+@@ -439,9 +439,9 @@ static int vfio_intx_set_signal(struct vfio_pci_device *vdev, int fd)
+ 
+ static void vfio_intx_disable(struct vfio_pci_device *vdev)
+ {
+- vfio_intx_set_signal(vdev, -1);
+  virqfd_disable(vdev, &vdev->ctx[0].unmask);
+  virqfd_disable(vdev, &vdev->ctx[0].mask);
++ vfio_intx_set_signal(vdev, -1);
+  vdev->irq_type = VFIO_PCI_NUM_IRQS;
+  vdev->num_ctx = 0;
+  kfree(vdev->ctx);
+@@ -602,13 +602,13 @@ static void vfio_msi_disable(struct vfio_pci_device *vdev, bool msix)
+  struct pci_dev *pdev = vdev->pdev;
+  int i;
+ 
+- vfio_msi_set_block(vdev, 0, vdev->num_ctx, NULL, msix);
+-
+  for (i = 0; i < vdev->num_ctx; i++) {
+   virqfd_disable(vdev, &vdev->ctx[i].unmask);
+   virqfd_disable(vdev, &vdev->ctx[i].mask);
+  }
+ 
++ vfio_msi_set_block(vdev, 0, vdev->num_ctx, NULL, msix);
++
+  if (msix) {
+   pci_disable_msix(vdev->pdev);
+   kfree(vdev->msix);
+-- 
+1.7.1

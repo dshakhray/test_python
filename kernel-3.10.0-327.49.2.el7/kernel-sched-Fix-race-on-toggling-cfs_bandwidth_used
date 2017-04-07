@@ -1,0 +1,127 @@
+From 850d9b4fcb5f2e54d66fca16919ffb4387df046d Mon Sep 17 00:00:00 2001
+From: Herton R. Krzesinski <herton@redhat.com>
+Date: Wed, 18 May 2016 06:41:02 +0200
+Subject: [kernel] sched: Fix race on toggling cfs_bandwidth_used
+
+Message-id: <1463553686-8136-2-git-send-email-herton@redhat.com>
+Patchwork-id: 145565
+O-Subject: [RHEL7 PATCH 01/25] sched: Fix race on toggling cfs_bandwidth_used
+Bugzilla: 1336863
+Z-Bugzilla: 1370157
+RH-Acked-by: Jiri Olsa <jolsa@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1336863
+Upstream Status: commit 1ee14e6, linux-stable commit 9d80092
+Build Info: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11035443
+Tested: kt1 (looking for consistent regressions) and with test case on the bug
+
+commit 9d80092f8d9e0fc4aa2b6a7c8d2e4a7437899ca5
+Author: Ben Segall <bsegall@google.com>
+Date:   Wed Oct 16 11:16:12 2013 -0700
+
+    sched: Fix race on toggling cfs_bandwidth_used
+
+    commit 1ee14e6c8cddeeb8a490d7b54cd9016e4bb900b4 upstream.
+
+    When we transition cfs_bandwidth_used to false, any currently
+    throttled groups will incorrectly return false from cfs_rq_throttled.
+    While tg_set_cfs_bandwidth will unthrottle them eventually, currently
+    running code (including at least dequeue_task_fair and
+    distribute_cfs_runtime) will cause errors.
+
+    Fix this by turning off cfs_bandwidth_used only after unthrottling all
+    cfs_rqs.
+
+    Tested: toggle bandwidth back and forth on a loaded cgroup. Caused
+    crashes in minutes without the patch, hasn't crashed with it.
+
+    Signed-off-by: Ben Segall <bsegall@google.com>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: pjt@google.com
+    Link: http://lkml.kernel.org/r/20131016181611.22647.80365.stgit@sword-of-the-dawn.mtv.corp.google.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Cc: Chris J Arges <chris.j.arges@canonical.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Signed-off-by: Herton R. Krzesinski <herton@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index c6bdfc1..54f54dd 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8173,7 +8173,12 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+ 
+  runtime_enabled = quota != RUNTIME_INF;
+  runtime_was_enabled = cfs_b->quota != RUNTIME_INF;
+- account_cfs_bandwidth_used(runtime_enabled, runtime_was_enabled);
++ /*
++  * If we need to toggle cfs_bandwidth_used, off->on must occur
++  * before making related changes, and on->off must occur afterwards
++  */
++ if (runtime_enabled && !runtime_was_enabled)
++  cfs_bandwidth_usage_inc();
+  raw_spin_lock_irq(&cfs_b->lock);
+  cfs_b->period = ns_to_ktime(period);
+  cfs_b->quota = quota;
+@@ -8199,6 +8204,8 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+    unthrottle_cfs_rq(cfs_rq);
+   raw_spin_unlock_irq(&rq->lock);
+  }
++ if (runtime_was_enabled && !runtime_enabled)
++  cfs_bandwidth_usage_dec();
+ out_unlock:
+  mutex_unlock(&cfs_constraints_mutex);
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3a110fc..57ceaed 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3013,13 +3013,14 @@ static inline bool cfs_bandwidth_used(void)
+  return static_key_false(&__cfs_bandwidth_used);
+ }
+ 
+-void account_cfs_bandwidth_used(int enabled, int was_enabled)
++void cfs_bandwidth_usage_inc(void)
+ {
+- /* only need to count groups transitioning between enabled/!enabled */
+- if (enabled && !was_enabled)
+-  static_key_slow_inc(&__cfs_bandwidth_used);
+- else if (!enabled && was_enabled)
+-  static_key_slow_dec(&__cfs_bandwidth_used);
++ static_key_slow_inc(&__cfs_bandwidth_used);
++}
++
++void cfs_bandwidth_usage_dec(void)
++{
++ static_key_slow_dec(&__cfs_bandwidth_used);
+ }
+ #else /* HAVE_JUMP_LABEL */
+ static bool cfs_bandwidth_used(void)
+@@ -3027,7 +3028,8 @@ static bool cfs_bandwidth_used(void)
+  return true;
+ }
+ 
+-void account_cfs_bandwidth_used(int enabled, int was_enabled) {}
++void cfs_bandwidth_usage_inc(void) {}
++void cfs_bandwidth_usage_dec(void) {}
+ #endif /* HAVE_JUMP_LABEL */
+ 
+ /*
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index eed371b..43d5174 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1401,7 +1401,8 @@ extern void print_rt_stats(struct seq_file *m, int cpu);
+ extern void init_cfs_rq(struct cfs_rq *cfs_rq);
+ extern void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq);
+ 
+-extern void account_cfs_bandwidth_used(int enabled, int was_enabled);
++extern void cfs_bandwidth_usage_inc(void);
++extern void cfs_bandwidth_usage_dec(void);
+ 
+ #ifdef CONFIG_NO_HZ_COMMON
+ enum rq_nohz_flag_bits {
+-- 
+1.7.1

@@ -1,0 +1,222 @@
+From 7eba3be85851cec99a0df0c8aa051df21c459570 Mon Sep 17 00:00:00 2001
+From: Miklos Szeredi <mszeredi@redhat.com>
+Date: Fri, 14 Oct 2016 09:54:39 +0200
+Subject: [fs] vfs: add d_real_inode() helper
+
+Message-id: <1476438880-5494-1-git-send-email-mszeredi@redhat.com>
+Patchwork-id: 158866
+O-Subject: [RHEL-7.2.z PATCH 1/2] vfs: add d_real_inode() helper
+Bugzilla: 1273111
+Z-Bugzilla: 1365628
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1365628
+Upstream status: differs slightly from upstream
+Brew: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11903833
+Testing: see https://bugzilla.redhat.com/show_bug.cgi?id=1273111#c11
+
+This patch selects parts of the d_real() interface from 7.3 that are needed
+to fix z-stream bug 1365628.
+
+In particular:
+
+ - the d_op->d_real() interface is the same as in mainline and RHEL7.3
+ - the KABI protection for d_op->d_real() is the same as in RHEL7.3
+ - the d_real() helper is left out
+ - overlayfs implementation is limited to the use by d_real_inode().
+
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 861aeaf..ce4b824 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1473,7 +1473,8 @@ void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op)
+     DCACHE_OP_COMPARE |
+     DCACHE_OP_REVALIDATE |
+     DCACHE_OP_WEAK_REVALIDATE |
+-    DCACHE_OP_DELETE ));
++    DCACHE_OP_DELETE |
++    DCACHE_OP_REAL));
+  dentry->d_op = op;
+  if (!op)
+   return;
+@@ -1490,6 +1491,8 @@ void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op)
+  if (op->d_prune)
+   dentry->d_flags |= DCACHE_OP_PRUNE;
+ 
++ if (get_real_dop(dentry))
++  dentry->d_flags |= DCACHE_OP_REAL;
+ }
+ EXPORT_SYMBOL(d_set_d_op);
+ 
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index 7e0388b..ecc7353 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -273,6 +273,23 @@ static void ovl_dentry_release(struct dentry *dentry)
+  }
+ }
+ 
++static struct dentry *ovl_d_real(struct dentry *dentry,
++     const struct inode *inode,
++     unsigned int open_flags)
++{
++ /* The only caller in 7.2.z is d_real_inode() */
++ if (WARN_ON(inode || open_flags))
++  return dentry;
++
++ if (d_is_dir(dentry))
++  return dentry;
++
++ if (d_is_negative(dentry))
++  return dentry;
++
++ return ovl_dentry_real(dentry);
++}
++
+ static int ovl_dentry_revalidate(struct dentry *dentry, unsigned int flags)
+ {
+  struct ovl_entry *oe = dentry->d_fsdata;
+@@ -314,14 +331,22 @@ static int ovl_dentry_weak_revalidate(struct dentry *dentry, unsigned int flags)
+  return ret;
+ }
+ 
+-static const struct dentry_operations ovl_dentry_operations = {
+- .d_release = ovl_dentry_release,
++static const struct dentry_operations_wrapper ovl_dentry_operations = {
++ .ops = {
++  .d_release = ovl_dentry_release,
++ },
++ .size = sizeof(struct dentry_operations_wrapper),
++ .d_real = ovl_d_real,
+ };
+ 
+-static const struct dentry_operations ovl_reval_dentry_operations = {
+- .d_release = ovl_dentry_release,
+- .d_revalidate = ovl_dentry_revalidate,
+- .d_weak_revalidate = ovl_dentry_weak_revalidate,
++static const struct dentry_operations_wrapper ovl_reval_dentry_operations = {
++ .ops = {
++  .d_release = ovl_dentry_release,
++  .d_revalidate = ovl_dentry_revalidate,
++  .d_weak_revalidate = ovl_dentry_weak_revalidate,
++ },
++ .size = sizeof(struct dentry_operations_wrapper),
++ .d_real = ovl_d_real,
+ };
+ 
+ static struct ovl_entry *ovl_alloc_entry(unsigned int numlower)
+@@ -1049,9 +1074,9 @@ static int ovl_fill_super(struct super_block *sb, void *data, int silent)
+   sb->s_flags |= MS_RDONLY;
+ 
+  if (remote)
+-  sb->s_d_op = &ovl_reval_dentry_operations;
++  sb->s_d_op = &ovl_reval_dentry_operations.ops;
+  else
+-  sb->s_d_op = &ovl_dentry_operations;
++  sb->s_d_op = &ovl_dentry_operations.ops;
+ 
+  err = -ENOMEM;
+  oe = ovl_alloc_entry(numlower);
+@@ -1129,6 +1154,7 @@ static struct file_system_type ovl_fs_type = {
+  .name  = "overlay",
+  .mount  = ovl_mount,
+  .kill_sb = kill_anon_super,
++ .fs_flags = FS_HAS_DOPS_WRAPPER,
+ };
+ MODULE_ALIAS_FS("overlay");
+ 
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index 5888528..88a4961 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -160,6 +160,16 @@ struct dentry_operations {
+  int (*d_manage)(struct dentry *, bool);
+ } ____cacheline_aligned;
+ 
++typedef struct dentry* (*dop_real_t) (struct dentry *, const struct inode *, unsigned int);
++
++struct dentry_operations_wrapper {
++ struct dentry_operations ops;
++ size_t size;
++
++ struct dentry *(*d_real)(struct dentry *, const struct inode *,
++     unsigned int);
++} ____cacheline_aligned;
++
+ /*
+  * Locking rules for dentry_operations callbacks are to be found in
+  * Documentation/filesystems/Locking. Keep it updated!
+@@ -217,6 +227,7 @@ struct dentry_operations {
+ #define DCACHE_AUTODIR_TYPE  0x02000000 /* Lookupless directory (presumed automount) */
+ #define DCACHE_SYMLINK_TYPE  0x03000000 /* Symlink */
+ #define DCACHE_FILE_TYPE  0x04000000 /* Other file type */
++#define DCACHE_OP_REAL   0x08000000
+ 
+ extern seqlock_t rename_lock;
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 9a3e057..a2bac1c 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1949,6 +1949,8 @@ struct file_system_type {
+ #define FS_USERNS_DEV_MOUNT 16 /* A userns mount does not imply MNT_NODEV */
+ #define FS_HAS_RM_XQUOTA 256 /* KABI: fs has the rm_xquota quota op */
+ #define FS_HAS_INVALIDATE_RANGE 512 /* FS has new ->invalidatepage with length arg */
++#define FS_HAS_DOPS_WRAPPER 4096 /* kabi: fs is using dentry_operations_wrapper. sb->s_d_op points to
++dentry_operations_wrapper */
+ #define FS_RENAME_DOES_D_MOVE 32768 /* FS will handle d_move() during rename() internally. */
+  struct dentry *(*mount) (struct file_system_type *, int,
+          const char *, void *);
+@@ -1968,6 +1970,48 @@ struct file_system_type {
+ };
+ 
+ #define sb_has_rm_xquota(sb) ((sb)->s_type->fs_flags & FS_HAS_RM_XQUOTA)
++#define sb_has_dops_wrapper(sb) ((sb)->s_type->fs_flags & FS_HAS_DOPS_WRAPPER)
++
++/*
++ * FIXME: These should be in include/linux/dcache.h but there
++ * sb_has_dops_wrapper() is not available and compilation fails. This happens
++ * as fs.h includes dcache.h and not other way around. So putting these
++ * operations here for now.
++ */
++static inline const struct dentry_operations_wrapper *get_dop_wrapper(struct dentry *dentry)
++{
++ if (!sb_has_dops_wrapper(dentry->d_sb))
++  return NULL;
++
++ return container_of(dentry->d_op, const struct dentry_operations_wrapper, ops);
++}
++
++static inline dop_real_t get_real_dop(struct dentry *dentry)
++{
++ const struct dentry_operations_wrapper *wrapper = get_dop_wrapper(dentry);
++ if (!wrapper)
++  return NULL;
++
++ return (offsetof(struct dentry_operations_wrapper, d_real) < wrapper->size) ? wrapper->d_real : NULL;
++}
++
++/**
++ * d_real_inode - Return the real inode
++ * @dentry: The dentry to query
++ *
++ * If dentry is on an union/overlay, then return the underlying, real inode.
++ * Otherwise return ->d_inode.
++ */
++static inline struct inode *d_real_inode(struct dentry *dentry)
++{
++ if (unlikely(dentry->d_flags & DCACHE_OP_REAL)) {
++  dop_real_t d_real_op = get_real_dop(dentry);
++
++  dentry = d_real_op(dentry, NULL, 0);
++ }
++
++ return dentry->d_inode;
++}
+ 
+ /*
+  * the fs address space operations contain a new invalidatepage_rang () op
+-- 
+1.7.1

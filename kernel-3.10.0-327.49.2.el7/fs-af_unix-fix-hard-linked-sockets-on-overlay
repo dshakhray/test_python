@@ -1,0 +1,113 @@
+From f53cd457bac39db0534c586800c9fdc484c83ea9 Mon Sep 17 00:00:00 2001
+From: Miklos Szeredi <mszeredi@redhat.com>
+Date: Tue, 21 Jun 2016 18:49:22 +0200
+Subject: [fs] af_unix: fix hard linked sockets on overlay
+
+Message-id: <1466534962-739-3-git-send-email-mszeredi@redhat.com>
+Patchwork-id: 153884
+O-Subject: [RHEL7.3 PATCH 2/2] af_unix: fix hard linked sockets on overlay
+Bugzilla: 1273111
+Z-Bugzilla: 1365628
+RH-Acked-by: Jeremy McNicoll <jmcnicol@redhat.com>
+RH-Acked-by: Vivek Goyal <vgoyal@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1273111
+Upstream status: Linus
+Brew: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=11238163
+Testing: see bug
+Depends on: http://post-office.corp.redhat.com/archives/rhkernel-list/2016-June/msg00451.html
+
+commit eb0a4a47ae89aaa0674ab3180de6a162f3be2ddf
+Author: Miklos Szeredi <mszeredi@redhat.com>
+Date:   Fri May 20 22:13:45 2016 +0200
+
+    af_unix: fix hard linked sockets on overlay
+
+    Overlayfs uses separate inodes even in the case of hard links on the
+    underlying filesystems.  This is a problem for AF_UNIX socket
+    implementation which indexes sockets based on the inode.  This resulted in
+    hard linked sockets not working.
+
+    The fix is to use the real, underlying inode.
+
+    Test case follows:
+
+    -- ovl-sock-test.c --
+    #include <unistd.h>
+    #include <err.h>
+    #include <sys/socket.h>
+    #include <sys/un.h>
+
+    #define SOCK "test-sock"
+    #define SOCK2 "test-sock2"
+
+    int main(void)
+    {
+     int fd, fd2;
+     struct sockaddr_un addr = {
+      .sun_family = AF_UNIX,
+      .sun_path = SOCK,
+     };
+     struct sockaddr_un addr2 = {
+      .sun_family = AF_UNIX,
+      .sun_path = SOCK2,
+     };
+
+     unlink(SOCK);
+     unlink(SOCK2);
+     if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+      err(1, "socket");
+     if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) == -1)
+      err(1, "bind");
+     if (listen(fd, 0) == -1)
+      err(1, "listen");
+     if (link(SOCK, SOCK2) == -1)
+      err(1, "link");
+     if ((fd2 = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+      err(1, "socket");
+     if (connect(fd2, (struct sockaddr *) &addr2, sizeof(addr2)) == -1)
+      err (1, "connect");
+     return 0;
+    }
+    ----
+
+    Reported-by: Alexander Morozov <alexandr.morozov@docker.com>
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+    Cc: <stable@vger.kernel.org>
+
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index 0e629f5..a288868 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -304,7 +304,7 @@ static struct sock *unix_find_socket_byinode(struct inode *i)
+       &unix_socket_table[i->i_ino & (UNIX_HASH_SIZE - 1)]) {
+   struct dentry *dentry = unix_sk(s)->path.dentry;
+ 
+-  if (dentry && dentry->d_inode == i) {
++  if (dentry && d_real_inode(dentry) == i) {
+    sock_hold(s);
+    goto found;
+   }
+@@ -903,7 +903,7 @@ static struct sock *unix_find_other(struct net *net,
+   err = kern_path(sunname->sun_path, LOOKUP_FOLLOW, &path);
+   if (err)
+    goto fail;
+-  inode = path.dentry->d_inode;
++  inode = d_real_inode(path.dentry);
+   err = inode_permission(inode, MAY_WRITE);
+   if (err)
+    goto put_fail;
+@@ -1030,7 +1030,7 @@ static int unix_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+    goto out_up;
+   }
+   addr->hash = UNIX_HASH_SIZE;
+-  hash = path.dentry->d_inode->i_ino & (UNIX_HASH_SIZE-1);
++  hash = d_real_inode(path.dentry)->i_ino & (UNIX_HASH_SIZE-1);
+   spin_lock(&unix_table_lock);
+   u->path = path;
+   list = &unix_socket_table[hash];
+-- 
+1.7.1
