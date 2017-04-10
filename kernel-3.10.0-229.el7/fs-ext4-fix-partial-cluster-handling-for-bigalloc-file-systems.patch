@@ -1,0 +1,80 @@
+From 5c4ec16d4cb40b6dc841a6a0552e62d397c865ca Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:54:46 -0400
+Subject: [fs] ext4: fix partial cluster handling for bigalloc file systems
+
+Message-id: <1414058125-4183-133-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98254
+O-Subject: [RHEL 7.1 PATCH v2 132/171] ext4: fix partial cluster handling for bigalloc file systems
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Eric Whitney <enwlinux@gmail.com>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit c06344939422bbd032ac967223a7863de57496b5
+
+ Commit 9cb00419fa, which enables hole punching for bigalloc file
+ systems, exposed a bug introduced by commit 6ae06ff51e in an earlier
+ release.  When run on a bigalloc file system, xfstests generic/013, 068,
+ 075, 083, 091, 100, 112, 127, 263, 269, and 270 fail with e2fsck errors
+ or cause kernel error messages indicating that previously freed blocks
+ are being freed again.
+
+ The latter commit optimizes the selection of the starting extent in
+ ext4_ext_rm_leaf() when hole punching by beginning with the extent
+ supplied in the path argument rather than with the last extent in the
+ leaf node (as is still done when truncating).  However, the code in
+ rm_leaf that initially sets partial_cluster to track cluster sharing on
+ extent boundaries is only guaranteed to run if rm_leaf starts with the
+ last node in the leaf.  Consequently, partial_cluster is not correctly
+ initialized when hole punching, and a cluster on the boundary of a
+ punched region that should be retained may instead be deallocated.
+
+ Signed-off-by: Eric Whitney <enwlinux@gmail.com>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Cc: stable@vger.kernel.org
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 6450498..7727ade 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -2597,6 +2597,27 @@ ext4_ext_rm_leaf(handle_t *handle, struct inode *inode,
+  ex_ee_block = le32_to_cpu(ex->ee_block);
+  ex_ee_len = ext4_ext_get_actual_len(ex);
+ 
++ /*
++  * If we're starting with an extent other than the last one in the
++  * node, we need to see if it shares a cluster with the extent to
++  * the right (towards the end of the file). If its leftmost cluster
++  * is this extent's rightmost cluster and it is not cluster aligned,
++  * we'll mark it as a partial that is not to be deallocated.
++  */
++
++ if (ex != EXT_LAST_EXTENT(eh)) {
++  ext4_fsblk_t current_pblk, right_pblk;
++  long long current_cluster, right_cluster;
++
++  current_pblk = ext4_ext_pblock(ex) + ex_ee_len - 1;
++  current_cluster = (long long)EXT4_B2C(sbi, current_pblk);
++  right_pblk = ext4_ext_pblock(ex + 1);
++  right_cluster = (long long)EXT4_B2C(sbi, right_pblk);
++  if (current_cluster == right_cluster &&
++   EXT4_PBLK_COFF(sbi, right_pblk))
++   *partial_cluster = -right_cluster;
++ }
++
+  trace_ext4_ext_rm_leaf(inode, start, ex, *partial_cluster);
+ 
+  while (ex >= EXT_FIRST_EXTENT(eh) &&
+-- 
+1.7.1

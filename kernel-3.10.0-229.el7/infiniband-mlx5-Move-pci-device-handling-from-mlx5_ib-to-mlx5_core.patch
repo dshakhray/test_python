@@ -1,0 +1,1909 @@
+From e9e90dd630fc48efd8ad668019779ebd6f7ff916 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:01:50 -0400
+Subject: [infiniband] mlx5: Move pci device handling from mlx5_ib to mlx5_core
+
+Message-id: <e908e520c6725d36a57b28c2e4e2afdf07608d17.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93710
+O-Subject: [Patch RHEL7.1 V1 174/197] mlx5: Move pci device handling from mlx5_ib to mlx5_core
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Jack Morgenstein <jackm@dev.mellanox.co.il>
+
+In preparation for a new mlx5 device which is VPI (i.e., ports can be
+either IB or ETH), move the pci device functionality from mlx5_ib
+to mlx5_core.
+
+This involves the following changes:
+1. Move mlx5_core_dev struct out of mlx5_ib_dev. mlx5_core_dev
+   is now an independent structure maintained by mlx5_core.
+   mlx5_ib_dev now has a pointer to that struct.
+   This requires changing a lot of places where the core_dev
+   struct was accessed via mlx5_ib_dev (now, this needs to
+   be a pointer dereference).
+2. All PCI initializations are now done in mlx5_core. Thus,
+   it is now mlx5_core which does pci_register_device (and not
+   mlx5_ib, as was previously).
+3. mlx5_ib now registers itself with mlx5_core as an "interface"
+   driver. This is very similar to the mechanism employed for
+   the mlx4 (ConnectX) driver. Once the HCA is initialized
+   (by mlx5_core), it invokes the interface drivers to do
+   their initializations.
+4. There is a new event handler which the core registers:
+   mlx5_core_event(). This event handler invokes the
+   event handlers registered by the interfaces.
+
+Based on a patch by Eli Cohen <eli@mellanox.com>
+
+Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Signed-off-by: Eli Cohen <eli@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9603b61de1eee92977d74ff42541be20c0c5b1a7)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx5/cq.c b/drivers/infiniband/hw/mlx5/cq.c
+index 8ae4f89..3b4dc85 100644
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -180,7 +180,7 @@ static void handle_responder(struct ib_wc *wc, struct mlx5_cqe64 *cqe,
+   struct mlx5_core_srq *msrq = NULL;
+ 
+   if (qp->ibqp.xrcd) {
+-   msrq = mlx5_core_get_srq(&dev->mdev,
++   msrq = mlx5_core_get_srq(dev->mdev,
+        be32_to_cpu(cqe->srqn));
+    srq = to_mibsrq(msrq);
+   } else {
+@@ -364,7 +364,7 @@ static void handle_atomics(struct mlx5_ib_qp *qp, struct mlx5_cqe64 *cqe64,
+ 
+ static void free_cq_buf(struct mlx5_ib_dev *dev, struct mlx5_ib_cq_buf *buf)
+ {
+- mlx5_buf_free(&dev->mdev, &buf->buf);
++ mlx5_buf_free(dev->mdev, &buf->buf);
+ }
+ 
+ static void get_sig_err_item(struct mlx5_sig_err_cqe *cqe,
+@@ -450,7 +450,7 @@ repoll:
+    * because CQs will be locked while QPs are removed
+    * from the table.
+    */
+-  mqp = __mlx5_qp_lookup(&dev->mdev, qpn);
++  mqp = __mlx5_qp_lookup(dev->mdev, qpn);
+   if (unlikely(!mqp)) {
+    mlx5_ib_warn(dev, "CQE@CQ %06x for unknown QPN %6x\n",
+          cq->mcq.cqn, qpn);
+@@ -514,11 +514,11 @@ repoll:
+  case MLX5_CQE_SIG_ERR:
+   sig_err_cqe = (struct mlx5_sig_err_cqe *)cqe64;
+ 
+-  read_lock(&dev->mdev.priv.mr_table.lock);
+-  mmr = __mlx5_mr_lookup(&dev->mdev,
++  read_lock(&dev->mdev->priv.mr_table.lock);
++  mmr = __mlx5_mr_lookup(dev->mdev,
+            mlx5_base_mkey(be32_to_cpu(sig_err_cqe->mkey)));
+   if (unlikely(!mmr)) {
+-   read_unlock(&dev->mdev.priv.mr_table.lock);
++   read_unlock(&dev->mdev->priv.mr_table.lock);
+    mlx5_ib_warn(dev, "CQE@CQ %06x for unknown MR %6x\n",
+          cq->mcq.cqn, be32_to_cpu(sig_err_cqe->mkey));
+    return -EINVAL;
+@@ -536,7 +536,7 @@ repoll:
+         mr->sig->err_item.expected,
+         mr->sig->err_item.actual);
+ 
+-  read_unlock(&dev->mdev.priv.mr_table.lock);
++  read_unlock(&dev->mdev->priv.mr_table.lock);
+   goto repoll;
+  }
+ 
+@@ -575,8 +575,8 @@ int mlx5_ib_arm_cq(struct ib_cq *ibcq, enum ib_cq_notify_flags flags)
+  mlx5_cq_arm(&to_mcq(ibcq)->mcq,
+       (flags & IB_CQ_SOLICITED_MASK) == IB_CQ_SOLICITED ?
+       MLX5_CQ_DB_REQ_NOT_SOL : MLX5_CQ_DB_REQ_NOT,
+-      to_mdev(ibcq->device)->mdev.priv.uuari.uars[0].map,
+-      MLX5_GET_DOORBELL_LOCK(&to_mdev(ibcq->device)->mdev.priv.cq_uar_lock));
++      to_mdev(ibcq->device)->mdev->priv.uuari.uars[0].map,
++      MLX5_GET_DOORBELL_LOCK(&to_mdev(ibcq->device)->mdev->priv.cq_uar_lock));
+ 
+  return 0;
+ }
+@@ -586,7 +586,7 @@ static int alloc_cq_buf(struct mlx5_ib_dev *dev, struct mlx5_ib_cq_buf *buf,
+ {
+  int err;
+ 
+- err = mlx5_buf_alloc(&dev->mdev, nent * cqe_size,
++ err = mlx5_buf_alloc(dev->mdev, nent * cqe_size,
+         PAGE_SIZE * 2, &buf->buf);
+  if (err)
+   return err;
+@@ -691,7 +691,7 @@ static int create_cq_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *cq,
+ {
+  int err;
+ 
+- err = mlx5_db_alloc(&dev->mdev, &cq->db);
++ err = mlx5_db_alloc(dev->mdev, &cq->db);
+  if (err)
+   return err;
+ 
+@@ -716,7 +716,7 @@ static int create_cq_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *cq,
+  mlx5_fill_page_array(&cq->buf.buf, (*cqb)->pas);
+ 
+  (*cqb)->ctx.log_pg_sz = cq->buf.buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT;
+- *index = dev->mdev.priv.uuari.uars[0].index;
++ *index = dev->mdev->priv.uuari.uars[0].index;
+ 
+  return 0;
+ 
+@@ -724,14 +724,14 @@ err_buf:
+  free_cq_buf(dev, &cq->buf);
+ 
+ err_db:
+- mlx5_db_free(&dev->mdev, &cq->db);
++ mlx5_db_free(dev->mdev, &cq->db);
+  return err;
+ }
+ 
+ static void destroy_cq_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *cq)
+ {
+  free_cq_buf(dev, &cq->buf);
+- mlx5_db_free(&dev->mdev, &cq->db);
++ mlx5_db_free(dev->mdev, &cq->db);
+ }
+ 
+ struct ib_cq *mlx5_ib_create_cq(struct ib_device *ibdev, int entries,
+@@ -752,7 +752,7 @@ struct ib_cq *mlx5_ib_create_cq(struct ib_device *ibdev, int entries,
+   return ERR_PTR(-EINVAL);
+ 
+  entries = roundup_pow_of_two(entries + 1);
+- if (entries > dev->mdev.caps.max_cqes)
++ if (entries > dev->mdev->caps.max_cqes)
+   return ERR_PTR(-EINVAL);
+ 
+  cq = kzalloc(sizeof(*cq), GFP_KERNEL);
+@@ -789,7 +789,7 @@ struct ib_cq *mlx5_ib_create_cq(struct ib_device *ibdev, int entries,
+  cqb->ctx.c_eqn = cpu_to_be16(eqn);
+  cqb->ctx.db_record_addr = cpu_to_be64(cq->db.dma);
+ 
+- err = mlx5_core_create_cq(&dev->mdev, &cq->mcq, cqb, inlen);
++ err = mlx5_core_create_cq(dev->mdev, &cq->mcq, cqb, inlen);
+  if (err)
+   goto err_cqb;
+ 
+@@ -809,7 +809,7 @@ struct ib_cq *mlx5_ib_create_cq(struct ib_device *ibdev, int entries,
+  return &cq->ibcq;
+ 
+ err_cmd:
+- mlx5_core_destroy_cq(&dev->mdev, &cq->mcq);
++ mlx5_core_destroy_cq(dev->mdev, &cq->mcq);
+ 
+ err_cqb:
+  mlx5_vfree(cqb);
+@@ -834,7 +834,7 @@ int mlx5_ib_destroy_cq(struct ib_cq *cq)
+  if (cq->uobject)
+   context = cq->uobject->context;
+ 
+- mlx5_core_destroy_cq(&dev->mdev, &mcq->mcq);
++ mlx5_core_destroy_cq(dev->mdev, &mcq->mcq);
+  if (context)
+   destroy_cq_user(mcq, context);
+  else
+@@ -919,7 +919,7 @@ int mlx5_ib_modify_cq(struct ib_cq *cq, u16 cq_count, u16 cq_period)
+  int err;
+  u32 fsel;
+ 
+- if (!(dev->mdev.caps.flags & MLX5_DEV_CAP_FLAG_CQ_MODER))
++ if (!(dev->mdev->caps.flags & MLX5_DEV_CAP_FLAG_CQ_MODER))
+   return -ENOSYS;
+ 
+  in = kzalloc(sizeof(*in), GFP_KERNEL);
+@@ -931,7 +931,7 @@ int mlx5_ib_modify_cq(struct ib_cq *cq, u16 cq_count, u16 cq_period)
+  in->ctx.cq_period = cpu_to_be16(cq_period);
+  in->ctx.cq_max_count = cpu_to_be16(cq_count);
+  in->field_select = cpu_to_be32(fsel);
+- err = mlx5_core_modify_cq(&dev->mdev, &mcq->mcq, in, sizeof(*in));
++ err = mlx5_core_modify_cq(dev->mdev, &mcq->mcq, in, sizeof(*in));
+  kfree(in);
+ 
+  if (err)
+@@ -1074,7 +1074,7 @@ int mlx5_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata)
+  int uninitialized_var(cqe_size);
+  unsigned long flags;
+ 
+- if (!(dev->mdev.caps.flags & MLX5_DEV_CAP_FLAG_RESIZE_CQ)) {
++ if (!(dev->mdev->caps.flags & MLX5_DEV_CAP_FLAG_RESIZE_CQ)) {
+   pr_info("Firmware does not support resize CQ\n");
+   return -ENOSYS;
+  }
+@@ -1083,7 +1083,7 @@ int mlx5_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata)
+   return -EINVAL;
+ 
+  entries = roundup_pow_of_two(entries + 1);
+- if (entries > dev->mdev.caps.max_cqes + 1)
++ if (entries > dev->mdev->caps.max_cqes + 1)
+   return -EINVAL;
+ 
+  if (entries == ibcq->cqe + 1)
+@@ -1128,7 +1128,7 @@ int mlx5_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata)
+  in->hdr.opmod = cpu_to_be16(MLX5_CQ_OPMOD_RESIZE);
+  in->cqn = cpu_to_be32(cq->mcq.cqn);
+ 
+- err = mlx5_core_modify_cq(&dev->mdev, &cq->mcq, in, inlen);
++ err = mlx5_core_modify_cq(dev->mdev, &cq->mcq, in, inlen);
+  if (err)
+   goto ex_alloc;
+ 
+diff --git a/drivers/infiniband/hw/mlx5/mad.c b/drivers/infiniband/hw/mlx5/mad.c
+index 5c8938b..e259e73 100644
+--- a/drivers/infiniband/hw/mlx5/mad.c
++++ b/drivers/infiniband/hw/mlx5/mad.c
+@@ -54,7 +54,7 @@ int mlx5_MAD_IFC(struct mlx5_ib_dev *dev, int ignore_mkey, int ignore_bkey,
+  if (ignore_bkey || !in_wc)
+   op_modifier |= 0x2;
+ 
+- return mlx5_core_mad_ifc(&dev->mdev, in_mad, response_mad, op_modifier, port);
++ return mlx5_core_mad_ifc(dev->mdev, in_mad, response_mad, op_modifier, port);
+ }
+ 
+ int mlx5_ib_process_mad(struct ib_device *ibdev, int mad_flags, u8 port_num,
+@@ -129,7 +129,7 @@ int mlx5_query_ext_port_caps(struct mlx5_ib_dev *dev, u8 port)
+ 
+  packet_error = be16_to_cpu(out_mad->status);
+ 
+- dev->mdev.caps.ext_port_cap[port - 1] = (!err && !packet_error) ?
++ dev->mdev->caps.ext_port_cap[port - 1] = (!err && !packet_error) ?
+   MLX_EXT_PORT_CAP_FLAG_EXTENDED_PORT_INFO : 0;
+ 
+ out:
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 364d4b6..f2cfd36 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -54,96 +54,17 @@ MODULE_DESCRIPTION("Mellanox Connect-IB HCA IB driver");
+ MODULE_LICENSE("Dual BSD/GPL");
+ MODULE_VERSION(DRIVER_VERSION);
+ 
+-static int prof_sel = 2;
+-module_param_named(prof_sel, prof_sel, int, 0444);
+-MODULE_PARM_DESC(prof_sel, "profile selector. Valid range 0 - 2");
++static int deprecated_prof_sel = 2;
++module_param_named(prof_sel, deprecated_prof_sel, int, 0444);
++MODULE_PARM_DESC(prof_sel, "profile selector. Deprecated here. Moved to module mlx5_core");
+ 
+ static char mlx5_version[] =
+  DRIVER_NAME ": Mellanox Connect-IB Infiniband driver v"
+  DRIVER_VERSION " (" DRIVER_RELDATE ")\n";
+ 
+-static struct mlx5_profile profile[] = {
+- [0] = {
+-  .mask  = 0,
+- },
+- [1] = {
+-  .mask  = MLX5_PROF_MASK_QP_SIZE,
+-  .log_max_qp = 12,
+- },
+- [2] = {
+-  .mask  = MLX5_PROF_MASK_QP_SIZE |
+-      MLX5_PROF_MASK_MR_CACHE,
+-  .log_max_qp = 17,
+-  .mr_cache[0] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[1] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[2] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[3] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[4] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[5] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[6] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[7] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[8] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[9] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[10] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[11] = {
+-   .size = 500,
+-   .limit = 250
+-  },
+-  .mr_cache[12] = {
+-   .size = 64,
+-   .limit = 32
+-  },
+-  .mr_cache[13] = {
+-   .size = 32,
+-   .limit = 16
+-  },
+-  .mr_cache[14] = {
+-   .size = 16,
+-   .limit = 8
+-  },
+-  .mr_cache[15] = {
+-   .size = 8,
+-   .limit = 4
+-  },
+- },
+-};
+-
+ int mlx5_vector2eqn(struct mlx5_ib_dev *dev, int vector, int *eqn, int *irqn)
+ {
+- struct mlx5_eq_table *table = &dev->mdev.priv.eq_table;
++ struct mlx5_eq_table *table = &dev->mdev->priv.eq_table;
+  struct mlx5_eq *eq, *n;
+  int err = -ENOENT;
+ 
+@@ -163,7 +84,7 @@ int mlx5_vector2eqn(struct mlx5_ib_dev *dev, int vector, int *eqn, int *irqn)
+ 
+ static int alloc_comp_eqs(struct mlx5_ib_dev *dev)
+ {
+- struct mlx5_eq_table *table = &dev->mdev.priv.eq_table;
++ struct mlx5_eq_table *table = &dev->mdev->priv.eq_table;
+  char name[MLX5_MAX_EQ_NAME];
+  struct mlx5_eq *eq, *n;
+  int ncomp_vec;
+@@ -182,9 +103,9 @@ static int alloc_comp_eqs(struct mlx5_ib_dev *dev)
+   }
+ 
+   snprintf(name, MLX5_MAX_EQ_NAME, "mlx5_comp%d", i);
+-  err = mlx5_create_map_eq(&dev->mdev, eq,
++  err = mlx5_create_map_eq(dev->mdev, eq,
+       i + MLX5_EQ_VEC_COMP_BASE, nent, 0,
+-      name, &dev->mdev.priv.uuari.uars[0]);
++      name, &dev->mdev->priv.uuari.uars[0]);
+   if (err) {
+    kfree(eq);
+    goto clean;
+@@ -204,7 +125,7 @@ clean:
+  list_for_each_entry_safe(eq, n, &dev->eqs_list, list) {
+   list_del(&eq->list);
+   spin_unlock(&table->lock);
+-  if (mlx5_destroy_unmap_eq(&dev->mdev, eq))
++  if (mlx5_destroy_unmap_eq(dev->mdev, eq))
+    mlx5_ib_warn(dev, "failed to destroy EQ 0x%x\n", eq->eqn);
+   kfree(eq);
+   spin_lock(&table->lock);
+@@ -215,14 +136,14 @@ clean:
+ 
+ static void free_comp_eqs(struct mlx5_ib_dev *dev)
+ {
+- struct mlx5_eq_table *table = &dev->mdev.priv.eq_table;
++ struct mlx5_eq_table *table = &dev->mdev->priv.eq_table;
+  struct mlx5_eq *eq, *n;
+ 
+  spin_lock(&table->lock);
+  list_for_each_entry_safe(eq, n, &dev->eqs_list, list) {
+   list_del(&eq->list);
+   spin_unlock(&table->lock);
+-  if (mlx5_destroy_unmap_eq(&dev->mdev, eq))
++  if (mlx5_destroy_unmap_eq(dev->mdev, eq))
+    mlx5_ib_warn(dev, "failed to destroy EQ 0x%x\n", eq->eqn);
+   kfree(eq);
+   spin_lock(&table->lock);
+@@ -255,14 +176,14 @@ static int mlx5_ib_query_device(struct ib_device *ibdev,
+ 
+  memset(props, 0, sizeof(*props));
+ 
+- props->fw_ver = ((u64)fw_rev_maj(&dev->mdev) << 32) |
+-  (fw_rev_min(&dev->mdev) << 16) |
+-  fw_rev_sub(&dev->mdev);
++ props->fw_ver = ((u64)fw_rev_maj(dev->mdev) << 32) |
++  (fw_rev_min(dev->mdev) << 16) |
++  fw_rev_sub(dev->mdev);
+  props->device_cap_flags    = IB_DEVICE_CHANGE_PHY_PORT |
+   IB_DEVICE_PORT_ACTIVE_EVENT  |
+   IB_DEVICE_SYS_IMAGE_GUID  |
+   IB_DEVICE_RC_RNR_NAK_GEN;
+- flags = dev->mdev.caps.flags;
++ flags = dev->mdev->caps.flags;
+  if (flags & MLX5_DEV_CAP_FLAG_BAD_PKEY_CNTR)
+   props->device_cap_flags |= IB_DEVICE_BAD_PKEY_CNTR;
+  if (flags & MLX5_DEV_CAP_FLAG_BAD_QKEY_CNTR)
+@@ -292,30 +213,30 @@ static int mlx5_ib_query_device(struct ib_device *ibdev,
+  memcpy(&props->sys_image_guid, out_mad->data + 4, 8);
+ 
+  props->max_mr_size    = ~0ull;
+- props->page_size_cap    = dev->mdev.caps.min_page_sz;
+- props->max_qp     = 1 << dev->mdev.caps.log_max_qp;
+- props->max_qp_wr    = dev->mdev.caps.max_wqes;
+- max_rq_sg = dev->mdev.caps.max_rq_desc_sz / sizeof(struct mlx5_wqe_data_seg);
+- max_sq_sg = (dev->mdev.caps.max_sq_desc_sz - sizeof(struct mlx5_wqe_ctrl_seg)) /
++ props->page_size_cap    = dev->mdev->caps.min_page_sz;
++ props->max_qp     = 1 << dev->mdev->caps.log_max_qp;
++ props->max_qp_wr    = dev->mdev->caps.max_wqes;
++ max_rq_sg = dev->mdev->caps.max_rq_desc_sz / sizeof(struct mlx5_wqe_data_seg);
++ max_sq_sg = (dev->mdev->caps.max_sq_desc_sz - sizeof(struct mlx5_wqe_ctrl_seg)) /
+   sizeof(struct mlx5_wqe_data_seg);
+  props->max_sge = min(max_rq_sg, max_sq_sg);
+- props->max_cq     = 1 << dev->mdev.caps.log_max_cq;
+- props->max_cqe     = dev->mdev.caps.max_cqes - 1;
+- props->max_mr     = 1 << dev->mdev.caps.log_max_mkey;
+- props->max_pd     = 1 << dev->mdev.caps.log_max_pd;
+- props->max_qp_rd_atom    = dev->mdev.caps.max_ra_req_qp;
+- props->max_qp_init_rd_atom = dev->mdev.caps.max_ra_res_qp;
++ props->max_cq     = 1 << dev->mdev->caps.log_max_cq;
++ props->max_cqe     = dev->mdev->caps.max_cqes - 1;
++ props->max_mr     = 1 << dev->mdev->caps.log_max_mkey;
++ props->max_pd     = 1 << dev->mdev->caps.log_max_pd;
++ props->max_qp_rd_atom    = dev->mdev->caps.max_ra_req_qp;
++ props->max_qp_init_rd_atom = dev->mdev->caps.max_ra_res_qp;
+  props->max_res_rd_atom    = props->max_qp_rd_atom * props->max_qp;
+- props->max_srq     = 1 << dev->mdev.caps.log_max_srq;
+- props->max_srq_wr    = dev->mdev.caps.max_srq_wqes - 1;
++ props->max_srq     = 1 << dev->mdev->caps.log_max_srq;
++ props->max_srq_wr    = dev->mdev->caps.max_srq_wqes - 1;
+  props->max_srq_sge    = max_rq_sg - 1;
+  props->max_fast_reg_page_list_len = (unsigned int)-1;
+- props->local_ca_ack_delay  = dev->mdev.caps.local_ca_ack_delay;
++ props->local_ca_ack_delay  = dev->mdev->caps.local_ca_ack_delay;
+  props->atomic_cap    = IB_ATOMIC_NONE;
+  props->masked_atomic_cap   = IB_ATOMIC_NONE;
+  props->max_pkeys    = be16_to_cpup((__be16 *)(out_mad->data + 28));
+- props->max_mcast_grp    = 1 << dev->mdev.caps.log_max_mcg;
+- props->max_mcast_qp_attach = dev->mdev.caps.max_qp_mcg;
++ props->max_mcast_grp    = 1 << dev->mdev->caps.log_max_mcg;
++ props->max_mcast_qp_attach = dev->mdev->caps.max_qp_mcg;
+  props->max_total_mcast_qp_attach = props->max_mcast_qp_attach *
+         props->max_mcast_grp;
+  props->max_map_per_fmr = INT_MAX; /* no limit in ConnectIB */
+@@ -336,7 +257,7 @@ int mlx5_ib_query_port(struct ib_device *ibdev, u8 port,
+  int ext_active_speed;
+  int err = -ENOMEM;
+ 
+- if (port < 1 || port > dev->mdev.caps.num_ports) {
++ if (port < 1 || port > dev->mdev->caps.num_ports) {
+   mlx5_ib_warn(dev, "invalid port number %d\n", port);
+   return -EINVAL;
+  }
+@@ -367,8 +288,8 @@ int mlx5_ib_query_port(struct ib_device *ibdev, u8 port,
+  props->phys_state = out_mad->data[33] >> 4;
+  props->port_cap_flags = be32_to_cpup((__be32 *)(out_mad->data + 20));
+  props->gid_tbl_len = out_mad->data[50];
+- props->max_msg_sz = 1 << to_mdev(ibdev)->mdev.caps.log_max_msg;
+- props->pkey_tbl_len = to_mdev(ibdev)->mdev.caps.port[port - 1].pkey_table_len;
++ props->max_msg_sz = 1 << to_mdev(ibdev)->mdev->caps.log_max_msg;
++ props->pkey_tbl_len = to_mdev(ibdev)->mdev->caps.port[port - 1].pkey_table_len;
+  props->bad_pkey_cntr = be16_to_cpup((__be16 *)(out_mad->data + 46));
+  props->qkey_viol_cntr = be16_to_cpup((__be16 *)(out_mad->data + 48));
+  props->active_width = out_mad->data[31] & 0xf;
+@@ -395,7 +316,7 @@ int mlx5_ib_query_port(struct ib_device *ibdev, u8 port,
+ 
+  /* If reported active speed is QDR, check if is FDR-10 */
+  if (props->active_speed == 4) {
+-  if (dev->mdev.caps.ext_port_cap[port - 1] &
++  if (dev->mdev->caps.ext_port_cap[port - 1] &
+       MLX_EXT_PORT_CAP_FLAG_EXTENDED_PORT_INFO) {
+    init_query_mad(in_mad);
+    in_mad->attr_id = MLX5_ATTR_EXTENDED_PORT_INFO;
+@@ -508,7 +429,7 @@ static int mlx5_ib_modify_device(struct ib_device *ibdev, int mask,
+   * a 144 trap.  If cmd fails, just ignore.
+   */
+  memcpy(&in, props->node_desc, 64);
+- err = mlx5_core_access_reg(&dev->mdev, &in, sizeof(in), &out,
++ err = mlx5_core_access_reg(dev->mdev, &in, sizeof(in), &out,
+        sizeof(out), MLX5_REG_NODE_DESC, 0, 1);
+  if (err)
+   return err;
+@@ -535,7 +456,7 @@ static int mlx5_ib_modify_port(struct ib_device *ibdev, u8 port, int mask,
+  tmp = (attr.port_cap_flags | props->set_port_cap_mask) &
+   ~props->clr_port_cap_mask;
+ 
+- err = mlx5_set_port_caps(&dev->mdev, port, tmp);
++ err = mlx5_set_port_caps(dev->mdev, port, tmp);
+ 
+ out:
+  mutex_unlock(&dev->cap_mask_mutex);
+@@ -591,14 +512,14 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+ 
+  num_uars = req.total_num_uuars / MLX5_NON_FP_BF_REGS_PER_PAGE;
+  gross_uuars = num_uars * MLX5_BF_REGS_PER_PAGE;
+- resp.qp_tab_size      = 1 << dev->mdev.caps.log_max_qp;
+- resp.bf_reg_size      = dev->mdev.caps.bf_reg_size;
++ resp.qp_tab_size      = 1 << dev->mdev->caps.log_max_qp;
++ resp.bf_reg_size      = dev->mdev->caps.bf_reg_size;
+  resp.cache_line_size  = L1_CACHE_BYTES;
+- resp.max_sq_desc_sz = dev->mdev.caps.max_sq_desc_sz;
+- resp.max_rq_desc_sz = dev->mdev.caps.max_rq_desc_sz;
+- resp.max_send_wqebb = dev->mdev.caps.max_wqes;
+- resp.max_recv_wr = dev->mdev.caps.max_wqes;
+- resp.max_srq_recv_wr = dev->mdev.caps.max_srq_wqes;
++ resp.max_sq_desc_sz = dev->mdev->caps.max_sq_desc_sz;
++ resp.max_rq_desc_sz = dev->mdev->caps.max_rq_desc_sz;
++ resp.max_send_wqebb = dev->mdev->caps.max_wqes;
++ resp.max_recv_wr = dev->mdev->caps.max_wqes;
++ resp.max_srq_recv_wr = dev->mdev->caps.max_srq_wqes;
+ 
+  context = kzalloc(sizeof(*context), GFP_KERNEL);
+  if (!context)
+@@ -635,7 +556,7 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+  }
+ 
+  for (i = 0; i < num_uars; i++) {
+-  err = mlx5_cmd_alloc_uar(&dev->mdev, &uars[i].index);
++  err = mlx5_cmd_alloc_uar(dev->mdev, &uars[i].index);
+   if (err)
+    goto out_count;
+  }
+@@ -644,7 +565,7 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+  mutex_init(&context->db_page_mutex);
+ 
+  resp.tot_uuars = req.total_num_uuars;
+- resp.num_ports = dev->mdev.caps.num_ports;
++ resp.num_ports = dev->mdev->caps.num_ports;
+  err = ib_copy_to_udata(udata, &resp,
+           sizeof(resp) - sizeof(resp.reserved));
+  if (err)
+@@ -658,7 +579,7 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+ 
+ out_uars:
+  for (i--; i >= 0; i--)
+-  mlx5_cmd_free_uar(&dev->mdev, uars[i].index);
++  mlx5_cmd_free_uar(dev->mdev, uars[i].index);
+ out_count:
+  kfree(uuari->count);
+ 
+@@ -681,7 +602,7 @@ static int mlx5_ib_dealloc_ucontext(struct ib_ucontext *ibcontext)
+  int i;
+ 
+  for (i = 0; i < uuari->num_uars; i++) {
+-  if (mlx5_cmd_free_uar(&dev->mdev, uuari->uars[i].index))
++  if (mlx5_cmd_free_uar(dev->mdev, uuari->uars[i].index))
+    mlx5_ib_warn(dev, "failed to free UAR 0x%x\n", uuari->uars[i].index);
+  }
+ 
+@@ -695,7 +616,7 @@ static int mlx5_ib_dealloc_ucontext(struct ib_ucontext *ibcontext)
+ 
+ static phys_addr_t uar_index2pfn(struct mlx5_ib_dev *dev, int index)
+ {
+- return (pci_resource_start(dev->mdev.pdev, 0) >> PAGE_SHIFT) + index;
++ return (pci_resource_start(dev->mdev->pdev, 0) >> PAGE_SHIFT) + index;
+ }
+ 
+ static int get_command(unsigned long offset)
+@@ -773,7 +694,7 @@ static int alloc_pa_mkey(struct mlx5_ib_dev *dev, u32 *key, u32 pdn)
+  seg->qpn_mkey7_0 = cpu_to_be32(0xffffff << 8);
+  seg->start_addr = 0;
+ 
+- err = mlx5_core_create_mkey(&dev->mdev, &mr, in, sizeof(*in),
++ err = mlx5_core_create_mkey(dev->mdev, &mr, in, sizeof(*in),
+         NULL, NULL, NULL);
+  if (err) {
+   mlx5_ib_warn(dev, "failed to create mkey, %d\n", err);
+@@ -798,7 +719,7 @@ static void free_pa_mkey(struct mlx5_ib_dev *dev, u32 key)
+ 
+  memset(&mr, 0, sizeof(mr));
+  mr.key = key;
+- err = mlx5_core_destroy_mkey(&dev->mdev, &mr);
++ err = mlx5_core_destroy_mkey(dev->mdev, &mr);
+  if (err)
+   mlx5_ib_warn(dev, "failed to destroy mkey 0x%x\n", key);
+ }
+@@ -815,7 +736,7 @@ static struct ib_pd *mlx5_ib_alloc_pd(struct ib_device *ibdev,
+  if (!pd)
+   return ERR_PTR(-ENOMEM);
+ 
+- err = mlx5_core_alloc_pd(&to_mdev(ibdev)->mdev, &pd->pdn);
++ err = mlx5_core_alloc_pd(to_mdev(ibdev)->mdev, &pd->pdn);
+  if (err) {
+   kfree(pd);
+   return ERR_PTR(err);
+@@ -824,14 +745,14 @@ static struct ib_pd *mlx5_ib_alloc_pd(struct ib_device *ibdev,
+  if (context) {
+   resp.pdn = pd->pdn;
+   if (ib_copy_to_udata(udata, &resp, sizeof(resp))) {
+-   mlx5_core_dealloc_pd(&to_mdev(ibdev)->mdev, pd->pdn);
++   mlx5_core_dealloc_pd(to_mdev(ibdev)->mdev, pd->pdn);
+    kfree(pd);
+    return ERR_PTR(-EFAULT);
+   }
+  } else {
+   err = alloc_pa_mkey(to_mdev(ibdev), &pd->pa_lkey, pd->pdn);
+   if (err) {
+-   mlx5_core_dealloc_pd(&to_mdev(ibdev)->mdev, pd->pdn);
++   mlx5_core_dealloc_pd(to_mdev(ibdev)->mdev, pd->pdn);
+    kfree(pd);
+    return ERR_PTR(err);
+   }
+@@ -848,7 +769,7 @@ static int mlx5_ib_dealloc_pd(struct ib_pd *pd)
+  if (!pd->uobject)
+   free_pa_mkey(mdev, mpd->pa_lkey);
+ 
+- mlx5_core_dealloc_pd(&mdev->mdev, mpd->pdn);
++ mlx5_core_dealloc_pd(mdev->mdev, mpd->pdn);
+  kfree(mpd);
+ 
+  return 0;
+@@ -859,7 +780,7 @@ static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
+  struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
+  int err;
+ 
+- err = mlx5_core_attach_mcg(&dev->mdev, gid, ibqp->qp_num);
++ err = mlx5_core_attach_mcg(dev->mdev, gid, ibqp->qp_num);
+  if (err)
+   mlx5_ib_warn(dev, "failed attaching QPN 0x%x, MGID %pI6\n",
+         ibqp->qp_num, gid->raw);
+@@ -872,7 +793,7 @@ static int mlx5_ib_mcg_detach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
+  struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
+  int err;
+ 
+- err = mlx5_core_detach_mcg(&dev->mdev, gid, ibqp->qp_num);
++ err = mlx5_core_detach_mcg(dev->mdev, gid, ibqp->qp_num);
+  if (err)
+   mlx5_ib_warn(dev, "failed detaching QPN 0x%x, MGID %pI6\n",
+         ibqp->qp_num, gid->raw);
+@@ -906,7 +827,7 @@ static int init_node_data(struct mlx5_ib_dev *dev)
+  if (err)
+   goto out;
+ 
+- dev->mdev.rev_id = be32_to_cpup((__be32 *)(out_mad->data + 32));
++ dev->mdev->rev_id = be32_to_cpup((__be32 *)(out_mad->data + 32));
+  memcpy(&dev->ib_dev.node_guid, out_mad->data + 12, 8);
+ 
+ out:
+@@ -921,7 +842,7 @@ static ssize_t show_fw_pages(struct device *device, struct device_attribute *att
+  struct mlx5_ib_dev *dev =
+   container_of(device, struct mlx5_ib_dev, ib_dev.dev);
+ 
+- return sprintf(buf, "%d\n", dev->mdev.priv.fw_pages);
++ return sprintf(buf, "%d\n", dev->mdev->priv.fw_pages);
+ }
+ 
+ static ssize_t show_reg_pages(struct device *device,
+@@ -930,7 +851,7 @@ static ssize_t show_reg_pages(struct device *device,
+  struct mlx5_ib_dev *dev =
+   container_of(device, struct mlx5_ib_dev, ib_dev.dev);
+ 
+- return sprintf(buf, "%d\n", dev->mdev.priv.reg_pages);
++ return sprintf(buf, "%d\n", dev->mdev->priv.reg_pages);
+ }
+ 
+ static ssize_t show_hca(struct device *device, struct device_attribute *attr,
+@@ -938,7 +859,7 @@ static ssize_t show_hca(struct device *device, struct device_attribute *attr,
+ {
+  struct mlx5_ib_dev *dev =
+   container_of(device, struct mlx5_ib_dev, ib_dev.dev);
+- return sprintf(buf, "MT%d\n", dev->mdev.pdev->device);
++ return sprintf(buf, "MT%d\n", dev->mdev->pdev->device);
+ }
+ 
+ static ssize_t show_fw_ver(struct device *device, struct device_attribute *attr,
+@@ -946,8 +867,8 @@ static ssize_t show_fw_ver(struct device *device, struct device_attribute *attr,
+ {
+  struct mlx5_ib_dev *dev =
+   container_of(device, struct mlx5_ib_dev, ib_dev.dev);
+- return sprintf(buf, "%d.%d.%d\n", fw_rev_maj(&dev->mdev),
+-         fw_rev_min(&dev->mdev), fw_rev_sub(&dev->mdev));
++ return sprintf(buf, "%d.%d.%d\n", fw_rev_maj(dev->mdev),
++         fw_rev_min(dev->mdev), fw_rev_sub(dev->mdev));
+ }
+ 
+ static ssize_t show_rev(struct device *device, struct device_attribute *attr,
+@@ -955,7 +876,7 @@ static ssize_t show_rev(struct device *device, struct device_attribute *attr,
+ {
+  struct mlx5_ib_dev *dev =
+   container_of(device, struct mlx5_ib_dev, ib_dev.dev);
+- return sprintf(buf, "%x\n", dev->mdev.rev_id);
++ return sprintf(buf, "%x\n", dev->mdev->rev_id);
+ }
+ 
+ static ssize_t show_board(struct device *device, struct device_attribute *attr,
+@@ -964,7 +885,7 @@ static ssize_t show_board(struct device *device, struct device_attribute *attr,
+  struct mlx5_ib_dev *dev =
+   container_of(device, struct mlx5_ib_dev, ib_dev.dev);
+  return sprintf(buf, "%.*s\n", MLX5_BOARD_ID_LEN,
+-         dev->mdev.board_id);
++         dev->mdev->board_id);
+ }
+ 
+ static DEVICE_ATTR(hw_rev,   S_IRUGO, show_rev,    NULL);
+@@ -983,11 +904,12 @@ static struct device_attribute *mlx5_class_attributes[] = {
+  &dev_attr_reg_pages,
+ };
+ 
+-static void mlx5_ib_event(struct mlx5_core_dev *dev, enum mlx5_dev_event event,
+-     void *data)
++static void mlx5_ib_event(struct mlx5_core_dev *dev, void *context,
++     enum mlx5_dev_event event, void *data)
+ {
+- struct mlx5_ib_dev *ibdev = container_of(dev, struct mlx5_ib_dev, mdev);
++ struct mlx5_ib_dev *ibdev = (struct mlx5_ib_dev *)context;
+  struct ib_event ibev;
++
+  u8 port = 0;
+ 
+  switch (event) {
+@@ -1047,7 +969,7 @@ static void get_ext_port_caps(struct mlx5_ib_dev *dev)
+ {
+  int port;
+ 
+- for (port = 1; port <= dev->mdev.caps.num_ports; port++)
++ for (port = 1; port <= dev->mdev->caps.num_ports; port++)
+   mlx5_query_ext_port_caps(dev, port);
+ }
+ 
+@@ -1072,14 +994,14 @@ static int get_port_caps(struct mlx5_ib_dev *dev)
+   goto out;
+  }
+ 
+- for (port = 1; port <= dev->mdev.caps.num_ports; port++) {
++ for (port = 1; port <= dev->mdev->caps.num_ports; port++) {
+   err = mlx5_ib_query_port(&dev->ib_dev, port, pprops);
+   if (err) {
+    mlx5_ib_warn(dev, "query_port %d failed %d\n", port, err);
+    break;
+   }
+-  dev->mdev.caps.port[port - 1].pkey_table_len = dprops->max_pkeys;
+-  dev->mdev.caps.port[port - 1].gid_table_len = pprops->gid_tbl_len;
++  dev->mdev->caps.port[port - 1].pkey_table_len = dprops->max_pkeys;
++  dev->mdev->caps.port[port - 1].gid_table_len = pprops->gid_tbl_len;
+   mlx5_ib_dbg(dev, "pkey_table_len %d, gid_table_len %d\n",
+        dprops->max_pkeys, pprops->gid_tbl_len);
+  }
+@@ -1328,10 +1250,8 @@ static void destroy_dev_resources(struct mlx5_ib_resources *devr)
+  mlx5_ib_dealloc_pd(devr->p0);
+ }
+ 
+-static int init_one(struct pci_dev *pdev,
+-      const struct pci_device_id *id)
++static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
+ {
+- struct mlx5_core_dev *mdev;
+  struct mlx5_ib_dev *dev;
+  int err;
+  int i;
+@@ -1340,28 +1260,19 @@ static int init_one(struct pci_dev *pdev,
+ 
+  dev = (struct mlx5_ib_dev *)ib_alloc_device(sizeof(*dev));
+  if (!dev)
+-  return -ENOMEM;
++  return NULL;
+ 
+- mdev = &dev->mdev;
+- mdev->event = mlx5_ib_event;
+- if (prof_sel >= ARRAY_SIZE(profile)) {
+-  pr_warn("selected pofile out of range, selceting default\n");
+-  prof_sel = 0;
+- }
+- mdev->profile = &profile[prof_sel];
+- err = mlx5_dev_init(mdev, pdev);
+- if (err)
+-  goto err_free;
++ dev->mdev = mdev;
+ 
+  err = get_port_caps(dev);
+  if (err)
+-  goto err_cleanup;
++  goto err_dealloc;
+ 
+  get_ext_port_caps(dev);
+ 
+  err = alloc_comp_eqs(dev);
+  if (err)
+-  goto err_cleanup;
++  goto err_dealloc;
+ 
+  MLX5_INIT_DOORBELL_LOCK(&dev->uar_lock);
+ 
+@@ -1480,7 +1391,7 @@ static int init_one(struct pci_dev *pdev,
+ 
+  dev->ib_active = true;
+ 
+- return 0;
++ return dev;
+ 
+ err_umrc:
+  destroy_umrc_res(dev);
+@@ -1494,49 +1405,39 @@ err_rsrc:
+ err_eqs:
+  free_comp_eqs(dev);
+ 
+-err_cleanup:
+- mlx5_dev_cleanup(mdev);
+-
+-err_free:
++err_dealloc:
+  ib_dealloc_device((struct ib_device *)dev);
+ 
+- return err;
++ return NULL;
+ }
+ 
+-static void remove_one(struct pci_dev *pdev)
++static void mlx5_ib_remove(struct mlx5_core_dev *mdev, void *context)
+ {
+- struct mlx5_ib_dev *dev = mlx5_pci2ibdev(pdev);
+-
++ struct mlx5_ib_dev *dev = context;
+  destroy_umrc_res(dev);
+  ib_unregister_device(&dev->ib_dev);
+  destroy_dev_resources(&dev->devr);
+  free_comp_eqs(dev);
+- mlx5_dev_cleanup(&dev->mdev);
+  ib_dealloc_device(&dev->ib_dev);
+ }
+ 
+-static DEFINE_PCI_DEVICE_TABLE(mlx5_ib_pci_table) = {
+- { PCI_VDEVICE(MELLANOX, 4113) }, /* MT4113 Connect-IB */
+- { 0, }
+-};
+-
+-MODULE_DEVICE_TABLE(pci, mlx5_ib_pci_table);
+-
+-static struct pci_driver mlx5_ib_driver = {
+- .name  = DRIVER_NAME,
+- .id_table = mlx5_ib_pci_table,
+- .probe  = init_one,
+- .remove  = remove_one
++static struct mlx5_interface mlx5_ib_interface = {
++ .add            = mlx5_ib_add,
++ .remove         = mlx5_ib_remove,
++ .event          = mlx5_ib_event,
+ };
+ 
+ static int __init mlx5_ib_init(void)
+ {
+- return pci_register_driver(&mlx5_ib_driver);
++ if (deprecated_prof_sel != 2)
++  pr_warn("prof_sel is deprecated for mlx5_ib, set it for mlx5_core\n");
++
++ return mlx5_register_interface(&mlx5_ib_interface);
+ }
+ 
+ static void __exit mlx5_ib_cleanup(void)
+ {
+- pci_unregister_driver(&mlx5_ib_driver);
++ mlx5_unregister_interface(&mlx5_ib_interface);
+ }
+ 
+ module_init(mlx5_ib_init);
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index f2ccf1a..a0e204f 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -360,7 +360,7 @@ struct mlx5_ib_resources {
+ 
+ struct mlx5_ib_dev {
+  struct ib_device  ib_dev;
+- struct mlx5_core_dev  mdev;
++ struct mlx5_core_dev  *mdev;
+  MLX5_DECLARE_DOORBELL_LOCK(uar_lock);
+  struct list_head  eqs_list;
+  int    num_ports;
+@@ -454,16 +454,6 @@ static inline struct mlx5_ib_ah *to_mah(struct ib_ah *ibah)
+  return container_of(ibah, struct mlx5_ib_ah, ibah);
+ }
+ 
+-static inline struct mlx5_ib_dev *mlx5_core2ibdev(struct mlx5_core_dev *dev)
+-{
+- return container_of(dev, struct mlx5_ib_dev, mdev);
+-}
+-
+-static inline struct mlx5_ib_dev *mlx5_pci2ibdev(struct pci_dev *pdev)
+-{
+- return mlx5_core2ibdev(pci2mlx5_core_dev(pdev));
+-}
+-
+ int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
+    struct mlx5_db *db);
+ void mlx5_ib_db_unmap_user(struct mlx5_ib_ucontext *context, struct mlx5_db *db);
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index afa873b..80b3c63 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -73,7 +73,7 @@ static void reg_mr_callback(int status, void *context)
+  struct mlx5_cache_ent *ent = &cache->ent[c];
+  u8 key;
+  unsigned long flags;
+- struct mlx5_mr_table *table = &dev->mdev.priv.mr_table;
++ struct mlx5_mr_table *table = &dev->mdev->priv.mr_table;
+  int err;
+ 
+  spin_lock_irqsave(&ent->lock, flags);
+@@ -97,9 +97,9 @@ static void reg_mr_callback(int status, void *context)
+   return;
+  }
+ 
+- spin_lock_irqsave(&dev->mdev.priv.mkey_lock, flags);
+- key = dev->mdev.priv.mkey_key++;
+- spin_unlock_irqrestore(&dev->mdev.priv.mkey_lock, flags);
++ spin_lock_irqsave(&dev->mdev->priv.mkey_lock, flags);
++ key = dev->mdev->priv.mkey_key++;
++ spin_unlock_irqrestore(&dev->mdev->priv.mkey_lock, flags);
+  mr->mmr.key = mlx5_idx_to_mkey(be32_to_cpu(mr->out.mkey) & 0xffffff) | key;
+ 
+  cache->last_add = jiffies;
+@@ -155,7 +155,7 @@ static int add_keys(struct mlx5_ib_dev *dev, int c, int num)
+   spin_lock_irq(&ent->lock);
+   ent->pending++;
+   spin_unlock_irq(&ent->lock);
+-  err = mlx5_core_create_mkey(&dev->mdev, &mr->mmr, in,
++  err = mlx5_core_create_mkey(dev->mdev, &mr->mmr, in,
+          sizeof(*in), reg_mr_callback,
+          mr, &mr->out);
+   if (err) {
+@@ -188,7 +188,7 @@ static void remove_keys(struct mlx5_ib_dev *dev, int c, int num)
+   ent->cur--;
+   ent->size--;
+   spin_unlock_irq(&ent->lock);
+-  err = mlx5_core_destroy_mkey(&dev->mdev, &mr->mmr);
++  err = mlx5_core_destroy_mkey(dev->mdev, &mr->mmr);
+   if (err)
+    mlx5_ib_warn(dev, "failed destroy mkey\n");
+   else
+@@ -479,7 +479,7 @@ static void clean_keys(struct mlx5_ib_dev *dev, int c)
+   ent->cur--;
+   ent->size--;
+   spin_unlock_irq(&ent->lock);
+-  err = mlx5_core_destroy_mkey(&dev->mdev, &mr->mmr);
++  err = mlx5_core_destroy_mkey(dev->mdev, &mr->mmr);
+   if (err)
+    mlx5_ib_warn(dev, "failed destroy mkey\n");
+   else
+@@ -496,7 +496,7 @@ static int mlx5_mr_cache_debugfs_init(struct mlx5_ib_dev *dev)
+  if (!mlx5_debugfs_root)
+   return 0;
+ 
+- cache->root = debugfs_create_dir("mr_cache", dev->mdev.priv.dbg_root);
++ cache->root = debugfs_create_dir("mr_cache", dev->mdev->priv.dbg_root);
+  if (!cache->root)
+   return -ENOMEM;
+ 
+@@ -571,8 +571,8 @@ int mlx5_mr_cache_init(struct mlx5_ib_dev *dev)
+   ent->order = i + 2;
+   ent->dev = dev;
+ 
+-  if (dev->mdev.profile->mask & MLX5_PROF_MASK_MR_CACHE)
+-   limit = dev->mdev.profile->mr_cache[i].limit;
++  if (dev->mdev->profile->mask & MLX5_PROF_MASK_MR_CACHE)
++   limit = dev->mdev->profile->mr_cache[i].limit;
+   else
+    limit = 0;
+ 
+@@ -610,7 +610,7 @@ int mlx5_mr_cache_cleanup(struct mlx5_ib_dev *dev)
+ struct ib_mr *mlx5_ib_get_dma_mr(struct ib_pd *pd, int acc)
+ {
+  struct mlx5_ib_dev *dev = to_mdev(pd->device);
+- struct mlx5_core_dev *mdev = &dev->mdev;
++ struct mlx5_core_dev *mdev = dev->mdev;
+  struct mlx5_create_mkey_mbox_in *in;
+  struct mlx5_mkey_seg *seg;
+  struct mlx5_ib_mr *mr;
+@@ -846,7 +846,7 @@ static struct mlx5_ib_mr *reg_create(struct ib_pd *pd, u64 virt_addr,
+  in->seg.qpn_mkey7_0 = cpu_to_be32(0xffffff << 8);
+  in->xlat_oct_act_size = cpu_to_be32(get_octo_len(virt_addr, length,
+         1 << page_shift));
+- err = mlx5_core_create_mkey(&dev->mdev, &mr->mmr, in, inlen, NULL,
++ err = mlx5_core_create_mkey(dev->mdev, &mr->mmr, in, inlen, NULL,
+         NULL, NULL);
+  if (err) {
+   mlx5_ib_warn(dev, "create mkey failed\n");
+@@ -923,7 +923,7 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  mr->umem = umem;
+  mr->npages = npages;
+  spin_lock(&dev->mr_lock);
+- dev->mdev.priv.reg_pages += npages;
++ dev->mdev->priv.reg_pages += npages;
+  spin_unlock(&dev->mr_lock);
+  mr->ibmr.lkey = mr->mmr.key;
+  mr->ibmr.rkey = mr->mmr.key;
+@@ -978,7 +978,7 @@ int mlx5_ib_dereg_mr(struct ib_mr *ibmr)
+  int err;
+ 
+  if (!umred) {
+-  err = mlx5_core_destroy_mkey(&dev->mdev, &mr->mmr);
++  err = mlx5_core_destroy_mkey(dev->mdev, &mr->mmr);
+   if (err) {
+    mlx5_ib_warn(dev, "failed to destroy mkey 0x%x (%d)\n",
+          mr->mmr.key, err);
+@@ -996,7 +996,7 @@ int mlx5_ib_dereg_mr(struct ib_mr *ibmr)
+  if (umem) {
+   ib_umem_release(umem);
+   spin_lock(&dev->mr_lock);
+-  dev->mdev.priv.reg_pages -= npages;
++  dev->mdev->priv.reg_pages -= npages;
+   spin_unlock(&dev->mr_lock);
+  }
+ 
+@@ -1044,7 +1044,7 @@ struct ib_mr *mlx5_ib_create_mr(struct ib_pd *pd,
+   }
+ 
+   /* create mem & wire PSVs */
+-  err = mlx5_core_create_psv(&dev->mdev, to_mpd(pd)->pdn,
++  err = mlx5_core_create_psv(dev->mdev, to_mpd(pd)->pdn,
+         2, psv_index);
+   if (err)
+    goto err_free_sig;
+@@ -1060,7 +1060,7 @@ struct ib_mr *mlx5_ib_create_mr(struct ib_pd *pd,
+  }
+ 
+  in->seg.flags = MLX5_PERM_UMR_EN | access_mode;
+- err = mlx5_core_create_mkey(&dev->mdev, &mr->mmr, in, sizeof(*in),
++ err = mlx5_core_create_mkey(dev->mdev, &mr->mmr, in, sizeof(*in),
+         NULL, NULL, NULL);
+  if (err)
+   goto err_destroy_psv;
+@@ -1074,11 +1074,11 @@ struct ib_mr *mlx5_ib_create_mr(struct ib_pd *pd,
+ 
+ err_destroy_psv:
+  if (mr->sig) {
+-  if (mlx5_core_destroy_psv(&dev->mdev,
++  if (mlx5_core_destroy_psv(dev->mdev,
+        mr->sig->psv_memory.psv_idx))
+    mlx5_ib_warn(dev, "failed to destroy mem psv %d\n",
+          mr->sig->psv_memory.psv_idx);
+-  if (mlx5_core_destroy_psv(&dev->mdev,
++  if (mlx5_core_destroy_psv(dev->mdev,
+        mr->sig->psv_wire.psv_idx))
+    mlx5_ib_warn(dev, "failed to destroy wire psv %d\n",
+          mr->sig->psv_wire.psv_idx);
+@@ -1099,18 +1099,18 @@ int mlx5_ib_destroy_mr(struct ib_mr *ibmr)
+  int err;
+ 
+  if (mr->sig) {
+-  if (mlx5_core_destroy_psv(&dev->mdev,
++  if (mlx5_core_destroy_psv(dev->mdev,
+        mr->sig->psv_memory.psv_idx))
+    mlx5_ib_warn(dev, "failed to destroy mem psv %d\n",
+          mr->sig->psv_memory.psv_idx);
+-  if (mlx5_core_destroy_psv(&dev->mdev,
++  if (mlx5_core_destroy_psv(dev->mdev,
+        mr->sig->psv_wire.psv_idx))
+    mlx5_ib_warn(dev, "failed to destroy wire psv %d\n",
+          mr->sig->psv_wire.psv_idx);
+   kfree(mr->sig);
+  }
+ 
+- err = mlx5_core_destroy_mkey(&dev->mdev, &mr->mmr);
++ err = mlx5_core_destroy_mkey(dev->mdev, &mr->mmr);
+  if (err) {
+   mlx5_ib_warn(dev, "failed to destroy mkey 0x%x (%d)\n",
+         mr->mmr.key, err);
+@@ -1149,7 +1149,7 @@ struct ib_mr *mlx5_ib_alloc_fast_reg_mr(struct ib_pd *pd,
+   * TBD not needed - issue 197292 */
+  in->seg.log2_page_size = PAGE_SHIFT;
+ 
+- err = mlx5_core_create_mkey(&dev->mdev, &mr->mmr, in, sizeof(*in), NULL,
++ err = mlx5_core_create_mkey(dev->mdev, &mr->mmr, in, sizeof(*in), NULL,
+         NULL, NULL);
+  kfree(in);
+  if (err)
+@@ -1202,7 +1202,7 @@ void mlx5_ib_free_fast_reg_page_list(struct ib_fast_reg_page_list *page_list)
+  struct mlx5_ib_dev *dev = to_mdev(page_list->device);
+  int size = page_list->max_page_list_len * sizeof(u64);
+ 
+- dma_free_coherent(&dev->mdev.pdev->dev, size, mfrpl->mapped_page_list,
++ dma_free_coherent(&dev->mdev->pdev->dev, size, mfrpl->mapped_page_list,
+      mfrpl->map);
+  kfree(mfrpl->ibfrpl.page_list);
+  kfree(mfrpl);
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index bbbcf38..b8bb6ad 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -162,7 +162,7 @@ static int set_rq_size(struct mlx5_ib_dev *dev, struct ib_qp_cap *cap,
+  int wq_size;
+ 
+  /* Sanity check RQ size before proceeding */
+- if (cap->max_recv_wr  > dev->mdev.caps.max_wqes)
++ if (cap->max_recv_wr  > dev->mdev->caps.max_wqes)
+   return -EINVAL;
+ 
+  if (!has_rq) {
+@@ -182,10 +182,10 @@ static int set_rq_size(struct mlx5_ib_dev *dev, struct ib_qp_cap *cap,
+    wq_size = roundup_pow_of_two(cap->max_recv_wr) * wqe_size;
+    wq_size = max_t(int, wq_size, MLX5_SEND_WQE_BB);
+    qp->rq.wqe_cnt = wq_size / wqe_size;
+-   if (wqe_size > dev->mdev.caps.max_rq_desc_sz) {
++   if (wqe_size > dev->mdev->caps.max_rq_desc_sz) {
+     mlx5_ib_dbg(dev, "wqe_size %d, max %d\n",
+          wqe_size,
+-         dev->mdev.caps.max_rq_desc_sz);
++         dev->mdev->caps.max_rq_desc_sz);
+     return -EINVAL;
+    }
+    qp->rq.wqe_shift = ilog2(wqe_size);
+@@ -277,9 +277,9 @@ static int calc_sq_size(struct mlx5_ib_dev *dev, struct ib_qp_init_attr *attr,
+  if (wqe_size < 0)
+   return wqe_size;
+ 
+- if (wqe_size > dev->mdev.caps.max_sq_desc_sz) {
++ if (wqe_size > dev->mdev->caps.max_sq_desc_sz) {
+   mlx5_ib_dbg(dev, "wqe_size(%d) > max_sq_desc_sz(%d)\n",
+-       wqe_size, dev->mdev.caps.max_sq_desc_sz);
++       wqe_size, dev->mdev->caps.max_sq_desc_sz);
+   return -EINVAL;
+  }
+ 
+@@ -292,9 +292,9 @@ static int calc_sq_size(struct mlx5_ib_dev *dev, struct ib_qp_init_attr *attr,
+ 
+  wq_size = roundup_pow_of_two(attr->cap.max_send_wr * wqe_size);
+  qp->sq.wqe_cnt = wq_size / MLX5_SEND_WQE_BB;
+- if (qp->sq.wqe_cnt > dev->mdev.caps.max_wqes) {
++ if (qp->sq.wqe_cnt > dev->mdev->caps.max_wqes) {
+   mlx5_ib_dbg(dev, "wqe count(%d) exceeds limits(%d)\n",
+-       qp->sq.wqe_cnt, dev->mdev.caps.max_wqes);
++       qp->sq.wqe_cnt, dev->mdev->caps.max_wqes);
+   return -ENOMEM;
+  }
+  qp->sq.wqe_shift = ilog2(MLX5_SEND_WQE_BB);
+@@ -311,9 +311,9 @@ static int set_user_buf_size(struct mlx5_ib_dev *dev,
+ {
+  int desc_sz = 1 << qp->sq.wqe_shift;
+ 
+- if (desc_sz > dev->mdev.caps.max_sq_desc_sz) {
++ if (desc_sz > dev->mdev->caps.max_sq_desc_sz) {
+   mlx5_ib_warn(dev, "desc_sz %d, max_sq_desc_sz %d\n",
+-        desc_sz, dev->mdev.caps.max_sq_desc_sz);
++        desc_sz, dev->mdev->caps.max_sq_desc_sz);
+   return -EINVAL;
+  }
+ 
+@@ -325,9 +325,9 @@ static int set_user_buf_size(struct mlx5_ib_dev *dev,
+ 
+  qp->sq.wqe_cnt = ucmd->sq_wqe_count;
+ 
+- if (qp->sq.wqe_cnt > dev->mdev.caps.max_wqes) {
++ if (qp->sq.wqe_cnt > dev->mdev->caps.max_wqes) {
+   mlx5_ib_warn(dev, "wqe_cnt %d, max_wqes %d\n",
+-        qp->sq.wqe_cnt, dev->mdev.caps.max_wqes);
++        qp->sq.wqe_cnt, dev->mdev->caps.max_wqes);
+   return -EINVAL;
+  }
+ 
+@@ -674,7 +674,7 @@ static int create_kernel_qp(struct mlx5_ib_dev *dev,
+  int uuarn;
+  int err;
+ 
+- uuari = &dev->mdev.priv.uuari;
++ uuari = &dev->mdev->priv.uuari;
+  if (init_attr->create_flags & ~(IB_QP_CREATE_SIGNATURE_EN | IB_QP_CREATE_BLOCK_MULTICAST_LOOPBACK))
+   return -EINVAL;
+ 
+@@ -700,7 +700,7 @@ static int create_kernel_qp(struct mlx5_ib_dev *dev,
+  qp->sq.offset = qp->rq.wqe_cnt << qp->rq.wqe_shift;
+  qp->buf_size = err + (qp->rq.wqe_cnt << qp->rq.wqe_shift);
+ 
+- err = mlx5_buf_alloc(&dev->mdev, qp->buf_size, PAGE_SIZE * 2, &qp->buf);
++ err = mlx5_buf_alloc(dev->mdev, qp->buf_size, PAGE_SIZE * 2, &qp->buf);
+  if (err) {
+   mlx5_ib_dbg(dev, "err %d\n", err);
+   goto err_uuar;
+@@ -722,7 +722,7 @@ static int create_kernel_qp(struct mlx5_ib_dev *dev,
+ 
+  mlx5_fill_page_array(&qp->buf, (*in)->pas);
+ 
+- err = mlx5_db_alloc(&dev->mdev, &qp->db);
++ err = mlx5_db_alloc(dev->mdev, &qp->db);
+  if (err) {
+   mlx5_ib_dbg(dev, "err %d\n", err);
+   goto err_free;
+@@ -747,7 +747,7 @@ static int create_kernel_qp(struct mlx5_ib_dev *dev,
+  return 0;
+ 
+ err_wrid:
+- mlx5_db_free(&dev->mdev, &qp->db);
++ mlx5_db_free(dev->mdev, &qp->db);
+  kfree(qp->sq.wqe_head);
+  kfree(qp->sq.w_list);
+  kfree(qp->sq.wrid);
+@@ -758,23 +758,23 @@ err_free:
+  mlx5_vfree(*in);
+ 
+ err_buf:
+- mlx5_buf_free(&dev->mdev, &qp->buf);
++ mlx5_buf_free(dev->mdev, &qp->buf);
+ 
+ err_uuar:
+- free_uuar(&dev->mdev.priv.uuari, uuarn);
++ free_uuar(&dev->mdev->priv.uuari, uuarn);
+  return err;
+ }
+ 
+ static void destroy_qp_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp)
+ {
+- mlx5_db_free(&dev->mdev, &qp->db);
++ mlx5_db_free(dev->mdev, &qp->db);
+  kfree(qp->sq.wqe_head);
+  kfree(qp->sq.w_list);
+  kfree(qp->sq.wrid);
+  kfree(qp->sq.wr_data);
+  kfree(qp->rq.wrid);
+- mlx5_buf_free(&dev->mdev, &qp->buf);
+- free_uuar(&dev->mdev.priv.uuari, qp->bf->uuarn);
++ mlx5_buf_free(dev->mdev, &qp->buf);
++ free_uuar(&dev->mdev->priv.uuari, qp->bf->uuarn);
+ }
+ 
+ static __be32 get_rx_type(struct mlx5_ib_qp *qp, struct ib_qp_init_attr *attr)
+@@ -812,7 +812,7 @@ static int create_qp_common(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+  spin_lock_init(&qp->rq.lock);
+ 
+  if (init_attr->create_flags & IB_QP_CREATE_BLOCK_MULTICAST_LOOPBACK) {
+-  if (!(dev->mdev.caps.flags & MLX5_DEV_CAP_FLAG_BLOCK_MCAST)) {
++  if (!(dev->mdev->caps.flags & MLX5_DEV_CAP_FLAG_BLOCK_MCAST)) {
+    mlx5_ib_dbg(dev, "block multicast loopback isn't supported\n");
+    return -EINVAL;
+   } else {
+@@ -851,9 +851,9 @@ static int create_qp_common(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+     mlx5_ib_dbg(dev, "invalid rq params\n");
+     return -EINVAL;
+    }
+-   if (ucmd.sq_wqe_count > dev->mdev.caps.max_wqes) {
++   if (ucmd.sq_wqe_count > dev->mdev->caps.max_wqes) {
+     mlx5_ib_dbg(dev, "requested sq_wqe_count (%d) > max allowed (%d)\n",
+-         ucmd.sq_wqe_count, dev->mdev.caps.max_wqes);
++         ucmd.sq_wqe_count, dev->mdev->caps.max_wqes);
+     return -EINVAL;
+    }
+    err = create_user_qp(dev, pd, qp, udata, &in, &resp, &inlen);
+@@ -957,7 +957,7 @@ static int create_qp_common(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 
+  in->ctx.db_rec_addr = cpu_to_be64(qp->db.dma);
+ 
+- err = mlx5_core_create_qp(&dev->mdev, &qp->mqp, in, inlen);
++ err = mlx5_core_create_qp(dev->mdev, &qp->mqp, in, inlen);
+  if (err) {
+   mlx5_ib_dbg(dev, "create qp failed\n");
+   goto err_create;
+@@ -1081,7 +1081,7 @@ static void destroy_qp_common(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp)
+  if (!in)
+   return;
+  if (qp->state != IB_QPS_RESET)
+-  if (mlx5_core_qp_modify(&dev->mdev, to_mlx5_state(qp->state),
++  if (mlx5_core_qp_modify(dev->mdev, to_mlx5_state(qp->state),
+      MLX5_QP_STATE_RST, in, sizeof(*in), &qp->mqp))
+    mlx5_ib_warn(dev, "mlx5_ib: modify QP %06x to RESET failed\n",
+          qp->mqp.qpn);
+@@ -1097,7 +1097,7 @@ static void destroy_qp_common(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp)
+   mlx5_ib_unlock_cqs(send_cq, recv_cq);
+  }
+ 
+- err = mlx5_core_destroy_qp(&dev->mdev, &qp->mqp);
++ err = mlx5_core_destroy_qp(dev->mdev, &qp->mqp);
+  if (err)
+   mlx5_ib_warn(dev, "failed to destroy QP 0x%x\n", qp->mqp.qpn);
+  kfree(in);
+@@ -1165,7 +1165,7 @@ struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd,
+  switch (init_attr->qp_type) {
+  case IB_QPT_XRC_TGT:
+  case IB_QPT_XRC_INI:
+-  if (!(dev->mdev.caps.flags & MLX5_DEV_CAP_FLAG_XRC)) {
++  if (!(dev->mdev->caps.flags & MLX5_DEV_CAP_FLAG_XRC)) {
+    mlx5_ib_dbg(dev, "XRC not supported\n");
+    return ERR_PTR(-ENOSYS);
+   }
+@@ -1279,7 +1279,7 @@ static int ib_rate_to_mlx5(struct mlx5_ib_dev *dev, u8 rate)
+  } else {
+   while (rate != IB_RATE_2_5_GBPS &&
+          !(1 << (rate + MLX5_STAT_RATE_OFFSET) &
+-    dev->mdev.caps.stat_rate_support))
++    dev->mdev->caps.stat_rate_support))
+    --rate;
+  }
+ 
+@@ -1318,9 +1318,9 @@ static int mlx5_set_path(struct mlx5_ib_dev *dev, const struct ib_ah_attr *ah,
+  path->port = port;
+ 
+  if (ah->ah_flags & IB_AH_GRH) {
+-  if (ah->grh.sgid_index >= dev->mdev.caps.port[port - 1].gid_table_len) {
++  if (ah->grh.sgid_index >= dev->mdev->caps.port[port - 1].gid_table_len) {
+    pr_err(KERN_ERR "sgid_index (%u) too large. max is %d\n",
+-          ah->grh.sgid_index, dev->mdev.caps.port[port - 1].gid_table_len);
++          ah->grh.sgid_index, dev->mdev->caps.port[port - 1].gid_table_len);
+    return -EINVAL;
+   }
+ 
+@@ -1539,7 +1539,7 @@ static int __mlx5_ib_modify_qp(struct ib_qp *ibqp,
+    err = -EINVAL;
+    goto out;
+   }
+-  context->mtu_msgmax = (attr->path_mtu << 5) | dev->mdev.caps.log_max_msg;
++  context->mtu_msgmax = (attr->path_mtu << 5) | dev->mdev->caps.log_max_msg;
+  }
+ 
+  if (attr_mask & IB_QP_DEST_QPN)
+@@ -1637,7 +1637,7 @@ static int __mlx5_ib_modify_qp(struct ib_qp *ibqp,
+  optpar = ib_mask_to_mlx5_opt(attr_mask);
+  optpar &= opt_mask[mlx5_cur][mlx5_new][mlx5_st];
+  in->optparam = cpu_to_be32(optpar);
+- err = mlx5_core_qp_modify(&dev->mdev, to_mlx5_state(cur_state),
++ err = mlx5_core_qp_modify(dev->mdev, to_mlx5_state(cur_state),
+       to_mlx5_state(new_state), in, sqd_event,
+       &qp->mqp);
+  if (err)
+@@ -1699,21 +1699,21 @@ int mlx5_ib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+   goto out;
+ 
+  if ((attr_mask & IB_QP_PORT) &&
+-     (attr->port_num == 0 || attr->port_num > dev->mdev.caps.num_ports))
++     (attr->port_num == 0 || attr->port_num > dev->mdev->caps.num_ports))
+   goto out;
+ 
+  if (attr_mask & IB_QP_PKEY_INDEX) {
+   port = attr_mask & IB_QP_PORT ? attr->port_num : qp->port;
+-  if (attr->pkey_index >= dev->mdev.caps.port[port - 1].pkey_table_len)
++  if (attr->pkey_index >= dev->mdev->caps.port[port - 1].pkey_table_len)
+    goto out;
+  }
+ 
+  if (attr_mask & IB_QP_MAX_QP_RD_ATOMIC &&
+-     attr->max_rd_atomic > dev->mdev.caps.max_ra_res_qp)
++     attr->max_rd_atomic > dev->mdev->caps.max_ra_res_qp)
+   goto out;
+ 
+  if (attr_mask & IB_QP_MAX_DEST_RD_ATOMIC &&
+-     attr->max_dest_rd_atomic > dev->mdev.caps.max_ra_req_qp)
++     attr->max_dest_rd_atomic > dev->mdev->caps.max_ra_req_qp)
+   goto out;
+ 
+  if (cur_state == new_state && cur_state == IB_QPS_RESET) {
+@@ -2479,7 +2479,7 @@ int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ {
+  struct mlx5_wqe_ctrl_seg *ctrl = NULL;  /* compiler warning */
+  struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
+- struct mlx5_core_dev *mdev = &dev->mdev;
++ struct mlx5_core_dev *mdev = dev->mdev;
+  struct mlx5_ib_qp *qp = to_mqp(ibqp);
+  struct mlx5_ib_mr *mr;
+  struct mlx5_wqe_data_seg *dpseg;
+@@ -2888,7 +2888,7 @@ static int to_ib_qp_access_flags(int mlx5_flags)
+ static void to_ib_ah_attr(struct mlx5_ib_dev *ibdev, struct ib_ah_attr *ib_ah_attr,
+     struct mlx5_qp_path *path)
+ {
+- struct mlx5_core_dev *dev = &ibdev->mdev;
++ struct mlx5_core_dev *dev = ibdev->mdev;
+ 
+  memset(ib_ah_attr, 0, sizeof(*ib_ah_attr));
+  ib_ah_attr->port_num   = path->port;
+@@ -2931,7 +2931,7 @@ int mlx5_ib_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr, int qp_attr
+   goto out;
+  }
+  context = &outb->ctx;
+- err = mlx5_core_qp_query(&dev->mdev, &qp->mqp, outb, sizeof(*outb));
++ err = mlx5_core_qp_query(dev->mdev, &qp->mqp, outb, sizeof(*outb));
+  if (err)
+   goto out_free;
+ 
+@@ -3014,14 +3014,14 @@ struct ib_xrcd *mlx5_ib_alloc_xrcd(struct ib_device *ibdev,
+  struct mlx5_ib_xrcd *xrcd;
+  int err;
+ 
+- if (!(dev->mdev.caps.flags & MLX5_DEV_CAP_FLAG_XRC))
++ if (!(dev->mdev->caps.flags & MLX5_DEV_CAP_FLAG_XRC))
+   return ERR_PTR(-ENOSYS);
+ 
+  xrcd = kmalloc(sizeof(*xrcd), GFP_KERNEL);
+  if (!xrcd)
+   return ERR_PTR(-ENOMEM);
+ 
+- err = mlx5_core_xrcd_alloc(&dev->mdev, &xrcd->xrcdn);
++ err = mlx5_core_xrcd_alloc(dev->mdev, &xrcd->xrcdn);
+  if (err) {
+   kfree(xrcd);
+   return ERR_PTR(-ENOMEM);
+@@ -3036,7 +3036,7 @@ int mlx5_ib_dealloc_xrcd(struct ib_xrcd *xrcd)
+  u32 xrcdn = to_mxrcd(xrcd)->xrcdn;
+  int err;
+ 
+- err = mlx5_core_xrcd_dealloc(&dev->mdev, xrcdn);
++ err = mlx5_core_xrcd_dealloc(dev->mdev, xrcdn);
+  if (err) {
+   mlx5_ib_warn(dev, "failed to dealloc xrcdn 0x%x\n", xrcdn);
+   return err;
+diff --git a/drivers/infiniband/hw/mlx5/srq.c b/drivers/infiniband/hw/mlx5/srq.c
+index 384af6d..70bd131 100644
+--- a/drivers/infiniband/hw/mlx5/srq.c
++++ b/drivers/infiniband/hw/mlx5/srq.c
+@@ -159,7 +159,7 @@ static int create_srq_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_srq *srq,
+  int page_shift;
+  int npages;
+ 
+- err = mlx5_db_alloc(&dev->mdev, &srq->db);
++ err = mlx5_db_alloc(dev->mdev, &srq->db);
+  if (err) {
+   mlx5_ib_warn(dev, "alloc dbell rec failed\n");
+   return err;
+@@ -167,7 +167,7 @@ static int create_srq_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_srq *srq,
+ 
+  *srq->db.db = 0;
+ 
+- if (mlx5_buf_alloc(&dev->mdev, buf_size, PAGE_SIZE * 2, &srq->buf)) {
++ if (mlx5_buf_alloc(dev->mdev, buf_size, PAGE_SIZE * 2, &srq->buf)) {
+   mlx5_ib_dbg(dev, "buf alloc failed\n");
+   err = -ENOMEM;
+   goto err_db;
+@@ -212,10 +212,10 @@ err_in:
+  mlx5_vfree(*in);
+ 
+ err_buf:
+- mlx5_buf_free(&dev->mdev, &srq->buf);
++ mlx5_buf_free(dev->mdev, &srq->buf);
+ 
+ err_db:
+- mlx5_db_free(&dev->mdev, &srq->db);
++ mlx5_db_free(dev->mdev, &srq->db);
+  return err;
+ }
+ 
+@@ -229,8 +229,8 @@ static void destroy_srq_user(struct ib_pd *pd, struct mlx5_ib_srq *srq)
+ static void destroy_srq_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_srq *srq)
+ {
+  kfree(srq->wrid);
+- mlx5_buf_free(&dev->mdev, &srq->buf);
+- mlx5_db_free(&dev->mdev, &srq->db);
++ mlx5_buf_free(dev->mdev, &srq->buf);
++ mlx5_db_free(dev->mdev, &srq->db);
+ }
+ 
+ struct ib_srq *mlx5_ib_create_srq(struct ib_pd *pd,
+@@ -248,10 +248,10 @@ struct ib_srq *mlx5_ib_create_srq(struct ib_pd *pd,
+  u32 flgs, xrcdn;
+ 
+  /* Sanity check SRQ size before proceeding */
+- if (init_attr->attr.max_wr >= dev->mdev.caps.max_srq_wqes) {
++ if (init_attr->attr.max_wr >= dev->mdev->caps.max_srq_wqes) {
+   mlx5_ib_dbg(dev, "max_wr %d, cap %d\n",
+        init_attr->attr.max_wr,
+-       dev->mdev.caps.max_srq_wqes);
++       dev->mdev->caps.max_srq_wqes);
+   return ERR_PTR(-EINVAL);
+  }
+ 
+@@ -303,7 +303,7 @@ struct ib_srq *mlx5_ib_create_srq(struct ib_pd *pd,
+ 
+  in->ctx.pd = cpu_to_be32(to_mpd(pd)->pdn);
+  in->ctx.db_record = cpu_to_be64(srq->db.dma);
+- err = mlx5_core_create_srq(&dev->mdev, &srq->msrq, in, inlen);
++ err = mlx5_core_create_srq(dev->mdev, &srq->msrq, in, inlen);
+  mlx5_vfree(in);
+  if (err) {
+   mlx5_ib_dbg(dev, "create SRQ failed, err %d\n", err);
+@@ -327,7 +327,7 @@ struct ib_srq *mlx5_ib_create_srq(struct ib_pd *pd,
+  return &srq->ibsrq;
+ 
+ err_core:
+- mlx5_core_destroy_srq(&dev->mdev, &srq->msrq);
++ mlx5_core_destroy_srq(dev->mdev, &srq->msrq);
+ 
+ err_usr_kern_srq:
+  if (pd->uobject)
+@@ -357,7 +357,7 @@ int mlx5_ib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+    return -EINVAL;
+ 
+   mutex_lock(&srq->mutex);
+-  ret = mlx5_core_arm_srq(&dev->mdev, &srq->msrq, attr->srq_limit, 1);
++  ret = mlx5_core_arm_srq(dev->mdev, &srq->msrq, attr->srq_limit, 1);
+   mutex_unlock(&srq->mutex);
+ 
+   if (ret)
+@@ -378,7 +378,7 @@ int mlx5_ib_query_srq(struct ib_srq *ibsrq, struct ib_srq_attr *srq_attr)
+  if (!out)
+   return -ENOMEM;
+ 
+- ret = mlx5_core_query_srq(&dev->mdev, &srq->msrq, out);
++ ret = mlx5_core_query_srq(dev->mdev, &srq->msrq, out);
+  if (ret)
+   goto out_box;
+ 
+@@ -396,7 +396,7 @@ int mlx5_ib_destroy_srq(struct ib_srq *srq)
+  struct mlx5_ib_dev *dev = to_mdev(srq->device);
+  struct mlx5_ib_srq *msrq = to_msrq(srq);
+ 
+- mlx5_core_destroy_srq(&dev->mdev, &msrq->msrq);
++ mlx5_core_destroy_srq(dev->mdev, &msrq->msrq);
+ 
+  if (srq->uobject) {
+   mlx5_ib_db_unmap_user(to_mucontext(srq->uobject->context), &msrq->db);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index ee24f13..4b7f9da 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -58,7 +58,100 @@ int mlx5_core_debug_mask;
+ module_param_named(debug_mask, mlx5_core_debug_mask, int, 0644);
+ MODULE_PARM_DESC(debug_mask, "debug mask: 1 = dump cmd data, 2 = dump cmd exec time, 3 = both. Default=0");
+ 
++#define MLX5_DEFAULT_PROF 2
++static int prof_sel = MLX5_DEFAULT_PROF;
++module_param_named(prof_sel, prof_sel, int, 0444);
++MODULE_PARM_DESC(prof_sel, "profile selector. Valid range 0 - 2");
++
+ struct workqueue_struct *mlx5_core_wq;
++static LIST_HEAD(intf_list);
++static LIST_HEAD(dev_list);
++static DEFINE_MUTEX(intf_mutex);
++
++struct mlx5_device_context {
++ struct list_head list;
++ struct mlx5_interface  *intf;
++ void         *context;
++};
++
++static struct mlx5_profile profile[] = {
++ [0] = {
++  .mask           = 0,
++ },
++ [1] = {
++  .mask  = MLX5_PROF_MASK_QP_SIZE,
++  .log_max_qp = 12,
++ },
++ [2] = {
++  .mask  = MLX5_PROF_MASK_QP_SIZE |
++      MLX5_PROF_MASK_MR_CACHE,
++  .log_max_qp = 17,
++  .mr_cache[0] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[1] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[2] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[3] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[4] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[5] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[6] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[7] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[8] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[9] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[10] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[11] = {
++   .size = 500,
++   .limit = 250
++  },
++  .mr_cache[12] = {
++   .size = 64,
++   .limit = 32
++  },
++  .mr_cache[13] = {
++   .size = 32,
++   .limit = 16
++  },
++  .mr_cache[14] = {
++   .size = 16,
++   .limit = 8
++  },
++  .mr_cache[15] = {
++   .size = 8,
++   .limit = 4
++  },
++ },
++};
+ 
+ static int set_dma_caps(struct pci_dev *pdev)
+ {
+@@ -299,7 +392,7 @@ static int mlx5_core_disable_hca(struct mlx5_core_dev *dev)
+  return 0;
+ }
+ 
+-int mlx5_dev_init(struct mlx5_core_dev *dev, struct pci_dev *pdev)
++static int mlx5_dev_init(struct mlx5_core_dev *dev, struct pci_dev *pdev)
+ {
+  struct mlx5_priv *priv = &dev->priv;
+  int err;
+@@ -489,7 +582,7 @@ err_dbg:
+ }
+ EXPORT_SYMBOL(mlx5_dev_init);
+ 
+-void mlx5_dev_cleanup(struct mlx5_core_dev *dev)
++static void mlx5_dev_cleanup(struct mlx5_core_dev *dev)
+ {
+  struct mlx5_priv *priv = &dev->priv;
+ 
+@@ -516,7 +609,190 @@ void mlx5_dev_cleanup(struct mlx5_core_dev *dev)
+  pci_disable_device(dev->pdev);
+  debugfs_remove(priv->dbg_root);
+ }
+-EXPORT_SYMBOL(mlx5_dev_cleanup);
++
++static void mlx5_add_device(struct mlx5_interface *intf, struct mlx5_priv *priv)
++{
++ struct mlx5_device_context *dev_ctx;
++ struct mlx5_core_dev *dev = container_of(priv, struct mlx5_core_dev, priv);
++
++ dev_ctx = kmalloc(sizeof(*dev_ctx), GFP_KERNEL);
++ if (!dev_ctx) {
++  pr_warn("mlx5_add_device: alloc context failed\n");
++  return;
++ }
++
++ dev_ctx->intf    = intf;
++ dev_ctx->context = intf->add(dev);
++
++ if (dev_ctx->context) {
++  spin_lock_irq(&priv->ctx_lock);
++  list_add_tail(&dev_ctx->list, &priv->ctx_list);
++  spin_unlock_irq(&priv->ctx_lock);
++ } else {
++  kfree(dev_ctx);
++ }
++}
++
++static void mlx5_remove_device(struct mlx5_interface *intf, struct mlx5_priv *priv)
++{
++ struct mlx5_device_context *dev_ctx;
++ struct mlx5_core_dev *dev = container_of(priv, struct mlx5_core_dev, priv);
++
++ list_for_each_entry(dev_ctx, &priv->ctx_list, list)
++  if (dev_ctx->intf == intf) {
++   spin_lock_irq(&priv->ctx_lock);
++   list_del(&dev_ctx->list);
++   spin_unlock_irq(&priv->ctx_lock);
++
++   intf->remove(dev, dev_ctx->context);
++   kfree(dev_ctx);
++   return;
++  }
++}
++static int mlx5_register_device(struct mlx5_core_dev *dev)
++{
++ struct mlx5_priv *priv = &dev->priv;
++ struct mlx5_interface *intf;
++
++ mutex_lock(&intf_mutex);
++ list_add_tail(&priv->dev_list, &dev_list);
++ list_for_each_entry(intf, &intf_list, list)
++  mlx5_add_device(intf, priv);
++ mutex_unlock(&intf_mutex);
++
++ return 0;
++}
++static void mlx5_unregister_device(struct mlx5_core_dev *dev)
++{
++ struct mlx5_priv *priv = &dev->priv;
++ struct mlx5_interface *intf;
++
++ mutex_lock(&intf_mutex);
++ list_for_each_entry(intf, &intf_list, list)
++  mlx5_remove_device(intf, priv);
++ list_del(&priv->dev_list);
++ mutex_unlock(&intf_mutex);
++}
++
++int mlx5_register_interface(struct mlx5_interface *intf)
++{
++ struct mlx5_priv *priv;
++
++ if (!intf->add || !intf->remove)
++  return -EINVAL;
++
++ mutex_lock(&intf_mutex);
++ list_add_tail(&intf->list, &intf_list);
++ list_for_each_entry(priv, &dev_list, dev_list)
++  mlx5_add_device(intf, priv);
++ mutex_unlock(&intf_mutex);
++
++ return 0;
++}
++EXPORT_SYMBOL(mlx5_register_interface);
++
++void mlx5_unregister_interface(struct mlx5_interface *intf)
++{
++ struct mlx5_priv *priv;
++
++ mutex_lock(&intf_mutex);
++ list_for_each_entry(priv, &dev_list, dev_list)
++        mlx5_remove_device(intf, priv);
++ list_del(&intf->list);
++ mutex_unlock(&intf_mutex);
++}
++EXPORT_SYMBOL(mlx5_unregister_interface);
++
++static void mlx5_core_event(struct mlx5_core_dev *dev, enum mlx5_dev_event event,
++       void *data)
++{
++ struct mlx5_priv *priv = &dev->priv;
++ struct mlx5_device_context *dev_ctx;
++ unsigned long flags;
++
++ spin_lock_irqsave(&priv->ctx_lock, flags);
++
++ list_for_each_entry(dev_ctx, &priv->ctx_list, list)
++  if (dev_ctx->intf->event)
++   dev_ctx->intf->event(dev, dev_ctx->context, event, data);
++
++ spin_unlock_irqrestore(&priv->ctx_lock, flags);
++}
++
++struct mlx5_core_event_handler {
++ void (*event)(struct mlx5_core_dev *dev,
++        enum mlx5_dev_event event,
++        void *data);
++};
++
++static int init_one(struct pci_dev *pdev,
++      const struct pci_device_id *id)
++{
++ struct mlx5_core_dev *dev;
++ struct mlx5_priv *priv;
++ int err;
++
++ dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++ if (!dev) {
++  dev_err(&pdev->dev, "kzalloc failed\n");
++  return -ENOMEM;
++ }
++ priv = &dev->priv;
++
++ pci_set_drvdata(pdev, dev);
++
++ if (prof_sel < 0 || prof_sel >= ARRAY_SIZE(profile)) {
++  pr_warn("selected profile out of range, selecting default (%d)\n",
++   MLX5_DEFAULT_PROF);
++  prof_sel = MLX5_DEFAULT_PROF;
++ }
++ dev->profile = &profile[prof_sel];
++ dev->event = mlx5_core_event;
++
++ err = mlx5_dev_init(dev, pdev);
++ if (err) {
++  dev_err(&pdev->dev, "mlx5_dev_init failed %d\n", err);
++  goto out;
++ }
++
++ INIT_LIST_HEAD(&priv->ctx_list);
++ spin_lock_init(&priv->ctx_lock);
++ err = mlx5_register_device(dev);
++ if (err) {
++  dev_err(&pdev->dev, "mlx5_register_device failed %d\n", err);
++  goto out_init;
++ }
++
++ return 0;
++
++out_init:
++ mlx5_dev_cleanup(dev);
++out:
++ kfree(dev);
++ return err;
++}
++static void remove_one(struct pci_dev *pdev)
++{
++ struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
++
++ mlx5_unregister_device(dev);
++ mlx5_dev_cleanup(dev);
++ kfree(dev);
++}
++
++static const struct pci_device_id mlx5_core_pci_table[] = {
++ { PCI_VDEVICE(MELLANOX, 4113) }, /* MT4113 Connect-IB */
++ { 0, }
++};
++
++MODULE_DEVICE_TABLE(pci, mlx5_core_pci_table);
++
++static struct pci_driver mlx5_core_driver = {
++ .name           = DRIVER_NAME,
++ .id_table       = mlx5_core_pci_table,
++ .probe          = init_one,
++ .remove         = remove_one
++};
+ 
+ static int __init init(void)
+ {
+@@ -530,8 +806,15 @@ static int __init init(void)
+  }
+  mlx5_health_init();
+ 
++ err = pci_register_driver(&mlx5_core_driver);
++ if (err)
++  goto err_health;
++
+  return 0;
+ 
++err_health:
++ mlx5_health_cleanup();
++ destroy_workqueue(mlx5_core_wq);
+ err_debug:
+  mlx5_unregister_debugfs();
+  return err;
+@@ -539,6 +822,7 @@ err_debug:
+ 
+ static void __exit cleanup(void)
+ {
++ pci_unregister_driver(&mlx5_core_driver);
+  mlx5_health_cleanup();
+  destroy_workqueue(mlx5_core_wq);
+  mlx5_unregister_debugfs();
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 2bce4aa..d0cb598 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -543,6 +543,10 @@ struct mlx5_priv {
+  /* protect mkey key part */
+  spinlock_t  mkey_lock;
+  u8   mkey_key;
++
++ struct list_head        dev_list;
++ struct list_head        ctx_list;
++ spinlock_t              ctx_lock;
+ };
+ 
+ struct mlx5_core_dev {
+@@ -686,8 +690,6 @@ static inline u32 mlx5_base_mkey(const u32 key)
+  return key & 0xffffff00u;
+ }
+ 
+-int mlx5_dev_init(struct mlx5_core_dev *dev, struct pci_dev *pdev);
+-void mlx5_dev_cleanup(struct mlx5_core_dev *dev);
+ int mlx5_cmd_init(struct mlx5_core_dev *dev);
+ void mlx5_cmd_cleanup(struct mlx5_core_dev *dev);
+ void mlx5_cmd_use_events(struct mlx5_core_dev *dev);
+@@ -811,6 +813,17 @@ enum {
+  MAX_MR_CACHE_ENTRIES    = 16,
+ };
+ 
++struct mlx5_interface {
++ void *   (*add)(struct mlx5_core_dev *dev);
++ void   (*remove)(struct mlx5_core_dev *dev, void *context);
++ void   (*event)(struct mlx5_core_dev *dev, void *context,
++      enum mlx5_dev_event event, void *data);
++ struct list_head list;
++};
++
++int mlx5_register_interface(struct mlx5_interface *intf);
++void mlx5_unregister_interface(struct mlx5_interface *intf);
++
+ struct mlx5_profile {
+  u64 mask;
+  u32 log_max_qp;
+-- 
+1.7.1

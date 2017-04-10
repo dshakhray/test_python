@@ -1,0 +1,266 @@
+From fe2506c4bab5235683e2f5e314735ed5c80705f7 Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:12:27 -0400
+Subject: [virt] kvm/ppc: book3s - Allow only implemented hcalls to be enabled or disabled
+
+Message-id: <1410765214-16377-12-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94722
+O-Subject: [PATCH 11/78] KVM: PPC: Book3S: Allow only implemented hcalls to be enabled or disabled
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1123145
+
+Prerequisite to backport 9642382e826066c2d30d1b23d1b45410cdd8e07d
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit ae2113a4f1a6cd5a3cd3d75f394547922758e9ac
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Mon Jun 2 11:03:00 2014 +1000
+
+    KVM: PPC: Book3S: Allow only implemented hcalls to be enabled or disabled
+
+    This adds code to check that when the KVM_CAP_PPC_ENABLE_HCALL
+    capability is used to enable or disable in-kernel handling of an
+    hcall, that the hcall is actually implemented by the kernel.
+    If not an EINVAL error is returned.
+
+    This also checks the default-enabled list of hcalls and prints a
+    warning if any hcall there is not actually implemented.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index d79531b..9f0efc2 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -2953,3 +2953,7 @@ not to attempt to handle the hcall, but will always exit to userspace
+ to handle it.  Note that it may not make sense to enable some and
+ disable others of a group of related hcalls, but KVM does not prevent
+ userspace from doing that.
++
++If the hcall number specified is not one that has an in-kernel
++implementation, the KVM_ENABLE_CAP ioctl will fail with an EINVAL
++error.
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 49d846e..fe83b6c 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -148,6 +148,7 @@ extern void kvmppc_mmu_invalidate_pte(struct kvm_vcpu *vcpu, struct hpte_cache *
+ extern int kvmppc_mmu_hpte_sysinit(void);
+ extern void kvmppc_mmu_hpte_sysexit(void);
+ extern int kvmppc_mmu_hv_init(void);
++extern int kvmppc_book3s_hcall_implemented(struct kvm *kvm, unsigned long hc);
+ 
+ extern int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr, bool data);
+ extern int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr, bool data);
+@@ -190,6 +191,8 @@ extern u32 kvmppc_alignment_dsisr(struct kvm_vcpu *vcpu, unsigned int inst);
+ extern ulong kvmppc_alignment_dar(struct kvm_vcpu *vcpu, unsigned int inst);
+ extern int kvmppc_h_pr(struct kvm_vcpu *vcpu, unsigned long cmd);
+ extern void kvmppc_pr_init_default_hcalls(struct kvm *kvm);
++extern int kvmppc_hcall_impl_pr(unsigned long cmd);
++extern int kvmppc_hcall_impl_hv_realmode(unsigned long cmd);
+ extern void kvmppc_copy_to_svcpu(struct kvmppc_book3s_shadow_vcpu *svcpu,
+      struct kvm_vcpu *vcpu);
+ extern void kvmppc_copy_from_svcpu(struct kvm_vcpu *vcpu,
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index 22222a4..0b5c79c 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -228,7 +228,7 @@ struct kvmppc_ops {
+  void (*fast_vcpu_kick)(struct kvm_vcpu *vcpu);
+  long (*arch_vm_ioctl)(struct file *filp, unsigned int ioctl,
+          unsigned long arg);
+-
++ int (*hcall_implemented)(unsigned long hcall);
+ };
+ 
+ extern struct kvmppc_ops *kvmppc_hv_ops;
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index d5a35c9..f3b6f34 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -877,6 +877,11 @@ int kvmppc_core_check_processor_compat(void)
+  return 0;
+ }
+ 
++int kvmppc_book3s_hcall_implemented(struct kvm *kvm, unsigned long hcall)
++{
++ return kvm->arch.kvm_ops->hcall_implemented(hcall);
++}
++
+ static int kvmppc_book3s_init(void)
+ {
+  int r;
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index f01c0ae..60cb19c 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -641,6 +641,28 @@ int kvmppc_pseries_do_hcall(struct kvm_vcpu *vcpu)
+  return RESUME_GUEST;
+ }
+ 
++static int kvmppc_hcall_impl_hv(unsigned long cmd)
++{
++ switch (cmd) {
++ case H_CEDE:
++ case H_PROD:
++ case H_CONFER:
++ case H_REGISTER_VPA:
++#ifdef CONFIG_KVM_XICS
++ case H_XIRR:
++ case H_CPPR:
++ case H_EOI:
++ case H_IPI:
++ case H_IPOLL:
++ case H_XIRR_X:
++#endif
++  return 1;
++ }
++
++ /* See if it's in the real-mode table */
++ return kvmppc_hcall_impl_hv_realmode(cmd);
++}
++
+ static int kvmppc_handle_exit_hv(struct kvm_run *run, struct kvm_vcpu *vcpu,
+      struct task_struct *tsk)
+ {
+@@ -2473,9 +2495,13 @@ static unsigned int default_hcall_list[] = {
+ static void init_default_hcalls(void)
+ {
+  int i;
++ unsigned int hcall;
+ 
+- for (i = 0; default_hcall_list[i]; ++i)
+-  __set_bit(default_hcall_list[i] / 4, default_enabled_hcalls);
++ for (i = 0; default_hcall_list[i]; ++i) {
++  hcall = default_hcall_list[i];
++  WARN_ON(!kvmppc_hcall_impl_hv(hcall));
++  __set_bit(hcall / 4, default_enabled_hcalls);
++ }
+ }
+ 
+ static struct kvmppc_ops kvm_ops_hv = {
+@@ -2510,6 +2536,7 @@ static struct kvmppc_ops kvm_ops_hv = {
+  .emulate_mfspr = kvmppc_core_emulate_mfspr_hv,
+  .fast_vcpu_kick = kvmppc_fast_vcpu_kick_hv,
+  .arch_vm_ioctl  = kvm_arch_vm_ioctl_hv,
++ .hcall_implemented = kvmppc_hcall_impl_hv,
+ };
+ 
+ static int kvmppc_book3s_init_hv(void)
+diff --git a/arch/powerpc/kvm/book3s_hv_builtin.c b/arch/powerpc/kvm/book3s_hv_builtin.c
+index 7cde8a6..3b41447 100644
+--- a/arch/powerpc/kvm/book3s_hv_builtin.c
++++ b/arch/powerpc/kvm/book3s_hv_builtin.c
+@@ -212,3 +212,16 @@ bool kvm_hv_mode_active(void)
+ {
+  return atomic_read(&hv_vm_count) != 0;
+ }
++
++extern int hcall_real_table[], hcall_real_table_end[];
++
++int kvmppc_hcall_impl_hv_realmode(unsigned long cmd)
++{
++ cmd /= 4;
++ if (cmd < hcall_real_table_end - hcall_real_table &&
++     hcall_real_table[cmd])
++  return 1;
++
++ return 0;
++}
++EXPORT_SYMBOL_GPL(kvmppc_hcall_impl_hv_realmode);
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 5f6ee64..8069a9f 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -2006,6 +2006,7 @@ hcall_real_table:
+  .long 0  /* 0x12c */
+  .long 0  /* 0x130 */
+  .long DOTSYM(kvmppc_h_set_xdabr) - hcall_real_table
++ .globl hcall_real_table_end
+ hcall_real_table_end:
+ 
+ ignore_hdec:
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 36cdbcb..57a4da5 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -1468,6 +1468,9 @@ static struct kvmppc_ops kvm_ops_pr = {
+  .emulate_mfspr = kvmppc_core_emulate_mfspr_pr,
+  .fast_vcpu_kick = kvm_vcpu_kick,
+  .arch_vm_ioctl  = kvm_arch_vm_ioctl_pr,
++#ifdef CONFIG_PPC_BOOK3S_64
++ .hcall_implemented = kvmppc_hcall_impl_pr,
++#endif
+ };
+ 
+ 
+diff --git a/arch/powerpc/kvm/book3s_pr_papr.c b/arch/powerpc/kvm/book3s_pr_papr.c
+index 5aeb465..eccf9cc 100644
+--- a/arch/powerpc/kvm/book3s_pr_papr.c
++++ b/arch/powerpc/kvm/book3s_pr_papr.c
+@@ -300,6 +300,27 @@ int kvmppc_h_pr(struct kvm_vcpu *vcpu, unsigned long cmd)
+  return EMULATE_FAIL;
+ }
+ 
++int kvmppc_hcall_impl_pr(unsigned long cmd)
++{
++ switch (cmd) {
++ case H_ENTER:
++ case H_REMOVE:
++ case H_PROTECT:
++ case H_BULK_REMOVE:
++ case H_PUT_TCE:
++ case H_CEDE:
++#ifdef CONFIG_KVM_XICS
++ case H_XIRR:
++ case H_CPPR:
++ case H_EOI:
++ case H_IPI:
++ case H_IPOLL:
++ case H_XIRR_X:
++#endif
++  return 1;
++ }
++ return 0;
++}
+ 
+ /*
+  * List of hcall numbers to enable by default.
+@@ -328,7 +349,11 @@ static unsigned int default_hcall_list[] = {
+ void kvmppc_pr_init_default_hcalls(struct kvm *kvm)
+ {
+  int i;
++ unsigned int hcall;
+ 
+- for (i = 0; default_hcall_list[i]; ++i)
+-  __set_bit(default_hcall_list[i] / 4, kvm->arch.enabled_hcalls);
++ for (i = 0; default_hcall_list[i]; ++i) {
++  hcall = default_hcall_list[i];
++  WARN_ON(!kvmppc_hcall_impl_pr(hcall));
++  __set_bit(hcall / 4, kvm->arch.enabled_hcalls);
++ }
+ }
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index 3ee3e25..1a7f7f4 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -1086,6 +1086,8 @@ static int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+   if (hcall > MAX_HCALL_OPCODE || (hcall & 3) ||
+       cap->args[1] > 1)
+    break;
++  if (!kvmppc_book3s_hcall_implemented(kvm, hcall))
++   break;
+   if (cap->args[1])
+    set_bit(hcall / 4, kvm->arch.enabled_hcalls);
+   else
+-- 
+1.7.1

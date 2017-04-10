@@ -1,0 +1,199 @@
+From b9349164360eb7de7768775ffe88362f1687ac26 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:24:06 -0400
+Subject: [net] libceph: introduce and start using oid abstraction
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-140-git-send-email-sweil@redhat.com>
+Patchwork-id: 89711
+O-Subject: [PATCH 139/303] libceph: introduce and start using oid abstraction
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+In preparation for tiering support, which would require having two
+(base and target) object names for each osd request and also copying
+those names around, introduce struct ceph_object_id (oid) and a couple
+helpers to facilitate those copies and encapsulate the fact that object
+name is not necessarily a NUL-terminated string.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit 4295f2217a5aa8ef2738e3a368db3c1ceab41212)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 4a626d0..87e7b4e 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -1793,10 +1793,7 @@ static struct ceph_osd_request *rbd_osd_req_create(
+  osd_req->r_priv = obj_request;
+ 
+  osd_req->r_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
+-
+- osd_req->r_oid_len = strlen(obj_request->object_name);
+- rbd_assert(osd_req->r_oid_len < sizeof (osd_req->r_oid));
+- memcpy(osd_req->r_oid, obj_request->object_name, osd_req->r_oid_len);
++ ceph_oid_set_name(&osd_req->r_oid, obj_request->object_name);
+ 
+  return osd_req;
+ }
+@@ -1834,10 +1831,7 @@ rbd_osd_req_create_copyup(struct rbd_obj_request *obj_request)
+  osd_req->r_priv = obj_request;
+ 
+  osd_req->r_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
+-
+- osd_req->r_oid_len = strlen(obj_request->object_name);
+- rbd_assert(osd_req->r_oid_len < sizeof (osd_req->r_oid));
+- memcpy(osd_req->r_oid, obj_request->object_name, osd_req->r_oid_len);
++ ceph_oid_set_name(&osd_req->r_oid, obj_request->object_name);
+ 
+  return osd_req;
+ }
+diff --git a/include/linux/ceph/osd_client.h b/include/linux/ceph/osd_client.h
+index b42f158..8d8bb53 100644
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@ -12,12 +12,6 @@
+ #include <linux/ceph/auth.h>
+ #include <linux/ceph/pagelist.h>
+ 
+-/* 
+- * Maximum object name size 
+- * (must be at least as big as RBD_MAX_MD_NAME_LEN -- currently 100) 
+- */
+-#define CEPH_MAX_OID_NAME_LEN 100
+-
+ struct ceph_msg;
+ struct ceph_snap_context;
+ struct ceph_osd_request;
+@@ -160,9 +154,8 @@ struct ceph_osd_request {
+  void *r_priv;         /* ditto */
+ 
+  struct ceph_object_locator r_oloc;
++ struct ceph_object_id r_oid;
+ 
+- char              r_oid[CEPH_MAX_OID_NAME_LEN];      /* object name */
+- int               r_oid_len;
+  u64               r_snapid;
+  unsigned long     r_stamp;            /* send OR check time */
+ 
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index f2679c3..c85f7d4 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -43,6 +43,18 @@ struct ceph_object_locator {
+  s64 pool;
+ };
+ 
++/*
++ * Maximum supported by kernel client object name length
++ *
++ * (probably outdated: must be >= RBD_MAX_MD_NAME_LEN -- currently 100)
++ */
++#define CEPH_MAX_OID_NAME_LEN 100
++
++struct ceph_object_id {
++ char name[CEPH_MAX_OID_NAME_LEN];
++ int name_len;
++};
++
+ struct ceph_pg_mapping {
+  struct rb_node node;
+  struct ceph_pg pgid;
+@@ -72,6 +84,30 @@ struct ceph_osdmap {
+  struct crush_map *crush;
+ };
+ 
++static inline void ceph_oid_set_name(struct ceph_object_id *oid,
++         const char *name)
++{
++ int len;
++
++ len = strlen(name);
++ if (len > sizeof(oid->name)) {
++  WARN(1, "ceph_oid_set_name '%s' len %d vs %zu, truncating\n",
++       name, len, sizeof(oid->name));
++  len = sizeof(oid->name);
++ }
++
++ memcpy(oid->name, name, len);
++ oid->name_len = len;
++}
++
++static inline void ceph_oid_copy(struct ceph_object_id *dest,
++     struct ceph_object_id *src)
++{
++ BUG_ON(src->name_len > sizeof(dest->name));
++ memcpy(dest->name, src->name, src->name_len);
++ dest->name_len = src->name_len;
++}
++
+ static inline int ceph_osd_is_up(struct ceph_osdmap *map, int osd)
+ {
+  return (osd < map->max_osd) && (map->osd_state[osd] & CEPH_OSD_UP);
+diff --git a/net/ceph/debugfs.c b/net/ceph/debugfs.c
+index 83661cd..1f85627 100644
+--- a/net/ceph/debugfs.c
++++ b/net/ceph/debugfs.c
+@@ -132,7 +132,8 @@ static int osdc_show(struct seq_file *s, void *pp)
+       req->r_osd ? req->r_osd->o_osd : -1,
+       req->r_pgid.pool, req->r_pgid.seed);
+ 
+-  seq_printf(s, "%.*s", req->r_oid_len, req->r_oid);
++  seq_printf(s, "%.*s", req->r_oid.name_len,
++      req->r_oid.name);
+ 
+   if (req->r_reassert_version.epoch)
+    seq_printf(s, "\t%u'%llu",
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index a053e7e..2988d68 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -765,9 +765,9 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
+ 
+  req->r_oloc.pool = ceph_file_layout_pg_pool(*layout);
+ 
+- snprintf(req->r_oid, sizeof(req->r_oid), "%llx.%08llx",
+-  vino.ino, objnum);
+- req->r_oid_len = strlen(req->r_oid);
++ snprintf(req->r_oid.name, sizeof(req->r_oid.name),
++   "%llx.%08llx", vino.ino, objnum);
++ req->r_oid.name_len = strlen(req->r_oid.name);
+ 
+  return req;
+ }
+@@ -1269,7 +1269,7 @@ static int __map_request(struct ceph_osd_client *osdc,
+  bool was_paused;
+ 
+  dout("map_request %p tid %lld\n", req, req->r_tid);
+- err = ceph_calc_ceph_pg(&pgid, req->r_oid, osdc->osdmap,
++ err = ceph_calc_ceph_pg(&pgid, req->r_oid.name, osdc->osdmap,
+     req->r_oloc.pool);
+  if (err) {
+   list_move(&req->r_req_lru_item, &osdc->req_notarget);
+@@ -2118,10 +2118,11 @@ void ceph_osdc_build_request(struct ceph_osd_request *req, u64 off,
+  ceph_encode_32(&p, -1);  /* preferred */
+ 
+  /* oid */
+- ceph_encode_32(&p, req->r_oid_len);
+- memcpy(p, req->r_oid, req->r_oid_len);
+- dout("oid '%.*s' len %d\n", req->r_oid_len, req->r_oid, req->r_oid_len);
+- p += req->r_oid_len;
++ ceph_encode_32(&p, req->r_oid.name_len);
++ memcpy(p, req->r_oid.name, req->r_oid.name_len);
++ dout("oid '%.*s' len %d\n", req->r_oid.name_len,
++      req->r_oid.name, req->r_oid.name_len);
++ p += req->r_oid.name_len;
+ 
+  /* ops--can imply data */
+  ceph_encode_16(&p, (u16)req->r_num_ops);
+-- 
+1.7.1

@@ -1,0 +1,171 @@
+From 0306db8230abbc60e88bb03abb350dbd0917a5a6 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:01:54 -0400
+Subject: [infiniband] mlx4_ib: Add support for user MR re-registration
+
+Message-id: <f3301f786ef16d0deac80aa1a86356f18b6be5f7.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93712
+O-Subject: [Patch RHEL7.1 V1 178/197] IB/mlx4_ib: Add support for user MR re-registration
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Matan Barak <matanb@mellanox.com>
+
+This enables the user to change the protection domain, access flags
+and translation (address and length) of the MR.
+
+Use basic mlx4_core helper functions to get, update and set MPT and
+MTT objects according to the required modifications.
+
+Signed-off-by: Matan Barak <matanb@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 9376932d0c26d5f5f89c95d5bd45123bba96d3a9)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index b86e9ac..fed1f7a 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -2007,6 +2007,7 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
+   (1ull << IB_USER_VERBS_CMD_ALLOC_PD)  |
+   (1ull << IB_USER_VERBS_CMD_DEALLOC_PD)  |
+   (1ull << IB_USER_VERBS_CMD_REG_MR)  |
++  (1ull << IB_USER_VERBS_CMD_REREG_MR)  |
+   (1ull << IB_USER_VERBS_CMD_DEREG_MR)  |
+   (1ull << IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL) |
+   (1ull << IB_USER_VERBS_CMD_CREATE_CQ)  |
+@@ -2059,6 +2060,7 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
+  ibdev->ib_dev.req_notify_cq = mlx4_ib_arm_cq;
+  ibdev->ib_dev.get_dma_mr = mlx4_ib_get_dma_mr;
+  ibdev->ib_dev.reg_user_mr = mlx4_ib_reg_user_mr;
++ ibdev->ib_dev.rereg_user_mr = mlx4_ib_rereg_user_mr;
+  ibdev->ib_dev.dereg_mr  = mlx4_ib_dereg_mr;
+  ibdev->ib_dev.alloc_fast_reg_mr = mlx4_ib_alloc_fast_reg_mr;
+  ibdev->ib_dev.alloc_fast_reg_page_list = mlx4_ib_alloc_fast_reg_page_list;
+diff --git a/drivers/infiniband/hw/mlx4/mlx4_ib.h b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+index 369da3c..e8cad39 100644
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@ -788,5 +788,9 @@ int mlx4_ib_steer_qp_alloc(struct mlx4_ib_dev *dev, int count, int *qpn);
+ void mlx4_ib_steer_qp_free(struct mlx4_ib_dev *dev, u32 qpn, int count);
+ int mlx4_ib_steer_qp_reg(struct mlx4_ib_dev *mdev, struct mlx4_ib_qp *mqp,
+     int is_attach);
++int mlx4_ib_rereg_user_mr(struct ib_mr *mr, int flags,
++     u64 start, u64 length, u64 virt_addr,
++     int mr_access_flags, struct ib_pd *pd,
++     struct ib_udata *udata);
+ 
+ #endif /* MLX4_IB_H */
+diff --git a/drivers/infiniband/hw/mlx4/mr.c b/drivers/infiniband/hw/mlx4/mr.c
+index cb2a872..9b0e80e 100644
+--- a/drivers/infiniband/hw/mlx4/mr.c
++++ b/drivers/infiniband/hw/mlx4/mr.c
+@@ -144,8 +144,10 @@ struct ib_mr *mlx4_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  if (!mr)
+   return ERR_PTR(-ENOMEM);
+ 
++ /* Force registering the memory as writable. */
++ /* Used for memory re-registeration. HCA protects the access */
+  mr->umem = ib_umem_get(pd->uobject->context, start, length,
+-          access_flags, 0);
++          access_flags | IB_ACCESS_LOCAL_WRITE, 0);
+  if (IS_ERR(mr->umem)) {
+   err = PTR_ERR(mr->umem);
+   goto err_free;
+@@ -183,6 +185,90 @@ err_free:
+  return ERR_PTR(err);
+ }
+ 
++int mlx4_ib_rereg_user_mr(struct ib_mr *mr, int flags,
++     u64 start, u64 length, u64 virt_addr,
++     int mr_access_flags, struct ib_pd *pd,
++     struct ib_udata *udata)
++{
++ struct mlx4_ib_dev *dev = to_mdev(mr->device);
++ struct mlx4_ib_mr *mmr = to_mmr(mr);
++ struct mlx4_mpt_entry *mpt_entry;
++ struct mlx4_mpt_entry **pmpt_entry = &mpt_entry;
++ int err;
++
++ /* Since we synchronize this call and mlx4_ib_dereg_mr via uverbs,
++  * we assume that the calls can't run concurrently. Otherwise, a
++  * race exists.
++  */
++ err =  mlx4_mr_hw_get_mpt(dev->dev, &mmr->mmr, &pmpt_entry);
++
++ if (err)
++  return err;
++
++ if (flags & IB_MR_REREG_PD) {
++  err = mlx4_mr_hw_change_pd(dev->dev, *pmpt_entry,
++        to_mpd(pd)->pdn);
++
++  if (err)
++   goto release_mpt_entry;
++ }
++
++ if (flags & IB_MR_REREG_ACCESS) {
++  err = mlx4_mr_hw_change_access(dev->dev, *pmpt_entry,
++            convert_access(mr_access_flags));
++
++  if (err)
++   goto release_mpt_entry;
++ }
++
++ if (flags & IB_MR_REREG_TRANS) {
++  int shift;
++  int err;
++  int n;
++
++  mlx4_mr_rereg_mem_cleanup(dev->dev, &mmr->mmr);
++  ib_umem_release(mmr->umem);
++  mmr->umem = ib_umem_get(mr->uobject->context, start, length,
++     mr_access_flags |
++     IB_ACCESS_LOCAL_WRITE,
++     0);
++  if (IS_ERR(mmr->umem)) {
++   err = PTR_ERR(mmr->umem);
++   mmr->umem = NULL;
++   goto release_mpt_entry;
++  }
++  n = ib_umem_page_count(mmr->umem);
++  shift = ilog2(mmr->umem->page_size);
++
++  mmr->mmr.iova       = virt_addr;
++  mmr->mmr.size       = length;
++  err = mlx4_mr_rereg_mem_write(dev->dev, &mmr->mmr,
++           virt_addr, length, n, shift,
++           *pmpt_entry);
++  if (err) {
++   ib_umem_release(mmr->umem);
++   goto release_mpt_entry;
++  }
++
++  err = mlx4_ib_umem_write_mtt(dev, &mmr->mmr.mtt, mmr->umem);
++  if (err) {
++   mlx4_mr_rereg_mem_cleanup(dev->dev, &mmr->mmr);
++   ib_umem_release(mmr->umem);
++   goto release_mpt_entry;
++  }
++ }
++
++ /* If we couldn't transfer the MR to the HCA, just remember to
++  * return a failure. But dereg_mr will free the resources.
++  */
++ err = mlx4_mr_hw_write_mpt(dev->dev, &mmr->mmr, pmpt_entry);
++
++release_mpt_entry:
++ mlx4_mr_hw_put_mpt(dev->dev, pmpt_entry);
++
++ return err;
++}
++
+ int mlx4_ib_dereg_mr(struct ib_mr *ibmr)
+ {
+  struct mlx4_ib_mr *mr = to_mmr(ibmr);
+-- 
+1.7.1

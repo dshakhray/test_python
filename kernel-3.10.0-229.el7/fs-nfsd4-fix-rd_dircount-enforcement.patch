@@ -1,0 +1,68 @@
+From cd1efc1e13c229d757484d35374726436116c220 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:20:49 -0400
+Subject: [fs] nfsd4: fix rd_dircount enforcement
+
+Message-id: <1410898849-22126-166-git-send-email-bfields@redhat.com>
+Patchwork-id: 95829
+O-Subject: [Patch RHEL7 165/165] nfsd4: fix rd_dircount enforcement
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+Commit 3b299709091b "nfsd4: enforce rd_dircount" totally misunderstood
+rd_dircount; it refers to total non-attribute bytes returned, not number
+of directory entries returned.
+
+Bring the code into agreement with RFC 3530 section 14.2.24.
+
+Cc: stable@vger.kernel.org
+Fixes: 3b299709091b "nfsd4: enforce rd_dircount"
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: aee3776441461c14ba6d8ed9e2149933e65abb6e
+Bugzilla: 1123721
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c
+index f9821ce..e94457c 100644
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@ -2657,6 +2657,7 @@ nfsd4_encode_dirent(void *ccdv, const char *name, int namlen,
+  struct xdr_stream *xdr = cd->xdr;
+  int start_offset = xdr->buf->len;
+  int cookie_offset;
++ u32 name_and_cookie;
+  int entry_bytes;
+  __be32 nfserr = nfserr_toosmall;
+  __be64 wire_offset;
+@@ -2718,7 +2719,14 @@ nfsd4_encode_dirent(void *ccdv, const char *name, int namlen,
+  cd->rd_maxcount -= entry_bytes;
+  if (!cd->rd_dircount)
+   goto fail;
+- cd->rd_dircount--;
++ /*
++  * RFC 3530 14.2.24 describes rd_dircount as only a "hint", so
++  * let's always let through the first entry, at least:
++  */
++ name_and_cookie = 4 * XDR_QUADLEN(namlen) + 8;
++ if (name_and_cookie > cd->rd_dircount && cd->cookie_offset)
++  goto fail;
++ cd->rd_dircount -= min(cd->rd_dircount, name_and_cookie);
+  cd->cookie_offset = cookie_offset;
+ skip_entry:
+  cd->common.err = nfs_ok;
+@@ -3321,6 +3329,10 @@ nfsd4_encode_readdir(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4
+  }
+  maxcount = min_t(int, maxcount-16, bytes_left);
+ 
++ /* RFC 3530 14.2.24 allows us to ignore dircount when it's 0: */
++ if (!readdir->rd_dircount)
++  readdir->rd_dircount = INT_MAX;
++
+  readdir->xdr = xdr;
+  readdir->rd_maxcount = maxcount;
+  readdir->common.err = 0;
+-- 
+1.7.1

@@ -1,0 +1,114 @@
+From 873b9dcd0956a3cacf07b5fb57f272af89cb434e Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 19 Sep 2014 12:28:56 -0400
+Subject: [acpi] hotplug/pci: Fix bridge removal race in handle_hotplug_event()
+
+Message-id: <1411129776-21656-22-git-send-email-prarit@redhat.com>
+Patchwork-id: 96382
+O-Subject: [RHEL7.1 PATCH BZ 1141846 21/61] ACPI / hotplug / PCI: Fix bridge removal race in handle_hotplug_event()
+Bugzilla: 1141846
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1141846
+
+commit 1b360f44d009059e446532f29c1a889951e72667
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Mon Feb 3 22:30:06 2014 +0100
+
+    ACPI / hotplug / PCI: Fix bridge removal race in handle_hotplug_event()
+
+    If a PCI bridge with an ACPIPHP context attached is removed via
+    sysfs, the code path executed as a result is the following:
+
+    pci_stop_and_remove_bus_device_locked
+     pci_remove_bus
+      pcibios_remove_bus
+       acpi_pci_remove_bus
+        acpiphp_remove_slots
+         cleanup_bridge
+         put_bridge
+          free_bridge
+           acpiphp_put_context (for each child, under context lock)
+            kfree (child context)
+
+    Now, if a hotplug notify is dispatched for one of the bridge's
+    children and the timing is such that handle_hotplug_event() for
+    that notify is executed while free_bridge() above is running,
+    the get_bridge(context->func.parent) in handle_hotplug_event()
+    will not really help, because it is too late to prevent the bridge
+    from going away and the child's context may be freed before
+    hotplug_event_work() scheduled from handle_hotplug_event()
+    dereferences the pointer to it passed via the data argument.
+    That will cause a kernel crash to happpen in hotplug_event_work().
+
+    To prevent that from happening, make handle_hotplug_event()
+    check the is_going_away flag of the function's parent bridge
+    (under acpiphp_context_lock) and bail out if it's set.  Also,
+    make cleanup_bridge() set the bridge's is_going_away flag under
+    acpiphp_context_lock so that it cannot be changed between the
+    check and the subsequent get_bridge(context->func.parent) in
+    handle_hotplug_event().
+
+    Then, in the above scenario, handle_hotplug_event() will notice
+    that context->func.parent->is_going_away is already set and it
+    will exit immediately preventing the crash from happening.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Myron Stowe <mstowe@redhat.com>
+Cc: Andy Gospodarek <agospoda@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index 04dc7e0..88dd83a 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -441,7 +441,9 @@ static void cleanup_bridge(struct acpiphp_bridge *bridge)
+  list_del(&bridge->list);
+  mutex_unlock(&bridge_mutex);
+ 
++ mutex_lock(&acpiphp_context_lock);
+  bridge->is_going_away = true;
++ mutex_unlock(&acpiphp_context_lock);
+ }
+ 
+ /**
+@@ -941,6 +943,7 @@ static void handle_hotplug_event(acpi_handle handle, u32 type, void *data)
+ {
+  struct acpiphp_context *context;
+  u32 ost_code = ACPI_OST_SC_SUCCESS;
++ acpi_status status;
+ 
+  switch (type) {
+  case ACPI_NOTIFY_BUS_CHECK:
+@@ -976,13 +979,20 @@ static void handle_hotplug_event(acpi_handle handle, u32 type, void *data)
+ 
+  mutex_lock(&acpiphp_context_lock);
+  context = acpiphp_get_context(handle);
+- if (context && !WARN_ON(context->handle != handle)) {
+-  get_bridge(context->func.parent);
+-  acpiphp_put_context(context);
+-  acpi_hotplug_execute(hotplug_event_work, context, type);
++ if (!context || WARN_ON(context->handle != handle)
++     || context->func.parent->is_going_away)
++  goto err_out;
++
++ get_bridge(context->func.parent);
++ acpiphp_put_context(context);
++ status = acpi_hotplug_execute(hotplug_event_work, context, type);
++ if (ACPI_SUCCESS(status)) {
+   mutex_unlock(&acpiphp_context_lock);
+   return;
+  }
++ put_bridge(context->func.parent);
++
++ err_out:
+  mutex_unlock(&acpiphp_context_lock);
+  ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+ 
+-- 
+1.7.1

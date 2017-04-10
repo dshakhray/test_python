@@ -1,0 +1,88 @@
+From a3a8a679e02dc8e1a84aa0d3215358b0923d38cf Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 23 Oct 2014 20:01:26 -0400
+Subject: [md] dm-thin: grab a virtual cell before looking up the mapping
+
+Message-id: <1414094494-22068-17-git-send-email-snitzer@redhat.com>
+Patchwork-id: 98353
+O-Subject: [RHEL7.2 PATCH 16/24] dm thin: grab a virtual cell before looking up the mapping
+Bugzilla: 1156164
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1156164
+
+Upstream linux-dm.git commit d21e2c3c93af926285a1059023aaaa739f20f3b8
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Fri Oct 10 09:41:09 2014 +0100
+
+    dm thin: grab a virtual cell before looking up the mapping
+
+    Avoids normal IO racing with discard.
+
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Cc: stable@vger.kernel.org
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index 677346c..eaf7d2a 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -1999,6 +1999,14 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
+   return DM_MAPIO_SUBMITTED;
+  }
+ 
++ /*
++  * We must hold the virtual cell before doing the lookup, otherwise
++  * there's a race with discard.
++  */
++ build_virtual_key(tc->td, block, &key);
++ if (dm_bio_detain(tc->pool->prison, &key, bio, &cell1, &cell_result))
++  return DM_MAPIO_SUBMITTED;
++
+  r = dm_thin_find_block(td, block, 0, &result);
+ 
+  /*
+@@ -2022,13 +2030,10 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
+     * shared flag will be set in their case.
+     */
+    thin_defer_bio(tc, bio);
++   cell_defer_no_holder_no_free(tc, &cell1);
+    return DM_MAPIO_SUBMITTED;
+   }
+ 
+-  build_virtual_key(tc->td, block, &key);
+-  if (dm_bio_detain(tc->pool->prison, &key, bio, &cell1, &cell_result))
+-   return DM_MAPIO_SUBMITTED;
+-
+   build_data_key(tc->td, result.block, &key);
+   if (dm_bio_detain(tc->pool->prison, &key, bio, &cell2, &cell_result)) {
+    cell_defer_no_holder_no_free(tc, &cell1);
+@@ -2049,12 +2054,14 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
+     * of doing so.
+     */
+    handle_unserviceable_bio(tc->pool, bio);
++   cell_defer_no_holder_no_free(tc, &cell1);
+    return DM_MAPIO_SUBMITTED;
+   }
+   /* fall through */
+ 
+  case -EWOULDBLOCK:
+   thin_defer_bio(tc, bio);
++  cell_defer_no_holder_no_free(tc, &cell1);
+   return DM_MAPIO_SUBMITTED;
+ 
+  default:
+@@ -2064,6 +2071,7 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
+    * pool is switched to fail-io mode.
+    */
+   bio_io_error(bio);
++  cell_defer_no_holder_no_free(tc, &cell1);
+   return DM_MAPIO_SUBMITTED;
+  }
+ }
+-- 
+1.7.1

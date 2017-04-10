@@ -1,0 +1,94 @@
+From 5bae011923d0bca73f4a5aeb76403079e7c4130a Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:19:05 -0400
+Subject: [fs] nfsd: Ensure stateids remain unique until they are freed
+
+Message-id: <1410898849-22126-62-git-send-email-bfields@redhat.com>
+Patchwork-id: 95783
+O-Subject: [Patch RHEL7 061/165] nfsd: Ensure stateids remain unique until they are freed
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+Add an extra delegation state to allow the stateid to remain in the idr
+tree until the last reference has been released. This will be necessary
+to ensure uniqueness once the client_mutex is removed.
+
+[jlayton: reset the sc_type under the state_lock in unhash_delegation]
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: b0fc29d6fcd0310a8437123fe6f30b1ae60a62f9
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 1b01a20..fd4deb0 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -616,6 +616,7 @@ void
+ nfs4_put_delegation(struct nfs4_delegation *dp)
+ {
+  if (atomic_dec_and_test(&dp->dl_count)) {
++  remove_stid(&dp->dl_stid);
+   nfs4_free_stid(deleg_slab, &dp->dl_stid);
+   num_delegations--;
+  }
+@@ -657,6 +658,7 @@ unhash_delegation(struct nfs4_delegation *dp)
+  struct nfs4_file *fp = dp->dl_file;
+ 
+  spin_lock(&state_lock);
++ dp->dl_stid.sc_type = NFS4_CLOSED_DELEG_STID;
+  list_del_init(&dp->dl_perclnt);
+  list_del_init(&dp->dl_recall_lru);
+  spin_lock(&fp->fi_lock);
+@@ -670,19 +672,15 @@ unhash_delegation(struct nfs4_delegation *dp)
+  }
+ }
+ 
+-
+-
+ static void destroy_revoked_delegation(struct nfs4_delegation *dp)
+ {
+  list_del_init(&dp->dl_recall_lru);
+- remove_stid(&dp->dl_stid);
+  nfs4_put_delegation(dp);
+ }
+ 
+ static void destroy_delegation(struct nfs4_delegation *dp)
+ {
+  unhash_delegation(dp);
+- remove_stid(&dp->dl_stid);
+  nfs4_put_delegation(dp);
+ }
+ 
+@@ -4036,7 +4034,9 @@ static __be32 nfsd4_validate_stateid(struct nfs4_client *cl, stateid_t *stateid)
+   return nfs_ok;
+  default:
+   printk("unknown stateid type %x\n", s->sc_type);
++  /* Fallthrough */
+  case NFS4_CLOSED_STID:
++ case NFS4_CLOSED_DELEG_STID:
+   return nfserr_bad_stateid;
+  }
+ }
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index 81b7522..996d61e 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -80,6 +80,7 @@ struct nfs4_stid {
+ #define NFS4_CLOSED_STID 8
+ /* For a deleg stateid kept around only to process free_stateid's: */
+ #define NFS4_REVOKED_DELEG_STID 16
++#define NFS4_CLOSED_DELEG_STID 32
+  unsigned char sc_type;
+  stateid_t sc_stateid;
+  struct nfs4_client *sc_client;
+-- 
+1.7.1

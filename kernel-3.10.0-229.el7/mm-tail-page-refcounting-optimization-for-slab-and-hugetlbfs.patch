@@ -1,0 +1,201 @@
+From 843f509f0c70d2aab72c51e2e3a0932b8b2f44fe Mon Sep 17 00:00:00 2001
+From: Andrea Arcangeli <aarcange@redhat.com>
+Date: Tue, 9 Sep 2014 01:16:22 -0400
+Subject: [mm] tail page refcounting optimization for slab and hugetlbfs
+
+Message-id: <1410225399-8094-6-git-send-email-aarcange@redhat.com>
+Patchwork-id: 93368
+O-Subject: [RHEL7.1 PATCH 05/22] mm: tail page refcounting optimization for slab and hugetlbfs
+Bugzilla: 1135506
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+This skips the _mapcount mangling for slab and hugetlbfs pages.
+
+The main trouble in doing this is to guarantee that PageSlab and
+PageHeadHuge remains constant for all get_page/put_page run on the tail
+of slab or hugetlbfs compound pages.  Otherwise if they're set during
+get_page but not set during put_page, the _mapcount of the tail page
+would underflow.
+
+PageHeadHuge will remain true until the compound page is released and
+enters the buddy allocator so it won't risk to change even if the tail
+page is the last reference left on the page.
+
+PG_slab instead is cleared before the slab frees the head page with
+put_page, so if the tail pin is released after the slab freed the page,
+we would have a problem.  But in the slab case the tail pin cannot be
+the last reference left on the page.  This is because the slab code is
+free to reuse the compound page after a kfree/kmem_cache_free without
+having to check if there's any tail pin left.  In turn all tail pins
+must be always released while the head is still pinned by the slab code
+and so we know PG_slab will be still set too.
+
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Reviewed-by: Khalid Aziz <khalid.aziz@oracle.com>
+Cc: Pravin Shelar <pshelar@nicira.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Ben Hutchings <bhutchings@solarflare.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Johannes Weiner <jweiner@redhat.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Andi Kleen <andi@firstfloor.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 1266f53..5fb0244 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -31,7 +31,6 @@ struct hugepage_subpool *hugepage_new_subpool(long nr_blocks);
+ void hugepage_put_subpool(struct hugepage_subpool *spool);
+ 
+ int PageHuge(struct page *page);
+-int PageHeadHuge(struct page *page_head);
+ 
+ void reset_vma_resv_huge_pages(struct vm_area_struct *vma);
+ int hugetlb_sysctl_handler(struct ctl_table *, int, void __user *, size_t *, loff_t *);
+@@ -99,11 +98,6 @@ static inline int PageHuge(struct page *page)
+  return 0;
+ }
+ 
+-static inline int PageHeadHuge(struct page *page_head)
+-{
+- return 0;
+-}
+-
+ static inline void reset_vma_resv_huge_pages(struct vm_area_struct *vma)
+ {
+ }
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 0510566..eafe4b8 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -398,15 +398,45 @@ static inline int page_count(struct page *page)
+  return atomic_read(&compound_head(page)->_count);
+ }
+ 
++#ifdef CONFIG_HUGETLB_PAGE
++extern int PageHeadHuge(struct page *page_head);
++#else /* CONFIG_HUGETLB_PAGE */
++static inline int PageHeadHuge(struct page *page_head)
++{
++ return 0;
++}
++#endif /* CONFIG_HUGETLB_PAGE */
++
++static inline bool __compound_tail_refcounted(struct page *page)
++{
++ return !PageSlab(page) && !PageHeadHuge(page);
++}
++
++/*
++ * This takes a head page as parameter and tells if the
++ * tail page reference counting can be skipped.
++ *
++ * For this to be safe, PageSlab and PageHeadHuge must remain true on
++ * any given page where they return true here, until all tail pins
++ * have been released.
++ */
++static inline bool compound_tail_refcounted(struct page *page)
++{
++ VM_BUG_ON(!PageHead(page));
++ return __compound_tail_refcounted(page);
++}
++
+ static inline void get_huge_page_tail(struct page *page)
+ {
+  /*
+   * __split_huge_page_refcount() cannot run
+   * from under us.
++  * In turn no need of compound_trans_head here.
+   */
+  VM_BUG_ON(page_mapcount(page) < 0);
+  VM_BUG_ON(atomic_read(&page->_count) != 0);
+- atomic_inc(&page->_mapcount);
++ if (compound_tail_refcounted(compound_head(page)))
++  atomic_inc(&page->_mapcount);
+ }
+ 
+ extern bool __get_page_tail(struct page *page);
+diff --git a/mm/internal.h b/mm/internal.h
+index ebebea6..1247150 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -56,7 +56,8 @@ static inline void __get_page_tail_foll(struct page *page,
+  VM_BUG_ON(page_mapcount(page) < 0);
+  if (get_page_head)
+   atomic_inc(&page->first_page->_count);
+- atomic_inc(&page->_mapcount);
++ if (compound_tail_refcounted(page->first_page))
++  atomic_inc(&page->_mapcount);
+ }
+ 
+ /*
+diff --git a/mm/swap.c b/mm/swap.c
+index 0d0cfa0..94f00cc 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -88,8 +88,9 @@ static void put_compound_page(struct page *page)
+ 
+   /*
+    * THP can not break up slab pages so avoid taking
+-   * compound_lock(). Slab performs non-atomic bit ops
+-   * on page->flags for better performance. In
++   * compound_lock() and skip the tail page refcounting
++   * (in _mapcount) too. Slab performs non-atomic bit
++   * ops on page->flags for better performance. In
+    * particular slab_unlock() in slub used to be a hot
+    * path. It is still hot on arches that do not support
+    * this_cpu_cmpxchg_double().
+@@ -102,7 +103,7 @@ static void put_compound_page(struct page *page)
+    * PageTail clear after smp_rmb() and we'll treat it
+    * as a single page.
+    */
+-  if (PageSlab(page_head) || PageHeadHuge(page_head)) {
++  if (!__compound_tail_refcounted(page_head)) {
+    /*
+     * If "page" is a THP tail, we must read the tail page
+     * flags after the head page flags. The
+@@ -117,10 +118,30 @@ static void put_compound_page(struct page *page)
+      * cannot race here.
+      */
+     VM_BUG_ON(!PageHead(page_head));
+-    VM_BUG_ON(page_mapcount(page) <= 0);
+-    atomic_dec(&page->_mapcount);
+-    if (put_page_testzero(page_head))
++    VM_BUG_ON(page_mapcount(page) != 0);
++    if (put_page_testzero(page_head)) {
++     /*
++      * If this is the tail of a
++      * slab compound page, the
++      * tail pin must not be the
++      * last reference held on the
++      * page, because the PG_slab
++      * cannot be cleared before
++      * all tail pins (which skips
++      * the _mapcount tail
++      * refcounting) have been
++      * released. For hugetlbfs the
++      * tail pin may be the last
++      * reference on the page
++      * instead, because
++      * PageHeadHuge will not go
++      * away until the compound
++      * page enters the buddy
++      * allocator.
++      */
++     VM_BUG_ON(PageSlab(page_head));
+      __put_compound_page(page_head);
++    }
+     return;
+    } else
+     /*
+-- 
+1.7.1

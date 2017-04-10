@@ -1,0 +1,197 @@
+From c7b5d2dc9294d42a8b2b3121ed06307bb30c21c2 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:00:47 -0400
+Subject: [ethernet] mlx4: Enforce irq affinity changes immediatly
+
+Message-id: <32875c14a0b1ce9bbe5b8535ddbfc13a6197a1bc.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93744
+O-Subject: [Patch RHEL7.1 V1 111/197] net/mlx4_core: Enforce irq affinity changes immediatly
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Yuval Atias <yuvala@mellanox.com>
+
+During heavy traffic, napi is constatntly polling the complition queue
+and no interrupt is fired. Because of that, changes to irq affinity are
+ignored until traffic is stopped and resumed.
+
+By registering to the irq notifier mechanism, and forcing interrupt when
+affinity is changed, irq affinity changes will be immediatly enforced.
+
+Signed-off-by: Yuval Atias <yuvala@mellanox.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2eacc23c422b4553030168f315cb49522fa1b1f6)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/cq.c b/drivers/net/ethernet/mellanox/mlx4/cq.c
+index 34c5b87..111b184 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/cq.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cq.c
+@@ -294,6 +294,9 @@ int mlx4_cq_alloc(struct mlx4_dev *dev, int nent,
+  atomic_set(&cq->refcount, 1);
+  init_completion(&cq->free);
+ 
++ cq->irq = priv->eq_table.eq[cq->vector].irq;
++ cq->irq_affinity_change = false;
++
+  return 0;
+ 
+ err_radix:
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 47053f0..c65896b 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -894,10 +894,17 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
+  mlx4_en_cq_unlock_napi(cq);
+ 
+  /* If we used up all the quota - we're probably not done yet... */
+- if (done == budget)
++ if (done == budget) {
+   INC_PERF_COUNTER(priv->pstats.napi_quota);
+- else {
++  if (unlikely(cq->mcq.irq_affinity_change)) {
++   cq->mcq.irq_affinity_change = false;
++   napi_complete(napi);
++   mlx4_en_arm_cq(priv, cq);
++   return 0;
++  }
++ } else {
+   /* Done for now */
++  cq->mcq.irq_affinity_change = false;
+   napi_complete(napi);
+   mlx4_en_arm_cq(priv, cq);
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index 26b9802..1635ab8 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -474,9 +474,15 @@ int mlx4_en_poll_tx_cq(struct napi_struct *napi, int budget)
+  /* If we used up all the quota - we're probably not done yet... */
+  if (done < budget) {
+   /* Done for now */
++  cq->mcq.irq_affinity_change = false;
+   napi_complete(napi);
+   mlx4_en_arm_cq(priv, cq);
+   return done;
++ } else if (unlikely(cq->mcq.irq_affinity_change)) {
++  cq->mcq.irq_affinity_change = false;
++  napi_complete(napi);
++  mlx4_en_arm_cq(priv, cq);
++  return 0;
+  }
+  return budget;
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlx4/eq.c b/drivers/net/ethernet/mellanox/mlx4/eq.c
+index 4b464d7..b34e549 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx4/eq.c
+@@ -54,6 +54,11 @@ enum {
+  MLX4_EQ_ENTRY_SIZE = 0x20
+ };
+ 
++struct mlx4_irq_notify {
++ void *arg;
++ struct irq_affinity_notify notify;
++};
++
+ #define MLX4_EQ_STATUS_OK    ( 0 << 28)
+ #define MLX4_EQ_STATUS_WRITE_FAIL  (10 << 28)
+ #define MLX4_EQ_OWNER_SW    ( 0 << 24)
+@@ -1084,6 +1089,57 @@ static void mlx4_unmap_clr_int(struct mlx4_dev *dev)
+  iounmap(priv->clr_base);
+ }
+ 
++static void mlx4_irq_notifier_notify(struct irq_affinity_notify *notify,
++         const cpumask_t *mask)
++{
++ struct mlx4_irq_notify *n = container_of(notify,
++       struct mlx4_irq_notify,
++       notify);
++ struct mlx4_priv *priv = (struct mlx4_priv *)n->arg;
++ struct radix_tree_iter iter;
++ void **slot;
++
++ radix_tree_for_each_slot(slot, &priv->cq_table.tree, &iter, 0) {
++  struct mlx4_cq *cq = (struct mlx4_cq *)(*slot);
++
++  if (cq->irq == notify->irq)
++   cq->irq_affinity_change = true;
++ }
++}
++
++static void mlx4_release_irq_notifier(struct kref *ref)
++{
++ struct mlx4_irq_notify *n = container_of(ref, struct mlx4_irq_notify,
++       notify.kref);
++ kfree(n);
++}
++
++static void mlx4_assign_irq_notifier(struct mlx4_priv *priv,
++         struct mlx4_dev *dev, int irq)
++{
++ struct mlx4_irq_notify *irq_notifier = NULL;
++ int err = 0;
++
++ irq_notifier = kzalloc(sizeof(*irq_notifier), GFP_KERNEL);
++ if (!irq_notifier) {
++  mlx4_warn(dev, "Failed to allocate irq notifier. irq %d\n",
++     irq);
++  return;
++ }
++
++ irq_notifier->notify.irq = irq;
++ irq_notifier->notify.notify = mlx4_irq_notifier_notify;
++ irq_notifier->notify.release = mlx4_release_irq_notifier;
++ irq_notifier->arg = priv;
++ err = irq_set_affinity_notifier(irq, &irq_notifier->notify);
++ if (err) {
++  kfree(irq_notifier);
++  irq_notifier = NULL;
++  mlx4_warn(dev, "Failed to set irq notifier. irq %d\n", irq);
++ }
++}
++
++
+ int mlx4_alloc_eq_table(struct mlx4_dev *dev)
+ {
+  struct mlx4_priv *priv = mlx4_priv(dev);
+@@ -1354,6 +1410,9 @@ int mlx4_assign_eq(struct mlx4_dev *dev, char *name, struct cpu_rmap *rmap,
+     continue;
+     /*we dont want to break here*/
+    }
++   mlx4_assign_irq_notifier(priv, dev,
++       priv->eq_table.eq[vec].irq);
++
+    eq_set_ci(&priv->eq_table.eq[vec], 1);
+   }
+  }
+@@ -1380,6 +1439,9 @@ void mlx4_release_eq(struct mlx4_dev *dev, int vec)
+     Belonging to a legacy EQ*/
+   mutex_lock(&priv->msix_ctl.pool_lock);
+   if (priv->msix_ctl.pool_bm & 1ULL << i) {
++   irq_set_affinity_notifier(
++    priv->eq_table.eq[vec].irq,
++    NULL);
+    free_irq(priv->eq_table.eq[vec].irq,
+      &priv->eq_table.eq[vec]);
+    priv->msix_ctl.pool_bm &= ~(1ULL << i);
+diff --git a/include/linux/mlx4/device.h b/include/linux/mlx4/device.h
+index 9860882..333ae3a 100644
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@ -577,6 +577,9 @@ struct mlx4_cq {
+ 
+  u32   cons_index;
+ 
++ u16                     irq;
++ bool                    irq_affinity_change;
++
+  __be32         *set_ci_db;
+  __be32         *arm_db;
+  int   arm_sn;
+-- 
+1.7.1

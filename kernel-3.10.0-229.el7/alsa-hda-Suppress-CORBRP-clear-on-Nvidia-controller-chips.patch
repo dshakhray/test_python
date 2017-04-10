@@ -1,0 +1,106 @@
+From 17aca36ff715445542bd7117b1331b6535d8546c Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:31:26 -0400
+Subject: [alsa] hda: Suppress CORBRP clear on Nvidia controller chips
+
+Message-id: <140972823573-283-patchset-jkysela@redhat.com>
+Patchwork-id: 90979
+O-Subject: [RHEL 7.1 PATCH 282/442] ALSA: hda - Suppress CORBRP clear on Nvidia controller chips
+Bugzilla: 1112200
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+The recent commit (ca460f86521) changed the CORB RP reset procedure to
+follow the specification with a couple of sanity checks.
+Unfortunately, Nvidia controller chips seem not following this way,
+and spew the warning messages like:
+snd_hda_intel 0000:00:10.1: CORB reset timeout#1, CORBRP = 0
+
+This patch adds the workaround for such chips.  It just skips the new
+reset procedure for the known broken chips.
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+(picked from kernel: 6ba736dd02e7b3658c344efeb2f4a096a6785d83)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/sound/pci/hda/hda_controller.c b/sound/pci/hda/hda_controller.c
+index 248b90a..480bbdd 100644
+--- a/sound/pci/hda/hda_controller.c
++++ b/sound/pci/hda/hda_controller.c
+@@ -1059,24 +1059,26 @@ static void azx_init_cmd_io(struct azx *chip)
+ 
+  /* reset the corb hw read pointer */
+  azx_writew(chip, CORBRP, ICH6_CORBRP_RST);
+- for (timeout = 1000; timeout > 0; timeout--) {
+-  if ((azx_readw(chip, CORBRP) & ICH6_CORBRP_RST) == ICH6_CORBRP_RST)
+-   break;
+-  udelay(1);
+- }
+- if (timeout <= 0)
+-  dev_err(chip->card->dev, "CORB reset timeout#1, CORBRP = %d\n",
+-   azx_readw(chip, CORBRP));
++ if (!(chip->driver_caps & AZX_DCAPS_CORBRP_SELF_CLEAR)) {
++  for (timeout = 1000; timeout > 0; timeout--) {
++   if ((azx_readw(chip, CORBRP) & ICH6_CORBRP_RST) == ICH6_CORBRP_RST)
++    break;
++   udelay(1);
++  }
++  if (timeout <= 0)
++   dev_err(chip->card->dev, "CORB reset timeout#1, CORBRP = %d\n",
++    azx_readw(chip, CORBRP));
+ 
+- azx_writew(chip, CORBRP, 0);
+- for (timeout = 1000; timeout > 0; timeout--) {
+-  if (azx_readw(chip, CORBRP) == 0)
+-   break;
+-  udelay(1);
++  azx_writew(chip, CORBRP, 0);
++  for (timeout = 1000; timeout > 0; timeout--) {
++   if (azx_readw(chip, CORBRP) == 0)
++    break;
++   udelay(1);
++  }
++  if (timeout <= 0)
++   dev_err(chip->card->dev, "CORB reset timeout#2, CORBRP = %d\n",
++    azx_readw(chip, CORBRP));
+  }
+- if (timeout <= 0)
+-  dev_err(chip->card->dev, "CORB reset timeout#2, CORBRP = %d\n",
+-   azx_readw(chip, CORBRP));
+ 
+  /* enable corb dma */
+  azx_writeb(chip, CORBCTL, ICH6_CORBCTL_RUN);
+diff --git a/sound/pci/hda/hda_intel.c b/sound/pci/hda/hda_intel.c
+index c18f818..f675379 100644
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -249,7 +249,8 @@ enum {
+ /* quirks for Nvidia */
+ #define AZX_DCAPS_PRESET_NVIDIA \
+  (AZX_DCAPS_NVIDIA_SNOOP | AZX_DCAPS_RIRB_DELAY | AZX_DCAPS_NO_MSI |\
+-  AZX_DCAPS_ALIGN_BUFSIZE | AZX_DCAPS_NO_64BIT)
++  AZX_DCAPS_ALIGN_BUFSIZE | AZX_DCAPS_NO_64BIT |\
++  AZX_DCAPS_CORBRP_SELF_CLEAR)
+ 
+ #define AZX_DCAPS_PRESET_CTHDA \
+  (AZX_DCAPS_NO_MSI | AZX_DCAPS_POSFIX_LPIB | AZX_DCAPS_4K_BDLE_BOUNDARY)
+diff --git a/sound/pci/hda/hda_priv.h b/sound/pci/hda/hda_priv.h
+index ba38b81..4a7cb01 100644
+--- a/sound/pci/hda/hda_priv.h
++++ b/sound/pci/hda/hda_priv.h
+@@ -189,6 +189,7 @@ enum { SDI0, SDI1, SDI2, SDI3, SDO0, SDO1, SDO2, SDO3 };
+ #define AZX_DCAPS_COUNT_LPIB_DELAY  (1 << 25) /* Take LPIB as delay */
+ #define AZX_DCAPS_PM_RUNTIME (1 << 26) /* runtime PM support */
+ #define AZX_DCAPS_I915_POWERWELL (1 << 27) /* HSW i915 powerwell support */
++#define AZX_DCAPS_CORBRP_SELF_CLEAR (1 << 28) /* CORBRP clears itself after reset */
+ 
+ /* position fix mode */
+ enum {
+-- 
+1.7.1

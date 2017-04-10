@@ -1,0 +1,109 @@
+From b8cad93a02c0dde82a8ddee02762b2712d0a738b Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:25:50 -0400
+Subject: [md] check command validity early in md_ioctl()
+
+Message-id: <1409563584-9000-49-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 90002
+O-Subject: [RHEL7.1 PATCH 48/82] md: check command validity early in md_ioctl().
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: Nicolas Schichan <nschichan@freebox.fr>
+
+Verify that the cmd parameter passed to md_ioctl() is valid before
+doing anything.
+
+This fixes mddev->hold_active being set to 0 when an invalid ioctl
+command is passed to md_ioctl() before the array has been configured.
+
+Clearing mddev->hold_active in that case can lead to a livelock
+situation when an invalid ioctl number is given to md_ioctl() by a
+process when the mddev is currently being opened by another process:
+
+Process 1    Process 2
+---------    ---------
+
+md_alloc()
+  mddev_find()
+  -> returns a new mddev with
+     hold_active == UNTIL_IOCTL
+  add_disk()
+  -> sends KOBJ_ADD uevent
+
+     (sees KOBJ_ADD uevent for device)
+                       md_open()
+                       md_ioctl(INVALID_IOCTL)
+                       -> returns ENODEV and clears
+                             mddev->hold_active
+                       md_release()
+                         md_put()
+                         -> deletes the mddev as
+                              hold_active is 0
+
+md_open()
+  mddev_find()
+  -> returns a newly
+    allocated mddev with
+    mddev->gendisk == NULL
+-> returns with ERESTARTSYS
+   (kernel restarts the open syscall)
+
+Signed-off-by: Nicolas Schichan <nschichan@freebox.fr>
+Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit cb335f88eb35af712d1f4171642d0487f7bb2e7e)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 07ce45e..85effbd 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -6344,6 +6344,32 @@ static int md_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+  return 0;
+ }
+ 
++static inline bool md_ioctl_valid(unsigned int cmd)
++{
++ switch (cmd) {
++ case ADD_NEW_DISK:
++ case BLKROSET:
++ case GET_ARRAY_INFO:
++ case GET_BITMAP_FILE:
++ case GET_DISK_INFO:
++ case HOT_ADD_DISK:
++ case HOT_REMOVE_DISK:
++ case PRINT_RAID_DEBUG:
++ case RAID_AUTORUN:
++ case RAID_VERSION:
++ case RESTART_ARRAY_RW:
++ case RUN_ARRAY:
++ case SET_ARRAY_INFO:
++ case SET_BITMAP_FILE:
++ case SET_DISK_FAULTY:
++ case STOP_ARRAY:
++ case STOP_ARRAY_RO:
++  return true;
++ default:
++  return false;
++ }
++}
++
+ static int md_ioctl(struct block_device *bdev, fmode_t mode,
+    unsigned int cmd, unsigned long arg)
+ {
+@@ -6352,6 +6378,9 @@ static int md_ioctl(struct block_device *bdev, fmode_t mode,
+  struct mddev *mddev = NULL;
+  int ro;
+ 
++ if (!md_ioctl_valid(cmd))
++  return -ENOTTY;
++
+  switch (cmd) {
+  case RAID_VERSION:
+  case GET_ARRAY_INFO:
+-- 
+1.7.1

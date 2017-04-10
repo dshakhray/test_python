@@ -1,0 +1,130 @@
+From e6913fb2ddb11f218a24dd4c89ec3e998beef909 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:07:37 -0400
+Subject: [tools] perf: Add ->cmp(), ->collapse() and ->sort() to perf_hpp_fmt
+
+Message-id: <1410181752-25631-213-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91875
+O-Subject: [PATCH RHEL7.1 BZ1134356 212/307] perf tools: Add ->cmp(), ->collapse() and ->sort() to perf_hpp_fmt
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit bc18b7f2e3ca09b360b26c25a7541ba6f170111b
+Author: Namhyung Kim <namhyung@kernel.org>
+Date: Mon Mar 3 10:59:57 2014 +0900
+
+description
+===========
+Those function pointers will be used to sort report output based on
+the selected fields.  This is a preparation of later change.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/ui/hist.c b/tools/perf/ui/hist.c
+index 0912805..d4a4f2e 100644
+--- a/tools/perf/ui/hist.c
++++ b/tools/perf/ui/hist.c
+@@ -192,6 +192,14 @@ static int hpp__entry_##_type(struct perf_hpp_fmt *_fmt __maybe_unused,  \
+      hpp_entry_scnprintf, true);    \
+ }
+ 
++#define __HPP_SORT_FN(_type, _field)      \
++static int64_t hpp__sort_##_type(struct hist_entry *a, struct hist_entry *b) \
++{          \
++ s64 __a = he_get_##_field(a);      \
++ s64 __b = he_get_##_field(b);      \
++ return __a - __b;       \
++}
++
+ #define __HPP_ENTRY_RAW_FN(_type, _field)     \
+ static u64 he_get_raw_##_field(struct hist_entry *he)    \
+ {          \
+@@ -206,16 +214,27 @@ static int hpp__entry_##_type(struct perf_hpp_fmt *_fmt __maybe_unused,  \
+      hpp_entry_scnprintf, false);    \
+ }
+ 
++#define __HPP_SORT_RAW_FN(_type, _field)     \
++static int64_t hpp__sort_##_type(struct hist_entry *a, struct hist_entry *b) \
++{          \
++ s64 __a = he_get_raw_##_field(a);     \
++ s64 __b = he_get_raw_##_field(b);     \
++ return __a - __b;       \
++}
++
++
+ #define HPP_PERCENT_FNS(_type, _str, _field, _min_width, _unit_width) \
+ __HPP_HEADER_FN(_type, _str, _min_width, _unit_width)   \
+ __HPP_WIDTH_FN(_type, _min_width, _unit_width)    \
+ __HPP_COLOR_PERCENT_FN(_type, _field)     \
+-__HPP_ENTRY_PERCENT_FN(_type, _field)
++__HPP_ENTRY_PERCENT_FN(_type, _field)     \
++__HPP_SORT_FN(_type, _field)
+ 
+ #define HPP_RAW_FNS(_type, _str, _field, _min_width, _unit_width) \
+ __HPP_HEADER_FN(_type, _str, _min_width, _unit_width)   \
+ __HPP_WIDTH_FN(_type, _min_width, _unit_width)    \
+-__HPP_ENTRY_RAW_FN(_type, _field)
++__HPP_ENTRY_RAW_FN(_type, _field)     \
++__HPP_SORT_RAW_FN(_type, _field)
+ 
+ 
+ HPP_PERCENT_FNS(overhead, "Overhead", period, 8, 8)
+@@ -227,19 +246,31 @@ HPP_PERCENT_FNS(overhead_guest_us, "guest usr", period_guest_us, 9, 8)
+ HPP_RAW_FNS(samples, "Samples", nr_events, 12, 12)
+ HPP_RAW_FNS(period, "Period", period, 12, 12)
+ 
++static int64_t hpp__nop_cmp(struct hist_entry *a __maybe_unused,
++       struct hist_entry *b __maybe_unused)
++{
++ return 0;
++}
++
+ #define HPP__COLOR_PRINT_FNS(_name)   \
+  {      \
+   .header = hpp__header_ ## _name, \
+   .width = hpp__width_ ## _name,  \
+   .color = hpp__color_ ## _name,  \
+-  .entry = hpp__entry_ ## _name  \
++  .entry = hpp__entry_ ## _name,  \
++  .cmp = hpp__nop_cmp,   \
++  .collapse = hpp__nop_cmp,  \
++  .sort = hpp__sort_ ## _name,  \
+  }
+ 
+ #define HPP__PRINT_FNS(_name)    \
+  {      \
+   .header = hpp__header_ ## _name, \
+   .width = hpp__width_ ## _name,  \
+-  .entry = hpp__entry_ ## _name  \
++  .entry = hpp__entry_ ## _name,  \
++  .cmp = hpp__nop_cmp,   \
++  .collapse = hpp__nop_cmp,  \
++  .sort = hpp__sort_ ## _name,  \
+  }
+ 
+ struct perf_hpp_fmt perf_hpp__format[] = {
+diff --git a/tools/perf/util/hist.h b/tools/perf/util/hist.h
+index 38c3e87..36dbe00 100644
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@ -160,6 +160,9 @@ struct perf_hpp_fmt {
+        struct hist_entry *he);
+  int (*entry)(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,
+        struct hist_entry *he);
++ int64_t (*cmp)(struct hist_entry *a, struct hist_entry *b);
++ int64_t (*collapse)(struct hist_entry *a, struct hist_entry *b);
++ int64_t (*sort)(struct hist_entry *a, struct hist_entry *b);
+ 
+  struct list_head list;
+ };
+-- 
+1.7.1

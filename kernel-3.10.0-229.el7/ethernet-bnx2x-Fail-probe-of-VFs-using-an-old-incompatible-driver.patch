@@ -1,0 +1,138 @@
+From eb27da831690855db6620930c7d4bdbcd8cab753 Mon Sep 17 00:00:00 2001
+From: Michal Schmidt <mschmidt@redhat.com>
+Date: Fri, 5 Sep 2014 19:49:49 -0400
+Subject: [ethernet] bnx2x: Fail probe of VFs using an old incompatible driver
+
+Message-id: <1409946615-5862-45-git-send-email-mschmidt@redhat.com>
+Patchwork-id: 91585
+O-Subject: [RHEL7.1 PATCH 44/70] bnx2x: Fail probe of VFs using an old incompatible driver
+Bugzilla: 1089402
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+BZ: https://bugzilla.redhat.com/show_bug.cgi?id=1089402
+
+Upstream commit:
+commit ebf457f931e363cd5f57e661e103386af5a21629
+Author: Yuval Mintz <Yuval.Mintz@qlogic.com>
+Date:   Thu Jun 26 14:31:06 2014 +0300
+
+    bnx2x: Fail probe of VFs using an old incompatible driver
+
+    There are linux distributions where the inbox bnx2x driver contains SRIOV
+    support but doesn't contain the changes introduced in b9871bcf
+    "bnx2x: VF RSS support - PF side".
+
+    A VF in a VM running that distribution over a new hypervisor will access
+    incorrect addresses when trying to transmit packets, causing an attention
+    in the hypervisor and making that VF inactive until FLRed.
+
+    The driver in the VM has to ne upgraded [no real way to overcome this], but
+    due to the HW attention currently arising upgrading the driver in the VM
+    would not suffice [since the VF needs also be FLRed if the previous driver
+    was already loaded].
+
+    This patch causes the PF to fail the acquire message from a VF running an
+    old problematic driver; The VF will then gracefully fail it's probe preventing
+    the HW attention [and allow clean upgrade of driver in VM].
+
+    Signed-off-by: Yuval Mintz <Yuval.Mintz@qlogic.com>
+    Signed-off-by: Ariel Elior <Ariel.Elior@qlogic.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c
+index f350773..54e0427 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.c
+@@ -1235,6 +1235,41 @@ static void bnx2x_vf_mbx_acquire_resp(struct bnx2x *bp, struct bnx2x_virtf *vf,
+  bnx2x_vf_mbx_resp_send_msg(bp, vf, vfop_status);
+ }
+ 
++static bool bnx2x_vf_mbx_is_windows_vm(struct bnx2x *bp,
++           struct vfpf_acquire_tlv *acquire)
++{
++ /* Windows driver does one of three things:
++  * 1. Old driver doesn't have bulletin board address set.
++  * 2. 'Middle' driver sends mc_num == 32.
++  * 3. New driver sets the OS field.
++  */
++ if (!acquire->bulletin_addr ||
++     acquire->resc_request.num_mc_filters == 32 ||
++     ((acquire->vfdev_info.vf_os & VF_OS_MASK) ==
++      VF_OS_WINDOWS))
++  return true;
++
++ return false;
++}
++
++static int bnx2x_vf_mbx_acquire_chk_dorq(struct bnx2x *bp,
++      struct bnx2x_virtf *vf,
++      struct bnx2x_vf_mbx *mbx)
++{
++ /* Linux drivers which correctly set the doorbell size also
++  * send a physical port request
++  */
++ if (bnx2x_search_tlv_list(bp, &mbx->msg->req,
++      CHANNEL_TLV_PHYS_PORT_ID))
++  return 0;
++
++ /* Issue does not exist in windows VMs */
++ if (bnx2x_vf_mbx_is_windows_vm(bp, &mbx->msg->req.acquire))
++  return 0;
++
++ return -EOPNOTSUPP;
++}
++
+ static void bnx2x_vf_mbx_acquire(struct bnx2x *bp, struct bnx2x_virtf *vf,
+      struct bnx2x_vf_mbx *mbx)
+ {
+@@ -1250,6 +1285,18 @@ static void bnx2x_vf_mbx_acquire(struct bnx2x *bp, struct bnx2x_virtf *vf,
+     acquire->resc_request.num_vlan_filters,
+     acquire->resc_request.num_mc_filters);
+ 
++ /* Prevent VFs with old drivers from loading, since they calculate
++  * CIDs incorrectly requiring a VF-flr [VM reboot] in order to recover
++  * while being upgraded.
++  */
++ rc = bnx2x_vf_mbx_acquire_chk_dorq(bp, vf, mbx);
++ if (rc) {
++  DP(BNX2X_MSG_IOV,
++     "VF [%d] - Can't support acquire request due to doorbell mismatch. Please update VM driver\n",
++     vf->abs_vfid);
++  goto out;
++ }
++
+  /* acquire the resources */
+  rc = bnx2x_vf_acquire(bp, vf, &acquire->resc_request);
+ 
+@@ -1263,6 +1310,7 @@ static void bnx2x_vf_mbx_acquire(struct bnx2x *bp, struct bnx2x_virtf *vf,
+   vf->cfg_flags &= ~VF_CFG_EXT_BULLETIN;
+  }
+ 
++out:
+  /* response */
+  bnx2x_vf_mbx_acquire_resp(bp, vf, mbx, rc);
+ }
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h
+index ace4d7b..15670c4 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_vfpf.h
+@@ -118,6 +118,12 @@ struct vfpf_acquire_tlv {
+   /* the following fields are for debug purposes */
+   u8  vf_id;  /* ME register value */
+   u8  vf_os;  /* e.g. Linux, W2K8 */
++#define VF_OS_SUBVERSION_MASK (0x1f)
++#define VF_OS_MASK  (0xe0)
++#define VF_OS_SHIFT  (5)
++#define VF_OS_UNDEFINED  (0 << VF_OS_SHIFT)
++#define VF_OS_WINDOWS  (1 << VF_OS_SHIFT)
++
+   u8 padding;
+   u8 caps;
+ #define VF_CAP_SUPPORT_EXT_BULLETIN (1 << 0)
+-- 
+1.7.1

@@ -1,0 +1,154 @@
+From 06f2a75e55f5a1d481e81b9b79ac54b07b31e951 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 12 Sep 2014 14:30:16 -0400
+Subject: [net] openvswitch: Sample action without side effects
+
+Message-id: <02e0ea4438ad4936a9067c59fdf9e08b97e7bd21.1410531783.git.jbenc@redhat.com>
+Patchwork-id: 94040
+O-Subject: [RHEL7.1 net PATCH 43/50] openvswitch: Sample action without side effects
+Bugzilla: 1110384
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110384
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7948291
+
+commit 651887b0c22cffcfce7eb9c29ee23ffb105bdb0b
+Author: Simon Horman <horms@verge.net.au>
+Date:   Mon Jul 21 15:12:34 2014 -0700
+
+    openvswitch: Sample action without side effects
+
+    The sample action is rather generic, allowing arbitrary actions to be
+    executed based on a probability. However its use, within the Open
+    vSwitch
+    code-base is limited: only a single user-space action is ever nested.
+
+    A consequence of the current implementation of sample actions is that
+    depending on weather the sample action executed (due to its probability)
+    any side-effects of nested actions may or may not be present before
+    executing subsequent actions.  This has the potential to complicate
+    verification of valid actions by the (kernel) datapath. And indeed
+    adding support for push and pop MPLS actions inside sample actions
+    is one case where such case.
+
+    In order to allow all supported actions to be continue to be nested
+    inside sample actions without the potential need for complex
+    verification code this patch changes the implementation of the sample
+    action in the kernel datapath so that sample actions are more like
+    a function call and any side effects of nested actions are not
+    present when executing subsequent actions.
+
+    With the above in mind the motivation for this change is twofold:
+
+    * To contain side-effects the sample action in the hope of making it
+      easier to deal with in the future and;
+    * To avoid some rather complex verification code introduced in the MPLS
+      datapath patch.
+
+    Signed-off-by: Simon Horman <horms@verge.net.au>
+    Signed-off-by: Jesse Gross <jesse@nicira.com>
+    Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index 6054554..5445d9d 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -38,7 +38,7 @@
+ #include "vport.h"
+ 
+ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+-   const struct nlattr *attr, int len, bool keep_skb);
++         const struct nlattr *attr, int len);
+ 
+ static int make_writable(struct sk_buff *skb, int write_len)
+ {
+@@ -439,11 +439,17 @@ static int output_userspace(struct datapath *dp, struct sk_buff *skb,
+  return ovs_dp_upcall(dp, skb, &upcall);
+ }
+ 
++static bool last_action(const struct nlattr *a, int rem)
++{
++ return a->nla_len == rem;
++}
++
+ static int sample(struct datapath *dp, struct sk_buff *skb,
+     const struct nlattr *attr)
+ {
+  const struct nlattr *acts_list = NULL;
+  const struct nlattr *a;
++ struct sk_buff *sample_skb;
+  int rem;
+ 
+  for (a = nla_data(attr), rem = nla_len(attr); rem > 0;
+@@ -460,8 +466,32 @@ static int sample(struct datapath *dp, struct sk_buff *skb,
+   }
+  }
+ 
+- return do_execute_actions(dp, skb, nla_data(acts_list),
+-       nla_len(acts_list), true);
++ rem = nla_len(acts_list);
++ a = nla_data(acts_list);
++
++ /* Actions list is either empty or only contains a single user-space
++  * action, the latter being a special case as it is the only known
++  * usage of the sample action.
++  * In these special cases don't clone the skb as there are no
++  * side-effects in the nested actions.
++  * Otherwise, clone in case the nested actions have side effects.
++  */
++ if (likely(rem == 0 || (nla_type(a) == OVS_ACTION_ATTR_USERSPACE &&
++    last_action(a, rem)))) {
++  sample_skb = skb;
++  skb_get(skb);
++ } else {
++  sample_skb = skb_clone(skb, GFP_ATOMIC);
++ }
++
++ /* Note that do_execute_actions() never consumes skb.
++  * In the case where skb has been cloned above it is the clone that
++  * is consumed.  Otherwise the skb_get(skb) call prevents
++  * consumption by do_execute_actions(). Thus, it is safe to simply
++  * return the error code and let the caller (also
++  * do_execute_actions()) free skb on error.
++  */
++ return do_execute_actions(dp, sample_skb, a, rem);
+ }
+ 
+ static int execute_set_action(struct sk_buff *skb,
+@@ -512,7 +542,7 @@ static int execute_set_action(struct sk_buff *skb,
+ 
+ /* Execute a list of actions against 'skb'. */
+ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+-   const struct nlattr *attr, int len, bool keep_skb)
++         const struct nlattr *attr, int len)
+ {
+  /* Every output action needs a separate clone of 'skb', but the common
+   * case is just a single output action, so that doing a clone and
+@@ -567,12 +597,9 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+   }
+  }
+ 
+- if (prev_port != -1) {
+-  if (keep_skb)
+-   skb = skb_clone(skb, GFP_ATOMIC);
+-
++ if (prev_port != -1)
+   do_output(dp, skb, prev_port);
+- } else if (!keep_skb)
++ else
+   consume_skb(skb);
+ 
+  return 0;
+@@ -584,6 +611,5 @@ int ovs_execute_actions(struct datapath *dp, struct sk_buff *skb)
+  struct sw_flow_actions *acts = rcu_dereference(OVS_CB(skb)->flow->sf_acts);
+ 
+  OVS_CB(skb)->tun_key = NULL;
+- return do_execute_actions(dp, skb, acts->actions,
+-      acts->actions_len, false);
++ return do_execute_actions(dp, skb, acts->actions, acts->actions_len);
+ }
+-- 
+1.7.1

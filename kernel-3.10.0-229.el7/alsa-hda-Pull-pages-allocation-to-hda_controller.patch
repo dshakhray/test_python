@@ -1,0 +1,155 @@
+From 9c9d9eb9eb31b881177a8f633c7b396675aa1835 Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:26:30 -0400
+Subject: [alsa] hda: Pull pages allocation to hda_controller
+
+Message-id: <140972823573-212-patchset-jkysela@redhat.com>
+Patchwork-id: 90912
+O-Subject: [RHEL 7.1 PATCH 211/442] ALSA: hda - Pull pages allocation to hda_controller
+Bugzilla: 1112200
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+Pull allocation from first_init to a new function in hda_controller.c.
+Short term this will allow the dsp loader to be moved as well.  In
+later commits it will allow the same allocation to be used by the
+platform hda driver.
+
+Signed-off-by: Dylan Reid <dgreid@chromium.org>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+(picked from kernel: 679089944317963e9abf51899b48db3b6f424489)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/sound/pci/hda/hda_controller.c b/sound/pci/hda/hda_controller.c
+index fcc5c30..bf5e890 100644
+--- a/sound/pci/hda/hda_controller.c
++++ b/sound/pci/hda/hda_controller.c
+@@ -1014,5 +1014,48 @@ int azx_attach_pcm_stream(struct hda_bus *bus, struct hda_codec *codec,
+ }
+ EXPORT_SYMBOL_GPL(azx_attach_pcm_stream);
+ 
++int azx_alloc_stream_pages(struct azx *chip)
++{
++ int i, err;
++ struct snd_card *card = chip->card;
++
++ for (i = 0; i < chip->num_streams; i++) {
++  dsp_lock_init(&chip->azx_dev[i]);
++  /* allocate memory for the BDL for each stream */
++  err = chip->ops->dma_alloc_pages(chip, SNDRV_DMA_TYPE_DEV,
++       BDL_SIZE,
++       &chip->azx_dev[i].bdl);
++  if (err < 0) {
++   dev_err(card->dev, "cannot allocate BDL\n");
++   return -ENOMEM;
++  }
++ }
++ /* allocate memory for the position buffer */
++ err = chip->ops->dma_alloc_pages(chip, SNDRV_DMA_TYPE_DEV,
++      chip->num_streams * 8, &chip->posbuf);
++ if (err < 0) {
++  dev_err(card->dev, "cannot allocate posbuf\n");
++  return -ENOMEM;
++ }
++ return 0;
++}
++EXPORT_SYMBOL_GPL(azx_alloc_stream_pages);
++
++void azx_free_stream_pages(struct azx *chip)
++{
++ int i;
++ if (chip->azx_dev) {
++  for (i = 0; i < chip->num_streams; i++)
++   if (chip->azx_dev[i].bdl.area)
++    chip->ops->dma_free_pages(
++     chip, &chip->azx_dev[i].bdl);
++ }
++ if (chip->rb.area)
++  chip->ops->dma_free_pages(chip, &chip->rb);
++ if (chip->posbuf.area)
++  chip->ops->dma_free_pages(chip, &chip->posbuf);
++}
++EXPORT_SYMBOL_GPL(azx_free_stream_pages);
++
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("Common HDA driver funcitons");
+diff --git a/sound/pci/hda/hda_controller.h b/sound/pci/hda/hda_controller.h
+index a62cdde..9ea6b44 100644
+--- a/sound/pci/hda/hda_controller.h
++++ b/sound/pci/hda/hda_controller.h
+@@ -54,4 +54,8 @@ int setup_bdle(struct azx *chip,
+ #define dsp_is_locked(dev) 0
+ #endif
+ 
++/* Allocation functions. */
++int azx_alloc_stream_pages(struct azx *chip);
++void azx_free_stream_pages(struct azx *chip);
++
+ #endif /* __SOUND_HDA_CONTROLLER_H */
+diff --git a/sound/pci/hda/hda_intel.c b/sound/pci/hda/hda_intel.c
+index c4308e3..e28f19a 100644
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -1864,16 +1864,7 @@ static int azx_free(struct azx *chip)
+  if (chip->remap_addr)
+   iounmap(chip->remap_addr);
+ 
+- if (chip->azx_dev) {
+-  for (i = 0; i < chip->num_streams; i++)
+-   if (chip->azx_dev[i].bdl.area)
+-    chip->ops->dma_free_pages(
+-     chip, &chip->azx_dev[i].bdl);
+- }
+- if (chip->rb.area)
+-  chip->ops->dma_free_pages(chip, &chip->rb);
+- if (chip->posbuf.area)
+-  chip->ops->dma_free_pages(chip, &chip->posbuf);
++ azx_free_stream_pages(chip);
+  if (chip->region_requested)
+   pci_release_regions(chip->pci);
+  pci_disable_device(chip->pci);
+@@ -2210,7 +2201,7 @@ static int azx_first_init(struct azx *chip)
+  int dev = chip->dev_index;
+  struct pci_dev *pci = chip->pci;
+  struct snd_card *card = chip->card;
+- int i, err;
++ int err;
+  unsigned short gcap;
+ 
+ #if BITS_PER_LONG != 64
+@@ -2322,24 +2313,9 @@ static int azx_first_init(struct azx *chip)
+   return -ENOMEM;
+  }
+ 
+- for (i = 0; i < chip->num_streams; i++) {
+-  dsp_lock_init(&chip->azx_dev[i]);
+-  /* allocate memory for the BDL for each stream */
+-  err = chip->ops->dma_alloc_pages(chip, SNDRV_DMA_TYPE_DEV,
+-       BDL_SIZE,
+-       &chip->azx_dev[i].bdl);
+-  if (err < 0) {
+-   dev_err(card->dev, "cannot allocate BDL\n");
+-   return -ENOMEM;
+-  }
+- }
+- /* allocate memory for the position buffer */
+- err = chip->ops->dma_alloc_pages(chip, SNDRV_DMA_TYPE_DEV,
+-      chip->num_streams * 8, &chip->posbuf);
+- if (err < 0) {
+-  dev_err(card->dev, "cannot allocate posbuf\n");
+-  return -ENOMEM;
+- }
++ err = azx_alloc_stream_pages(chip);
++ if (err < 0)
++  return err;
+  /* allocate CORB/RIRB */
+  err = azx_alloc_cmd_io(chip);
+  if (err < 0)
+-- 
+1.7.1

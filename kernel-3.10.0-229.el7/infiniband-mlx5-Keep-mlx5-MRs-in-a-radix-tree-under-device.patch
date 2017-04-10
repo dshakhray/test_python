@@ -1,0 +1,151 @@
+From 0c0a524d6bae7caad4e59d62e0f2e611dd0ad0a4 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:00:04 -0400
+Subject: [infiniband] mlx5: Keep mlx5 MRs in a radix tree under device
+
+Message-id: <28d2866e2d063d66913400e5f98632f1c4e9ed20.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93654
+O-Subject: [Patch RHEL7.1 V1 068/197] IB/mlx5: Keep mlx5 MRs in a radix tree under device
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Sagi Grimberg <sagig@mellanox.com>
+
+This will be useful when processing signature errors on a specific
+key.  The mlx5 driver will lookup the matching mlx5 memory region
+structure and mark it as dirty (contains signature errors).
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 3bcdb17a5e88288ead90be3c107e754a6075a5b0)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 6f7c866..fac0b6d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -440,6 +440,7 @@ int mlx5_dev_init(struct mlx5_core_dev *dev, struct pci_dev *pdev)
+  mlx5_init_cq_table(dev);
+  mlx5_init_qp_table(dev);
+  mlx5_init_srq_table(dev);
++ mlx5_init_mr_table(dev);
+ 
+  return 0;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/mr.c b/drivers/net/ethernet/mellanox/mlx5/core/mr.c
+index bb746bb..4cc9276 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mr.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mr.c
+@@ -36,11 +36,24 @@
+ #include <linux/mlx5/cmd.h>
+ #include "mlx5_core.h"
+ 
++void mlx5_init_mr_table(struct mlx5_core_dev *dev)
++{
++ struct mlx5_mr_table *table = &dev->priv.mr_table;
++
++ rwlock_init(&table->lock);
++ INIT_RADIX_TREE(&table->tree, GFP_ATOMIC);
++}
++
++void mlx5_cleanup_mr_table(struct mlx5_core_dev *dev)
++{
++}
++
+ int mlx5_core_create_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr,
+      struct mlx5_create_mkey_mbox_in *in, int inlen,
+      mlx5_cmd_cbk_t callback, void *context,
+      struct mlx5_create_mkey_mbox_out *out)
+ {
++ struct mlx5_mr_table *table = &dev->priv.mr_table;
+  struct mlx5_create_mkey_mbox_out lout;
+  int err;
+  u8 key;
+@@ -73,14 +86,21 @@ int mlx5_core_create_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr,
+  mlx5_core_dbg(dev, "out 0x%x, key 0x%x, mkey 0x%x\n",
+         be32_to_cpu(lout.mkey), key, mr->key);
+ 
++ /* connect to MR tree */
++ write_lock_irq(&table->lock);
++ err = radix_tree_insert(&table->tree, mlx5_base_mkey(mr->key), mr);
++ write_unlock_irq(&table->lock);
++
+  return err;
+ }
+ EXPORT_SYMBOL(mlx5_core_create_mkey);
+ 
+ int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr)
+ {
++ struct mlx5_mr_table *table = &dev->priv.mr_table;
+  struct mlx5_destroy_mkey_mbox_in in;
+  struct mlx5_destroy_mkey_mbox_out out;
++ unsigned long flags;
+  int err;
+ 
+  memset(&in, 0, sizeof(in));
+@@ -95,6 +115,10 @@ int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr)
+  if (out.hdr.status)
+   return mlx5_cmd_status_to_err(&out.hdr);
+ 
++ write_lock_irqsave(&table->lock, flags);
++ radix_tree_delete(&table->tree, mlx5_base_mkey(mr->key));
++ write_unlock_irqrestore(&table->lock, flags);
++
+  return err;
+ }
+ EXPORT_SYMBOL(mlx5_core_destroy_mkey);
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index e1cb657..e562e01 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -491,6 +491,13 @@ struct mlx5_srq_table {
+  struct radix_tree_root tree;
+ };
+ 
++struct mlx5_mr_table {
++ /* protect radix tree
++  */
++ rwlock_t  lock;
++ struct radix_tree_root tree;
++};
++
+ struct mlx5_priv {
+  char   name[MLX5_MAX_NAME_LEN];
+  struct mlx5_eq_table eq_table;
+@@ -520,6 +527,10 @@ struct mlx5_priv {
+  struct mlx5_cq_table cq_table;
+  /* end: cq staff */
+ 
++ /* start: mr staff */
++ struct mlx5_mr_table mr_table;
++ /* end: mr staff */
++
+  /* start: alloc staff */
+  struct mutex            pgdir_mutex;
+  struct list_head        pgdir_list;
+@@ -667,6 +678,11 @@ static inline void mlx5_vfree(const void *addr)
+   kfree(addr);
+ }
+ 
++static inline u32 mlx5_base_mkey(const u32 key)
++{
++ return key & 0xffffff00u;
++}
++
+ int mlx5_dev_init(struct mlx5_core_dev *dev, struct pci_dev *pdev);
+ void mlx5_dev_cleanup(struct mlx5_core_dev *dev);
+ int mlx5_cmd_init(struct mlx5_core_dev *dev);
+@@ -701,6 +717,8 @@ int mlx5_core_query_srq(struct mlx5_core_dev *dev, struct mlx5_core_srq *srq,
+    struct mlx5_query_srq_mbox_out *out);
+ int mlx5_core_arm_srq(struct mlx5_core_dev *dev, struct mlx5_core_srq *srq,
+         u16 lwm, int is_srq);
++void mlx5_init_mr_table(struct mlx5_core_dev *dev);
++void mlx5_cleanup_mr_table(struct mlx5_core_dev *dev);
+ int mlx5_core_create_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr,
+      struct mlx5_create_mkey_mbox_in *in, int inlen,
+      mlx5_cmd_cbk_t callback, void *context,
+-- 
+1.7.1

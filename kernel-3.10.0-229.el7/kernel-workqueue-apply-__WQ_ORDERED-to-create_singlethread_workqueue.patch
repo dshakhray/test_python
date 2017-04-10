@@ -1,0 +1,106 @@
+From 2fcbdfb8c84f6c2fd1b338b063fe79342a1db8f4 Mon Sep 17 00:00:00 2001
+From: Tomas Henzl <thenzl@redhat.com>
+Date: Wed, 1 Oct 2014 11:50:02 -0400
+Subject: [kernel] workqueue: apply __WQ_ORDERED to create_singlethread_workqueue()
+
+Message-id: <1412164202-17106-1-git-send-email-thenzl@redhat.com>
+Patchwork-id: 96817
+O-Subject: [RHEL7.1 PATCH 1/1] workqueue: apply __WQ_ORDERED to create_singlethread_workqueue()
+Bugzilla: 1131563
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+RH-Acked-by: Tejun Heo <theo@redhat.com>
+RH-Acked-by: Oleg Nesterov <oleg@redhat.com>
+
+bz#1131563
+
+In this case - an mpt2sas driver issue is the 'singlethread'
+workqueue used to serialise acces to the controller.
+The analysis from the driver's view has shown (copied from bz) that:
+"During the driver load time and after the port enable event;
+First the driver has received the Event called "SAS DISCOVERY Event"
+and added this event work to Workqueue. Then while worker thread
+processing above "SAS DISCOVERY" event, driver has received
+anther event called "SAS TOPOLOGY CHANGE LIST" event.
+Then driver has added this event to the Workqueue. Immediately
+worker thread has started processing this newly added event work
+while still first event work process is going on.
+
+As both the event processes are trying to add HBA PHYs with the
+ransport layer and so while the second process is trying to add
+the phy to the transport layer, then transport layer says that
+this phy is already add and kernel panic occurs. So here we see
+the racing condition. (Normally first event work i.e. SAS DISCOVERY
+Event will be processed first and it will add the HBA PHYS to the
+transport layer and after completion of first event work, worker
+thread will start process second event work i.e. SAS TOPOLOGY CHANGE LIST.
+In this work process driver will verify the HBA variable called num_phys,
+in this work process driver will try to add HBA phys to transport layer only when this num_phys varable is zero)"
+
+Brew - task_8032916
+
+Tested by the reporter - IBM.
+
+Tomas
+
+Backported from  e09c2c295468476a239d13324ce9042ec4de05eb
+workqueue: apply __WQ_ORDERED to create_singlethread_workqueue()
+
+create_singlethread_workqueue() is a compat interface for single
+threaded workqueue which maps to ordered workqueue w/ rescuer in the
+current implementation.  create_singlethread_workqueue() currently
+implemented by invoking alloc_workqueue() w/ appropriate parameters.
+
+8719dceae2f9 ("workqueue: reject adjusting max_active or applying
+attrs to ordered workqueues") introduced __WQ_ORDERED to protect
+ordered workqueues against dynamic attribute changes which can break
+ordering guarantees but forgot to apply it to
+create_singlethread_workqueue().  This in itself is okay as nobody
+currently uses dynamic attribute change on workqueues created with
+create_singlethread_workqueue().
+
+However, 4c16bd327c ("workqueue: implement NUMA affinity for unbound
+workqueues") broke singlethreaded guarantee for ordered workqueues
+through allocating a separate pool_workqueue on each NUMA node by
+default.  A later change 8a2b75384444 ("workqueue: fix ordered
+workqueues in NUMA setups") fixed it by allocating only one global
+pool_workqueue if __WQ_ORDERED is set.
+
+Combined, the __WQ_ORDERED omission in create_singlethread_workqueue()
+became critical breaking its single threadedness and ordering
+guarantee.
+
+Let's make create_singlethread_workqueue() wrap
+alloc_ordered_workqueue() instead so that it inherits __WQ_ORDERED and
+can implicitly track future ordered_workqueue changes.
+
+v2: I missed that __WQ_ORDERED now protects against pwq splitting
+    across NUMA nodes and incorrectly described the patch as a
+    nice-to-have fix to protect against future dynamic attribute
+    usages.  Oleg pointed out that this is actually a critical
+    breakage due to 8a2b75384444 ("workqueue: fix ordered workqueues
+    in NUMA setups").
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Mike Anderson <mike.anderson@us.ibm.com>
+Cc: Oleg Nesterov <onestero@redhat.com>
+Cc: Gustavo Luiz Duarte <gduarte@redhat.com>
+Cc: Tomas Henzl <thenzl@redhat.com>
+Cc: stable@vger.kernel.org
+Fixes: 4c16bd327c ("workqueue: implement NUMA affinity for unbound workqueues")
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/workqueue.h b/include/linux/workqueue.h
+index 623488f..cce29ae 100644
+--- a/include/linux/workqueue.h
++++ b/include/linux/workqueue.h
+@@ -414,7 +414,7 @@ __alloc_workqueue_key(const char *fmt, unsigned int flags, int max_active,
+ #define create_freezable_workqueue(name)    \
+  alloc_workqueue((name), WQ_FREEZABLE | WQ_UNBOUND | WQ_MEM_RECLAIM, 1)
+ #define create_singlethread_workqueue(name)    \
+- alloc_workqueue((name), WQ_UNBOUND | WQ_MEM_RECLAIM, 1)
++ alloc_ordered_workqueue((name), WQ_MEM_RECLAIM)
+ 
+ extern void destroy_workqueue(struct workqueue_struct *wq);
+ 
+-- 
+1.7.1

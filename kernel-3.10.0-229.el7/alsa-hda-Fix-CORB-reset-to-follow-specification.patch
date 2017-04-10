@@ -1,0 +1,87 @@
+From 6701f0e73feb9d9119d4e824d7641d6fe86400a8 Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:25:37 -0400
+Subject: [alsa] hda: Fix CORB reset to follow specification
+
+Message-id: <140972823573-200-patchset-jkysela@redhat.com>
+Patchwork-id: 90900
+O-Subject: [RHEL 7.1 PATCH 199/442] ALSA: hda - Fix CORB reset to follow specification
+Bugzilla: 1112200
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+According to the HDA spec, we must write 1 to bit 15 on a CORBRP
+reset, read back 1, then write 0, then read back 0. This must be
+done while the DMA is not running.
+
+We accidentaly ended up writing back the 0 by using a writel
+instead of a writew to CORBWP.
+
+This caused occasional controller failure on Bay Trail hardware.
+
+[replaced error messages with dev_err() by tiwai]
+
+Signed-off-by: David Henningsson <david.henningsson@canonical.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+(picked from kernel: ca460f86521ed515d17dd1314f7b95183866f681)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/sound/pci/hda/hda_intel.c b/sound/pci/hda/hda_intel.c
+index 14b0a49..04d8074 100644
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -769,6 +769,8 @@ static int azx_alloc_cmd_io(struct azx *chip)
+ 
+ static void azx_init_cmd_io(struct azx *chip)
+ {
++ int timeout;
++
+  spin_lock_irq(&chip->reg_lock);
+  /* CORB set up */
+  chip->corb.addr = chip->rb.addr;
+@@ -780,8 +782,28 @@ static void azx_init_cmd_io(struct azx *chip)
+  azx_writeb(chip, CORBSIZE, 0x02);
+  /* set the corb write pointer to 0 */
+  azx_writew(chip, CORBWP, 0);
++
+  /* reset the corb hw read pointer */
+  azx_writew(chip, CORBRP, ICH6_CORBRP_RST);
++ for (timeout = 1000; timeout > 0; timeout--) {
++  if ((azx_readw(chip, CORBRP) & ICH6_CORBRP_RST) == ICH6_CORBRP_RST)
++   break;
++  udelay(1);
++ }
++ if (timeout <= 0)
++  dev_err(chip->card->dev, "CORB reset timeout#1, CORBRP = %d\n",
++   azx_readw(chip, CORBRP));
++
++ azx_writew(chip, CORBRP, 0);
++ for (timeout = 1000; timeout > 0; timeout--) {
++  if (azx_readw(chip, CORBRP) == 0)
++   break;
++  udelay(1);
++ }
++ if (timeout <= 0)
++  dev_err(chip->card->dev, "CORB reset timeout#2, CORBRP = %d\n",
++   azx_readw(chip, CORBRP));
++
+  /* enable corb dma */
+  azx_writeb(chip, CORBCTL, ICH6_CORBCTL_RUN);
+ 
+@@ -856,7 +878,7 @@ static int azx_corb_send_cmd(struct hda_bus *bus, u32 val)
+ 
+  chip->rirb.cmds[addr]++;
+  chip->corb.buf[wp] = cpu_to_le32(val);
+- azx_writel(chip, CORBWP, wp);
++ azx_writew(chip, CORBWP, wp);
+ 
+  spin_unlock_irq(&chip->reg_lock);
+ 
+-- 
+1.7.1

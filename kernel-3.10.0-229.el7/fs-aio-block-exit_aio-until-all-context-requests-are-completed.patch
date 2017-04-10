@@ -1,0 +1,60 @@
+From 535a132dfbb73a227224f99eb8b34a04489d3a5c Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Mon, 8 Sep 2014 22:52:57 -0400
+Subject: [fs] aio: block exit_aio() until all context requests are completed
+
+Message-id: <1410216777-18522-9-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 93354
+O-Subject: [RHEL7 PATCH 8/8] aio: block exit_aio() until all context requests are completed
+Bugzilla: 1122092
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+This is a backport of the following commit.  This was tested using the
+libaio test harness, aio-stress, and xfstests aio tests.
+
+This patch addresses bug 1122092.
+
+  commit 6098b45b32e6baeacc04790773ced9340601d511
+  Author: Gu Zheng <guz.fnst@cn.fujitsu.com>
+  Date:   Wed Sep 3 17:45:44 2014 +0800
+
+    aio: block exit_aio() until all context requests are completed
+
+    It seems that exit_aio() also needs to wait for all iocbs to complete (like
+    io_destroy), but we missed the wait step in current implemention, so fix
+    it in the same way as we did in io_destroy.
+
+    Signed-off-by: Gu Zheng <guz.fnst@cn.fujitsu.com>
+    Signed-off-by: Benjamin LaHaise <bcrl@kvack.org>
+    Cc: stable@vger.kernel.org
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/aio.c b/fs/aio.c
+index d6cf32c..a2c14ca 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -715,6 +715,8 @@ void exit_aio(struct mm_struct *mm)
+ {
+  struct kioctx *ctx;
+  struct hlist_node *n;
++ struct completion requests_done =
++  COMPLETION_INITIALIZER_ONSTACK(requests_done);
+ 
+  hlist_for_each_entry_safe(ctx, n, &mm->ioctx_list, list) {
+   if (1 != atomic_read(&ctx->users))
+@@ -732,8 +734,10 @@ void exit_aio(struct mm_struct *mm)
+    * place that uses ->mmap_size, so it's safe.
+    */
+   ctx->mmap_size = 0;
++  kill_ioctx(mm, ctx, &requests_done);
+ 
+-  kill_ioctx(mm, ctx, NULL);
++  /* Wait until all IO for the context are done. */
++  wait_for_completion(&requests_done);
+  }
+ }
+ 
+-- 
+1.7.1

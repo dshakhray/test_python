@@ -1,0 +1,159 @@
+From 867e5ae3b8ad6c264c7519c22e4e8d0aabf47429 Mon Sep 17 00:00:00 2001
+From: Marcelo Tosatti <mtosatti@redhat.com>
+Date: Wed, 3 Sep 2014 18:09:04 -0400
+Subject: [virt] kvm/x86: fix TSC matching
+
+Message-id: <20140903180904.GA10091@amt.cnet>
+Patchwork-id: 91187
+O-Subject: [RHEL7.1 PATCH] KVM: x86: fix TSC matching (v2)
+Bugzilla: 1115764
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+RH-Acked-by: Andrew Jones <drjones@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+
+BZ: 1115764
+
+Brew build: https://brewweb.devel.redhat.com/taskinfo?taskID=7912507
+
+commit 0d3da0d26e3c3515997c99451ce3b0ad1a69a36c upstream
+Author: Tomasz Grabiec <tgrabiec@cloudius-systems.com>
+
+I've observed kvmclock being marked as unstable on a modern
+single-socket system with a stable TSC and qemu-1.6.2 or qemu-2.0.0.
+
+The culprit was failure in TSC matching because of overflow of
+kvm_arch::nr_vcpus_matched_tsc in case there were multiple TSC writes
+in a single synchronization cycle.
+
+Turns out that qemu does multiple TSC writes during init, below is the
+evidence of that (qemu-2.0.0):
+
+The first one:
+
+ 0xffffffffa08ff2b4 : vmx_write_tsc_offset+0xa4/0xb0 [kvm_intel]
+ 0xffffffffa04c9c05 : kvm_write_tsc+0x1a5/0x360 [kvm]
+ 0xffffffffa04cfd6b : kvm_arch_vcpu_postcreate+0x4b/0x80 [kvm]
+ 0xffffffffa04b8188 : kvm_vm_ioctl+0x418/0x750 [kvm]
+
+The second one:
+
+ 0xffffffffa08ff2b4 : vmx_write_tsc_offset+0xa4/0xb0 [kvm_intel]
+ 0xffffffffa04c9c05 : kvm_write_tsc+0x1a5/0x360 [kvm]
+ 0xffffffffa090610d : vmx_set_msr+0x29d/0x350 [kvm_intel]
+ 0xffffffffa04be83b : do_set_msr+0x3b/0x60 [kvm]
+ 0xffffffffa04c10a8 : msr_io+0xc8/0x160 [kvm]
+ 0xffffffffa04caeb6 : kvm_arch_vcpu_ioctl+0xc86/0x1060 [kvm]
+ 0xffffffffa04b6797 : kvm_vcpu_ioctl+0xc7/0x5a0 [kvm]
+
+ #0  kvm_vcpu_ioctl at /build/buildd/qemu-2.0.0+dfsg/kvm-all.c:1780
+ #1  kvm_put_msrs at /build/buildd/qemu-2.0.0+dfsg/target-i386/kvm.c:1270
+ #2  kvm_arch_put_registers at /build/buildd/qemu-2.0.0+dfsg/target-i386/kvm.c:1909
+ #3  kvm_cpu_synchronize_post_init at /build/buildd/qemu-2.0.0+dfsg/kvm-all.c:1641
+ #4  cpu_synchronize_post_init at /build/buildd/qemu-2.0.0+dfsg/include/sysemu/kvm.h:330
+ #5  cpu_synchronize_all_post_init () at /build/buildd/qemu-2.0.0+dfsg/cpus.c:521
+ #6  main at /build/buildd/qemu-2.0.0+dfsg/vl.c:4390
+
+The third one:
+
+ 0xffffffffa08ff2b4 : vmx_write_tsc_offset+0xa4/0xb0 [kvm_intel]
+ 0xffffffffa04c9c05 : kvm_write_tsc+0x1a5/0x360 [kvm]
+ 0xffffffffa090610d : vmx_set_msr+0x29d/0x350 [kvm_intel]
+ 0xffffffffa04be83b : do_set_msr+0x3b/0x60 [kvm]
+ 0xffffffffa04c10a8 : msr_io+0xc8/0x160 [kvm]
+ 0xffffffffa04caeb6 : kvm_arch_vcpu_ioctl+0xc86/0x1060 [kvm]
+ 0xffffffffa04b6797 : kvm_vcpu_ioctl+0xc7/0x5a0 [kvm]
+
+ #0  kvm_vcpu_ioctl at /build/buildd/qemu-2.0.0+dfsg/kvm-all.c:1780
+ #1  kvm_put_msrs  at /build/buildd/qemu-2.0.0+dfsg/target-i386/kvm.c:1270
+ #2  kvm_arch_put_registers  at /build/buildd/qemu-2.0.0+dfsg/target-i386/kvm.c:1909
+ #3  kvm_cpu_synchronize_post_reset  at /build/buildd/qemu-2.0.0+dfsg/kvm-all.c:1635
+ #4  cpu_synchronize_post_reset  at /build/buildd/qemu-2.0.0+dfsg/include/sysemu/kvm.h:323
+ #5  cpu_synchronize_all_post_reset () at /build/buildd/qemu-2.0.0+dfsg/cpus.c:512
+ #6  main  at /build/buildd/qemu-2.0.0+dfsg/vl.c:4482
+
+The fix is to count each vCPU only once when matched, so that
+nr_vcpus_matched_tsc holds the size of the matched set. This is
+achieved by reusing generation counters. Every vCPU with
+this_tsc_generation == cur_tsc_generation is in the matched set. The
+match set is cleared by setting cur_tsc_generation to a value which no
+other vCPU is set to (by incrementing it).
+
+I needed to bump up the counter size form u8 to u64 to ensure it never
+overflows. Otherwise in cases TSC is not written the same number of
+times on each vCPU the counter could overflow and incorrectly indicate
+some vCPUs as being in the matched set. This scenario seems unlikely
+but I'm not sure if it can be disregarded.
+
+Signed-off-by: Tomasz Grabiec <tgrabiec@cloudius-systems.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index cb05d32..6d30b6f 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -448,7 +448,7 @@ struct kvm_vcpu_arch {
+  u64 tsc_offset_adjustment;
+  u64 this_tsc_nsec;
+  u64 this_tsc_write;
+- u8  this_tsc_generation;
++ u64 this_tsc_generation;
+  bool tsc_catchup;
+  bool tsc_always_catchup;
+  s8 virtual_tsc_shift;
+@@ -591,7 +591,7 @@ struct kvm_arch {
+  u64 cur_tsc_nsec;
+  u64 cur_tsc_write;
+  u64 cur_tsc_offset;
+- u8  cur_tsc_generation;
++ u64 cur_tsc_generation;
+  int nr_vcpus_matched_tsc;
+ 
+  spinlock_t pvclock_gtod_sync_lock;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 07c736b..c8bda21 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1215,6 +1215,7 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
+  unsigned long flags;
+  s64 usdiff;
+  bool matched;
++ bool already_matched;
+  u64 data = msr->data;
+ 
+  raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+@@ -1279,6 +1280,7 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
+    pr_debug("kvm: adjusted tsc offset by %llu\n", delta);
+   }
+   matched = true;
++  already_matched = (vcpu->arch.this_tsc_generation == kvm->arch.cur_tsc_generation);
+  } else {
+   /*
+    * We split periods of matched TSC writes into generations.
+@@ -1294,7 +1296,7 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
+   kvm->arch.cur_tsc_write = data;
+   kvm->arch.cur_tsc_offset = offset;
+   matched = false;
+-  pr_debug("kvm: new tsc generation %u, clock %llu\n",
++  pr_debug("kvm: new tsc generation %llu, clock %llu\n",
+     kvm->arch.cur_tsc_generation, data);
+  }
+ 
+@@ -1319,10 +1321,11 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
+  raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
+ 
+  spin_lock(&kvm->arch.pvclock_gtod_sync_lock);
+- if (matched)
+-  kvm->arch.nr_vcpus_matched_tsc++;
+- else
++ if (!matched) {
+   kvm->arch.nr_vcpus_matched_tsc = 0;
++ } else if (!already_matched) {
++  kvm->arch.nr_vcpus_matched_tsc++;
++ }
+ 
+  kvm_track_tsc_matching(vcpu);
+  spin_unlock(&kvm->arch.pvclock_gtod_sync_lock);
+-- 
+1.7.1

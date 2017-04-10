@@ -1,0 +1,95 @@
+From ad5097a3bb4baa138ccff1b11207f9f724626e0a Mon Sep 17 00:00:00 2001
+From: Sai Vemuri <svemuri@redhat.com>
+Date: Wed, 12 Nov 2014 19:08:11 -0500
+Subject: [ethernet] cxgb4: Fix FW flash logic using ethtool
+
+Message-id: <1415819300-32670-11-git-send-email-svemuri@redhat.com>
+Patchwork-id: 99864
+O-Subject: [RHEL7.1 PATCH BZ 1163467 10/19] cxgb4: Fix FW flash logic using ethtool
+Bugzilla: 1163467
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Use t4_fw_upgrade instead of t4_load_fw to write firmware into FLASH, since
+t4_load_fw doesn't co-ordinate with the firmware and the adapter can get hosed
+enough to require a power cycle of the system.
+
+Based on original work by Casey Leedom <leedom@chelsio.com>
+
+Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 22c0b963d7400971f4c5a1a67b083e3742996640)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index e539a78..6d750bf 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -978,6 +978,8 @@ static inline int t4_memory_write(struct adapter *adap, int mtype, u32 addr,
+ int t4_seeprom_wp(struct adapter *adapter, bool enable);
+ int get_vpd_params(struct adapter *adapter, struct vpd_params *p);
+ int t4_load_fw(struct adapter *adapter, const u8 *fw_data, unsigned int size);
++int t4_fw_upgrade(struct adapter *adap, unsigned int mbox,
++    const u8 *fw_data, unsigned int size, int force);
+ unsigned int t4_flash_cfg_addr(struct adapter *adapter);
+ int t4_get_fw_version(struct adapter *adapter, u32 *vers);
+ int t4_get_tp_version(struct adapter *adapter, u32 *vers);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 8a71d12..9df6656 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -2770,16 +2770,26 @@ static int set_flash(struct net_device *netdev, struct ethtool_flash *ef)
+  int ret;
+  const struct firmware *fw;
+  struct adapter *adap = netdev2adap(netdev);
++ unsigned int mbox = FW_PCIE_FW_MASTER_MASK + 1;
+ 
+  ef->data[sizeof(ef->data) - 1] = '\0';
+  ret = request_firmware(&fw, ef->data, adap->pdev_dev);
+  if (ret < 0)
+   return ret;
+ 
+- ret = t4_load_fw(adap, fw->data, fw->size);
++ /* If the adapter has been fully initialized then we'll go ahead and
++  * try to get the firmware's cooperation in upgrading to the new
++  * firmware image otherwise we'll try to do the entire job from the
++  * host ... and we always "force" the operation in this path.
++  */
++ if (adap->flags & FULL_INIT_DONE)
++  mbox = adap->mbox;
++
++ ret = t4_fw_upgrade(adap, mbox, fw->data, fw->size, 1);
+  release_firmware(fw);
+  if (!ret)
+-  dev_info(adap->pdev_dev, "loaded firmware %s\n", ef->data);
++  dev_info(adap->pdev_dev, "loaded firmware %s,"
++    " reload cxgb4 driver\n", ef->data);
+  return ret;
+ }
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index b7a5cf6..ffc5e4d 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@ -38,8 +38,6 @@
+ #include "t4_regs.h"
+ #include "t4fw_api.h"
+ 
+-static int t4_fw_upgrade(struct adapter *adap, unsigned int mbox,
+-    const u8 *fw_data, unsigned int size, int force);
+ /**
+  * t4_wait_op_done_val - wait until an operation is completed
+  * @adapter: the adapter performing the operation
+@@ -3077,8 +3075,8 @@ static int t4_fw_restart(struct adapter *adap, unsigned int mbox, int reset)
+  * positive errno indicates that the adapter is ~probably~ intact, a
+  * negative errno indicates that things are looking bad ...
+  */
+-static int t4_fw_upgrade(struct adapter *adap, unsigned int mbox,
+-    const u8 *fw_data, unsigned int size, int force)
++int t4_fw_upgrade(struct adapter *adap, unsigned int mbox,
++    const u8 *fw_data, unsigned int size, int force)
+ {
+  const struct fw_hdr *fw_hdr = (const struct fw_hdr *)fw_data;
+  int reset, ret;
+-- 
+1.7.1

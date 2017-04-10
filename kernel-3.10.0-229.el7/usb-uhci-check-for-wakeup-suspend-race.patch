@@ -1,0 +1,86 @@
+From 360ed9db521a3c13e04c572811e524e409516d3c Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:02:44 -0400
+Subject: [usb] uhci: check for wakeup/suspend race
+
+Message-id: <1410887463-20674-93-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95287
+O-Subject: [RHEL7 PATCH 092/591] USB: UHCI: check for wakeup/suspend race
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 1c124c9962b4ee6555fd6179ca318c2ad3a30354
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Fri Oct 18 11:19:18 2013 -0400
+
+    USB: UHCI: check for wakeup/suspend race
+
+    hcd-pci.c in usbcore contains a check for wakeup requests racing with
+    controller suspend.  This check is going to be moved out of usbcore
+    and into the individual controller drivers, where it can apply to all
+    platforms, not just PCI.
+
+    This patch adds the check to uhci-hcd.  Ironically, none of the
+    non-PCI platform drivers for uhci-hcd implement suspend/resume.
+    Nevertheless, this change is needed to accomodate the upcoming change
+    to usbcore.
+
+    The patch also removes an outdated check of the root hub state.  For
+    one thing, the PM layer has long been quite reliable about suspending
+    root hubs before controllers.  For another, virtually the same check
+    is also made in hcd-pci.c; there's no point in repeating it.
+
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/host/uhci-pci.c b/drivers/usb/host/uhci-pci.c
+index d89c78d..4cd7988 100644
+--- a/drivers/usb/host/uhci-pci.c
++++ b/drivers/usb/host/uhci-pci.c
+@@ -162,6 +162,8 @@ static void uhci_shutdown(struct pci_dev *pdev)
+ 
+ #ifdef CONFIG_PM
+ 
++static int uhci_pci_resume(struct usb_hcd *hcd, bool hibernated);
++
+ static int uhci_pci_suspend(struct usb_hcd *hcd, bool do_wakeup)
+ {
+  struct uhci_hcd *uhci = hcd_to_uhci(hcd);
+@@ -174,12 +176,6 @@ static int uhci_pci_suspend(struct usb_hcd *hcd, bool do_wakeup)
+  if (!HCD_HW_ACCESSIBLE(hcd) || uhci->dead)
+   goto done_okay;  /* Already suspended or dead */
+ 
+- if (uhci->rh_state > UHCI_RH_SUSPENDED) {
+-  dev_warn(uhci_dev(uhci), "Root hub isn't suspended!\n");
+-  rc = -EBUSY;
+-  goto done;
+- };
+-
+  /* All PCI host controllers are required to disable IRQ generation
+   * at the source, so we must turn off PIRQ.
+   */
+@@ -195,8 +191,15 @@ static int uhci_pci_suspend(struct usb_hcd *hcd, bool do_wakeup)
+ 
+ done_okay:
+  clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+-done:
+  spin_unlock_irq(&uhci->lock);
++
++ synchronize_irq(hcd->irq);
++
++ /* Check for race with a wakeup request */
++ if (do_wakeup && HCD_WAKEUP_PENDING(hcd)) {
++  uhci_pci_resume(hcd, false);
++  rc = -EBUSY;
++ }
+  return rc;
+ }
+ 
+-- 
+1.7.1

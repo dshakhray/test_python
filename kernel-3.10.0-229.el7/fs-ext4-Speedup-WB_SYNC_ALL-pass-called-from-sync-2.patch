@@ -1,0 +1,90 @@
+From 967685ff67cbfd9452da47d87391cec113de92e3 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:54:36 -0400
+Subject: [fs] ext4: Speedup WB_SYNC_ALL pass called from sync(2)
+
+Message-id: <1414058125-4183-123-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98255
+O-Subject: [RHEL 7.1 PATCH v2 122/171] ext4: Speedup WB_SYNC_ALL pass called from sync(2)
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Jan Kara <jack@suse.cz>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit 10542c229a4e8e25b40357beea66abe9dacda2c0
+
+ When doing filesystem wide sync, there's no need to force transaction
+ commit (or synchronously write inode buffer) separately for each inode
+ because ext4_sync_fs() takes care of forcing commit at the end (VFS
+ takes care of flushing buffer cache, respectively). Most of the time
+ this slowness doesn't manifest because previous WB_SYNC_NONE writeback
+ doesn't leave much to write but when there are processes aggressively
+ creating new files and several filesystems to sync, the sync slowness
+ can be noticeable. In the following test script sync(1) takes around 6
+ minutes when there are two ext4 filesystems mounted on a standard SATA
+ drive. After this patch sync takes a couple of seconds so we have about
+ two orders of magnitude improvement.
+
+       function run_writers
+       {
+         for (( i = 0; i < 10; i++ )); do
+           mkdir $1/dir$i
+           for (( j = 0; j < 40000; j++ )); do
+             dd if=/dev/zero of=$1/dir$i/$j bs=4k count=4 &>/dev/null
+           done &
+         done
+       }
+
+       for dir in "$@"; do
+         run_writers $dir
+       done
+
+       sleep 40
+       time sync
+
+ Signed-off-by: Jan Kara <jack@suse.cz>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 0866e31..503ec48 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4470,7 +4470,12 @@ int ext4_write_inode(struct inode *inode, struct writeback_control *wbc)
+    return -EIO;
+   }
+ 
+-  if (wbc->sync_mode != WB_SYNC_ALL)
++  /*
++   * No need to force transaction in WB_SYNC_NONE mode. Also
++   * ext4_sync_fs() will force the commit after everything is
++   * written.
++   */
++  if (wbc->sync_mode != WB_SYNC_ALL || wbc->for_sync)
+    return 0;
+ 
+   err = ext4_force_commit(inode->i_sb);
+@@ -4480,7 +4485,11 @@ int ext4_write_inode(struct inode *inode, struct writeback_control *wbc)
+   err = __ext4_get_inode_loc(inode, &iloc, 0);
+   if (err)
+    return err;
+-  if (wbc->sync_mode == WB_SYNC_ALL)
++  /*
++   * sync(2) will flush the whole buffer cache. No need to do
++   * it here separately for each inode.
++   */
++  if (wbc->sync_mode == WB_SYNC_ALL && !wbc->for_sync)
+    sync_dirty_buffer(iloc.bh);
+   if (buffer_req(iloc.bh) && !buffer_uptodate(iloc.bh)) {
+    EXT4_ERROR_INODE_BLOCK(inode, iloc.bh->b_blocknr,
+-- 
+1.7.1

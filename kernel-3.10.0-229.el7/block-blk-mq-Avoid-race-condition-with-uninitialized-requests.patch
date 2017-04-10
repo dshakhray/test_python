@@ -1,0 +1,76 @@
+From 7796b14c8eeaf9d305d525af4fec3b424629c34a Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 10 Oct 2014 21:03:22 -0400
+Subject: [block] blk-mq: Avoid race condition with uninitialized requests
+
+Message-id: <1412975015-5370-22-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 97460
+O-Subject: [RHEL7 PATCH 21/34] blk-mq: Avoid race condition with uninitialized requests
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a backport of the following commit.  This resolves bug
+1146660.
+
+  commit 683d0e126232d898a481daa3a4ca032c2b1a9660
+  Author: David Hildenbrand <dahi@linux.vnet.ibm.com>
+  Date:   Thu Sep 18 11:04:31 2014 +0200
+
+    blk-mq: Avoid race condition with uninitialized requests
+
+    This patch should fix the bug reported in
+    https://lkml.org/lkml/2014/9/11/249.
+
+    We have to initialize at least the atomic_flags and the cmd_flags when
+    allocating storage for the requests.
+
+    Otherwise blk_mq_timeout_check() might dereference uninitialized
+    pointers when racing with the creation of a request.
+
+    Also move the reset of cmd_flags for the initializing code to the point
+    where a request is freed. So we will never end up with pending flush
+    request indicators that might trigger dereferences of invalid pointers
+    in blk_mq_timeout_check().
+
+    Cc: stable@vger.kernel.org
+    Signed-off-by: David Hildenbrand <dahi@linux.vnet.ibm.com>
+    Reported-by: Paulo De Rezende Pinatti <ppinatti@linux.vnet.ibm.com>
+    Tested-by: Paulo De Rezende Pinatti <ppinatti@linux.vnet.ibm.com>
+    Acked-by: Christian Borntraeger <borntraeger@de.ibm.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 9bb4780..1b4961e 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -206,7 +206,6 @@ __blk_mq_alloc_request(struct blk_mq_alloc_data *data, int rw)
+  if (tag != BLK_MQ_TAG_FAIL) {
+   rq = data->hctx->tags->rqs[tag];
+ 
+-  rq->cmd_flags = 0;
+   if (blk_mq_tag_busy(data->hctx)) {
+    rq->cmd_flags = REQ_MQ_INFLIGHT;
+    atomic_inc(&data->hctx->nr_active);
+@@ -261,6 +260,7 @@ static void __blk_mq_free_request(struct blk_mq_hw_ctx *hctx,
+ 
+  if (rq->cmd_flags & REQ_MQ_INFLIGHT)
+   atomic_dec(&hctx->nr_active);
++ rq->cmd_flags = 0;
+ 
+  clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+  blk_mq_put_tag(hctx, tag, &ctx->last_tag);
+@@ -1413,6 +1413,8 @@ static struct blk_mq_tags *blk_mq_init_rq_map(struct blk_mq_tag_set *set,
+   left -= to_do * rq_size;
+   for (j = 0; j < to_do; j++) {
+    tags->rqs[i] = p;
++   tags->rqs[i]->atomic_flags = 0;
++   tags->rqs[i]->cmd_flags = 0;
+    if (set->ops->init_request) {
+     if (set->ops->init_request(set->driver_data,
+       tags->rqs[i], hctx_idx, i,
+-- 
+1.7.1

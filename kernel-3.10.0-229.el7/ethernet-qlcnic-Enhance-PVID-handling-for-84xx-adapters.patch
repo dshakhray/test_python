@@ -1,0 +1,117 @@
+From 48b0a99545a45cc03fdd0faaeccec2b43637664b Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:04:52 -0400
+Subject: [ethernet] qlcnic: Enhance PVID handling for 84xx adapters
+
+Message-id: <1408626422-3941-9-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88547
+O-Subject: [PATCH RHEL 7.1 008/138] qlcnic: Enhance PVID handling for 84xx adapters
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Manish Chopra <manish.chopra@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id 991ca269ed71b2b7aee27f5cb8bf64b689cc20bf
+
+o PF driver should not indicate PVID configuration to VF driver.
+  As adapter supports VLAN stripping, VF driver should stay agnostic
+  to any PVID configuration.
+
+o Return "QLC_NO_VLAN_MODE(= 0)" to VFD when PVID is configured.
+  VF driver should be in no VLAN configuration mode.
+
+Signed-off-by: Manish Chopra <manish.chopra@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+index 9a42c64..811b6c9 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+@@ -2070,6 +2070,14 @@ static inline bool qlcnic_82xx_check(struct qlcnic_adapter *adapter)
+  return (device == PCI_DEVICE_ID_QLOGIC_QLE824X) ? true : false;
+ }
+ 
++static inline bool qlcnic_84xx_check(struct qlcnic_adapter *adapter)
++{
++ unsigned short device = adapter->pdev->device;
++
++ return ((device == PCI_DEVICE_ID_QLOGIC_QLE844X) ||
++  (device == PCI_DEVICE_ID_QLOGIC_VF_QLE844X)) ? true : false;
++}
++
+ static inline bool qlcnic_83xx_check(struct qlcnic_adapter *adapter)
+ {
+  unsigned short device = adapter->pdev->device;
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+index 5b1e645..392b9bd 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+@@ -398,14 +398,10 @@ int qlcnic_sriov_get_vf_vport_info(struct qlcnic_adapter *adapter,
+ }
+ 
+ static int qlcnic_sriov_set_pvid_mode(struct qlcnic_adapter *adapter,
+-          struct qlcnic_cmd_args *cmd, u32 cap)
++          struct qlcnic_cmd_args *cmd)
+ {
+- if (cap & QLC_83XX_PVID_STRIP_CAPABILITY) {
+-  adapter->rx_pvid = 0;
+- } else {
+-  adapter->rx_pvid = (cmd->rsp.arg[1] >> 16) & 0xffff;
+-  adapter->flags &= ~QLCNIC_TAGGING_ENABLED;
+- }
++ adapter->rx_pvid = MSW(cmd->rsp.arg[1]) & 0xffff;
++ adapter->flags &= ~QLCNIC_TAGGING_ENABLED;
+  return 0;
+ }
+ 
+@@ -441,9 +437,8 @@ static int qlcnic_sriov_get_vf_acl(struct qlcnic_adapter *adapter,
+ {
+  struct qlcnic_sriov *sriov = adapter->ahw->sriov;
+  struct qlcnic_cmd_args cmd;
+- int ret, cap;
++ int ret = 0;
+ 
+- cap = info->capabilities;
+  ret = qlcnic_sriov_alloc_bc_mbx_args(&cmd, QLCNIC_BC_CMD_GET_ACL);
+  if (ret)
+   return ret;
+@@ -459,7 +454,7 @@ static int qlcnic_sriov_get_vf_acl(struct qlcnic_adapter *adapter,
+    ret = qlcnic_sriov_set_guest_vlan_mode(adapter, &cmd);
+    break;
+   case QLC_PVID_MODE:
+-   ret = qlcnic_sriov_set_pvid_mode(adapter, &cmd, cap);
++   ret = qlcnic_sriov_set_pvid_mode(adapter, &cmd);
+    break;
+   }
+  }
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+index 2d6faf0..95b7710 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+@@ -1183,10 +1183,19 @@ static int qlcnic_sriov_pf_get_acl_cmd(struct qlcnic_bc_trans *trans,
+  struct qlcnic_vf_info *vf = trans->vf;
+  struct qlcnic_vport *vp = vf->vp;
+  u8 cmd_op, mode = vp->vlan_mode;
++ struct qlcnic_adapter *adapter;
++
++ adapter = vf->adapter;
+ 
+  cmd_op = trans->req_hdr->cmd_op;
+  cmd->rsp.arg[0] |= 1 << 25;
+ 
++ /* For 84xx adapter in case of PVID , PFD should send vlan mode as
++  * QLC_NO_VLAN_MODE to VFD which is zero in mailbox response
++  */
++ if (qlcnic_84xx_check(adapter) && mode == QLC_PVID_MODE)
++  return 0;
++
+  switch (mode) {
+  case QLC_GUEST_VLAN_MODE:
+   cmd->rsp.arg[1] = mode | 1 << 8;
+-- 
+1.7.1

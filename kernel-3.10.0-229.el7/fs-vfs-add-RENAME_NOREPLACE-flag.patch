@@ -1,0 +1,154 @@
+From 39888fde1950884a877e9665766b179b02347861 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 25 Nov 2014 16:33:18 -0500
+Subject: [fs] vfs: add RENAME_NOREPLACE flag
+
+Message-id: <20141125163318.18115.29962.stgit@warthog.procyon.org.uk>
+Patchwork-id: 100906
+O-Subject: [PATCH 06/47] vfs: add RENAME_NOREPLACE flag
+Bugzilla: 985875
+RH-Acked-by: Ian Kent <ikent@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+From: Miklos Szeredi <mszeredi@suse.cz>
+
+If this flag is specified and the target of the rename exists then the
+rename syscall fails with EEXIST.
+
+The VFS does the existence checking, so it is trivial to enable for most
+local filesystems.  This patch only enables it in ext4.
+
+For network filesystems the VFS check is not enough as there may be a race
+between a remote create and the rename, so these filesystems need to handle
+this flag in their ->rename() implementations to ensure atomicity.
+
+Andy writes about why this is useful:
+
+"The trivial answer: to eliminate the race condition from 'mv -i'.
+
+Another answer: there's a common pattern to atomically create a file
+with contents: open a temporary file, write to it, optionally fsync
+it, close it, then link(2) it to the final name, then unlink the
+temporary file.
+
+The reason to use link(2) is because it won't silently clobber the destination.
+
+This is annoying:
+ - It requires an extra system call that shouldn't be necessary.
+ - It doesn't work on (IMO sensible) filesystems that don't support
+hard links (e.g. vfat).
+ - It's not atomic -- there's an intermediate state where both files exist.
+ - It's ugly.
+
+The new rename flag will make this totally sensible.
+
+To be fair, on new enough kernels, you can also use O_TMPFILE and
+linkat to achieve the same thing even more cleanly."
+
+Suggested-by: Andy Lutomirski <luto@amacapital.net>
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+Reviewed-by: J. Bruce Fields <bfields@redhat.com>
+Original-commit: 0a7c3937a1f23f8cb5fc77ae01661e9968a51d0c
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index f9da883..897f817 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -3276,6 +3276,16 @@ end_rename:
+  return retval;
+ }
+ 
++static int ext4_rename2(struct inode *old_dir, struct dentry *old_dentry,
++   struct inode *new_dir, struct dentry *new_dentry,
++   unsigned int flags)
++{
++ if (flags & ~RENAME_NOREPLACE)
++  return -EINVAL;
++
++ return ext4_rename(old_dir, old_dentry, new_dir, new_dentry);
++}
++
+ /*
+  * directories can handle most operations...
+  */
+@@ -3289,6 +3299,7 @@ const struct inode_operations ext4_dir_inode_operations = {
+  .rmdir  = ext4_rmdir,
+  .mknod  = ext4_mknod,
+  .rename  = ext4_rename,
++ .rename2 = ext4_rename2,
+  .setattr = ext4_setattr,
+  .setxattr = generic_setxattr,
+  .getxattr = generic_getxattr,
+diff --git a/fs/namei.c b/fs/namei.c
+index 164c053..d693cd1 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -4103,7 +4103,7 @@ SYSCALL_DEFINE5(renameat2, int, olddfd, const char __user *, oldname,
+  bool should_retry = false;
+  int error;
+ 
+- if (flags)
++ if (flags & ~RENAME_NOREPLACE)
+   return -EINVAL;
+ 
+ retry:
+@@ -4129,6 +4129,8 @@ retry:
+   goto exit2;
+ 
+  new_dir = newnd.path.dentry;
++ if (flags & RENAME_NOREPLACE)
++  error = -EEXIST;
+  if (newnd.last_type != LAST_NORM)
+   goto exit2;
+ 
+@@ -4151,22 +4153,25 @@ retry_deleg:
+  error = -ENOENT;
+  if (d_is_negative(old_dentry))
+   goto exit4;
++ new_dentry = lookup_hash(&newnd);
++ error = PTR_ERR(new_dentry);
++ if (IS_ERR(new_dentry))
++  goto exit4;
++ error = -EEXIST;
++ if ((flags & RENAME_NOREPLACE) && d_is_positive(new_dentry))
++  goto exit5;
+  /* unless the source is a directory trailing slashes give -ENOTDIR */
+  if (!d_is_dir(old_dentry)) {
+   error = -ENOTDIR;
+   if (oldnd.last.name[oldnd.last.len])
+-   goto exit4;
++   goto exit5;
+   if (newnd.last.name[newnd.last.len])
+-   goto exit4;
++   goto exit5;
+  }
+  /* source should not be ancestor of target */
+  error = -EINVAL;
+  if (old_dentry == trap)
+-  goto exit4;
+- new_dentry = lookup_hash(&newnd);
+- error = PTR_ERR(new_dentry);
+- if (IS_ERR(new_dentry))
+-  goto exit4;
++  goto exit5;
+  /* target should not be an ancestor of source */
+  error = -ENOTEMPTY;
+  if (new_dentry == trap)
+diff --git a/include/uapi/linux/fs.h b/include/uapi/linux/fs.h
+index a4ed56c..644ab86 100644
+--- a/include/uapi/linux/fs.h
++++ b/include/uapi/linux/fs.h
+@@ -35,6 +35,8 @@
+ #define SEEK_HOLE 4 /* seek to the next hole */
+ #define SEEK_MAX SEEK_HOLE
+ 
++#define RENAME_NOREPLACE (1 << 0) /* Don't overwrite target */
++
+ struct fstrim_range {
+  __u64 start;
+  __u64 len;
+-- 
+1.7.1

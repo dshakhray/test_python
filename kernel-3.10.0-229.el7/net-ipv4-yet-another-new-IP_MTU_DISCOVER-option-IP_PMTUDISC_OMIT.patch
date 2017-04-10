@@ -1,0 +1,142 @@
+From 8358dcf74f6ce8044b8f534590fba178ec8ef3ec Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@redhat.com>
+Date: Mon, 8 Dec 2014 17:33:08 -0500
+Subject: [net] ipv4: yet another new IP_MTU_DISCOVER option IP_PMTUDISC_OMIT
+
+Message-id: <8e108d43c048cada6be66f57e5302a03d097efa5.1418058212.git.hannes@redhat.com>
+Patchwork-id: 101185
+O-Subject: [RHEL7.1 net 12/13] ipv4: yet another new IP_MTU_DISCOVER option IP_PMTUDISC_OMIT
+Bugzilla: 1170116
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1170116
+Upstream Status: 1b346576359c72bee34b1476b4fc63d77d37b314
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8344420
+
+Upstream Commit:
+commit 1b346576359c72bee34b1476b4fc63d77d37b314
+Author: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date:   Wed Feb 26 01:20:42 2014 +0100
+
+    ipv4: yet another new IP_MTU_DISCOVER option IP_PMTUDISC_OMIT
+
+    IP_PMTUDISC_INTERFACE has a design error: because it does not allow the
+    generation of fragments if the interface mtu is exceeded, it is very
+    hard to make use of this option in already deployed name server software
+    for which I introduced this option.
+
+    This patch adds yet another new IP_MTU_DISCOVER option to not honor any
+    path mtu information and not accepting new icmp notifications destined for
+    the socket this option is enabled on. But we allow outgoing fragmentation
+    in case the packet size exceeds the outgoing interface mtu.
+
+    As such this new option can be used as a drop-in replacement for
+    IP_PMTUDISC_DONT, which is currently in use by most name server software
+    making the adoption of this option very smooth and easy.
+
+    The original advantage of IP_PMTUDISC_INTERFACE is still maintained:
+    ignoring incoming path MTU updates and not honoring discovered path MTUs
+    in the output path.
+
+    Fixes: 482fc6094afad5 ("ipv4: introduce new IP_MTU_DISCOVER mode IP_PMTUDISC_INTERFACE")
+    Cc: Florian Weimer <fweimer@redhat.com>
+    Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Hannes Frederic Sowa <hannes@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/ip.h b/include/net/ip.h
+index 3992a61..42ea6c8 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -277,7 +277,8 @@ int ip_dont_fragment(struct sock *sk, struct dst_entry *dst)
+ 
+ static inline bool ip_sk_accept_pmtu(const struct sock *sk)
+ {
+- return inet_sk(sk)->pmtudisc != IP_PMTUDISC_INTERFACE;
++ return inet_sk(sk)->pmtudisc != IP_PMTUDISC_INTERFACE &&
++        inet_sk(sk)->pmtudisc != IP_PMTUDISC_OMIT;
+ }
+ 
+ static inline bool ip_sk_use_pmtu(const struct sock *sk)
+@@ -285,6 +286,12 @@ static inline bool ip_sk_use_pmtu(const struct sock *sk)
+  return inet_sk(sk)->pmtudisc < IP_PMTUDISC_PROBE;
+ }
+ 
++static inline bool ip_sk_local_df(const struct sock *sk)
++{
++ return inet_sk(sk)->pmtudisc < IP_PMTUDISC_DO ||
++        inet_sk(sk)->pmtudisc == IP_PMTUDISC_OMIT;
++}
++
+ static inline unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,
+           bool forwarding)
+ {
+diff --git a/include/uapi/linux/in.h b/include/uapi/linux/in.h
+index 07ef373..d3a61df 100644
+--- a/include/uapi/linux/in.h
++++ b/include/uapi/linux/in.h
+@@ -97,6 +97,10 @@ struct in_addr {
+  * this socket to prevent accepting spoofed ones.
+  */
+ #define IP_PMTUDISC_INTERFACE  4
++/* weaker version of IP_PMTUDISC_INTERFACE, which allos packets to get
++ * fragmented if they exeed the interface mtu
++ */
++#define IP_PMTUDISC_OMIT  5
+ 
+ #define IP_MULTICAST_IF   32
+ #define IP_MULTICAST_TTL   33
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 3ddf426..d8a1745 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -866,8 +866,7 @@ static int __ip_append_data(struct sock *sk,
+ 
+  fragheaderlen = sizeof(struct iphdr) + (opt ? opt->optlen : 0);
+  maxfraglen = ((mtu - fragheaderlen) & ~7) + fragheaderlen;
+- maxnonfragsize = (inet->pmtudisc >= IP_PMTUDISC_DO) ?
+-    mtu : 0xFFFF;
++ maxnonfragsize = ip_sk_local_df(sk) ? 0xFFFF : mtu;
+ 
+  if (cork->length + length > maxnonfragsize - fragheaderlen) {
+   ip_local_error(sk, EMSGSIZE, fl4->daddr, inet->inet_dport,
+@@ -1190,8 +1189,7 @@ ssize_t ip_append_page(struct sock *sk, struct flowi4 *fl4, struct page *page,
+ 
+  fragheaderlen = sizeof(struct iphdr) + (opt ? opt->optlen : 0);
+  maxfraglen = ((mtu - fragheaderlen) & ~7) + fragheaderlen;
+- maxnonfragsize = (inet->pmtudisc >= IP_PMTUDISC_DO) ?
+-    mtu : 0xFFFF;
++ maxnonfragsize = ip_sk_local_df(sk) ? 0xFFFF : mtu;
+ 
+  if (cork->length + size > maxnonfragsize - fragheaderlen) {
+   ip_local_error(sk, EMSGSIZE, fl4->daddr, inet->inet_dport, mtu);
+@@ -1351,8 +1349,7 @@ struct sk_buff *__ip_make_skb(struct sock *sk,
+   * to fragment the frame generated here. No matter, what transforms
+   * how transforms change size of the packet, it will come out.
+   */
+- if (inet->pmtudisc < IP_PMTUDISC_DO)
+-  skb->local_df = 1;
++ skb->local_df = ip_sk_local_df(sk);
+ 
+  /* DF bit is set when we want to see DF on outgoing frames.
+   * If local_df is set too, we still allow to fragment this frame
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index 453ac74..8d174ce 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -628,7 +628,7 @@ static int do_ip_setsockopt(struct sock *sk, int level,
+   inet->nodefrag = val ? 1 : 0;
+   break;
+  case IP_MTU_DISCOVER:
+-  if (val < IP_PMTUDISC_DONT || val > IP_PMTUDISC_INTERFACE)
++  if (val < IP_PMTUDISC_DONT || val > IP_PMTUDISC_OMIT)
+    goto e_inval;
+   inet->pmtudisc = val;
+   break;
+-- 
+1.7.1

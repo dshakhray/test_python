@@ -1,0 +1,93 @@
+From 785a10943ec79e1581280fe5c580b66ab2d3879e Mon Sep 17 00:00:00 2001
+From: Rui Wang <ruwang@redhat.com>
+Date: Thu, 21 Aug 2014 04:13:51 -0400
+Subject: [acpi] emca: Combine eMCA/EDAC event reporting priority
+
+Message-id: <1408594432-28006-17-git-send-email-ruwang@redhat.com>
+Patchwork-id: 88496
+O-Subject: [PATCH RHEL7.1 BZ1076655 16/17] ACPI, eMCA: Combine eMCA/EDAC event reporting priority
+Bugzilla: 1076655
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: "Chen, Gong" <gong.chen@linux.intel.com>
+
+Backport of:
+Original commit: 42139eb356e3384759ca143ae04d82376346eb4c
+Original Author: "Chen, Gong" <gong.chen@linux.intel.com>
+Original Date: Fri, 6 Dec 2013 01:17:10 -0500
+
+ eMCA has higher H/W event reporting priority. Once it is
+ loaded, EDAC event reporting should be disabled, unless EDAC
+ overrides eMCA priority via command line parameter "edac_report=force".
+
+Signed-off-by: Chen, Gong <gong.chen@linux.intel.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/acpi_extlog.c b/drivers/acpi/acpi_extlog.c
+index 2635a01..ad11221 100644
+--- a/drivers/acpi/acpi_extlog.c
++++ b/drivers/acpi/acpi_extlog.c
+@@ -11,6 +11,7 @@
+ #include <linux/acpi.h>
+ #include <linux/cper.h>
+ #include <linux/ratelimit.h>
++#include <linux/edac.h>
+ #include <asm/cpu.h>
+ #include <asm/mce.h>
+ 
+@@ -42,6 +43,8 @@ struct extlog_l1_head {
+  u8  rev1[12];
+ };
+ 
++static int old_edac_report_status;
++
+ static u8 extlog_dsm_uuid[] = "663E35AF-CC10-41A4-88EA-5470AF055295";
+ 
+ /* L1 table related physical address */
+@@ -149,7 +152,7 @@ static int extlog_print(struct notifier_block *nb, unsigned long val,
+ 
+  rc = print_extlog_rcd(NULL, (struct acpi_generic_status *)elog_buf, cpu);
+ 
+- return NOTIFY_DONE;
++ return NOTIFY_STOP;
+ }
+ 
+ static int extlog_get_dsm(acpi_handle handle, int rev, int func, u64 *ret)
+@@ -230,8 +233,12 @@ static int __init extlog_init(void)
+  u64 cap;
+  int rc;
+ 
+- rc = -ENODEV;
++ if (get_edac_report_status() == EDAC_REPORTING_FORCE) {
++  pr_warn("Not loading eMCA, error reporting force-enabled through EDAC.\n");
++  return -EPERM;
++ }
+ 
++ rc = -ENODEV;
+  rdmsrl(MSR_IA32_MCG_CAP, cap);
+  if (!(cap & MCG_ELOG_P))
+   return rc;
+@@ -286,6 +293,12 @@ static int __init extlog_init(void)
+  if (elog_buf == NULL)
+   goto err_release_elog;
+ 
++ /*
++  * eMCA event report method has higher priority than EDAC method,
++  * unless EDAC event report method is mandatory.
++  */
++ old_edac_report_status = get_edac_report_status();
++ set_edac_report_status(EDAC_REPORTING_DISABLED);
+  mce_register_decode_chain(&extlog_mce_dec);
+  /* enable OS to be involved to take over management from BIOS */
+  ((struct extlog_l1_head *)extlog_l1_addr)->flags |= FLAG_OS_OPTIN;
+@@ -307,6 +320,7 @@ err:
+ 
+ static void __exit extlog_exit(void)
+ {
++ set_edac_report_status(old_edac_report_status);
+  mce_unregister_decode_chain(&extlog_mce_dec);
+  ((struct extlog_l1_head *)extlog_l1_addr)->flags &= ~FLAG_OS_OPTIN;
+  if (extlog_l1_addr)
+-- 
+1.7.1

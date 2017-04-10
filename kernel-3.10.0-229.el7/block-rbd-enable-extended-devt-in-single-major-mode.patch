@@ -1,0 +1,109 @@
+From d3f426f5368de20879be2e361428c093e8c17361 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:23:20 -0400
+Subject: [block] rbd: enable extended devt in single-major mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-94-git-send-email-sweil@redhat.com>
+Patchwork-id: 89786
+O-Subject: [PATCH 093/303] rbd: enable extended devt in single-major mode
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+If single-major device number allocation scheme is turned on, instead
+of reserving 256 minors per device, which imposes a limit of 4096
+images mapped at once, reserve 16 minors per device and enable extended
+devt feature.  This results in a theoretical limit of 65536 images
+mapped at once, and still allows to have more than 15 partititions:
+partitions starting with 16th are mapped under major 259 (Block
+Extended Major):
+
+$ rbd showmapped
+id pool image snap device
+0  rbd  b5    -    /dev/rbd0    # no partitions
+1  rbd  b2    -    /dev/rbd1    # 40 partitions
+2  rbd  b3    -    /dev/rbd2    #  2 partitions
+
+$ cat /proc/partitions
+ 251        0       1024 rbd0
+ 251       16       1024 rbd1
+ 251       17          0 rbd1p1
+ 251       18          0 rbd1p2
+ ...
+ 251       30          0 rbd1p14
+ 251       31          0 rbd1p15
+ 259        0          0 rbd1p16
+ 259        1          0 rbd1p17
+ ...
+ 259       23          0 rbd1p39
+ 259       24          0 rbd1p40
+ 251       32       1024 rbd2
+ 251       33          0 rbd2p1
+ 251       34          0 rbd2p2
+
+(major 251 was assigned dynamically at module load time)
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Josh Durgin <josh.durgin@inktank.com>
+(cherry picked from commit 7e513d43669a0505ee3b122344176147a674bcbf)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index bc195be..0c1cfa5 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -91,7 +91,8 @@ static int atomic_dec_return_safe(atomic_t *v)
+ 
+ #define RBD_DRV_NAME "rbd"
+ 
+-#define RBD_PART_SHIFT 8
++#define RBD_MINORS_PER_MAJOR  256
++#define RBD_SINGLE_MAJOR_PART_SHIFT 4
+ 
+ #define RBD_SNAP_DEV_NAME_PREFIX "snap_"
+ #define RBD_MAX_SNAP_NAME_LEN \
+@@ -429,12 +430,12 @@ static struct bus_attribute rbd_bus_attrs_single_major[] = {
+ 
+ static int rbd_dev_id_to_minor(int dev_id)
+ {
+- return dev_id << RBD_PART_SHIFT;
++ return dev_id << RBD_SINGLE_MAJOR_PART_SHIFT;
+ }
+ 
+ static int minor_to_rbd_dev_id(int minor)
+ {
+- return minor >> RBD_PART_SHIFT;
++ return minor >> RBD_SINGLE_MAJOR_PART_SHIFT;
+ }
+ 
+ static struct bus_type rbd_bus_type = {
+@@ -3418,7 +3419,9 @@ static int rbd_init_disk(struct rbd_device *rbd_dev)
+  u64 segment_size;
+ 
+  /* create gendisk info */
+- disk = alloc_disk(1 << RBD_PART_SHIFT);
++ disk = alloc_disk(single_major ?
++     (1 << RBD_SINGLE_MAJOR_PART_SHIFT) :
++     RBD_MINORS_PER_MAJOR);
+  if (!disk)
+   return -ENOMEM;
+ 
+@@ -3426,6 +3429,8 @@ static int rbd_init_disk(struct rbd_device *rbd_dev)
+    rbd_dev->dev_id);
+  disk->major = rbd_dev->major;
+  disk->first_minor = rbd_dev->minor;
++ if (single_major)
++  disk->flags |= GENHD_FL_EXT_DEVT;
+  disk->fops = &rbd_bd_ops;
+  disk->private_data = rbd_dev;
+ 
+-- 
+1.7.1

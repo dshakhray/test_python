@@ -1,0 +1,86 @@
+From 820dfbf09fa52d9b2aac113994f151812661614c Mon Sep 17 00:00:00 2001
+From: Marcelo Leitner <mleitner@redhat.com>
+Date: Tue, 21 Oct 2014 16:18:46 -0400
+Subject: [net] netfilter: nf_tables: atomic allocation in set notifications from rcu callback
+
+Message-id: <20141021161846.22888.23193.stgit@localhost.localdomain>
+Patchwork-id: 97964
+O-Subject: [RHEL7 net PATCH 067/124] netfilter: nf_tables: atomic allocation in set notifications from rcu callback
+Bugzilla: 1148041 1155088
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Backport of upstream commit: 31f8441c328b1c038c3e44bec740fb29393a56ad
+
+ commit 31f8441c328b1c038c3e44bec740fb29393a56ad
+ Author: Pablo Neira Ayuso <pablo@netfilter.org>
+ Date:   Thu May 29 10:29:58 2014 +0200
+
+    netfilter: nf_tables: atomic allocation in set notifications from rcu callback
+
+    Use GFP_ATOMIC allocations when sending removal notifications of
+    anonymous sets from rcu callback context. Sleeping in that context
+    is illegal.
+
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index dbf8236..624e083 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -2191,7 +2191,7 @@ nla_put_failure:
+ 
+ static int nf_tables_set_notify(const struct nft_ctx *ctx,
+     const struct nft_set *set,
+-    int event)
++    int event, gfp_t gfp_flags)
+ {
+  struct sk_buff *skb;
+  u32 portid = ctx->portid;
+@@ -2202,7 +2202,7 @@ static int nf_tables_set_notify(const struct nft_ctx *ctx,
+   return 0;
+ 
+  err = -ENOBUFS;
+- skb = nlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
++ skb = nlmsg_new(NLMSG_GOODSIZE, gfp_flags);
+  if (skb == NULL)
+   goto err;
+ 
+@@ -2213,7 +2213,7 @@ static int nf_tables_set_notify(const struct nft_ctx *ctx,
+  }
+ 
+  err = nfnetlink_send(skb, ctx->net, portid, NFNLGRP_NFTABLES,
+-        ctx->report, GFP_KERNEL);
++        ctx->report, gfp_flags);
+ err:
+  if (err < 0)
+   nfnetlink_set_err(ctx->net, portid, NFNLGRP_NFTABLES, err);
+@@ -2613,7 +2613,7 @@ static void nft_set_destroy(struct nft_set *set)
+ static void nf_tables_set_destroy(const struct nft_ctx *ctx, struct nft_set *set)
+ {
+  list_del(&set->list);
+- nf_tables_set_notify(ctx, set, NFT_MSG_DELSET);
++ nf_tables_set_notify(ctx, set, NFT_MSG_DELSET, GFP_ATOMIC);
+  nft_set_destroy(set);
+ }
+ 
+@@ -3409,12 +3409,12 @@ static int nf_tables_commit(struct sk_buff *skb)
+     trans->ctx.table->use--;
+ 
+    nf_tables_set_notify(&trans->ctx, nft_trans_set(trans),
+-          NFT_MSG_NEWSET);
++          NFT_MSG_NEWSET, GFP_KERNEL);
+    nft_trans_destroy(trans);
+    break;
+   case NFT_MSG_DELSET:
+    nf_tables_set_notify(&trans->ctx, nft_trans_set(trans),
+-          NFT_MSG_DELSET);
++          NFT_MSG_DELSET, GFP_KERNEL);
+    break;
+   case NFT_MSG_NEWSETELEM:
+    nf_tables_setelem_notify(&trans->ctx,
+-- 
+1.7.1

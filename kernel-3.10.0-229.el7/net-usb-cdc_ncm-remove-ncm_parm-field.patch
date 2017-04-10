@@ -1,0 +1,153 @@
+From bfeda917b9a6e861e09e2e48315bc3969104b685 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:03:59 -0400
+Subject: [net] usb/cdc_ncm: remove ncm_parm field
+
+Message-id: <1410887463-20674-168-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95152
+O-Subject: [RHEL7 PATCH 167/591] net: cdc_ncm: remove ncm_parm field
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 6a9612e2cb22b3fd6a7304dcbf2b4ee1cf2104b2
+Author: Bjorn Mork <bjorn@mork.no>
+Date:   Fri Nov 1 11:16:45 2013 +0100
+
+    net: cdc_ncm: remove ncm_parm field
+
+    Moving the call to cdc_ncm_setup() after the endpoint
+    setup removes the last remaining reference to ncm_parm
+    outside cdc_ncm_setup.
+
+    Collecting all the ncm_parm based calculations in
+    cdc_ncm_setup improves readability.
+
+    Cc: Alexey Orishko <alexey.orishko@gmail.com>
+    Signed-off-by: Bjorn Mork <bjorn@mork.no>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/usb/cdc_ncm.c b/drivers/net/usb/cdc_ncm.c
+index fc36a99..4de3a54 100644
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@ -83,6 +83,7 @@ cdc_ncm_get_drvinfo(struct net_device *net, struct ethtool_drvinfo *info)
+ static u8 cdc_ncm_setup(struct usbnet *dev)
+ {
+  struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
++ struct usb_cdc_ncm_ntb_parameters ncm_parm;
+  u32 val;
+  u8 flags;
+  u8 iface_no;
+@@ -97,22 +98,22 @@ static u8 cdc_ncm_setup(struct usbnet *dev)
+  err = usbnet_read_cmd(dev, USB_CDC_GET_NTB_PARAMETERS,
+          USB_TYPE_CLASS | USB_DIR_IN
+          |USB_RECIP_INTERFACE,
+-         0, iface_no, &ctx->ncm_parm,
+-         sizeof(ctx->ncm_parm));
++         0, iface_no, &ncm_parm,
++         sizeof(ncm_parm));
+  if (err < 0) {
+   pr_debug("failed GET_NTB_PARAMETERS\n");
+   return 1;
+  }
+ 
+  /* read correct set of parameters according to device mode */
+- ctx->rx_max = le32_to_cpu(ctx->ncm_parm.dwNtbInMaxSize);
+- ctx->tx_max = le32_to_cpu(ctx->ncm_parm.dwNtbOutMaxSize);
+- ctx->tx_remainder = le16_to_cpu(ctx->ncm_parm.wNdpOutPayloadRemainder);
+- ctx->tx_modulus = le16_to_cpu(ctx->ncm_parm.wNdpOutDivisor);
+- ctx->tx_ndp_modulus = le16_to_cpu(ctx->ncm_parm.wNdpOutAlignment);
++ ctx->rx_max = le32_to_cpu(ncm_parm.dwNtbInMaxSize);
++ ctx->tx_max = le32_to_cpu(ncm_parm.dwNtbOutMaxSize);
++ ctx->tx_remainder = le16_to_cpu(ncm_parm.wNdpOutPayloadRemainder);
++ ctx->tx_modulus = le16_to_cpu(ncm_parm.wNdpOutDivisor);
++ ctx->tx_ndp_modulus = le16_to_cpu(ncm_parm.wNdpOutAlignment);
+  /* devices prior to NCM Errata shall set this field to zero */
+- ctx->tx_max_datagrams = le16_to_cpu(ctx->ncm_parm.wNtbOutMaxDatagrams);
+- ntb_fmt_supported = le16_to_cpu(ctx->ncm_parm.bmNtbFormatsSupported);
++ ctx->tx_max_datagrams = le16_to_cpu(ncm_parm.wNtbOutMaxDatagrams);
++ ntb_fmt_supported = le16_to_cpu(ncm_parm.bmNtbFormatsSupported);
+ 
+  eth_hlen = ETH_HLEN;
+  min_dgram_size = CDC_NCM_MIN_DATAGRAM_SIZE;
+@@ -153,7 +154,7 @@ static u8 cdc_ncm_setup(struct usbnet *dev)
+  }
+ 
+  /* inform device about NTB input size changes */
+- if (ctx->rx_max != le32_to_cpu(ctx->ncm_parm.dwNtbInMaxSize)) {
++ if (ctx->rx_max != le32_to_cpu(ncm_parm.dwNtbInMaxSize)) {
+   __le32 dwNtbInMaxSize = cpu_to_le32(ctx->rx_max);
+ 
+   err = usbnet_write_cmd(dev, USB_CDC_SET_NTB_INPUT_SIZE,
+@@ -171,6 +172,14 @@ static u8 cdc_ncm_setup(struct usbnet *dev)
+   pr_debug("Using default maximum transmit length=%d\n",
+       CDC_NCM_NTB_MAX_SIZE_TX);
+   ctx->tx_max = CDC_NCM_NTB_MAX_SIZE_TX;
++
++  /* Adding a pad byte here simplifies the handling in
++   * cdc_ncm_fill_tx_frame, by making tx_max always
++   * represent the real skb max size.
++   */
++  if (ctx->tx_max % usb_maxpacket(dev->udev, dev->out, 1) == 0)
++   ctx->tx_max++;
++
+  }
+ 
+  /*
+@@ -473,10 +482,6 @@ advance:
+  if (temp)
+   goto error2;
+ 
+- /* initialize data interface */
+- if (cdc_ncm_setup(dev))
+-  goto error2;
+-
+  /* configure data interface */
+  temp = usb_set_interface(dev->udev, iface_no, data_altsetting);
+  if (temp)
+@@ -487,6 +492,10 @@ advance:
+  if (!dev->in || !dev->out || !dev->status)
+   goto error2;
+ 
++ /* initialize data interface */
++ if (cdc_ncm_setup(dev))
++  goto error2;
++
+  dev->net->ethtool_ops = &cdc_ncm_ethtool_ops;
+ 
+  usb_set_intfdata(ctx->data, dev);
+@@ -501,15 +510,6 @@ advance:
+ 
+  dev->rx_urb_size = ctx->rx_max;
+ 
+- /* cdc_ncm_setup will override dwNtbOutMaxSize if it is
+-  * outside the sane range. Adding a pad byte here if necessary
+-  * simplifies the handling in cdc_ncm_fill_tx_frame, making
+-  * tx_max always represent the real skb max size.
+-  */
+- if (ctx->tx_max != le32_to_cpu(ctx->ncm_parm.dwNtbOutMaxSize) &&
+-     ctx->tx_max % usb_maxpacket(dev->udev, dev->out, 1) == 0)
+-  ctx->tx_max++;
+-
+  return 0;
+ 
+ error2:
+diff --git a/include/linux/usb/cdc_ncm.h b/include/linux/usb/cdc_ncm.h
+index f14af3d..89b52a0 100644
+--- a/include/linux/usb/cdc_ncm.h
++++ b/include/linux/usb/cdc_ncm.h
+@@ -88,7 +88,6 @@
+ #define cdc_ncm_data_intf_is_mbim(x)  ((x)->desc.bInterfaceProtocol == USB_CDC_MBIM_PROTO_NTB)
+ 
+ struct cdc_ncm_ctx {
+- struct usb_cdc_ncm_ntb_parameters ncm_parm;
+  struct hrtimer tx_timer;
+  struct tasklet_struct bh;
+ 
+-- 
+1.7.1

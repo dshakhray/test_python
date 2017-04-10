@@ -1,0 +1,137 @@
+From acb67e19248cf0a2212d8a7298bfb63cfdcaeb62 Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Fri, 5 Sep 2014 18:56:12 -0400
+Subject: [crypto] pefile: Relax the check on the length of the PKCS#7 cert
+
+Message-id: <1409943373-12669-38-git-send-email-vgoyal@redhat.com>
+Patchwork-id: 91533
+O-Subject: [RHEL7.1 PATCH 37/38] PEFILE: Relax the check on the length of the PKCS#7 cert
+Bugzilla: 852066
+RH-Acked-by: Dave Anderson <anderson@redhat.com>
+RH-Acked-by: Baoquan He <bhe@redhat.com>
+RH-Acked-by: Dave Young <dyoung@redhat.com>
+RH-Acked-by: Chao WANG <chaowang@redhat.com>
+
+BZ:852066
+
+commit 0aa0409401046b3ec44d9f6d6d015edab885a579
+Author: David Howells <dhowells@redhat.com>
+Date: Tue, 2 Sep 2014 13:52:28 +0100
+
+Relax the check on the length of the PKCS#7 cert as it appears that the PE
+file wrapper size gets rounded up to the nearest 8.
+
+The debugging output looks like this:
+
+ PEFILE: ==> verify_pefile_signature()
+ PEFILE: ==> pefile_parse_binary()
+ PEFILE: checksum @ 110
+ PEFILE: header size = 200
+ PEFILE: cert = 968 @547be0 [68 09 00 00 00 02 02 00 30 82 09 56 ]
+ PEFILE: sig wrapper = { 968, 200, 2 }
+ PEFILE: Signature data not PKCS#7
+
+The wrapper is the first 8 bytes of the hex dump inside [].  This indicates a
+length of 0x968 bytes, including the wrapper header - so 0x960 bytes of
+payload.
+
+The ASN.1 wrapper begins [ ... 30 82 09 56 ].  That indicates an object of size
+0x956 - a four byte discrepency, presumably just padding for alignment
+purposes.
+
+So we just check that the ASN.1 container is no bigger than the payload and
+reduce the recorded size appropriately.
+
+Whilst we're at it, allow shorter PKCS#7 objects that manage to squeeze within
+127 or 255 bytes.  It's just about conceivable if no X.509 certs are included
+in the PKCS#7 message.
+
+Reported-by: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+Acked-by: Vivek Goyal <vgoyal@redhat.com>
+Acked-by: Peter Jones <pjones@redhat.com>
+Signed-off-by: James Morris <james.l.morris@oracle.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/crypto/asymmetric_keys/verify_pefile.c b/crypto/asymmetric_keys/verify_pefile.c
+index 79175e6..2421f46 100644
+--- a/crypto/asymmetric_keys/verify_pefile.c
++++ b/crypto/asymmetric_keys/verify_pefile.c
+@@ -128,6 +128,7 @@ static int pefile_strip_sig_wrapper(const void *pebuf,
+ {
+  struct win_certificate wrapper;
+  const u8 *pkcs7;
++ unsigned len;
+ 
+  if (ctx->sig_len < sizeof(wrapper)) {
+   pr_debug("Signature wrapper too short\n");
+@@ -154,33 +155,49 @@ static int pefile_strip_sig_wrapper(const void *pebuf,
+   return -ENOTSUPP;
+  }
+ 
+- /* Looks like actual pkcs signature length is in wrapper->length.
+-  * size obtained from data dir entries lists the total size of
+-  * certificate table which is also aligned to octawrod boundary.
+-  *
+-  * So set signature length field appropriately.
++ /* It looks like the pkcs signature length in wrapper->length and the
++  * size obtained from the data dir entries, which lists the total size
++  * of certificate table, are both aligned to an octaword boundary, so
++  * we may have to deal with some padding.
+   */
+  ctx->sig_len = wrapper.length;
+  ctx->sig_offset += sizeof(wrapper);
+  ctx->sig_len -= sizeof(wrapper);
+- if (ctx->sig_len == 0) {
++ if (ctx->sig_len < 4) {
+   pr_debug("Signature data missing\n");
+   return -EKEYREJECTED;
+  }
+ 
+- /* What's left should a PKCS#7 cert */
++ /* What's left should be a PKCS#7 cert */
+  pkcs7 = pebuf + ctx->sig_offset;
+- if (pkcs7[0] == (ASN1_CONS_BIT | ASN1_SEQ)) {
+-  if (pkcs7[1] == 0x82 &&
+-      pkcs7[2] == (((ctx->sig_len - 4) >> 8) & 0xff) &&
+-      pkcs7[3] ==  ((ctx->sig_len - 4)       & 0xff))
+-   return 0;
+-  if (pkcs7[1] == 0x80)
+-   return 0;
+-  if (pkcs7[1] > 0x82)
+-   return -EMSGSIZE;
++ if (pkcs7[0] != (ASN1_CONS_BIT | ASN1_SEQ))
++  goto not_pkcs7;
++
++ switch (pkcs7[1]) {
++ case 0 ... 0x7f:
++  len = pkcs7[1] + 2;
++  goto check_len;
++ case ASN1_INDEFINITE_LENGTH:
++  return 0;
++ case 0x81:
++  len = pkcs7[2] + 3;
++  goto check_len;
++ case 0x82:
++  len = ((pkcs7[2] << 8) | pkcs7[3]) + 4;
++  goto check_len;
++ case 0x83 ... 0xff:
++  return -EMSGSIZE;
++ default:
++  goto not_pkcs7;
+  }
+ 
++check_len:
++ if (len <= ctx->sig_len) {
++  /* There may be padding */
++  ctx->sig_len = len;
++  return 0;
++ }
++not_pkcs7:
+  pr_debug("Signature data not PKCS#7\n");
+  return -ELIBBAD;
+ }
+-- 
+1.7.1

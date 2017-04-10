@@ -1,0 +1,83 @@
+From 92ebb0aa165a75525bec57e407e5cd4d381e9487 Mon Sep 17 00:00:00 2001
+From: Jacob Tanenbaum <jtanenba@redhat.com>
+Date: Thu, 25 Sep 2014 13:40:37 -0400
+Subject: [hid] logitech-dj: fix OOB array access
+
+Message-id: <1411652437-12430-1-git-send-email-jtanenba@redhat.com>
+Patchwork-id: 96723
+O-Subject: [RHEL7 PATCH BZ1141212 CVE-2014-3182] Kernel: HID: logitech-dj OOB array access
+Bugzilla: 1141212
+CVE: CVE-2014-3182
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+Linux kernel built with the Human Interface Device(HID) Bus support(CONFIG_HID)
+along with a Logitech Unifying receivers full support(CONFIG_HID_LOGITECH_DJ)
+driver, is vulnerable to an OOB read flaw. It could occur if a device offers
+a malicious HID report with arbitrary device_index.
+
+A local user with physical access to the system could use this flaw to crash
+the system resulting in DoS.
+
+Backport of the following:
+commit ad3e14d7c5268c2e24477c6ef54bbdf88add5d36
+Author: Jiri Kosina <jkosina@suse.cz>
+Date:   Thu Aug 21 09:57:17 2014 -0500
+
+HID: logitech: perform bounds checking on device_id early enough
+
+device_index is a char type and the size of paired_dj_deivces is 7
+elements, therefore proper bounds checking has to be applied to
+device_index before it is used.
+
+We are currently performing the bounds checking in
+logi_dj_recv_add_djhid_device(), which is too late, as malicious device
+could send REPORT_TYPE_NOTIF_DEVICE_UNPAIRED early enough and trigger the
+problem in one of the report forwarding functions called from
+logi_dj_raw_event().
+
+Fix this by performing the check at the earliest possible ocasion in
+logi_dj_raw_event().
+
+BUGZILLA: https://bugzilla.redhat.com/show_bug.cgi?id=1141212
+BREW: https://brewweb.devel.redhat.com/taskinfo?taskID=8005216
+BEAKER: https://beaker.engineering.redhat.com/jobs/758215
+
+No issues seen in Brew build or Beaker tests. It is a known issue that
+test case "/kernel/RHEL7/perf/sanity/test" fails sporadically.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/hid/hid-logitech-dj.c b/drivers/hid/hid-logitech-dj.c
+index e495ec1..d0b7d13 100644
+--- a/drivers/hid/hid-logitech-dj.c
++++ b/drivers/hid/hid-logitech-dj.c
+@@ -235,13 +235,6 @@ static void logi_dj_recv_add_djhid_device(struct dj_receiver_dev *djrcv_dev,
+   return;
+  }
+ 
+- if ((dj_report->device_index < DJ_DEVICE_INDEX_MIN) ||
+-     (dj_report->device_index > DJ_DEVICE_INDEX_MAX)) {
+-  dev_err(&djrcv_hdev->dev, "%s: invalid device index:%d\n",
+-   __func__, dj_report->device_index);
+-  return;
+- }
+-
+  dj_hiddev = hid_allocate_device();
+  if (IS_ERR(dj_hiddev)) {
+   dev_err(&djrcv_hdev->dev, "%s: hid_allocate_device failed\n",
+@@ -676,6 +669,12 @@ static int logi_dj_raw_event(struct hid_device *hdev,
+   * device (via hid_input_report() ) and return 1 so hid-core does not do
+   * anything else with it.
+   */
++ if ((dj_report->device_index < DJ_DEVICE_INDEX_MIN) ||
++     (dj_report->device_index > DJ_DEVICE_INDEX_MAX)) {
++  dev_err(&hdev->dev, "%s: invalid device index:%d\n",
++    __func__, dj_report->device_index);
++  return false;
++ }
+ 
+  spin_lock_irqsave(&djrcv_dev->lock, flags);
+  if (dj_report->report_id == REPORT_ID_DJ_SHORT) {
+-- 
+1.7.1

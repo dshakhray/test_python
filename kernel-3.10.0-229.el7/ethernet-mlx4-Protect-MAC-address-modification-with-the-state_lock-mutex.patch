@@ -1,0 +1,56 @@
+From d06b0bef8dd77ed12688ecb6276ceb3a2ea099cc Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:00:52 -0400
+Subject: [ethernet] mlx4: Protect MAC address modification with the state_lock mutex
+
+Message-id: <94d8e4349dd3f2048e16a82b56d6189ebd8cbd0f.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93735
+O-Subject: [Patch RHEL7.1 V1 116/197] net/mlx4_en: Protect MAC address modification with the state_lock mutex
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Shani Michaelli <shanim@mellanox.com>
+
+This Patches solves an issue that could raise when modifying the
+device's MAC. It occurs due to a simultaneous access to priv->mac_hash
+from two contexts. The buggy scenario described below:
+Context 1: copy the new mac address to the dev->dev_addr field.
+Context 2: mlx4_en_do_uc_filter removes prev_mac entry from the mac_hash
+           db since it is not in dev->uc and not equal to dev->dev_addr.
+Context 1: mlx4_en_do_set_mac() calls mlx4_en_replace_mac() to replace
+           prev_mac with dev_addr but it fails to update the mac_hash db
+           since it no longer contains prev_mac, therefore it returns
+           with an error.
+
+The fix is to prevent mlx4_en_do_uc_filter from being executed by both
+of the context 1 calls described above, This is done by putting them
+both under the mdev->state_lock lock, it will solve this issue since
+mlx4_en_do_uc_filter is already protected by the mdev->state_lock.
+
+Reviewed-by: Eyal Perry <eyalpe@mellanox.com>
+Signed-off-by: Shani Michaeli <shanim@mellanox.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fe1ff29dd4989f6371e8d78bc340f596f4a78e04)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index eea7868..9090643 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -789,9 +789,8 @@ static int mlx4_en_set_mac(struct net_device *dev, void *addr)
+  if (!is_valid_ether_addr(saddr->sa_data))
+   return -EADDRNOTAVAIL;
+ 
+- memcpy(dev->dev_addr, saddr->sa_data, ETH_ALEN);
+-
+  mutex_lock(&mdev->state_lock);
++ memcpy(dev->dev_addr, saddr->sa_data, ETH_ALEN);
+  err = mlx4_en_do_set_mac(priv);
+  mutex_unlock(&mdev->state_lock);
+ 
+-- 
+1.7.1

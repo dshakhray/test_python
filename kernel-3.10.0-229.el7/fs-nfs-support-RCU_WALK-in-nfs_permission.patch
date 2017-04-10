@@ -1,0 +1,94 @@
+From 593df94935bbf6243c1e9915d4e3f451e1d69bf4 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:20:35 -0400
+Subject: [fs] nfs: support RCU_WALK in nfs_permission()
+
+Message-id: <1411050057-12417-73-git-send-email-steved@redhat.com>
+Patchwork-id: 96210
+O-Subject: [RHEL7.1 PATCH 72/94] NFS: support RCU_WALK in nfs_permission()
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: NeilBrown <neilb@suse.de>
+
+nfs_permission makes two calls which are not always safe in RCU_WALK,
+rpc_lookup_cred and nfs_do_access.
+
+The second can easily be made rcu-safe by aborting with -ECHILD before
+making the RPC call.
+
+The former can be made rcu-safe by calling rpc_lookup_cred_nonblock()
+instead.
+As this will almost always succeed, we use it even when RCU_WALK
+isn't being used as it still saves some spinlocks in a common case.
+We only fall back to rpc_lookup_cred() if rpc_lookup_cred_nonblock()
+fails and MAY_NOT_BLOCK isn't set.
+
+This optimisation (always trying rpc_lookup_cred_nonblock()) is
+particularly important when a security module is active.
+In that case inode_permission() may return -ECHILD from
+security_inode_permission() even though ->permission() succeeded in
+RCU_WALK mode.
+This leads to may_lookup() retrying inode_permission after performing
+unlazy_walk().  The spinlock that rpc_lookup_cred() takes is often
+more expensive than anything security_inode_permission() does, so that
+spinlock becomes the main bottleneck.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: f3324a2a94c229831cfd42d871902cd4a9bd5e0f
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 9cbc78a..0473986 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -2281,6 +2281,10 @@ static int nfs_do_access(struct inode *inode, struct rpc_cred *cred, int mask)
+  if (status == 0)
+   goto out_cached;
+ 
++ status = -ECHILD;
++ if (mask & MAY_NOT_BLOCK)
++  goto out;
++
+  /* Be clever: ask server to check for all possible rights */
+  cache.mask = MAY_EXEC | MAY_WRITE | MAY_READ;
+  cache.cred = cred;
+@@ -2357,15 +2361,23 @@ force_lookup:
+  if (!NFS_PROTO(inode)->access)
+   goto out_notsup;
+ 
+- if (mask & MAY_NOT_BLOCK)
+-  return -ECHILD;
+-
+- cred = rpc_lookup_cred();
+- if (!IS_ERR(cred)) {
+-  res = nfs_do_access(inode, cred, mask);
+-  put_rpccred(cred);
+- } else
++ /* Always try fast lookups first */
++ rcu_read_lock();
++ cred = rpc_lookup_cred_nonblock();
++ if (!IS_ERR(cred))
++  res = nfs_do_access(inode, cred, mask|MAY_NOT_BLOCK);
++ else
+   res = PTR_ERR(cred);
++ rcu_read_unlock();
++ if (res == -ECHILD && !(mask & MAY_NOT_BLOCK)) {
++  /* Fast lookup failed, try the slow way */
++  cred = rpc_lookup_cred();
++  if (!IS_ERR(cred)) {
++   res = nfs_do_access(inode, cred, mask);
++   put_rpccred(cred);
++  } else
++   res = PTR_ERR(cred);
++ }
+ out:
+  if (!res && (mask & MAY_EXEC) && !execute_ok(inode))
+   res = -EACCES;
+-- 
+1.7.1

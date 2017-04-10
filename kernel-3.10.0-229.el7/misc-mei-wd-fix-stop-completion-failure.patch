@@ -1,0 +1,118 @@
+From 73f41e607284aef67b0a24230acfbd4939ec40d8 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 2 May 2014 14:37:37 -0400
+Subject: [misc] mei: wd: fix stop completion failure
+
+Message-id: <1399041470-21330-65-git-send-email-prarit@redhat.com>
+Patchwork-id: 79354
+O-Subject: [RHEL7.1 PATCH BZ 1088953 64/77] mei: wd: fix stop completion failure
+Bugzilla: 1088953
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1088953
+
+commit 5877255dc57403f49b4961070b206b832c931201
+Author: Tomas Winkler <tomas.winkler@intel.com>
+Date:   Wed Feb 19 17:35:51 2014 +0200
+
+    mei: wd: fix stop completion failure
+
+    While running Documentation/watchdog/src/watchdog-simple.c
+    and quiting by Ctrl-C, fallowing error is displayed:
+    mei_me 0000:00:16.0: wd: stop failed to complete ret=-512.
+
+    The whatchdog core framework is not able to propagate
+    -ESYSRESTART or -EINTR. Also There is no much sense in
+    restarting the close system call so instead of using
+    wait_event_interruptible_timeout we can use wait_event_timeout
+    with reasonable 10 msecs timeout.
+
+    Reported-by: Prarit Bhargava <prarit@redhat.com>
+    Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/misc/mei/interrupt.c b/drivers/misc/mei/interrupt.c
+index 834220a..5aab335 100644
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -474,7 +474,7 @@ int mei_irq_write_handler(struct mei_device *dev, struct mei_cl_cb *cmpl_list)
+ 
+  if (dev->wd_state == MEI_WD_STOPPING) {
+   dev->wd_state = MEI_WD_IDLE;
+-  wake_up_interruptible(&dev->wait_stop_wd);
++  wake_up(&dev->wait_stop_wd);
+  }
+ 
+  if (mei_cl_is_connected(&dev->wd_cl)) {
+diff --git a/drivers/misc/mei/wd.c b/drivers/misc/mei/wd.c
+index 1dae0da..9956f17 100644
+--- a/drivers/misc/mei/wd.c
++++ b/drivers/misc/mei/wd.c
+@@ -161,9 +161,11 @@ int mei_wd_send(struct mei_device *dev)
+  * @dev: the device structure
+  * @preserve: indicate if to keep the timeout value
+  *
+- * returns 0 if success,
+- * -EIO when message send fails
++ * returns 0 if success
++ * on error:
++ * -EIO    when message send fails
+  * -EINVAL when invalid message is to be sent
++ * -ETIME  on message timeout
+  */
+ int mei_wd_stop(struct mei_device *dev)
+ {
+@@ -179,12 +181,12 @@ int mei_wd_stop(struct mei_device *dev)
+ 
+  ret = mei_cl_flow_ctrl_creds(&dev->wd_cl);
+  if (ret < 0)
+-  goto out;
++  goto err;
+ 
+  if (ret && mei_hbuf_acquire(dev)) {
+   ret = mei_wd_send(dev);
+   if (ret)
+-   goto out;
++   goto err;
+   dev->wd_pending = false;
+  } else {
+   dev->wd_pending = true;
+@@ -192,21 +194,21 @@ int mei_wd_stop(struct mei_device *dev)
+ 
+  mutex_unlock(&dev->device_lock);
+ 
+- ret = wait_event_interruptible_timeout(dev->wait_stop_wd,
+-     dev->wd_state == MEI_WD_IDLE,
+-     msecs_to_jiffies(MEI_WD_STOP_TIMEOUT));
++ ret = wait_event_timeout(dev->wait_stop_wd,
++    dev->wd_state == MEI_WD_IDLE,
++    msecs_to_jiffies(MEI_WD_STOP_TIMEOUT));
+  mutex_lock(&dev->device_lock);
+- if (dev->wd_state == MEI_WD_IDLE) {
+-  dev_dbg(&dev->pdev->dev, "wd: stop completed ret=%d.\n", ret);
+-  ret = 0;
+- } else {
+-  if (!ret)
+-   ret = -ETIME;
++ if (dev->wd_state != MEI_WD_IDLE) {
++  /* timeout */
++  ret = -ETIME;
+   dev_warn(&dev->pdev->dev,
+    "wd: stop failed to complete ret=%d.\n", ret);
++  goto err;
+  }
+-
+-out:
++ dev_dbg(&dev->pdev->dev, "wd: stop completed after %u msec\n",
++   MEI_WD_STOP_TIMEOUT - jiffies_to_msecs(ret));
++ return 0;
++err:
+  return ret;
+ }
+ 
+-- 
+1.7.1

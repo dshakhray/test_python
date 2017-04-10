@@ -1,0 +1,135 @@
+From ded0e92781ca80b93d0d74719d36e2e076f8ae62 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Thu, 8 Jan 2015 00:45:35 -0500
+Subject: [drm] mgag200: Consolidate depth/bpp handling
+
+Message-id: <1420677936-9887-1-git-send-email-airlied@redhat.com>
+Patchwork-id: 102546
+O-Subject: [PATCH 1/2] [PATCH RHEL7.1 BZ1044555] drm/mgag200: Consolidate depth/bpp handling
+Bugzilla: 1044555
+RH-Acked-by: Rob Clark <rclark@redhat.com>
+RH-Acked-by: Jerome Glisse <jglisse@redhat.com>
+
+From: Egbert Eich <eich@suse.de>
+
+Upstream status: waiting for SuSE to submit but RHEL needs this for
+partner hw.
+Bugzilla: 1044555
+
+This is the first part of the fix for some servers with
+unusual bpp/resolution requirements.
+
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/gpu/drm/mgag200/mgag200_drv.h b/drivers/gpu/drm/mgag200/mgag200_drv.h
+index cf11ee6..63e6317 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_drv.h
++++ b/drivers/gpu/drm/mgag200/mgag200_drv.h
+@@ -204,6 +204,8 @@ struct mga_device {
+  int    has_sdram;
+  struct drm_display_mode  mode;
+ 
++ int preferred_bpp;
++
+  int bpp_shifts[4];
+ 
+  int fb_mtrr;
+diff --git a/drivers/gpu/drm/mgag200/mgag200_fb.c b/drivers/gpu/drm/mgag200/mgag200_fb.c
+index 13b7dd8..3bf4aa1 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_fb.c
++++ b/drivers/gpu/drm/mgag200/mgag200_fb.c
+@@ -282,11 +282,6 @@ int mgag200_fbdev_init(struct mga_device *mdev)
+ {
+  struct mga_fbdev *mfbdev;
+  int ret;
+- int bpp_sel = 32;
+-
+- /* prefer 16bpp on low end gpus with limited VRAM */
+- if (IS_G200_SE(mdev) && mdev->mc.vram_size < (2048*1024))
+-  bpp_sel = 16;
+ 
+  mfbdev = devm_kzalloc(mdev->dev->dev, sizeof(struct mga_fbdev), GFP_KERNEL);
+  if (!mfbdev)
+@@ -306,7 +301,7 @@ int mgag200_fbdev_init(struct mga_device *mdev)
+  /* disable all the possible outputs/crtcs before entering KMS mode */
+  drm_helper_disable_unused_functions(mdev->dev);
+ 
+- drm_fb_helper_initial_config(&mfbdev->helper, bpp_sel);
++ drm_fb_helper_initial_config(&mfbdev->helper, mdev->preferred_bpp);
+ 
+  return 0;
+ }
+diff --git a/drivers/gpu/drm/mgag200/mgag200_main.c b/drivers/gpu/drm/mgag200/mgag200_main.c
+index f6b283b..c860078 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_main.c
++++ b/drivers/gpu/drm/mgag200/mgag200_main.c
+@@ -217,10 +217,13 @@ int mgag200_driver_load(struct drm_device *dev, unsigned long flags)
+ 
+  drm_mode_config_init(dev);
+  dev->mode_config.funcs = (void *)&mga_mode_funcs;
+- if (IS_G200_SE(mdev) && mdev->mc.vram_size < (2048*1024))
+-  dev->mode_config.preferred_depth = 16;
+- else
++ if (IS_G200_SE(mdev) && mdev->mc.vram_size < (2048*1024)) {
++  mdev->preferred_bpp = dev->mode_config.preferred_depth = 16;
++ } else {
++  /* prefer 16bpp on low end gpus with limited VRAM */
++  mdev->preferred_bpp = 32;
+   dev->mode_config.preferred_depth = 24;
++ }
+  dev->mode_config.prefer_shadow = 1;
+ 
+  r = mgag200_modeset_init(mdev);
+diff --git a/drivers/gpu/drm/mgag200/mgag200_mode.c b/drivers/gpu/drm/mgag200/mgag200_mode.c
+index a034ed4..5b6699b 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_mode.c
++++ b/drivers/gpu/drm/mgag200/mgag200_mode.c
+@@ -1486,9 +1486,24 @@ static int mga_vga_mode_valid(struct drm_connector *connector,
+  struct mga_fbdev *mfbdev = mdev->mfbdev;
+  struct drm_fb_helper *fb_helper = &mfbdev->helper;
+  struct drm_fb_helper_connector *fb_helper_conn = NULL;
+- int bpp = 32;
++ int bpp;
+  int i = 0;
+ 
++ bpp = mdev->preferred_bpp;
++ /* Validate the mode input by the user - since we don't have depth information
++  * in the mode this is the best we can do */
++ for (i = 0; i < fb_helper->connector_count; i++) {
++  if (fb_helper->connector_info[i]->connector == connector) {
++   /* Found the helper for this connector */
++   fb_helper_conn = fb_helper->connector_info[i];
++   if (fb_helper_conn->cmdline_mode.specified) {
++    if (fb_helper_conn->cmdline_mode.bpp_specified) {
++     bpp = fb_helper_conn->cmdline_mode.bpp;
++    }
++   }
++  }
++ }
++
+  if (IS_G200_SE(mdev)) {
+   if (mdev->unique_rev_id == 0x01) {
+    if (mode->hdisplay > 1600)
+@@ -1536,19 +1551,6 @@ static int mga_vga_mode_valid(struct drm_connector *connector,
+   return MODE_BAD;
+  }
+ 
+- /* Validate the mode input by the user */
+- for (i = 0; i < fb_helper->connector_count; i++) {
+-  if (fb_helper->connector_info[i]->connector == connector) {
+-   /* Found the helper for this connector */
+-   fb_helper_conn = fb_helper->connector_info[i];
+-   if (fb_helper_conn->cmdline_mode.specified) {
+-    if (fb_helper_conn->cmdline_mode.bpp_specified) {
+-     bpp = fb_helper_conn->cmdline_mode.bpp;
+-    }
+-   }
+-  }
+- }
+-
+  if ((mode->hdisplay * mode->vdisplay * (bpp/8)) > mdev->mc.vram_size) {
+   if (fb_helper_conn)
+    fb_helper_conn->cmdline_mode.specified = false;
+-- 
+1.7.1

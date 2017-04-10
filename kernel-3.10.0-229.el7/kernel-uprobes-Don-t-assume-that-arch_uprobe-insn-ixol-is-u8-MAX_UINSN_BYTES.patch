@@ -1,0 +1,115 @@
+From 0b33d18a5e5e10e3b05434495b00e063497548f9 Mon Sep 17 00:00:00 2001
+From: Steve Best <sbest@redhat.com>
+Date: Mon, 10 Nov 2014 18:17:55 -0500
+Subject: [kernel] uprobes: Don't assume that arch_uprobe->insn/ixol is u8[MAX_UINSN_BYTES]
+
+Message-id: <20141110181755.44863.65923.sendpatchset@ibm-p7r2-01.lab.bos.redhat.com>
+Patchwork-id: 99815
+O-Subject: [PATCH RHEL7.1 BZ1159365] uprobes: Don't assume that arch_uprobe->insn/ixol is u8[MAX_UINSN_BYTES]
+Bugzilla: 1159365
+RH-Acked-by: Oleg Nesterov <oleg@redhat.com>
+
+RHBZ#:
+------
+https://bugzilla.redhat.com/show_bug.cgi?id=1159365
+
+Description:
+------------
+arch_uprobe should be opaque as much as possible to the generic
+code, but currently it assumes that insn/ixol must be u8[] of the
+known size. Remove this unnecessary dependency, we can use "&" and
+and sizeof() with the same effect.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Acked-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+
+RHEL Version Found:
+-------------------
+RHEL 7.0
+
+Brew:
+-----
+BE: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=8213570
+LE: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=8213584
+
+Upstream:
+---------
+https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=803200e24abf0f9ec18631290d26b2185477f3a6
+
+Test Status:
+------------
+Ran Kernel Tier 1 successfully on BE system (ibm-p740-01-lp5):job was 797511
+The following systemtap script would oops the power LE kernel before the patch.
+After the patch the kernel no longer oops.
+[root@ibm-p8-kvm-03-guest-04 ~]# cat t2.stp
+global probe_hits
+
+probe begin {
+        system("/bin/ed < /dev/null > /dev/null")
+}
+
+probe process("stap").mark("*") {
+        probe_hits <<< 1
+}
+
+probe timer.ms(1000) {
+        if (@count(probe_hits) > 0)
+                println("PASS")
+        else
+                println("FAIL")
+        exit()
+}
+[root@ibm-p8-kvm-03-guest-05 ~]# stap -vvv t2.stp
+
+---------------------------------------------------------------
+Steve Best
+
+Proposed Patch:
+---------------
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index d8bfa5b..058aee8 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -328,7 +328,7 @@ int __weak set_swbp(struct arch_uprobe *auprobe, struct mm_struct *mm, unsigned
+ int __weak
+ set_orig_insn(struct arch_uprobe *auprobe, struct mm_struct *mm, unsigned long vaddr)
+ {
+- return write_opcode(mm, vaddr, *(uprobe_opcode_t *)auprobe->insn);
++ return write_opcode(mm, vaddr, *(uprobe_opcode_t *)&auprobe->insn);
+ }
+ 
+ static int match_uprobe(struct uprobe *l, struct uprobe *r)
+@@ -524,8 +524,8 @@ static int copy_insn(struct uprobe *uprobe, struct file *filp)
+ {
+  struct address_space *mapping = uprobe->inode->i_mapping;
+  loff_t offs = uprobe->offset;
+- void *insn = uprobe->arch.insn;
+- int size = MAX_UINSN_BYTES;
++ void *insn = &uprobe->arch.insn;
++ int size = sizeof(uprobe->arch.insn);
+  int len, err = -EIO;
+ 
+  /* Copy only available bytes, -EIO if nothing was read */
+@@ -564,7 +564,7 @@ static int prepare_uprobe(struct uprobe *uprobe, struct file *file,
+   goto out;
+ 
+  ret = -ENOTSUPP;
+- if (is_trap_insn((uprobe_opcode_t *)uprobe->arch.insn))
++ if (is_trap_insn((uprobe_opcode_t *)&uprobe->arch.insn))
+   goto out;
+ 
+  ret = arch_uprobe_analyze_insn(&uprobe->arch, mm, vaddr);
+@@ -1258,7 +1258,7 @@ static unsigned long xol_get_insn_slot(struct uprobe *uprobe)
+   return 0;
+ 
+  /* Initialize the slot */
+- copy_to_page(area->page, xol_vaddr, uprobe->arch.insn, MAX_UINSN_BYTES);
++ copy_to_page(area->page, xol_vaddr, &uprobe->arch.insn, MAX_UINSN_BYTES);
+  /*
+   * We probably need flush_icache_user_range() but it needs vma.
+   * This should work on supported architectures too.
+-- 
+1.7.1

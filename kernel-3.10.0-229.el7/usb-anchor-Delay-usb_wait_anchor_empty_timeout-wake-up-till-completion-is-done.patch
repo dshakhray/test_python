@@ -1,0 +1,180 @@
+From 4d614518bdd5555477a1e4c1209047e930319c7b Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:01:47 -0400
+Subject: [usb] anchor: Delay usb_wait_anchor_empty_timeout wake up till completion is done
+
+Message-id: <1410887463-20674-36-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95269
+O-Subject: [RHEL7 PATCH 035/591] usb-anchor: Delay usb_wait_anchor_empty_timeout wake up till completion is done
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 6ec4147e7bdbde168f5bce30de5984aa4f971b22
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Wed Oct 9 17:01:41 2013 +0200
+
+    usb-anchor: Delay usb_wait_anchor_empty_timeout wake up till completion is done
+
+    usb_wait_anchor_empty_timeout() should wait till the completion handler
+    has run. Both the zd1211rw driver and the uas driver (in its task mgmt) depend
+    on the completion handler having completed when usb_wait_anchor_empty_timeout()
+    returns, as they read state set by the completion handler after an
+    usb_wait_anchor_empty_timeout() call.
+
+    But __usb_hcd_giveback_urb() calls usb_unanchor_urb before calling the
+    completion handler. This is necessary as the completion handler may
+    re-submit and re-anchor the urb. But this introduces a race where the state
+    these drivers want to read has not been set yet by the completion handler
+    (this race is easily triggered with the uas task mgmt code).
+
+    I've considered adding an anchor_count to struct urb, which would be
+    incremented on anchor and decremented on unanchor, and then only actually
+    do the anchor / unanchor on 0 -> 1 and 1 -> 0 transtions, combined with
+    moving the unanchor call in hcd_giveback_urb to after calling the completion
+    handler. But this will only work if urb's are only re-anchored to the same
+    anchor as they were anchored to before the completion handler ran.
+
+    And at least one driver re-anchors to another anchor from the completion
+    handler (rtlwifi).
+
+    So I have come up with this patch instead, which adds the ability to
+    suspend wakeups of usb_wait_anchor_empty_timeout() waiters to the usb_anchor
+    functionality, and uses this in __usb_hcd_giveback_urb() to delay wake-ups
+    until the completion handler has run.
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Acked-by: Oliver Neukum <oliver@neukum.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index 460bb59..149cdf1 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1652,6 +1652,7 @@ int usb_hcd_unlink_urb (struct urb *urb, int status)
+ static void __usb_hcd_giveback_urb(struct urb *urb)
+ {
+  struct usb_hcd *hcd = bus_to_hcd(urb->dev->bus);
++ struct usb_anchor *anchor = urb->anchor;
+  int status = urb->unlinked;
+  unsigned long flags;
+ 
+@@ -1663,6 +1664,7 @@ static void __usb_hcd_giveback_urb(struct urb *urb)
+ 
+  unmap_urb_for_dma(hcd, urb);
+  usbmon_urb_complete(&hcd->self, urb, status);
++ usb_anchor_suspend_wakeups(anchor);
+  usb_unanchor_urb(urb);
+ 
+  /* pass ownership to the completion handler */
+@@ -1682,6 +1684,7 @@ static void __usb_hcd_giveback_urb(struct urb *urb)
+  urb->complete(urb);
+  local_irq_restore(flags);
+ 
++ usb_anchor_resume_wakeups(anchor);
+  atomic_dec(&urb->use_count);
+  if (unlikely(atomic_read(&urb->reject)))
+   wake_up(&usb_kill_urb_queue);
+diff --git a/drivers/usb/core/urb.c b/drivers/usb/core/urb.c
+index c12bc79..e622083 100644
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -138,13 +138,19 @@ void usb_anchor_urb(struct urb *urb, struct usb_anchor *anchor)
+ }
+ EXPORT_SYMBOL_GPL(usb_anchor_urb);
+ 
++static int usb_anchor_check_wakeup(struct usb_anchor *anchor)
++{
++ return atomic_read(&anchor->suspend_wakeups) == 0 &&
++  list_empty(&anchor->urb_list);
++}
++
+ /* Callers must hold anchor->lock */
+ static void __usb_unanchor_urb(struct urb *urb, struct usb_anchor *anchor)
+ {
+  urb->anchor = NULL;
+  list_del(&urb->anchor_list);
+  usb_put_urb(urb);
+- if (list_empty(&anchor->urb_list))
++ if (usb_anchor_check_wakeup(anchor))
+   wake_up(&anchor->wait);
+ }
+ 
+@@ -846,6 +852,39 @@ void usb_unlink_anchored_urbs(struct usb_anchor *anchor)
+ EXPORT_SYMBOL_GPL(usb_unlink_anchored_urbs);
+ 
+ /**
++ * usb_anchor_suspend_wakeups
++ * @anchor: the anchor you want to suspend wakeups on
++ *
++ * Call this to stop the last urb being unanchored from waking up any
++ * usb_wait_anchor_empty_timeout waiters. This is used in the hcd urb give-
++ * back path to delay waking up until after the completion handler has run.
++ */
++void usb_anchor_suspend_wakeups(struct usb_anchor *anchor)
++{
++ if (anchor)
++  atomic_inc(&anchor->suspend_wakeups);
++}
++EXPORT_SYMBOL_GPL(usb_anchor_suspend_wakeups);
++
++/**
++ * usb_anchor_resume_wakeups
++ * @anchor: the anchor you want to resume wakeups on
++ *
++ * Allow usb_wait_anchor_empty_timeout waiters to be woken up again, and
++ * wake up any current waiters if the anchor is empty.
++ */
++void usb_anchor_resume_wakeups(struct usb_anchor *anchor)
++{
++ if (!anchor)
++  return;
++
++ atomic_dec(&anchor->suspend_wakeups);
++ if (usb_anchor_check_wakeup(anchor))
++  wake_up(&anchor->wait);
++}
++EXPORT_SYMBOL_GPL(usb_anchor_resume_wakeups);
++
++/**
+  * usb_wait_anchor_empty_timeout - wait for an anchor to be unused
+  * @anchor: the anchor you want to become unused
+  * @timeout: how long you are willing to wait in milliseconds
+@@ -858,7 +897,8 @@ EXPORT_SYMBOL_GPL(usb_unlink_anchored_urbs);
+ int usb_wait_anchor_empty_timeout(struct usb_anchor *anchor,
+       unsigned int timeout)
+ {
+- return wait_event_timeout(anchor->wait, list_empty(&anchor->urb_list),
++ return wait_event_timeout(anchor->wait,
++      usb_anchor_check_wakeup(anchor),
+       msecs_to_jiffies(timeout));
+ }
+ EXPORT_SYMBOL_GPL(usb_wait_anchor_empty_timeout);
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index dd7904c..190e040 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1209,6 +1209,7 @@ struct usb_anchor {
+  struct list_head urb_list;
+  wait_queue_head_t wait;
+  spinlock_t lock;
++ atomic_t suspend_wakeups;
+  unsigned int poisoned:1;
+ };
+ 
+@@ -1577,6 +1578,8 @@ extern void usb_kill_anchored_urbs(struct usb_anchor *anchor);
+ extern void usb_poison_anchored_urbs(struct usb_anchor *anchor);
+ extern void usb_unpoison_anchored_urbs(struct usb_anchor *anchor);
+ extern void usb_unlink_anchored_urbs(struct usb_anchor *anchor);
++extern void usb_anchor_suspend_wakeups(struct usb_anchor *anchor);
++extern void usb_anchor_resume_wakeups(struct usb_anchor *anchor);
+ extern void usb_anchor_urb(struct urb *urb, struct usb_anchor *anchor);
+ extern void usb_unanchor_urb(struct urb *urb);
+ extern int usb_wait_anchor_empty_timeout(struct usb_anchor *anchor,
+-- 
+1.7.1

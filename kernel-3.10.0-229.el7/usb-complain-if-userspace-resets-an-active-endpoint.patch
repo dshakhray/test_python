@@ -1,0 +1,85 @@
+From 9b3f4ca862068b6a47a809da59430042d9717d27 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:05:41 -0400
+Subject: [usb] complain if userspace resets an active endpoint
+
+Message-id: <1410887463-20674-270-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95418
+O-Subject: [RHEL7 PATCH 269/591] USB: complain if userspace resets an active endpoint
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit f080a51bef2caa9b0f647dc430bc608d5723ac29
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Thu Feb 20 10:49:30 2014 -0500
+
+    USB: complain if userspace resets an active endpoint
+
+    It is an error for a driver to call usb_clear_halt() or
+    usb_reset_endpoint() while there are URBs queued for the endpoint,
+    because the end result is not well defined.  At the time the endpoint
+    gets reset, it may or may not be actively running.
+
+    As far as I know, no kernel drivers do this.  But some userspace
+    drivers do, and it seems like a good idea to bring this error to their
+    attention.
+
+    This patch adds a warning to the kernel log whenever a program invokes
+    the USBDEVFS_CLEAR_HALT or USBDEVFS_RESETEP ioctls at an inappropriate
+    time, and includes the name of the program.  This will make it clear
+    that any subsequent errors are not due to the misbehavior of a kernel
+    driver.
+
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    Suggested-by: Bjorn Mork <bjorn@mork.no>
+    CC: Stanislaw Gruszka <sgruszka@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/devio.c b/drivers/usb/core/devio.c
+index 90e18f6..f3ba2e0 100644
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -1043,6 +1043,20 @@ static int proc_bulk(struct dev_state *ps, void __user *arg)
+  return ret;
+ }
+ 
++static void check_reset_of_active_ep(struct usb_device *udev,
++  unsigned int epnum, char *ioctl_name)
++{
++ struct usb_host_endpoint **eps;
++ struct usb_host_endpoint *ep;
++
++ eps = (epnum & USB_DIR_IN) ? udev->ep_in : udev->ep_out;
++ ep = eps[epnum & 0x0f];
++ if (ep && !list_empty(&ep->urb_list))
++  dev_warn(&udev->dev, "Process %d (%s) called USBDEVFS_%s for active endpoint 0x%02x\n",
++    task_pid_nr(current), current->comm,
++    ioctl_name, epnum);
++}
++
+ static int proc_resetep(struct dev_state *ps, void __user *arg)
+ {
+  unsigned int ep;
+@@ -1056,6 +1070,7 @@ static int proc_resetep(struct dev_state *ps, void __user *arg)
+  ret = checkintf(ps, ret);
+  if (ret)
+   return ret;
++ check_reset_of_active_ep(ps->dev, ep, "RESETEP");
+  usb_reset_endpoint(ps->dev, ep);
+  return 0;
+ }
+@@ -1074,6 +1089,7 @@ static int proc_clearhalt(struct dev_state *ps, void __user *arg)
+  ret = checkintf(ps, ret);
+  if (ret)
+   return ret;
++ check_reset_of_active_ep(ps->dev, ep, "CLEAR_HALT");
+  if (ep & USB_DIR_IN)
+   pipe = usb_rcvbulkpipe(ps->dev, ep & 0x7f);
+  else
+-- 
+1.7.1

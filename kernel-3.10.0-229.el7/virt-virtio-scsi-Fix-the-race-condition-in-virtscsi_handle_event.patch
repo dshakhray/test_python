@@ -1,0 +1,88 @@
+From 8e8234024b6fd2d95a45405261f0f937e88e2055 Mon Sep 17 00:00:00 2001
+From: Fam Zheng <famz@redhat.com>
+Date: Wed, 21 Jan 2015 01:35:15 -0500
+Subject: [virt] virtio-scsi: Fix the race condition in virtscsi_handle_event
+
+Message-id: <1421804115-4689-1-git-send-email-famz@redhat.com>
+Patchwork-id: 103227
+O-Subject: [RHEL7.1 kernel PATCH] virtio-scsi: Fix the race condition in virtscsi_handle_event
+Bugzilla: 1152140
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+
+BZ: https://bugzilla.redhat.com/show_bug.cgi?id=1152140
+Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=8573339
+Upstream: posted.
+
+There is a race condition in virtscsi_handle_event, when many device
+hotplug/unplug events flush in quickly.
+
+The scsi_remove_device in virtscsi_handle_transport_reset may trigger
+the BUG_ON in scsi_target_reap, because the state is altered behind it,
+probably by scsi_scan_host of another event. I'm able to reproduce it by
+repeatedly plugging and unplugging a scsi disk with the same lun number.
+
+To fix this, a single thread workqueue (local to the module) is added,
+which makes the scan work serialized. With this change, the panic goes
+away.
+
+Reviewed-by: Venkatesh Srinivas <venkateshs@google.com>
+Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Fam Zheng <famz@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/virtio_scsi.c b/drivers/scsi/virtio_scsi.c
+index c1efcf2..8db3d95 100644
+--- a/drivers/scsi/virtio_scsi.c
++++ b/drivers/scsi/virtio_scsi.c
+@@ -120,6 +120,7 @@ struct virtio_scsi {
+ 
+ static struct kmem_cache *virtscsi_cmd_cache;
+ static mempool_t *virtscsi_cmd_pool;
++static struct workqueue_struct *virtscsi_scan_wq;
+ 
+ static inline struct Scsi_Host *virtio_scsi_host(struct virtio_device *vdev)
+ {
+@@ -428,7 +429,7 @@ static void virtscsi_complete_event(struct virtio_scsi *vscsi, void *buf)
+ {
+  struct virtio_scsi_event_node *event_node = buf;
+ 
+- schedule_work(&event_node->work);
++ queue_work(virtscsi_scan_wq, &event_node->work);
+ }
+ 
+ static void virtscsi_event_done(struct virtqueue *vq)
+@@ -1050,6 +1051,14 @@ static int __init init(void)
+   pr_err("mempool_create() for virtscsi_cmd_pool failed\n");
+   goto error;
+  }
++
++ virtscsi_scan_wq =
++  alloc_ordered_workqueue("virtscsi-scan", WQ_FREEZABLE | WQ_MEM_RECLAIM);
++ if (!virtscsi_scan_wq) {
++  pr_err("create_singlethread_workqueue() for virtscsi_scan_wq failed\n");
++  goto error;
++ }
++
+  ret = register_virtio_driver(&virtio_scsi_driver);
+  if (ret < 0)
+   goto error;
+@@ -1057,6 +1066,8 @@ static int __init init(void)
+  return 0;
+ 
+ error:
++ if (virtscsi_scan_wq)
++  destroy_workqueue(virtscsi_scan_wq);
+  if (virtscsi_cmd_pool) {
+   mempool_destroy(virtscsi_cmd_pool);
+   virtscsi_cmd_pool = NULL;
+@@ -1071,6 +1082,7 @@ error:
+ static void __exit fini(void)
+ {
+  unregister_virtio_driver(&virtio_scsi_driver);
++ destroy_workqueue(virtscsi_scan_wq);
+  mempool_destroy(virtscsi_cmd_pool);
+  kmem_cache_destroy(virtscsi_cmd_cache);
+ }
+-- 
+1.7.1

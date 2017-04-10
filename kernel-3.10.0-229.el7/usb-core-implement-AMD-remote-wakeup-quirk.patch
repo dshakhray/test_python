@@ -1,0 +1,205 @@
+From 77767561501f1278112606a223f44bc1d4ad1e12 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:01:23 -0400
+Subject: [usb] core: implement AMD remote wakeup quirk
+
+Message-id: <1410887463-20674-12-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95129
+O-Subject: [RHEL7 PATCH 011/591] usb: core: implement AMD remote wakeup quirk
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 7868943db1668fba898cf71bed1506c19d6958aa
+Author: Huang Rui <ray.huang@amd.com>
+Date:   Mon Sep 16 23:47:28 2013 +0800
+
+    usb: core: implement AMD remote wakeup quirk
+
+    The following patch is required to resolve remote wake issues with
+    certain devices.
+
+    Issue description:
+    If the remote wake is issued from the device in a specific timing
+    condition while the system is entering sleep state then it may cause
+    system to auto wake on subsequent sleep cycle.
+
+    Root cause:
+    Host controller rebroadcasts the Resume signal > 100 useconds after
+    receiving the original resume event from the device. For proper
+    function, some devices may require the rebroadcast of resume event
+    within the USB spec of 100uS.
+
+    Workaroud:
+    1. Filter the AMD platforms with Yangtze chipset, then judge of all the usb
+    devices are mouse or not. And get out the port id which attached a mouse
+    with Pixart controller.
+    2. Then reset the port which attached issue device during system resume
+    from S3.
+
+    [Q] Why the special devices are only mice? Would high speed devices
+    such as 3G modem or USB Bluetooth adapter trigger this issue?
+    - Current this sensitivity is only confined to devices that use Pixart
+      controllers. This controller is designed for use with LS mouse
+    devices only. We have not observed any other devices failing. There
+    may be a small risk for other devices also but this patch (reset
+    device in resume phase) will cover the cases if required.
+
+    [Q] Shouldn't the resume signal be sent within 100 us for every
+    device?
+    - The Host controller may not send the resume signal within 100us,
+      this our host controller specification change. This is why we
+    require the patch to prevent side effects on certain known devices.
+
+    [Q] Why would clicking mouse INTENSELY to wake the system up trigger
+    this issue?
+    - This behavior is specific to the devices that use Pixart controller.
+      It is timing dependent on when the resume event is triggered during
+    the sleep state.
+
+    [Q] Is it a host controller issue or mouse?
+    - It is the host controller behavior during resume that triggers the
+      device incorrect behavior on the next resume.
+
+    This patch sets USB_QUIRK_RESET_RESUME flag for these Pixart-based mice
+    when they attached to platforms with AMD Yangtze chipset.
+
+    Signed-off-by: Huang Rui <ray.huang@amd.com>
+    Suggested-by: Alan Stern <stern@rowland.harvard.edu>
+    Acked-by: Alan Stern <stern@rowland.harvard.edu>
+    Acked-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/hcd-pci.c b/drivers/usb/core/hcd-pci.c
+index b9d3c43..dfe9d0f 100644
+--- a/drivers/usb/core/hcd-pci.c
++++ b/drivers/usb/core/hcd-pci.c
+@@ -215,6 +215,9 @@ int usb_hcd_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
+   goto disable_pci;
+  }
+ 
++ hcd->amd_resume_bug = (usb_hcd_amd_remote_wakeup_quirk(dev) &&
++   driver->flags & (HCD_USB11 | HCD_USB3)) ? 1 : 0;
++
+  if (driver->flags & HCD_MEMORY) {
+   /* EHCI, OHCI */
+   hcd->rsrc_start = pci_resource_start(dev, 0);
+diff --git a/drivers/usb/core/quirks.c b/drivers/usb/core/quirks.c
+index 01fe362..aeda2ee 100644
+--- a/drivers/usb/core/quirks.c
++++ b/drivers/usb/core/quirks.c
+@@ -13,6 +13,7 @@
+ 
+ #include <linux/usb.h>
+ #include <linux/usb/quirks.h>
++#include <linux/usb/hcd.h>
+ #include "usb.h"
+ 
+ /* Lists of quirky USB devices, split in device quirks and interface quirks.
+@@ -161,6 +162,21 @@ static const struct usb_device_id usb_interface_quirk_list[] = {
+  { }  /* terminating entry must be last */
+ };
+ 
++static const struct usb_device_id usb_amd_resume_quirk_list[] = {
++ /* Lenovo Mouse with Pixart controller */
++ { USB_DEVICE(0x17ef, 0x602e), .driver_info = USB_QUIRK_RESET_RESUME },
++
++ /* Pixart Mouse */
++ { USB_DEVICE(0x093a, 0x2500), .driver_info = USB_QUIRK_RESET_RESUME },
++ { USB_DEVICE(0x093a, 0x2510), .driver_info = USB_QUIRK_RESET_RESUME },
++ { USB_DEVICE(0x093a, 0x2521), .driver_info = USB_QUIRK_RESET_RESUME },
++
++ /* Logitech Optical Mouse M90/M100 */
++ { USB_DEVICE(0x046d, 0xc05a), .driver_info = USB_QUIRK_RESET_RESUME },
++
++ { }  /* terminating entry must be last */
++};
++
+ static bool usb_match_any_interface(struct usb_device *udev,
+         const struct usb_device_id *id)
+ {
+@@ -187,6 +203,18 @@ static bool usb_match_any_interface(struct usb_device *udev,
+  return false;
+ }
+ 
++int usb_amd_resume_quirk(struct usb_device *udev)
++{
++ struct usb_hcd *hcd;
++
++ hcd = bus_to_hcd(udev->bus);
++ /* The device should be attached directly to root hub */
++ if (udev->level == 1 && hcd->amd_resume_bug == 1)
++  return 1;
++
++ return 0;
++}
++
+ static u32 __usb_detect_quirks(struct usb_device *udev,
+           const struct usb_device_id *id)
+ {
+@@ -212,6 +240,15 @@ static u32 __usb_detect_quirks(struct usb_device *udev,
+ void usb_detect_quirks(struct usb_device *udev)
+ {
+  udev->quirks = __usb_detect_quirks(udev, usb_quirk_list);
++
++ /*
++  * Pixart-based mice would trigger remote wakeup issue on AMD
++  * Yangtze chipset, so set them as RESET_RESUME flag.
++  */
++ if (usb_amd_resume_quirk(udev))
++  udev->quirks |= __usb_detect_quirks(udev,
++    usb_amd_resume_quirk_list);
++
+  if (udev->quirks)
+   dev_dbg(&udev->dev, "USB quirks for this device: %x\n",
+    udev->quirks);
+diff --git a/drivers/usb/host/pci-quirks.c b/drivers/usb/host/pci-quirks.c
+index daa1e58..367ab42 100644
+--- a/drivers/usb/host/pci-quirks.c
++++ b/drivers/usb/host/pci-quirks.c
+@@ -250,6 +250,18 @@ commit:
+ }
+ EXPORT_SYMBOL_GPL(usb_amd_find_chipset_info);
+ 
++int usb_hcd_amd_remote_wakeup_quirk(struct pci_dev *pdev)
++{
++ /* Make sure amd chipset type has already been initialized */
++ usb_amd_find_chipset_info();
++ if (amd_chipset.sb_type.gen != AMD_CHIPSET_YANGTZE)
++  return 0;
++
++ dev_dbg(&pdev->dev, "QUIRK: Enable AMD remote wakeup fix\n");
++ return 1;
++}
++EXPORT_SYMBOL_GPL(usb_hcd_amd_remote_wakeup_quirk);
++
+ /*
+  * The hardware normally enables the A-link power management feature, which
+  * lets the system lower the power consumption in idle states.
+diff --git a/include/linux/usb/hcd.h b/include/linux/usb/hcd.h
+index 8c86513..fc64b68 100644
+--- a/include/linux/usb/hcd.h
++++ b/include/linux/usb/hcd.h
+@@ -141,6 +141,7 @@ struct usb_hcd {
+  unsigned  wireless:1; /* Wireless USB HCD */
+  unsigned  authorized_default:1;
+  unsigned  has_tt:1; /* Integrated TT in root hub */
++ unsigned  amd_resume_bug:1; /* AMD remote wakeup quirk */
+ 
+  unsigned int  irq;  /* irq allocated */
+  void __iomem  *regs;  /* device memory/io */
+@@ -435,6 +436,8 @@ extern int usb_hcd_pci_probe(struct pci_dev *dev,
+ extern void usb_hcd_pci_remove(struct pci_dev *dev);
+ extern void usb_hcd_pci_shutdown(struct pci_dev *dev);
+ 
++extern int usb_hcd_amd_remote_wakeup_quirk(struct pci_dev *dev);
++
+ #ifdef CONFIG_PM
+ extern const struct dev_pm_ops usb_hcd_pci_pm_ops;
+ #endif
+-- 
+1.7.1

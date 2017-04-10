@@ -1,0 +1,82 @@
+From 83a5677155ab4ec9260395475479a2d5927bcd42 Mon Sep 17 00:00:00 2001
+From: Rui Wang <ruwang@redhat.com>
+Date: Wed, 5 Nov 2014 02:58:15 -0500
+Subject: [infiniband] qib: Correct reference counting in debugfs qp_stats
+
+Message-id: <1415156295-29996-1-git-send-email-ruwang@redhat.com>
+Patchwork-id: 99399
+O-Subject: [PATCH RHEL7.1 BZ1150001] IB/qib: Correct reference counting in debugfs qp_stats
+Bugzilla: 1150001
+RH-Acked-by: Doug Ledford <dledford@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1150001
+
+Backport of:
+Original commit 85cbb7c728bf39c45a9789b88c9471c0d7a58b0e
+Original Author: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Original Date:   Fri Sep 19 08:32:19 2014 -0400
+
+    This particular reference count is not needed with the rcu
+    protection, and the current code leaks a reference count,
+    causing a hang in qib_qp_destroy().
+
+Signed-off-by: Vinit Abhay Agnihotri <vinit.abhay.agnihotri@intel.com>
+Signed-off-by: Rui Wang <ruwang@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/qib/qib_debugfs.c b/drivers/infiniband/hw/qib/qib_debugfs.c
+index 799a0c3..6abd3ed 100644
+--- a/drivers/infiniband/hw/qib/qib_debugfs.c
++++ b/drivers/infiniband/hw/qib/qib_debugfs.c
+@@ -193,6 +193,7 @@ static void *_qp_stats_seq_start(struct seq_file *s, loff_t *pos)
+  struct qib_qp_iter *iter;
+  loff_t n = *pos;
+ 
++ rcu_read_lock();
+  iter = qib_qp_iter_init(s->private);
+  if (!iter)
+   return NULL;
+@@ -224,7 +225,7 @@ static void *_qp_stats_seq_next(struct seq_file *s, void *iter_ptr,
+ 
+ static void _qp_stats_seq_stop(struct seq_file *s, void *iter_ptr)
+ {
+- /* nothing for now */
++ rcu_read_unlock();
+ }
+ 
+ static int _qp_stats_seq_show(struct seq_file *s, void *iter_ptr)
+diff --git a/drivers/infiniband/hw/qib/qib_qp.c b/drivers/infiniband/hw/qib/qib_qp.c
+index 7fcc150..6ddc026 100644
+--- a/drivers/infiniband/hw/qib/qib_qp.c
++++ b/drivers/infiniband/hw/qib/qib_qp.c
+@@ -1325,7 +1325,6 @@ int qib_qp_iter_next(struct qib_qp_iter *iter)
+  struct qib_qp *pqp = iter->qp;
+  struct qib_qp *qp;
+ 
+- rcu_read_lock();
+  for (; n < dev->qp_table_size; n++) {
+   if (pqp)
+    qp = rcu_dereference(pqp->next);
+@@ -1333,18 +1332,11 @@ int qib_qp_iter_next(struct qib_qp_iter *iter)
+    qp = rcu_dereference(dev->qp_table[n]);
+   pqp = qp;
+   if (qp) {
+-   if (iter->qp)
+-    atomic_dec(&iter->qp->refcount);
+-   atomic_inc(&qp->refcount);
+-   rcu_read_unlock();
+    iter->qp = qp;
+    iter->n = n;
+    return 0;
+   }
+  }
+- rcu_read_unlock();
+- if (iter->qp)
+-  atomic_dec(&iter->qp->refcount);
+  return ret;
+ }
+ 
+-- 
+1.7.1

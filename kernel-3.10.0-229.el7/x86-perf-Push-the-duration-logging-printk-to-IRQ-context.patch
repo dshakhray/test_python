@@ -1,0 +1,100 @@
+From 0440ce5ee40dc6de82004b5c6ec51a9ff8c1dc7e Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:06 -0400
+Subject: [x86] perf: Push the duration-logging printk() to IRQ context
+
+Message-id: <1410181752-25631-2-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91683
+O-Subject: [PATCH RHEL7.1 BZ1134356 001/307] perf/x86: Push the duration-logging printk() to IRQ context
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 6a02ad66b2c44155d529f430d4fa5c6c66321077
+Author: Peter Zijlstra <peterz@infradead.org>
+Date: Mon Feb 3 18:11:08 2014 +0100
+
+description
+===========
+Calling printk() from NMI context is bad (TM), so move it to IRQ
+context.
+
+This also avoids the problem where the printk() time is measured by
+the generic NMI duration goo and triggers a second warning.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/irq_work.h b/include/linux/irq_work.h
+index 6601702..add13c8 100644
+--- a/include/linux/irq_work.h
++++ b/include/linux/irq_work.h
+@@ -30,6 +30,8 @@ void init_irq_work(struct irq_work *work, void (*func)(struct irq_work *))
+  work->func = func;
+ }
+ 
++#define DEFINE_IRQ_WORK(name, _f) struct irq_work name = { .func = (_f), }
++
+ void irq_work_queue(struct irq_work *work);
+ void irq_work_run(void);
+ void irq_work_sync(struct irq_work *work);
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 4da6544..87e7252 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -231,11 +231,29 @@ int perf_cpu_time_max_percent_handler(struct ctl_table *table, int write,
+ #define NR_ACCUMULATED_SAMPLES 128
+ static DEFINE_PER_CPU(u64, running_sample_length);
+ 
+-void perf_sample_event_took(u64 sample_len_ns)
++static void perf_duration_warn(struct irq_work *w)
+ {
++ u64 allowed_ns = ACCESS_ONCE(perf_sample_allowed_ns);
+  u64 avg_local_sample_len;
+  u64 local_samples_len;
++
++ local_samples_len = __get_cpu_var(running_sample_length);
++ avg_local_sample_len = local_samples_len/NR_ACCUMULATED_SAMPLES;
++
++ printk_ratelimited(KERN_WARNING
++   "perf interrupt took too long (%lld > %lld), lowering "
++   "kernel.perf_event_max_sample_rate to %d\n",
++   avg_local_sample_len, allowed_ns,
++   sysctl_perf_event_sample_rate);
++}
++
++static DEFINE_IRQ_WORK(perf_duration_work, perf_duration_warn);
++
++void perf_sample_event_took(u64 sample_len_ns)
++{
+  u64 allowed_ns = ACCESS_ONCE(perf_sample_allowed_ns);
++ u64 avg_local_sample_len;
++ u64 local_samples_len;
+ 
+  if (allowed_ns == 0)
+   return;
+@@ -263,13 +281,9 @@ void perf_sample_event_took(u64 sample_len_ns)
+  sysctl_perf_event_sample_rate = max_samples_per_tick * HZ;
+  perf_sample_period_ns = NSEC_PER_SEC / sysctl_perf_event_sample_rate;
+ 
+- printk_ratelimited(KERN_WARNING
+-   "perf samples too long (%lld > %lld), lowering "
+-   "kernel.perf_event_max_sample_rate to %d\n",
+-   avg_local_sample_len, allowed_ns,
+-   sysctl_perf_event_sample_rate);
+-
+  update_perf_cpu_limits();
++
++ irq_work_queue(&perf_duration_work);
+ }
+ 
+ static atomic64_t perf_event_id;
+-- 
+1.7.1

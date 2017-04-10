@@ -1,0 +1,130 @@
+From 0482b4ba2e1dce615370365d150cd0157a1ba5cd Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 24 Oct 2014 20:28:10 -0400
+Subject: [net] vxlan: Call udp_flow_src_port
+
+Message-id: <1c4c4ff94facd984264bedd9b4adbfc7901818d2.1414182116.git.jbenc@redhat.com>
+Patchwork-id: 98448
+O-Subject: [RHEL7.1 net PATCH 02/11] vxlan: Call udp_flow_src_port
+Bugzilla: 1110384
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110384
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8159383
+
+RHEL changes: minor conflicts because of inet_get_local_port_range not being
+netns aware in RHEL7.
+
+commit 535fb8d006bc6a96d59558181a9a6f267be382c5
+Author: Tom Herbert <therbert@google.com>
+Date:   Tue Jul 1 21:32:49 2014 -0700
+
+    vxlan: Call udp_flow_src_port
+
+    In vxlan and OVS vport-vxlan call common function to get source port
+    for a UDP tunnel. Removed vxlan_src_port since the functionality is
+    now in udp_flow_src_port.
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 32289ce..1b7ef25 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -1554,25 +1554,6 @@ static bool route_shortcircuit(struct net_device *dev, struct sk_buff *skb)
+  return false;
+ }
+ 
+-/* Compute source port for outgoing packet
+- *   first choice to use L4 flow hash since it will spread
+- *     better and maybe available from hardware
+- *   secondary choice is to use jhash on the Ethernet header
+- */
+-__be16 vxlan_src_port(__u16 port_min, __u16 port_max, struct sk_buff *skb)
+-{
+- unsigned int range = (port_max - port_min) + 1;
+- u32 hash;
+-
+- hash = skb_get_hash(skb);
+- if (!hash)
+-  hash = jhash(skb->data, 2 * ETH_ALEN,
+-        (__force u32) skb->protocol);
+-
+- return htons((((u64) hash * range) >> 32) + port_min);
+-}
+-EXPORT_SYMBOL_GPL(vxlan_src_port);
+-
+ static inline struct sk_buff *vxlan_handle_offloads(struct sk_buff *skb,
+           bool udp_csum)
+ {
+@@ -1788,7 +1769,8 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
+  if (tos == 1)
+   tos = ip_tunnel_get_dsfield(old_iph, skb);
+ 
+- src_port = vxlan_src_port(vxlan->port_min, vxlan->port_max, skb);
++ src_port = udp_flow_src_port(dev_net(dev), skb, vxlan->port_min,
++         vxlan->port_max, true);
+ 
+  if (dst->sa.sa_family == AF_INET) {
+   memset(&fl4, 0, sizeof(fl4));
+@@ -2214,7 +2196,6 @@ static void vxlan_setup(struct net_device *dev)
+ {
+  struct vxlan_dev *vxlan = netdev_priv(dev);
+  unsigned int h;
+- int low, high;
+ 
+  eth_hw_addr_random(dev);
+  ether_setup(dev);
+@@ -2252,9 +2233,6 @@ static void vxlan_setup(struct net_device *dev)
+  vxlan->age_timer.function = vxlan_cleanup;
+  vxlan->age_timer.data = (unsigned long) vxlan;
+ 
+- inet_get_local_port_range(&low, &high);
+- vxlan->port_min = low;
+- vxlan->port_max = high;
+  vxlan->dst_port = htons(vxlan_port);
+ 
+  vxlan->dev = dev;
+diff --git a/include/net/vxlan.h b/include/net/vxlan.h
+index 4a48f07..1ddc747 100644
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@ -45,8 +45,6 @@ int vxlan_xmit_skb(struct net *net, struct vxlan_sock *vs,
+      __be32 src, __be32 dst, __u8 tos, __u8 ttl, __be16 df,
+      __be16 src_port, __be16 dst_port, __be32 vni);
+ 
+-__be16 vxlan_src_port(__u16 port_min, __u16 port_max, struct sk_buff *skb);
+-
+ /* IP header + UDP + VXLAN + Ethernet header */
+ #define VXLAN_HEADROOM (20 + 8 + 8 + 14)
+ /* IPv6 header + UDP + VXLAN + Ethernet header */
+diff --git a/net/openvswitch/vport-vxlan.c b/net/openvswitch/vport-vxlan.c
+index 05c0853..e5f6908 100644
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@ -143,8 +143,6 @@ static int vxlan_tnl_send(struct vport *vport, struct sk_buff *skb)
+  struct rtable *rt;
+  struct flowi4 fl;
+  __be16 src_port;
+- int port_min;
+- int port_max;
+  __be16 df;
+  int err;
+ 
+@@ -172,8 +170,7 @@ static int vxlan_tnl_send(struct vport *vport, struct sk_buff *skb)
+ 
+  skb->local_df = 1;
+ 
+- inet_get_local_port_range(&port_min, &port_max);
+- src_port = vxlan_src_port(port_min, port_max, skb);
++ src_port = udp_flow_src_port(net, skb, 0, 0, true);
+ 
+  err = vxlan_xmit_skb(net, vxlan_port->vs, rt, skb,
+         fl.saddr, OVS_CB(skb)->tun_key->ipv4_dst,
+-- 
+1.7.1

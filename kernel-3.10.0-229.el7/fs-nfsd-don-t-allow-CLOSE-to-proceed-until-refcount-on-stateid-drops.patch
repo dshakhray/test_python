@@ -1,0 +1,79 @@
+From 7eecf919ff59feb6e742c924790f9cdddcf4b603 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:19:58 -0400
+Subject: [fs] nfsd: don't allow CLOSE to proceed until refcount on stateid drops
+
+Message-id: <1410898849-22126-115-git-send-email-bfields@redhat.com>
+Patchwork-id: 95850
+O-Subject: [Patch RHEL7 114/165] nfsd: don't allow CLOSE to proceed until refcount on stateid drops
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jlayton@primarydata.com>
+
+Once we remove client_mutex protection, it'll be possible to have an
+in-flight operation using an openstateid when a CLOSE call comes in.
+If that happens, we can't just put the sc_file reference and clear its
+pointer without risking an oops.
+
+Fix this by ensuring that v4.0 CLOSE operations wait for the refcount
+to drop before proceeding to do so.
+
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: b401be22b5cf059290ee98106bc780e087407d45
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index b613194..6d26d26 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -85,6 +85,12 @@ static DEFINE_MUTEX(client_mutex);
+  */
+ static DEFINE_SPINLOCK(state_lock);
+ 
++/*
++ * A waitqueue for all in-progress 4.0 CLOSE operations that are waiting for
++ * the refcount on the open stateid to drop.
++ */
++static DECLARE_WAIT_QUEUE_HEAD(close_wq);
++
+ static struct kmem_cache *openowner_slab;
+ static struct kmem_cache *lockowner_slab;
+ static struct kmem_cache *file_slab;
+@@ -640,8 +646,10 @@ nfs4_put_stid(struct nfs4_stid *s)
+ 
+  might_lock(&clp->cl_lock);
+ 
+- if (!atomic_dec_and_lock(&s->sc_count, &clp->cl_lock))
++ if (!atomic_dec_and_lock(&s->sc_count, &clp->cl_lock)) {
++  wake_up_all(&close_wq);
+   return;
++ }
+  idr_remove(&clp->cl_stateids, s->sc_stateid.si_opaque.so_id);
+  spin_unlock(&clp->cl_lock);
+  s->sc_free(s);
+@@ -3070,6 +3078,17 @@ move_to_close_lru(struct nfs4_ol_stateid *s, struct net *net)
+ 
+  dprintk("NFSD: move_to_close_lru nfs4_openowner %p\n", oo);
+ 
++ /*
++  * We know that we hold one reference via nfsd4_close, and another
++  * "persistent" reference for the client. If the refcount is higher
++  * than 2, then there are still calls in progress that are using this
++  * stateid. We can't put the sc_file reference until they are finished.
++  * Wait for the refcount to drop to 2. Since it has been unhashed,
++  * there should be no danger of the refcount going back up again at
++  * this point.
++  */
++ wait_event(close_wq, atomic_read(&s->st_stid.sc_count) == 2);
++
+  release_all_access(s);
+  if (s->st_stid.sc_file) {
+   put_nfs4_file(s->st_stid.sc_file);
+-- 
+1.7.1

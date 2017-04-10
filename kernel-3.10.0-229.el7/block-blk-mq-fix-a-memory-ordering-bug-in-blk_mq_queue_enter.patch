@@ -1,0 +1,58 @@
+From 138af4129ea8c0b75378357c99c1785868384f5e Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 10 Oct 2014 21:03:02 -0400
+Subject: [block] blk-mq: fix a memory ordering bug in blk_mq_queue_enter()
+
+Message-id: <1412975015-5370-2-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 97444
+O-Subject: [RHEL7 PATCH 01/34] blk-mq: fix a memory ordering bug in blk_mq_queue_enter()
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a backport of the following commit.  This resolves bug
+1146660.
+
+  commit 531ed6261e7466907418b1a9971a5c71d7d250e4
+  Author: Tejun Heo <tj@kernel.org>
+  Date:   Wed Jun 18 11:21:08 2014 -0400
+
+    blk-mq: fix a memory ordering bug in blk_mq_queue_enter()
+
+    blk-mq uses a percpu_counter to keep track of how many usages are in
+    flight.  The percpu_counter is drained while freezing to ensure that
+    no usage is left in-flight after freezing is complete.
+
+    blk_mq_queue_enter/exit() and blk_mq_[un]freeze_queue() implement this
+    per-cpu gating mechanism; unfortunately, it contains a subtle bug -
+    smp_wmb() in blk_mq_queue_enter() doesn't prevent prevent the cpu from
+    fetching @q->bypass_depth before incrementing @q->mq_usage_counter and
+    if freezing happens inbetween the caller can slip through and freezing
+    can be complete while there are active users.
+
+    Use smp_mb() instead so that bypass_depth and mq_usage_counter
+    modifications and tests are properly interlocked.
+
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: Nicholas A. Bellinger <nab@linux-iscsi.org>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index ad69ef6..9541f51 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -81,7 +81,7 @@ static int blk_mq_queue_enter(struct request_queue *q)
+  int ret;
+ 
+  __percpu_counter_add(&q->mq_usage_counter, 1, 1000000);
+- smp_wmb();
++ smp_mb();
+ 
+  /* we have problems freezing the queue if it's initializing */
+  if (!blk_queue_dying(q) &&
+-- 
+1.7.1

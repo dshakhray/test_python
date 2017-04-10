@@ -1,0 +1,78 @@
+From 1544fccc40bedf729b7ccd8b0a4820cb66ffef8a Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:54:30 -0400
+Subject: [fs] ext4: avoid possible overflow in ext4_map_blocks()
+
+Message-id: <1414058125-4183-117-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98210
+O-Subject: [RHEL 7.1 PATCH v2 116/171] ext4: avoid possible overflow in ext4_map_blocks()
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Theodore Ts'o <tytso@mit.edu>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit e861b5e9a47bd8c6a7491a2b9f6e9a230b1b8e86
+
+ The ext4_map_blocks() function returns the number of blocks which
+ satisfying the caller's request.  This number of blocks requested by
+ the caller is specified by an unsigned integer, but the return value
+ of ext4_map_blocks() is a signed integer (to accomodate error codes
+ per the kernel's standard error signalling convention).
+
+ Historically, overflows could never happen since mballoc() will refuse
+ to allocate more than 2048 blocks at a time (which is something we
+ should fix), and if the blocks were already allocated, the fact that
+ there would be some number of intervening metadata blocks pretty much
+ guaranteed that there could never be a contiguous region of data
+ blocks that was greater than 2**31 blocks.
+
+ However, this is now possible if there is a file system which is a bit
+ bigger than 8TB, and is created using the new mke2fs hugeblock
+ feature, which can create a perfectly contiguous file.  In that case,
+ if a userspace program attempted to call fallocate() on this already
+ fully allocated file, it's possible that ext4_map_blocks() could
+ return a number large enough that it would overflow a signed integer,
+ resulting in a ext4 thinking that the ext4_map_blocks() call had
+ failed with some strange error code.
+
+ Since ext4_map_blocks() is always free to return a smaller number of
+ blocks than what was requested by the caller, fix this by capping the
+ number of blocks that ext4_map_blocks() will ever try to map to 2**31
+ - 1.  In practice this should never get hit, except by someone
+ deliberately trying to provke the above-described bug.
+
+ Thanks to the PaX team for asking whethre this could possibly happen
+ in some off-line discussions about using some static code checking
+ technology they are developing to find bugs in kernel code.
+
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 53a0874..d0794f6 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -514,6 +514,12 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
+     "logical block %lu\n", inode->i_ino, flags, map->m_len,
+     (unsigned long) map->m_lblk);
+ 
++ /*
++  * ext4_map_blocks returns an int, and m_len is an unsigned int
++  */
++ if (unlikely(map->m_len > INT_MAX))
++  map->m_len = INT_MAX;
++
+  /* Lookup extent status tree firstly */
+  if (ext4_es_lookup_extent(inode, map->m_lblk, &es)) {
+   ext4_es_lru_add(inode);
+-- 
+1.7.1

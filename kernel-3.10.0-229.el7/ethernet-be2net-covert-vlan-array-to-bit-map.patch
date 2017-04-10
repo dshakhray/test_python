@@ -1,0 +1,117 @@
+From 8e758daf6ebe474c8385cd3f2fbdb38cf217b08c Mon Sep 17 00:00:00 2001
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Mon, 8 Sep 2014 16:13:51 -0400
+Subject: [ethernet] be2net: covert vlan array to bit-map
+
+Message-id: <1410192881-30702-29-git-send-email-ivecera@redhat.com>
+Patchwork-id: 92409
+O-Subject: [RHEL7.1 PATCH 28/78] be2net: covert vlan array to bit-map
+Bugzilla: 1088575
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+
+BZ: #1088575
+
+Upstream commit(s):
+commit f6cbd3644ac3188b422ce83f5a95a65e4450b7c6
+Author: Ravikumar Nelavelli <ravikumar.nelavelli@emulex.com>
+Date:   Fri May 9 13:29:16 2014 +0530
+
+    be2net: covert vlan array to bit-map
+
+    This patch converts the vlan u8[] used to track vlan-id
+    membership to a bit-map as it reduces memory usage.
+
+    Signed-off-by: Ravikumar Nelavelli <ravikumar.nelavelli@emulex.com>
+    Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/emulex/benet/be.h b/drivers/net/ethernet/emulex/benet/be.h
+index 7ce84a4..a1187ea 100644
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@ -455,7 +455,7 @@ struct be_adapter {
+  struct be_drv_stats drv_stats;
+  struct be_aic_obj aic_obj[MAX_EVT_QS];
+  u16 vlans_added;
+- u8 vlan_tag[VLAN_N_VID];
++ unsigned long vids[BITS_TO_LONGS(VLAN_N_VID)];
+  u8 vlan_prio_bmap; /* Available Priority BitMap */
+  u16 recommended_prio; /* Recommended Priority */
+  struct be_dma_mem rx_filter; /* Cmd DMA mem for rx-filter */
+diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
+index c41913f..56f7b5b 100644
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -1094,7 +1094,7 @@ static int be_change_mtu(struct net_device *netdev, int new_mtu)
+ static int be_vid_config(struct be_adapter *adapter)
+ {
+  u16 vids[BE_NUM_VLANS_SUPPORTED];
+- u16 num = 0, i;
++ u16 num = 0, i = 0;
+  int status = 0;
+ 
+  /* No need to further configure vids if in promiscuous mode */
+@@ -1105,9 +1105,8 @@ static int be_vid_config(struct be_adapter *adapter)
+   goto set_vlan_promisc;
+ 
+  /* Construct VLAN Table to give to HW */
+- for (i = 0; i < VLAN_N_VID; i++)
+-  if (adapter->vlan_tag[i])
+-   vids[num++] = cpu_to_le16(i);
++ for_each_set_bit(i, adapter->vids, VLAN_N_VID)
++  vids[num++] = cpu_to_le16(i);
+ 
+  status = be_cmd_vlan_config(adapter, adapter->if_handle, vids, num, 0);
+ 
+@@ -1155,16 +1154,16 @@ static int be_vlan_add_vid(struct net_device *netdev, __be16 proto, u16 vid)
+  if (lancer_chip(adapter) && vid == 0)
+   return status;
+ 
+- if (adapter->vlan_tag[vid])
++ if (test_bit(vid, adapter->vids))
+   return status;
+ 
+- adapter->vlan_tag[vid] = 1;
++ set_bit(vid, adapter->vids);
+  adapter->vlans_added++;
+ 
+  status = be_vid_config(adapter);
+  if (status) {
+   adapter->vlans_added--;
+-  adapter->vlan_tag[vid] = 0;
++  clear_bit(vid, adapter->vids);
+  }
+ 
+  return status;
+@@ -1179,12 +1178,12 @@ static int be_vlan_rem_vid(struct net_device *netdev, __be16 proto, u16 vid)
+  if (lancer_chip(adapter) && vid == 0)
+   goto ret;
+ 
+- adapter->vlan_tag[vid] = 0;
++ clear_bit(vid, adapter->vids);
+  status = be_vid_config(adapter);
+  if (!status)
+   adapter->vlans_added--;
+  else
+-  adapter->vlan_tag[vid] = 1;
++  set_bit(vid, adapter->vids);
+ ret:
+  return status;
+ }
+@@ -1795,7 +1794,7 @@ static struct be_rx_compl_info *be_rx_compl_get(struct be_rx_obj *rxo)
+    rxcp->vlan_tag = swab16(rxcp->vlan_tag);
+ 
+   if (adapter->pvid == (rxcp->vlan_tag & VLAN_VID_MASK) &&
+-      !adapter->vlan_tag[rxcp->vlan_tag])
++      !test_bit(rxcp->vlan_tag, adapter->vids))
+    rxcp->vlanf = 0;
+  }
+ 
+-- 
+1.7.1

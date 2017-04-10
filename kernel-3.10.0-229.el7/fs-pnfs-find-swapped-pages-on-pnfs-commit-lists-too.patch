@@ -1,0 +1,201 @@
+From 8196c17efe1fd7c142407f842d2553d6246ddf57 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:20:28 -0400
+Subject: [fs] pnfs: find swapped pages on pnfs commit lists too
+
+Message-id: <1411050057-12417-66-git-send-email-steved@redhat.com>
+Patchwork-id: 96253
+O-Subject: [RHEL7.1 PATCH 65/94] pnfs: find swapped pages on pnfs commit lists too
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+nfs_page_find_head_request_locked looks through the regular nfs commit lists
+when the page is swapped out, but doesn't look through the pnfs commit lists.
+
+I'm not sure if anyone has hit any issues caused by this.
+
+Suggested-by: Peng Tao <tao.peng@primarydata.com>
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 02d1426c7053da7c5a828ae9cd7b636ea4e46bf7
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/filelayout/filelayout.c b/fs/nfs/filelayout/filelayout.c
+index 2576d28..524e66f 100644
+--- a/fs/nfs/filelayout/filelayout.c
++++ b/fs/nfs/filelayout/filelayout.c
+@@ -1237,6 +1237,36 @@ restart:
+  spin_unlock(cinfo->lock);
+ }
+ 
++/* filelayout_search_commit_reqs - Search lists in @cinfo for the head reqest
++ *       for @page
++ * @cinfo - commit info for current inode
++ * @page - page to search for matching head request
++ *
++ * Returns a the head request if one is found, otherwise returns NULL.
++ */
++static struct nfs_page *
++filelayout_search_commit_reqs(struct nfs_commit_info *cinfo, struct page *page)
++{
++ struct nfs_page *freq, *t;
++ struct pnfs_commit_bucket *b;
++ int i;
++
++ /* Linearly search the commit lists for each bucket until a matching
++  * request is found */
++ for (i = 0, b = cinfo->ds->buckets; i < cinfo->ds->nbuckets; i++, b++) {
++  list_for_each_entry_safe(freq, t, &b->written, wb_list) {
++   if (freq->wb_page == page)
++    return freq->wb_head;
++  }
++  list_for_each_entry_safe(freq, t, &b->committing, wb_list) {
++   if (freq->wb_page == page)
++    return freq->wb_head;
++  }
++ }
++
++ return NULL;
++}
++
+ static void filelayout_retry_commit(struct nfs_commit_info *cinfo, int idx)
+ {
+  struct pnfs_ds_commit_info *fl_cinfo = cinfo->ds;
+@@ -1386,6 +1416,7 @@ static struct pnfs_layoutdriver_type filelayout_type = {
+  .clear_request_commit = filelayout_clear_request_commit,
+  .scan_commit_lists = filelayout_scan_commit_lists,
+  .recover_commit_reqs = filelayout_recover_commit_reqs,
++ .search_commit_reqs = filelayout_search_commit_reqs,
+  .commit_pagelist = filelayout_commit_pagelist,
+  .read_pagelist  = filelayout_read_pagelist,
+  .write_pagelist  = filelayout_write_pagelist,
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index 552b2e9..2dc5ecf 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -104,6 +104,8 @@ struct pnfs_layoutdriver_type {
+       int max);
+  void (*recover_commit_reqs) (struct list_head *list,
+          struct nfs_commit_info *cinfo);
++ struct nfs_page * (*search_commit_reqs)(struct nfs_commit_info *cinfo,
++      struct page *page);
+  int (*commit_pagelist)(struct inode *inode,
+           struct list_head *mds_pages,
+           int how,
+@@ -341,6 +343,17 @@ pnfs_recover_commit_reqs(struct inode *inode, struct list_head *list,
+  NFS_SERVER(inode)->pnfs_curr_ld->recover_commit_reqs(list, cinfo);
+ }
+ 
++static inline struct nfs_page *
++pnfs_search_commit_reqs(struct inode *inode, struct nfs_commit_info *cinfo,
++   struct page *page)
++{
++ struct pnfs_layoutdriver_type *ld = NFS_SERVER(inode)->pnfs_curr_ld;
++
++ if (ld == NULL || ld->search_commit_reqs == NULL)
++  return NULL;
++ return ld->search_commit_reqs(cinfo, page);
++}
++
+ /* Should the pNFS client commit and return the layout upon a setattr */
+ static inline bool
+ pnfs_ld_layoutret_on_setattr(struct inode *inode)
+@@ -492,6 +505,13 @@ pnfs_recover_commit_reqs(struct inode *inode, struct list_head *list,
+ {
+ }
+ 
++static inline struct nfs_page *
++pnfs_search_commit_reqs(struct inode *inode, struct nfs_commit_info *cinfo,
++   struct page *page)
++{
++ return NULL;
++}
++
+ static inline int pnfs_layoutcommit_inode(struct inode *inode, bool sync)
+ {
+  return 0;
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 9c080f8..2d5c6f2 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -47,6 +47,8 @@ static const struct nfs_pgio_completion_ops nfs_async_write_completion_ops;
+ static const struct nfs_commit_completion_ops nfs_commit_completion_ops;
+ static const struct nfs_rw_ops nfs_rw_write_ops;
+ static void nfs_clear_request_commit(struct nfs_page *req);
++static void nfs_init_cinfo_from_inode(struct nfs_commit_info *cinfo,
++          struct inode *inode);
+ 
+ static struct kmem_cache *nfs_wdata_cachep;
+ static mempool_t *nfs_wdata_mempool;
+@@ -93,6 +95,38 @@ static void nfs_context_set_write_error(struct nfs_open_context *ctx, int error)
+ }
+ 
+ /*
++ * nfs_page_search_commits_for_head_request_locked
++ *
++ * Search through commit lists on @inode for the head request for @page.
++ * Must be called while holding the inode (which is cinfo) lock.
++ *
++ * Returns the head request if found, or NULL if not found.
++ */
++static struct nfs_page *
++nfs_page_search_commits_for_head_request_locked(struct nfs_inode *nfsi,
++      struct page *page)
++{
++ struct nfs_page *freq, *t;
++ struct nfs_commit_info cinfo;
++ struct inode *inode = &nfsi->vfs_inode;
++
++ nfs_init_cinfo_from_inode(&cinfo, inode);
++
++ /* search through pnfs commit lists */
++ freq = pnfs_search_commit_reqs(inode, &cinfo, page);
++ if (freq)
++  return freq->wb_head;
++
++ /* Linearly search the commit list for the correct request */
++ list_for_each_entry_safe(freq, t, &cinfo.mds->list, wb_list) {
++  if (freq->wb_page == page)
++   return freq->wb_head;
++ }
++
++ return NULL;
++}
++
++/*
+  * nfs_page_find_head_request_locked - find head request associated with @page
+  *
+  * must be called while holding the inode lock.
+@@ -106,21 +140,12 @@ nfs_page_find_head_request_locked(struct nfs_inode *nfsi, struct page *page)
+ 
+  if (PagePrivate(page))
+   req = (struct nfs_page *)page_private(page);
+- else if (unlikely(PageSwapCache(page))) {
+-  struct nfs_page *freq, *t;
+-
+-  /* Linearly search the commit list for the correct req */
+-  list_for_each_entry_safe(freq, t, &nfsi->commit_info.list, wb_list) {
+-   if (freq->wb_page == page) {
+-    req = freq->wb_head;
+-    break;
+-   }
+-  }
+- }
++ else if (unlikely(PageSwapCache(page)))
++  req = nfs_page_search_commits_for_head_request_locked(nfsi,
++   page);
+ 
+  if (req) {
+   WARN_ON_ONCE(req->wb_head != req);
+-
+   kref_get(&req->wb_kref);
+  }
+ 
+-- 
+1.7.1

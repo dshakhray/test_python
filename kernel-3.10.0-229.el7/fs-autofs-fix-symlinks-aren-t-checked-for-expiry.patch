@@ -1,0 +1,79 @@
+From 2fb2e8a1e2ab3e09c858dfb9d71443256dfa72c4 Mon Sep 17 00:00:00 2001
+From: Ian Kent <ikent@redhat.com>
+Date: Mon, 25 Aug 2014 02:11:11 -0400
+Subject: [fs] autofs: fix symlinks aren't checked for expiry
+
+Message-id: <20140825021111.7717.7902.stgit@perseus.themaw.net>
+Patchwork-id: 88716
+O-Subject: [RHEL-7.1 PATCH] autofs: fix symlinks aren't checked for expiry
+Bugzilla: 1116182
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+Bugzilla bug: https://bugzilla.redhat.com/show_bug.cgi?id=1116182
+Upstream commit: 8dc51fe5
+
+The autofs4 module doesn't consider symlinks for expire as it did in the
+older autofs v3 module (so it's actually a long standing regression).
+
+The user space daemon has focused on the use of bind mounts instead of
+symlinks for a long time now and that's why this has not been noticed.
+But with the future addition of amd map parsing to automount(8), not to
+mention amd itself (of am-utils), symlink expiry will be needed.
+
+The direct and offset mount types can't be symlinks and the tree mounts of
+version 4 were always real mounts so only indirect mounts need expire
+symlinks.
+
+Since the current users of the autofs4 module haven't reported this as a
+problem to date this patch probably isn't a candidate for backport to
+stable.
+
+Signed-off-by: Ian Kent <ikent@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/autofs4/expire.c b/fs/autofs4/expire.c
+index 3d9d3f5..394e90b 100644
+--- a/fs/autofs4/expire.c
++++ b/fs/autofs4/expire.c
+@@ -402,6 +402,20 @@ struct dentry *autofs4_expire_indirect(struct super_block *sb,
+    goto next;
+   }
+ 
++  if (dentry->d_inode && S_ISLNK(dentry->d_inode->i_mode)) {
++   DPRINTK("checking symlink %p %.*s",
++    dentry, (int)dentry->d_name.len, dentry->d_name.name);
++   /*
++    * A symlink can't be "busy" in the usual sense so
++    * just check last used for expire timeout.
++    */
++   if (autofs4_can_expire(dentry, timeout, do_now)) {
++    expired = dentry;
++    goto found;
++   }
++   goto next;
++  }
++
+   if (simple_empty(dentry))
+    goto next;
+ 
+diff --git a/fs/autofs4/symlink.c b/fs/autofs4/symlink.c
+index f27c094..1e8ea19 100644
+--- a/fs/autofs4/symlink.c
++++ b/fs/autofs4/symlink.c
+@@ -14,6 +14,10 @@
+ 
+ static void *autofs4_follow_link(struct dentry *dentry, struct nameidata *nd)
+ {
++ struct autofs_sb_info *sbi = autofs4_sbi(dentry->d_sb);
++ struct autofs_info *ino = autofs4_dentry_ino(dentry);
++ if (ino && !autofs4_oz_mode(sbi))
++  ino->last_used = jiffies;
+  nd_set_link(nd, dentry->d_inode->i_private);
+  return NULL;
+ }
+-- 
+1.7.1

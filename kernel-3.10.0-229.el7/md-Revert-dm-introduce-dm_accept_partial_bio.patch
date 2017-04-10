@@ -1,0 +1,216 @@
+From 124f46972eebe50513afe2684fdcea041bee9ca8 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@gmail.com>
+Date: Tue, 30 Sep 2014 15:26:30 -0400
+Subject: [md] Revert: dm: introduce dm_accept_partial_bio
+
+Message-id: <1412090791-9864-4-git-send-email-y>
+Patchwork-id: 96808
+O-Subject: [RHEL7.1 PATCH 3/4] Revert "[md] dm: introduce dm_accept_partial_bio"
+Bugzilla: 1147574
+RH-Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+
+From: Mike Snitzer <snitzer@redhat.com>
+
+BZ: 1147574
+
+This reverts rhel7.git commit 8eea83734eac0e90cdda9ec5f14851bc77f69473.
+
+RHEL7 doesn't have upstream's immutable biovec changes.  This backport
+attempted to side-step the immutable biovec changes but failed in that
+RHEL7's DM core needed to preserve the use of clone_info->idx (which
+upstream no longer has).
+
+Mikulas has reasoned through an approach that we could take to properly
+backport this change for RHEL7.2 (but it is unclear that this snapshot
+improvement warrants such RHEL7-specific hacks):
+
+ <mikulas> the current RHEL7 code copies the whole bio vector when cloning bios and then sets bi_idx and bi_vcnt to point to the relevant part.
+ <mikulas> this has the requirement that bio splits may happen only on bio vector boundary.
+ <mikulas> so, I'd change it so that it reads the source vector and produces the destination vector.
+ <mikulas> This avoids the requirement that split may happen on bio vector boundary - the logic would be more upstream-like.
+ <mikulas> And then, we can backport dm_accept_partial_bio
+ <snitm> ok
+ <snitm> not sure it is worth the energy though
+ <snitm> dm-snapshot is effectively deprecated given dm-thin
+ <mikulas> there is bio_for_each_segment in RHEL7
+ <mikulas> it walks all the vector entries - this implies that bio vector size must be consistent with the length of the vector.
+ <mikulas> so, dm_accept_partial_bio for RHEL7 must also trim the bio vector, so that it's length is consistent with the accepted size.
+ <mikulas> (this doesn't have to be done in the upstream code with immutable-biovec changes)
+ <mikulas> the idea was that dm-cache could use dm_accept_partial_bio
+ <mikulas> if it uses it, it may be benefical to backport it to RHEL7.
+ <mikulas> if not, it is probably no worth the effort to backport it.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 26bce33..1677b3b 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1137,46 +1137,6 @@ int dm_set_target_max_io_len(struct dm_target *ti, sector_t len)
+ }
+ EXPORT_SYMBOL_GPL(dm_set_target_max_io_len);
+ 
+-/*
+- * A target may call dm_accept_partial_bio only from the map routine.  It is
+- * allowed for all bio types except REQ_FLUSH.
+- *
+- * dm_accept_partial_bio informs the dm that the target only wants to process
+- * additional n_sectors sectors of the bio and the rest of the data should be
+- * sent in a next bio.
+- *
+- * A diagram that explains the arithmetics:
+- * +--------------------+---------------+-------+
+- * |         1          |       2       |   3   |
+- * +--------------------+---------------+-------+
+- *
+- * <-------------- *tio->len_ptr --------------->
+- *                      <------- bi_size ------->
+- *                      <-- n_sectors -->
+- *
+- * Region 1 was already iterated over with bio_advance or similar function.
+- * (it may be empty if the target doesn't use bio_advance)
+- * Region 2 is the remaining bio size that the target wants to process.
+- * (it may be empty if region 1 is non-empty, although there is no reason
+- *  to make it empty)
+- * The target requires that region 3 is to be sent in the next bio.
+- *
+- * If the target wants to receive multiple copies of the bio (via num_*bios, etc),
+- * the partially processed part (the sum of regions 1+2) must be the same for all
+- * copies of the bio.
+- */
+-void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
+-{
+- struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
+- unsigned bi_size = bio->bi_size >> SECTOR_SHIFT;
+- BUG_ON(bio->bi_rw & REQ_FLUSH);
+- BUG_ON(bi_size > *tio->len_ptr);
+- BUG_ON(n_sectors > bi_size);
+- *tio->len_ptr -= bi_size - n_sectors;
+- bio->bi_size = n_sectors << SECTOR_SHIFT;
+-}
+-EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
+-
+ static void __map_bio(struct dm_target_io *tio)
+ {
+  int r;
+@@ -1311,13 +1271,11 @@ static struct dm_target_io *alloc_tio(struct clone_info *ci,
+ 
+ static void __clone_and_map_simple_bio(struct clone_info *ci,
+            struct dm_target *ti,
+-           unsigned target_bio_nr, unsigned *len)
++           unsigned target_bio_nr, unsigned len)
+ {
+  struct dm_target_io *tio = alloc_tio(ci, ti, ci->bio->bi_max_vecs, target_bio_nr);
+  struct bio *clone = &tio->clone;
+ 
+- tio->len_ptr = len;
+-
+  /*
+   * Discard requests require the bio's inline iovecs be initialized.
+   * ci->bio->bi_max_vecs is BIO_INLINE_VECS anyway, for both flush
+@@ -1325,13 +1283,13 @@ static void __clone_and_map_simple_bio(struct clone_info *ci,
+   */
+   __bio_clone(clone, ci->bio);
+  if (len)
+-  bio_setup_sector(clone, ci->sector, *len);
++  bio_setup_sector(clone, ci->sector, len);
+ 
+  __map_bio(tio);
+ }
+ 
+ static void __send_duplicate_bios(struct clone_info *ci, struct dm_target *ti,
+-      unsigned num_bios, unsigned *len)
++      unsigned num_bios, unsigned len)
+ {
+  unsigned target_bio_nr;
+ 
+@@ -1346,7 +1304,7 @@ static int __send_empty_flush(struct clone_info *ci)
+ 
+  BUG_ON(bio_has_data(ci->bio));
+  while ((ti = dm_table_get_target(ci->map, target_nr++)))
+-  __send_duplicate_bios(ci, ti, ti->num_flush_bios, NULL);
++  __send_duplicate_bios(ci, ti, ti->num_flush_bios, 0);
+ 
+  return 0;
+ }
+@@ -1354,7 +1312,7 @@ static int __send_empty_flush(struct clone_info *ci)
+ static void __clone_and_map_data_bio(struct clone_info *ci, struct dm_target *ti,
+          sector_t sector, int nr_iovecs,
+          unsigned short idx, unsigned short bv_count,
+-         unsigned offset, unsigned *len,
++         unsigned offset, unsigned len,
+          unsigned split_bvec)
+ {
+  struct bio *bio = ci->bio;
+@@ -1370,11 +1328,10 @@ static void __clone_and_map_data_bio(struct clone_info *ci, struct dm_target *ti
+ 
+  for (target_bio_nr = 0; target_bio_nr < num_target_bios; target_bio_nr++) {
+   tio = alloc_tio(ci, ti, nr_iovecs, target_bio_nr);
+-  tio->len_ptr = len;
+   if (split_bvec)
+-   clone_split_bio(tio, bio, sector, idx, offset, *len);
++   clone_split_bio(tio, bio, sector, idx, offset, len);
+   else
+-   clone_bio(tio, bio, sector, idx, bv_count, *len);
++   clone_bio(tio, bio, sector, idx, bv_count, len);
+   __map_bio(tio);
+  }
+ }
+@@ -1426,7 +1383,7 @@ static int __send_changing_extent_only(struct clone_info *ci,
+   else
+    len = min((sector_t)ci->sector_count, max_io_len(ci->sector, ti));
+ 
+-  __send_duplicate_bios(ci, ti, num_bios, &len);
++  __send_duplicate_bios(ci, ti, num_bios, len);
+ 
+   ci->sector += len;
+  } while (ci->sector_count -= len);
+@@ -1487,7 +1444,7 @@ static int __split_bvec_across_targets(struct clone_info *ci,
+   len = min(remaining, max);
+ 
+   __clone_and_map_data_bio(ci, ti, ci->sector, 1, ci->idx, 0,
+-      bv->bv_offset + offset, &len, 1);
++      bv->bv_offset + offset, len, 1);
+ 
+   ci->sector += len;
+   ci->sector_count -= len;
+@@ -1528,7 +1485,7 @@ static int __split_and_process_non_flush(struct clone_info *ci)
+  if (ci->sector_count <= max) {
+   __clone_and_map_data_bio(ci, ti, ci->sector, bio->bi_max_vecs,
+       ci->idx, bio->bi_vcnt - ci->idx, 0,
+-      &ci->sector_count, 0);
++      ci->sector_count, 0);
+   ci->sector_count = 0;
+   return 0;
+  }
+@@ -1541,7 +1498,7 @@ static int __split_and_process_non_flush(struct clone_info *ci)
+   len = __len_within_target(ci, max, &idx);
+ 
+   __clone_and_map_data_bio(ci, ti, ci->sector, bio->bi_max_vecs,
+-      ci->idx, idx - ci->idx, 0, &len, 0);
++      ci->idx, idx - ci->idx, 0, len, 0);
+ 
+   ci->sector += len;
+   ci->sector_count -= len;
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index e1707de..0268840 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -285,7 +285,6 @@ struct dm_target_io {
+  struct dm_io *io;
+  struct dm_target *ti;
+  unsigned target_bio_nr;
+- unsigned *len_ptr;
+  struct bio clone;
+ };
+ 
+@@ -396,7 +395,6 @@ int dm_copy_name_and_uuid(struct mapped_device *md, char *name, char *uuid);
+ struct gendisk *dm_disk(struct mapped_device *md);
+ int dm_suspended(struct dm_target *ti);
+ int dm_noflush_suspending(struct dm_target *ti);
+-void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors);
+ union map_info *dm_get_rq_mapinfo(struct request *rq);
+ 
+ struct queue_limits *dm_get_queue_limits(struct mapped_device *md);
+-- 
+1.7.1

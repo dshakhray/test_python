@@ -1,0 +1,97 @@
+From cde39a2e1c76db0d656e93a3cd7983eb75d983db Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Mon, 29 Sep 2014 00:58:53 -0400
+Subject: [virt] hyperv: Move state setting for link query
+
+Message-id: <1411952358-34104-10-git-send-email-jasowang@redhat.com>
+Patchwork-id: 96757
+O-Subject: [RHEL7.1 PATCH 09/34] hyperv: Move state setting for link query
+Bugzilla: 1146357
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+
+From: Haiyang Zhang <haiyangz@microsoft.com>
+
+Bugzilla: 1146357
+
+It moves the state setting for query into rndis_filter_receive_response().
+All callbacks including query-complete and status-callback are synchronized
+by channel->inbound_lock. This prevents pentential race between them.
+
+Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1b07da516ee25250f458c76c012ebe4cd677a84f)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index 6a7ae39..e608064 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -443,6 +443,8 @@ static int netvsc_probe(struct hv_device *dev,
+  if (!net)
+   return -ENOMEM;
+ 
++ netif_carrier_off(net);
++
+  net_device_ctx = netdev_priv(net);
+  net_device_ctx->device_ctx = dev;
+  hv_set_drvdata(dev, net);
+@@ -474,6 +476,8 @@ static int netvsc_probe(struct hv_device *dev,
+   pr_err("Unable to register netdev.\n");
+   rndis_filter_device_remove(dev);
+   free_netdev(net);
++ } else {
++  schedule_delayed_work(&net_device_ctx->dwork, 0);
+  }
+ 
+  return ret;
+diff --git a/drivers/net/hyperv/rndis_filter.c b/drivers/net/hyperv/rndis_filter.c
+index bee78d4..c495fed 100644
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@ -241,6 +241,22 @@ static int rndis_filter_send_request(struct rndis_device *dev,
+  return ret;
+ }
+ 
++static void rndis_set_link_state(struct rndis_device *rdev,
++     struct rndis_request *request)
++{
++ u32 link_status;
++ struct rndis_query_complete *query_complete;
++
++ query_complete = &request->response_msg.msg.query_complete;
++
++ if (query_complete->status == RNDIS_STATUS_SUCCESS &&
++     query_complete->info_buflen == sizeof(u32)) {
++  memcpy(&link_status, (void *)((unsigned long)query_complete +
++         query_complete->info_buf_offset), sizeof(u32));
++  rdev->link_state = link_status != 0;
++ }
++}
++
+ static void rndis_filter_receive_response(struct rndis_device *dev,
+            struct rndis_message *resp)
+ {
+@@ -270,6 +286,10 @@ static void rndis_filter_receive_response(struct rndis_device *dev,
+       sizeof(struct rndis_message) + RNDIS_EXT_LEN) {
+    memcpy(&request->response_msg, resp,
+           resp->msg_len);
++   if (request->request_msg.ndis_msg_type ==
++       RNDIS_MSG_QUERY && request->request_msg.msg.
++       query_req.oid == RNDIS_OID_GEN_MEDIA_CONNECT_STATUS)
++    rndis_set_link_state(dev, request);
+   } else {
+    netdev_err(ndev,
+     "rndis response buffer overflow "
+@@ -618,7 +638,6 @@ static int rndis_filter_query_device_link_status(struct rndis_device *dev)
+  ret = rndis_filter_query_device(dev,
+           RNDIS_OID_GEN_MEDIA_CONNECT_STATUS,
+           &link_status, &size);
+- dev->link_state = (link_status != 0) ? true : false;
+ 
+  return ret;
+ }
+-- 
+1.7.1

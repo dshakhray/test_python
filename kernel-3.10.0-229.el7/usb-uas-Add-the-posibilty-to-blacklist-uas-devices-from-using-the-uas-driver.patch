@@ -1,0 +1,185 @@
+From cf0e7302bb51f9cfb0b53b2f715a6dfa8e9eeb87 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:28 -0400
+Subject: [usb] uas: Add the posibilty to blacklist uas devices from using the uas driver
+
+Message-id: <1410887463-20674-317-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95247
+O-Subject: [RHEL7 PATCH 316/591] uas: Add the posibilty to blacklist uas devices from using the uas driver
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 79b4c06112f12c31d03cf22b1ed5ce09423fd887
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Fri Oct 25 17:04:33 2013 +0100
+
+    uas: Add the posibilty to blacklist uas devices from using the uas driver
+
+    Once we start supporting uas hardware, and as more and more uas devices
+    become available, we will likely start seeing broken devices. This patch
+    prepares for the inevitable need for blacklisting those devices from
+    using the uas driver (they will use usb-storage instead).
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+ create mode 100644 drivers/usb/storage/unusual_uas.h
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/storage/uas-detect.h b/drivers/usb/storage/uas-detect.h
+index 28101c7..02bf5ec 100644
+--- a/drivers/usb/storage/uas-detect.h
++++ b/drivers/usb/storage/uas-detect.h
+@@ -38,3 +38,14 @@ static int uas_find_uas_alt_setting(struct usb_interface *intf)
+ 
+  return -ENODEV;
+ }
++
++static int uas_use_uas_driver(struct usb_interface *intf,
++         const struct usb_device_id *id)
++{
++ unsigned long flags = id->driver_info;
++
++ if (flags & US_FL_IGNORE_UAS)
++  return 0;
++
++ return uas_find_uas_alt_setting(intf) >= 0;
++}
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index 6ea892f..e817e72 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -13,6 +13,7 @@
+ #include <linux/types.h>
+ #include <linux/module.h>
+ #include <linux/usb.h>
++#include <linux/usb_usual.h>
+ #include <linux/usb/hcd.h>
+ #include <linux/usb/storage.h>
+ #include <linux/usb/uas.h>
+@@ -866,7 +867,14 @@ static struct scsi_host_template uas_host_template = {
+  .ordered_tag = 1,
+ };
+ 
++#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
++      vendorName, productName, useProtocol, useTransport, \
++      initFunction, flags) \
++{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
++ .driver_info = (flags) }
++
+ static struct usb_device_id uas_usb_ids[] = {
++# include "unusual_uas.h"
+  { USB_INTERFACE_INFO(USB_CLASS_MASS_STORAGE, USB_SC_SCSI, USB_PR_BULK) },
+  { USB_INTERFACE_INFO(USB_CLASS_MASS_STORAGE, USB_SC_SCSI, USB_PR_UAS) },
+  /* 0xaa is a prototype device I happen to have access to */
+@@ -875,6 +883,8 @@ static struct usb_device_id uas_usb_ids[] = {
+ };
+ MODULE_DEVICE_TABLE(usb, uas_usb_ids);
+ 
++#undef UNUSUAL_DEV
++
+ static int uas_switch_interface(struct usb_device *udev,
+     struct usb_interface *intf)
+ {
+@@ -973,6 +983,9 @@ static int uas_probe(struct usb_interface *intf, const struct usb_device_id *id)
+  struct uas_dev_info *devinfo;
+  struct usb_device *udev = interface_to_usbdev(intf);
+ 
++ if (!uas_use_uas_driver(intf, id))
++  return -ENODEV;
++
+  if (uas_switch_interface(udev, intf))
+   return -ENODEV;
+ 
+@@ -1083,10 +1096,6 @@ static void uas_disconnect(struct usb_interface *intf)
+  kfree(devinfo);
+ }
+ 
+-/*
+- * XXX: Should this plug into libusual so we can auto-upgrade devices from
+- * Bulk-Only to UAS?
+- */
+ static struct usb_driver uas_driver = {
+  .name = "uas",
+  .probe = uas_probe,
+diff --git a/drivers/usb/storage/unusual_uas.h b/drivers/usb/storage/unusual_uas.h
+new file mode 100644
+index 0000000..7244444
+--- /dev/null
++++ b/drivers/usb/storage/unusual_uas.h
+@@ -0,0 +1,52 @@
++/* Driver for USB Attached SCSI devices - Unusual Devices File
++ *
++ *   (c) 2013 Hans de Goede <hdegoede@redhat.com>
++ *
++ * Based on the same file for the usb-storage driver, which is:
++ *   (c) 2000-2002 Matthew Dharm (mdharm-usb@one-eyed-alien.net)
++ *   (c) 2000 Adam J. Richter (adam@yggdrasil.com), Yggdrasil Computing, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2, or (at your option) any
++ * later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++/*
++ * IMPORTANT NOTE: This file must be included in another file which defines
++ * a UNUSUAL_DEV macro before this file is included.
++ */
++
++/*
++ * If you edit this file, please try to keep it sorted first by VendorID,
++ * then by ProductID.
++ *
++ * If you want to add an entry for this file, be sure to include the
++ * following information:
++ * - a patch that adds the entry for your device, including your
++ *   email address right above the entry (plus maybe a brief
++ *   explanation of the reason for the entry),
++ * - lsusb -v output for the device
++ * Send your submission to Hans de Goede <hdegoede@redhat.com>
++ * and don't forget to CC: the USB development list <linux-usb@vger.kernel.org>
++ */
++
++/*
++ * This is an example entry for the US_FL_IGNORE_UAS flag. Once we have an
++ * actual entry using US_FL_IGNORE_UAS this entry should be removed.
++ *
++ * UNUSUAL_DEV(  0xabcd, 0x1234, 0x0100, 0x0100,
++ *  "Example",
++ *  "Storage with broken UAS",
++ *  USB_SC_DEVICE, USB_PR_DEVICE, NULL,
++ *  US_FL_IGNORE_UAS),
++ */
+diff --git a/include/linux/usb_usual.h b/include/linux/usb_usual.h
+index 6303568..1a64b26 100644
+--- a/include/linux/usb_usual.h
++++ b/include/linux/usb_usual.h
+@@ -67,8 +67,10 @@
+   /* Initial READ(10) (and others) must be retried */ \
+  US_FLAG(WRITE_CACHE, 0x00200000)   \
+   /* Write Cache status is not available */ \
+- US_FLAG(NEEDS_CAP16, 0x00400000)
+-  /* cannot handle READ_CAPACITY_10 */
++ US_FLAG(NEEDS_CAP16, 0x00400000)   \
++  /* cannot handle READ_CAPACITY_10 */  \
++ US_FLAG(IGNORE_UAS, 0x00800000)   \
++  /* Device advertises UAS but it is broken */
+ 
+ #define US_FLAG(name, value) US_FL_##name = value ,
+ enum { US_DO_ALL_FLAGS };
+-- 
+1.7.1

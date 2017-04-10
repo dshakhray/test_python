@@ -1,0 +1,99 @@
+From 3218a27fbcc17bd10b50fc23540e2ec52ce4fbed Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:05:17 -0400
+Subject: [usb] ch341: fix ignored TIOCMIWAIT mask
+
+Message-id: <1410887463-20674-246-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95417
+O-Subject: [RHEL7 PATCH 245/591] USB: ch341: fix ignored TIOCMIWAIT mask
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit fd74b0b144d3e392b5269207ae4abba03f0adf59
+Author: Johan Hovold <jhovold@gmail.com>
+Date:   Thu Jan 2 22:49:30 2014 +0100
+
+    USB: ch341: fix ignored TIOCMIWAIT mask
+
+    Make sure the TIOCMIWAIT mask is always honoured.
+
+    The CH341 interrupt status has a multiple-status changed flag which
+    indicates that multiple status changes has occurred since last interrupt
+    event. Unfortunately, if the final status is the same, there appears to
+    be no way to determine which signal(s) has changed (an even number of
+    times).
+
+    This means that the multiple-status flag should not be used in
+    TIOCMIWAIT as it leads to the signal mask argument being ignored (e.g.
+    TIOCMIWAIT could return if DSR changes twice, even though the user only
+    cares about carrier changes).
+
+    Signed-off-by: Johan Hovold <jhovold@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/serial/ch341.c b/drivers/usb/serial/ch341.c
+index 9dd94a7..025b785 100644
+--- a/drivers/usb/serial/ch341.c
++++ b/drivers/usb/serial/ch341.c
+@@ -83,7 +83,6 @@ struct ch341_private {
+  unsigned baud_rate; /* set baud rate */
+  u8 line_control; /* set line control value RTS/DTR */
+  u8 line_status; /* active status of modem control inputs */
+- u8 multi_status_change; /* status changed multiple since last call */
+ };
+ 
+ static int ch341_control_out(struct usb_device *dev, u8 request,
+@@ -174,7 +173,6 @@ static int ch341_get_status(struct usb_device *dev, struct ch341_private *priv)
+   r = 0;
+   spin_lock_irqsave(&priv->lock, flags);
+   priv->line_status = (~(*buffer)) & CH341_BITS_MODEM_STAT;
+-  priv->multi_status_change = 0;
+   spin_unlock_irqrestore(&priv->lock, flags);
+  } else
+   r = -EPROTO;
+@@ -457,10 +455,11 @@ static void ch341_update_line_status(struct usb_serial_port *port,
+  spin_lock_irqsave(&priv->lock, flags);
+  delta = status ^ priv->line_status;
+  priv->line_status = status;
+- if (data[1] & CH341_MULT_STAT)
+-  priv->multi_status_change = 1;
+  spin_unlock_irqrestore(&priv->lock, flags);
+ 
++ if (data[1] & CH341_MULT_STAT)
++  dev_dbg(&port->dev, "%s - multiple status change\n", __func__);
++
+  if (delta & CH341_BIT_DCD) {
+   tty = tty_port_tty_get(&port->port);
+   if (tty) {
+@@ -516,14 +515,12 @@ static int ch341_tiocmiwait(struct tty_struct *tty, unsigned long arg)
+  u8 prevstatus;
+  u8 status;
+  u8 changed;
+- u8 multi_change = 0;
+ 
+  spin_lock_irqsave(&priv->lock, flags);
+  prevstatus = priv->line_status;
+- priv->multi_status_change = 0;
+  spin_unlock_irqrestore(&priv->lock, flags);
+ 
+- while (!multi_change) {
++ for (;;) {
+   interruptible_sleep_on(&port->port.delta_msr_wait);
+   /* see if a signal did it */
+   if (signal_pending(current))
+@@ -534,7 +531,6 @@ static int ch341_tiocmiwait(struct tty_struct *tty, unsigned long arg)
+ 
+   spin_lock_irqsave(&priv->lock, flags);
+   status = priv->line_status;
+-  multi_change = priv->multi_status_change;
+   spin_unlock_irqrestore(&priv->lock, flags);
+ 
+   changed = prevstatus ^ status;
+-- 
+1.7.1

@@ -1,0 +1,96 @@
+From bdaa812ee7879958d822ff13985a5c29be2af536 Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:25:29 -0400
+Subject: [md] raid1: Add a field array_frozen to indicate whether raid in freeze state
+
+Message-id: <1409563584-9000-28-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 89965
+O-Subject: [RHEL7.1 PATCH 27/82] raid1: Add a field array_frozen to indicate whether raid in freeze state.
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: majianpeng <majianpeng@gmail.com>
+
+Because the following patch will rewrite the content between normal IO
+and resync IO. So we used a parameter to indicate whether raid is in freeze
+array.
+
+Signed-off-by: Jianpeng Ma <majianpeng@gmail.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit b364e3d048e49b1d177eb7ee7853e77aa0560464)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index af6681b..49c7040 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -829,6 +829,7 @@ static void raise_barrier(struct r1conf *conf)
+ 
+  /* Now wait for all pending IO to complete */
+  wait_event_lock_irq(conf->wait_barrier,
++       !conf->array_frozen &&
+        !conf->nr_pending && conf->barrier < RESYNC_DEPTH,
+        conf->resync_lock);
+ 
+@@ -860,10 +861,11 @@ static void wait_barrier(struct r1conf *conf)
+    * count down.
+    */
+   wait_event_lock_irq(conf->wait_barrier,
+-        !conf->barrier ||
++        !conf->array_frozen &&
++        (!conf->barrier ||
+         (conf->nr_pending &&
+          current->bio_list &&
+-         !bio_list_empty(current->bio_list)),
++         !bio_list_empty(current->bio_list))),
+         conf->resync_lock);
+   conf->nr_waiting--;
+  }
+@@ -884,8 +886,7 @@ static void freeze_array(struct r1conf *conf, int extra)
+ {
+  /* stop syncio and normal IO and wait for everything to
+   * go quite.
+-  * We increment barrier and nr_waiting, and then
+-  * wait until nr_pending match nr_queued+extra
++  * We wait until nr_pending match nr_queued+extra
+   * This is called in the context of one normal IO request
+   * that has failed. Thus any sync request that might be pending
+   * will be blocked by nr_pending, and we need to wait for
+@@ -895,8 +896,7 @@ static void freeze_array(struct r1conf *conf, int extra)
+   * we continue.
+   */
+  spin_lock_irq(&conf->resync_lock);
+- conf->barrier++;
+- conf->nr_waiting++;
++ conf->array_frozen = 1;
+  wait_event_lock_irq_cmd(conf->wait_barrier,
+     conf->nr_pending == conf->nr_queued+extra,
+     conf->resync_lock,
+@@ -907,8 +907,7 @@ static void unfreeze_array(struct r1conf *conf)
+ {
+  /* reverse the effect of the freeze */
+  spin_lock_irq(&conf->resync_lock);
+- conf->barrier--;
+- conf->nr_waiting--;
++ conf->array_frozen = 0;
+  wake_up(&conf->wait_barrier);
+  spin_unlock_irq(&conf->resync_lock);
+ }
+diff --git a/drivers/md/raid1.h b/drivers/md/raid1.h
+index 0ff3715..331a98a 100644
+--- a/drivers/md/raid1.h
++++ b/drivers/md/raid1.h
+@@ -65,6 +65,7 @@ struct r1conf {
+  int   nr_waiting;
+  int   nr_queued;
+  int   barrier;
++ int   array_frozen;
+ 
+  /* Set to 1 if a full sync is needed, (fresh device added).
+   * Cleared when a sync completes.
+-- 
+1.7.1

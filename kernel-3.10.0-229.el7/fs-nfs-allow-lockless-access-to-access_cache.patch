@@ -1,0 +1,131 @@
+From 41fbebf6e1c80a9bf27c75ecc6dec21a32f8bdd9 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:20:38 -0400
+Subject: [fs] nfs: allow lockless access to access_cache
+
+Message-id: <1411050057-12417-76-git-send-email-steved@redhat.com>
+Patchwork-id: 96230
+O-Subject: [RHEL7.1 PATCH 75/94] NFS: allow lockless access to access_cache
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: NeilBrown <neilb@suse.de>
+
+The access cache is used during RCU-walk path lookups, so it is best
+to avoid locking if possible as taking a lock kills concurrency.
+
+The rbtree is not rcu-safe and cannot easily be made so.
+Instead we simply check the last (i.e. most recent) entry on the LRU
+list.  If this doesn't match, then we return -ECHILD and retry in
+lock/refcount mode.
+
+This requires freeing the nfs_access_entry struct with rcu, and
+requires using rcu access primatives when adding entries to the lru, and
+when examining the last entry.
+
+Calling put_rpccred before kfree_rcu looks a bit odd, but as
+put_rpccred already provides rcu protection, we know that the cred will
+not actually be freed until the next grace period, so any concurrent
+access will be safe.
+
+This patch provides about 5% performance improvement on a stat-heavy
+synthetic work load with 4 threads on a 2-core CPU.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: f682a398b2e24ae0a775ddf37cced83b897198ee
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 6b85e78..b509207 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -2076,7 +2076,7 @@ static atomic_long_t nfs_access_nr_entries;
+ static void nfs_access_free_entry(struct nfs_access_entry *entry)
+ {
+  put_rpccred(entry->cred);
+- kfree(entry);
++ kfree_rcu(entry, rcu_head);
+  smp_mb__before_atomic_dec();
+  atomic_long_dec(&nfs_access_nr_entries);
+  smp_mb__after_atomic_dec();
+@@ -2223,6 +2223,38 @@ out_zap:
+  return -ENOENT;
+ }
+ 
++static int nfs_access_get_cached_rcu(struct inode *inode, struct rpc_cred *cred, struct nfs_access_entry *res)
++{
++ /* Only check the most recently returned cache entry,
++  * but do it without locking.
++  */
++ struct nfs_inode *nfsi = NFS_I(inode);
++ struct nfs_access_entry *cache;
++ int err = -ECHILD;
++ struct list_head *lh;
++
++ rcu_read_lock();
++ if (nfsi->cache_validity & NFS_INO_INVALID_ACCESS)
++  goto out;
++ lh = rcu_dereference(nfsi->access_cache_entry_lru.prev);
++ cache = list_entry(lh, struct nfs_access_entry, lru);
++ if (lh == &nfsi->access_cache_entry_lru ||
++     cred != cache->cred)
++  cache = NULL;
++ if (cache == NULL)
++  goto out;
++ if (!nfs_have_delegated_attributes(inode) &&
++     !time_in_range_open(jiffies, cache->jiffies, cache->jiffies + nfsi->attrtimeo))
++  goto out;
++ res->jiffies = cache->jiffies;
++ res->cred = cache->cred;
++ res->mask = cache->mask;
++ err = 0;
++out:
++ rcu_read_unlock();
++ return err;
++}
++
+ static void nfs_access_add_rbtree(struct inode *inode, struct nfs_access_entry *set)
+ {
+  struct nfs_inode *nfsi = NFS_I(inode);
+@@ -2266,6 +2298,11 @@ void nfs_access_add_cache(struct inode *inode, struct nfs_access_entry *set)
+  cache->cred = get_rpccred(set->cred);
+  cache->mask = set->mask;
+ 
++ /* The above field assignments must be visible
++  * before this item appears on the lru.  We cannot easily
++  * use rcu_assign_pointer, so just force the memory barrier.
++  */
++ smp_wmb();
+  nfs_access_add_rbtree(inode, cache);
+ 
+  /* Update accounting */
+@@ -2304,7 +2341,9 @@ static int nfs_do_access(struct inode *inode, struct rpc_cred *cred, int mask)
+ 
+  trace_nfs_access_enter(inode);
+ 
+- status = nfs_access_get_cached(inode, cred, &cache);
++ status = nfs_access_get_cached_rcu(inode, cred, &cache);
++ if (status != 0)
++  status = nfs_access_get_cached(inode, cred, &cache);
+  if (status == 0)
+   goto out_cached;
+ 
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 0a90052..5642f11 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -52,6 +52,7 @@ struct nfs_access_entry {
+  unsigned long  jiffies;
+  struct rpc_cred * cred;
+  int   mask;
++ struct rcu_head  rcu_head;
+ };
+ 
+ struct nfs_lockowner {
+-- 
+1.7.1

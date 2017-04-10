@@ -1,0 +1,118 @@
+From 4d9fbd310207d8e85113023aa38ef51ea71ff78c Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:15:44 -0400
+Subject: [alsa] oxygen: Xonar DG(X) modify capture volume functions
+
+Message-id: <140972823573-62-patchset-jkysela@redhat.com>
+Patchwork-id: 90762
+O-Subject: [RHEL 7.1 PATCH 061/442] ALSA: oxygen: Xonar DG(X): modify capture volume functions
+Bugzilla: 1112200
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+Modify the input_vol_* functions to use the new SPI routines,
+There is a new applying function that will be called when
+the capture source changed.
+
+Signed-off-by: Roman Volkov <v1ron@mail.ru>
+Signed-off-by: Clemens Ladisch <clemens@ladisch.de>
+
+(picked from kernel: cf218b2ef345a26f4ae242907150035950f90cb8)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/sound/pci/oxygen/xonar_dg.h b/sound/pci/oxygen/xonar_dg.h
+index a5cb751..a7e5110 100644
+--- a/sound/pci/oxygen/xonar_dg.h
++++ b/sound/pci/oxygen/xonar_dg.h
+@@ -28,7 +28,8 @@ struct dg {
+  unsigned char cs4245_shadow[17];
+  /* output select: headphone/speakers */
+  unsigned char output_sel;
+- s8 input_vol[4][2];
++ /* volumes for all capture sources */
++ char input_vol[4][2];
+  unsigned int input_sel;
+  u8 hp_vol_att;
+ };
+diff --git a/sound/pci/oxygen/xonar_dg_mixer.c b/sound/pci/oxygen/xonar_dg_mixer.c
+index 0c310e7..2417a1e 100644
+--- a/sound/pci/oxygen/xonar_dg_mixer.c
++++ b/sound/pci/oxygen/xonar_dg_mixer.c
+@@ -190,6 +190,21 @@ static int hp_mute_put(struct snd_kcontrol *ctl,
+  return changed;
+ }
+ 
++/* capture volume for all sources */
++
++static int input_volume_apply(struct oxygen *chip, char left, char right)
++{
++ struct dg *data = chip->model_data;
++ int ret;
++
++ data->cs4245_shadow[CS4245_PGA_A_CTRL] = left;
++ data->cs4245_shadow[CS4245_PGA_B_CTRL] = right;
++ ret = cs4245_write_spi(chip, CS4245_PGA_A_CTRL);
++ if (ret < 0)
++  return ret;
++ return cs4245_write_spi(chip, CS4245_PGA_B_CTRL);
++}
++
+ static int input_vol_info(struct snd_kcontrol *ctl,
+      struct snd_ctl_elem_info *info)
+ {
+@@ -221,6 +236,7 @@ static int input_vol_put(struct snd_kcontrol *ctl,
+  struct dg *data = chip->model_data;
+  unsigned int idx = ctl->private_value;
+  int changed = 0;
++ int ret = 0;
+ 
+  if (value->value.integer.value[0] < 2 * -12 ||
+      value->value.integer.value[0] > 2 * 12 ||
+@@ -234,18 +250,16 @@ static int input_vol_put(struct snd_kcontrol *ctl,
+   data->input_vol[idx][0] = value->value.integer.value[0];
+   data->input_vol[idx][1] = value->value.integer.value[1];
+   if (idx == data->input_sel) {
+-   cs4245_write_cached(chip, CS4245_PGA_A_CTRL,
+-         data->input_vol[idx][0]);
+-   cs4245_write_cached(chip, CS4245_PGA_B_CTRL,
+-         data->input_vol[idx][1]);
++   ret = input_volume_apply(chip,
++    data->input_vol[idx][0],
++    data->input_vol[idx][1]);
+   }
++  changed = ret >= 0 ? 1 : ret;
+  }
+  mutex_unlock(&chip->mutex);
+  return changed;
+ }
+ 
+-static DECLARE_TLV_DB_SCALE(cs4245_pga_db_scale, -1200, 50, 0);
+-
+ static int input_sel_info(struct snd_kcontrol *ctl,
+      struct snd_ctl_elem_info *info)
+ {
+@@ -345,13 +359,16 @@ static int hpf_put(struct snd_kcontrol *ctl, struct snd_ctl_elem_value *value)
+ #define INPUT_VOLUME(xname, index) { \
+  .iface = SNDRV_CTL_ELEM_IFACE_MIXER, \
+  .name = xname, \
++ .access = SNDRV_CTL_ELEM_ACCESS_READWRITE | \
++    SNDRV_CTL_ELEM_ACCESS_TLV_READ, \
+  .info = input_vol_info, \
+  .get = input_vol_get, \
+  .put = input_vol_put, \
+- .tlv = { .p = cs4245_pga_db_scale }, \
++ .tlv = { .p = pga_db_scale }, \
+  .private_value = index, \
+ }
+ static const DECLARE_TLV_DB_MINMAX(hp_db_scale, -12550, 0);
++static const DECLARE_TLV_DB_MINMAX(pga_db_scale, -1200, 1200);
+ static const struct snd_kcontrol_new dg_controls[] = {
+  {
+   .iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+-- 
+1.7.1

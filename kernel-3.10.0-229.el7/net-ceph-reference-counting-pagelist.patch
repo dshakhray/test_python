@@ -1,0 +1,121 @@
+From 43f44ad2133c343b4ffd9ab944fb04f06a827936 Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+Date: Tue, 18 Nov 2014 15:49:45 -0500
+Subject: [net] ceph: reference counting pagelist
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1416325805-26490-31-git-send-email-idryomov@redhat.com>
+Patchwork-id: 100222
+O-Subject: [RHEL7.1 PATCH 30/50] libceph: reference counting pagelist
+Bugzilla: 1165232
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Sage Weil <sweil@redhat.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+
+From: "Yan, Zheng" <zyan@redhat.com>
+
+this allow pagelist to present data that may be sent multiple times.
+
+Signed-off-by: Yan, Zheng <zyan@redhat.com>
+Reviewed-by: Sage Weil <sage@redhat.com>
+(cherry picked from commit e4339d28f640a7c0d92903bcf389a2dfa281270d)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 5474feb..b4430ce 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -2865,7 +2865,6 @@ fail:
+  mutex_unlock(&session->s_mutex);
+ fail_nomsg:
+  ceph_pagelist_release(pagelist);
+- kfree(pagelist);
+ fail_nopagelist:
+  pr_err("error %d preparing reconnect for mds%d\n", err, mds);
+  return;
+diff --git a/include/linux/ceph/pagelist.h b/include/linux/ceph/pagelist.h
+index 9660d6b..5f871d8 100644
+--- a/include/linux/ceph/pagelist.h
++++ b/include/linux/ceph/pagelist.h
+@@ -2,6 +2,7 @@
+ #define __FS_CEPH_PAGELIST_H
+ 
+ #include <linux/list.h>
++#include <linux/atomic.h>
+ 
+ struct ceph_pagelist {
+  struct list_head head;
+@@ -10,6 +11,7 @@ struct ceph_pagelist {
+  size_t room;
+  struct list_head free_list;
+  size_t num_pages_free;
++ atomic_t refcnt;
+ };
+ 
+ struct ceph_pagelist_cursor {
+@@ -26,9 +28,10 @@ static inline void ceph_pagelist_init(struct ceph_pagelist *pl)
+  pl->room = 0;
+  INIT_LIST_HEAD(&pl->free_list);
+  pl->num_pages_free = 0;
++ atomic_set(&pl->refcnt, 1);
+ }
+ 
+-extern int ceph_pagelist_release(struct ceph_pagelist *pl);
++extern void ceph_pagelist_release(struct ceph_pagelist *pl);
+ 
+ extern int ceph_pagelist_append(struct ceph_pagelist *pl, const void *d, size_t l);
+ 
+diff --git a/net/ceph/messenger.c b/net/ceph/messenger.c
+index 767f699..c202c92 100644
+--- a/net/ceph/messenger.c
++++ b/net/ceph/messenger.c
+@@ -3076,10 +3076,8 @@ static void ceph_msg_data_destroy(struct ceph_msg_data *data)
+   return;
+ 
+  WARN_ON(!list_empty(&data->links));
+- if (data->type == CEPH_MSG_DATA_PAGELIST) {
++ if (data->type == CEPH_MSG_DATA_PAGELIST)
+   ceph_pagelist_release(data->pagelist);
+-  kfree(data->pagelist);
+- }
+  kmem_cache_free(ceph_msg_data_cache, data);
+ }
+ 
+diff --git a/net/ceph/pagelist.c b/net/ceph/pagelist.c
+index 92866be..c7c220a 100644
+--- a/net/ceph/pagelist.c
++++ b/net/ceph/pagelist.c
+@@ -1,5 +1,6 @@
+ #include <linux/module.h>
+ #include <linux/gfp.h>
++#include <linux/slab.h>
+ #include <linux/pagemap.h>
+ #include <linux/highmem.h>
+ #include <linux/ceph/pagelist.h>
+@@ -13,8 +14,10 @@ static void ceph_pagelist_unmap_tail(struct ceph_pagelist *pl)
+  }
+ }
+ 
+-int ceph_pagelist_release(struct ceph_pagelist *pl)
++void ceph_pagelist_release(struct ceph_pagelist *pl)
+ {
++ if (!atomic_dec_and_test(&pl->refcnt))
++  return;
+  ceph_pagelist_unmap_tail(pl);
+  while (!list_empty(&pl->head)) {
+   struct page *page = list_first_entry(&pl->head, struct page,
+@@ -23,7 +26,7 @@ int ceph_pagelist_release(struct ceph_pagelist *pl)
+   __free_page(page);
+  }
+  ceph_pagelist_free_reserve(pl);
+- return 0;
++ kfree(pl);
+ }
+ EXPORT_SYMBOL(ceph_pagelist_release);
+ 
+-- 
+1.7.1

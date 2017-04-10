@@ -1,0 +1,159 @@
+From 3303ed9dd220473e659dc663a4bf12917f45c195 Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:13:13 -0400
+Subject: [virt] kvm/ppc: book3s/pr - Expose TAR facility to guest
+
+Message-id: <1410765214-16377-58-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94742
+O-Subject: [PATCH 57/78] KVM: PPC: Book3S PR: Expose TAR facility to guest
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit e14e7a1e537d6e18f9c511f25c25c5efb7799fb5
+Author: Alexander Graf <agraf@suse.de>
+Date:   Tue Apr 22 12:26:58 2014 +0200
+
+    KVM: PPC: Book3S PR: Expose TAR facility to guest
+
+    POWER8 implements a new register called TAR. This register has to be
+    enabled in FSCR and then from KVM's point of view is mere storage.
+
+    This patch enables the guest to use TAR.
+
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index b957575..18b1bab 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -465,7 +465,9 @@ struct kvm_vcpu_arch {
+  ulong pc;
+  ulong ctr;
+  ulong lr;
++#ifdef CONFIG_PPC_BOOK3S
+  ulong tar;
++#endif
+ 
+  ulong xer;
+  u32 cr;
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 5bb4ff1..3b59d08 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -438,7 +438,9 @@ int main(void)
+  DEFINE(VCPU_XER, offsetof(struct kvm_vcpu, arch.xer));
+  DEFINE(VCPU_CTR, offsetof(struct kvm_vcpu, arch.ctr));
+  DEFINE(VCPU_LR, offsetof(struct kvm_vcpu, arch.lr));
++#ifdef CONFIG_PPC_BOOK3S
+  DEFINE(VCPU_TAR, offsetof(struct kvm_vcpu, arch.tar));
++#endif
+  DEFINE(VCPU_CR, offsetof(struct kvm_vcpu, arch.cr));
+  DEFINE(VCPU_PC, offsetof(struct kvm_vcpu, arch.pc));
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index dfe4dd2..f142ea3 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -634,6 +634,9 @@ int kvm_vcpu_ioctl_get_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+   case KVM_REG_PPC_FSCR:
+    val = get_reg_val(reg->id, vcpu->arch.fscr);
+    break;
++  case KVM_REG_PPC_TAR:
++   val = get_reg_val(reg->id, vcpu->arch.tar);
++   break;
+   default:
+    r = -EINVAL;
+    break;
+@@ -726,6 +729,9 @@ int kvm_vcpu_ioctl_set_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+   case KVM_REG_PPC_FSCR:
+    vcpu->arch.fscr = set_reg_val(reg->id, val);
+    break;
++  case KVM_REG_PPC_TAR:
++   vcpu->arch.tar = set_reg_val(reg->id, val);
++   break;
+   default:
+    r = -EINVAL;
+    break;
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 8ba468f..913dceb 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -969,9 +969,6 @@ static int kvmppc_get_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+  case KVM_REG_PPC_BESCR:
+   *val = get_reg_val(id, vcpu->arch.bescr);
+   break;
+- case KVM_REG_PPC_TAR:
+-  *val = get_reg_val(id, vcpu->arch.tar);
+-  break;
+  case KVM_REG_PPC_DPDES:
+   *val = get_reg_val(id, vcpu->arch.vcore->dpdes);
+   break;
+@@ -1178,9 +1175,6 @@ static int kvmppc_set_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+  case KVM_REG_PPC_BESCR:
+   vcpu->arch.bescr = set_reg_val(id, *val);
+   break;
+- case KVM_REG_PPC_TAR:
+-  vcpu->arch.tar = set_reg_val(id, *val);
+-  break;
+  case KVM_REG_PPC_DPDES:
+   vcpu->arch.vcore->dpdes = set_reg_val(id, *val);
+   break;
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 6f48479..b0767f3 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -90,6 +90,7 @@ static void kvmppc_core_vcpu_put_pr(struct kvm_vcpu *vcpu)
+ #endif
+ 
+  kvmppc_giveup_ext(vcpu, MSR_FP | MSR_VEC | MSR_VSX);
++ kvmppc_giveup_fac(vcpu, FSCR_TAR_LG);
+  vcpu->cpu = -1;
+ }
+ 
+@@ -625,6 +626,14 @@ static void kvmppc_giveup_fac(struct kvm_vcpu *vcpu, ulong fac)
+   /* Facility not available to the guest, ignore giveup request*/
+   return;
+  }
++
++ switch (fac) {
++ case FSCR_TAR_LG:
++  vcpu->arch.tar = mfspr(SPRN_TAR);
++  mtspr(SPRN_TAR, current->thread.tar);
++  vcpu->arch.shadow_fscr &= ~FSCR_TAR;
++  break;
++ }
+ #endif
+ }
+ 
+@@ -794,6 +803,12 @@ static int kvmppc_handle_fac(struct kvm_vcpu *vcpu, ulong fac)
+  }
+ 
+  switch (fac) {
++ case FSCR_TAR_LG:
++  /* TAR switching isn't lazy in Linux yet */
++  current->thread.tar = mfspr(SPRN_TAR);
++  mtspr(SPRN_TAR, vcpu->arch.tar);
++  vcpu->arch.shadow_fscr |= FSCR_TAR;
++  break;
+  default:
+   kvmppc_emulate_fac(vcpu, fac);
+   break;
+@@ -1393,6 +1408,9 @@ static int kvmppc_vcpu_run_pr(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
+  /* Make sure we save the guest FPU/Altivec/VSX state */
+  kvmppc_giveup_ext(vcpu, MSR_FP | MSR_VEC | MSR_VSX);
+ 
++ /* Make sure we save the guest TAR/EBB/DSCR state */
++ kvmppc_giveup_fac(vcpu, FSCR_TAR_LG);
++
+ out:
+  vcpu->mode = OUTSIDE_GUEST_MODE;
+  return ret;
+-- 
+1.7.1

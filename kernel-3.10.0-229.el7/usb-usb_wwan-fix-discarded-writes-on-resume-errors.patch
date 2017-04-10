@@ -1,0 +1,80 @@
+From 083a894885c882152b2815f0ffd81a0329db391b Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:08:42 -0400
+Subject: [usb] usb_wwan: fix discarded writes on resume errors
+
+Message-id: <1410887463-20674-451-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95266
+O-Subject: [RHEL7 PATCH 450/591] USB: usb_wwan: fix discarded writes on resume errors
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 7436f41283ef2a45f8320ad482edd0aba1bd5843
+Author: Johan Hovold <jhovold@gmail.com>
+Date:   Mon May 26 19:23:19 2014 +0200
+
+    USB: usb_wwan: fix discarded writes on resume errors
+
+    There's no reason not to try sending off any further delayed write urbs,
+    should one urb-submission fail.
+
+    Signed-off-by: Johan Hovold <jhovold@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/serial/usb_wwan.c b/drivers/usb/serial/usb_wwan.c
+index d91a988..ab8c175 100644
+--- a/drivers/usb/serial/usb_wwan.c
++++ b/drivers/usb/serial/usb_wwan.c
+@@ -621,28 +621,33 @@ EXPORT_SYMBOL(usb_wwan_suspend);
+ 
+ static int play_delayed(struct usb_serial_port *port)
+ {
++ struct usb_serial *serial = port->serial;
+  struct usb_wwan_intf_private *data;
+  struct usb_wwan_port_private *portdata;
+  struct urb *urb;
+- int err = 0;
++ int err_count = 0;
++ int err;
+ 
+  portdata = usb_get_serial_port_data(port);
+  data = port->serial->private;
+  while ((urb = usb_get_from_anchor(&portdata->delayed))) {
+   err = usb_submit_urb(urb, GFP_ATOMIC);
+-  if (!err) {
+-   data->in_flight++;
+-  } else {
+-   /* we have to throw away the rest */
+-   do {
+-    unbusy_queued_urb(urb, portdata);
+-    usb_autopm_put_interface_no_suspend(port->serial->interface);
+-   } while ((urb = usb_get_from_anchor(&portdata->delayed)));
+-   break;
++  if (err) {
++   dev_err(&port->dev,
++     "%s: submit write urb failed: %d\n",
++     __func__, err);
++   err_count++;
++   unbusy_queued_urb(urb, portdata);
++   usb_autopm_put_interface_async(serial->interface);
++   continue;
+   }
++  data->in_flight++;
+  }
+ 
+- return err;
++ if (err_count)
++  return -EIO;
++
++ return 0;
+ }
+ 
+ int usb_wwan_resume(struct usb_serial *serial)
+-- 
+1.7.1

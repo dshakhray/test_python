@@ -1,0 +1,132 @@
+From 27820a6528d607aec937f0aa8c269baddb510c97 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:05:43 -0400
+Subject: [tools] perf/symbols: Introduce thread__find_cpumode_addr_location
+
+Message-id: <1410181752-25631-99-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91760
+O-Subject: [PATCH RHEL7.1 BZ1134356 098/307] perf symbols: Introduce thread__find_cpumode_addr_location
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 52a3cb8cfca16db73cf825cb94325cf54da8304f
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date: Tue Mar 11 16:16:49 2014 -0300
+
+description
+===========
+Its one level up thread__find_addr_location, where it will look in
+different domains for a sample: user, kernel, hypervisor, etc.
+
+Will soon be used by a patchkit by Andi Kleen.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index 813e94e..a679953 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -1184,39 +1184,22 @@ static bool symbol__match_regex(struct symbol *sym, regex_t *regex)
+  return 0;
+ }
+ 
+-static const u8 cpumodes[] = {
+- PERF_RECORD_MISC_USER,
+- PERF_RECORD_MISC_KERNEL,
+- PERF_RECORD_MISC_GUEST_USER,
+- PERF_RECORD_MISC_GUEST_KERNEL
+-};
+-#define NCPUMODES (sizeof(cpumodes)/sizeof(u8))
+-
+ static void ip__resolve_ams(struct machine *machine, struct thread *thread,
+        struct addr_map_symbol *ams,
+        u64 ip)
+ {
+  struct addr_location al;
+- size_t i;
+- u8 m;
+ 
+  memset(&al, 0, sizeof(al));
++ /*
++  * We cannot use the header.misc hint to determine whether a
++  * branch stack address is user, kernel, guest, hypervisor.
++  * Branches may straddle the kernel/user/hypervisor boundaries.
++  * Thus, we have to try consecutively until we find a match
++  * or else, the symbol is unknown
++  */
++ thread__find_cpumode_addr_location(thread, machine, MAP__FUNCTION, ip, &al);
+ 
+- for (i = 0; i < NCPUMODES; i++) {
+-  m = cpumodes[i];
+-  /*
+-   * We cannot use the header.misc hint to determine whether a
+-   * branch stack address is user, kernel, guest, hypervisor.
+-   * Branches may straddle the kernel/user/hypervisor boundaries.
+-   * Thus, we have to try consecutively until we find a match
+-   * or else, the symbol is unknown
+-   */
+-  thread__find_addr_location(thread, machine, m, MAP__FUNCTION,
+-    ip, &al);
+-  if (al.map)
+-   goto found;
+- }
+-found:
+  ams->addr = ip;
+  ams->al_addr = al.addr;
+  ams->sym = al.sym;
+diff --git a/tools/perf/util/thread.c b/tools/perf/util/thread.c
+index 0358882..3ce0498 100644
+--- a/tools/perf/util/thread.c
++++ b/tools/perf/util/thread.c
+@@ -142,3 +142,24 @@ int thread__fork(struct thread *thread, struct thread *parent, u64 timestamp)
+ 
+  return 0;
+ }
++
++void thread__find_cpumode_addr_location(struct thread *thread,
++     struct machine *machine,
++     enum map_type type, u64 addr,
++     struct addr_location *al)
++{
++ size_t i;
++ const u8 const cpumodes[] = {
++  PERF_RECORD_MISC_USER,
++  PERF_RECORD_MISC_KERNEL,
++  PERF_RECORD_MISC_GUEST_USER,
++  PERF_RECORD_MISC_GUEST_KERNEL
++ };
++
++ for (i = 0; i < ARRAY_SIZE(cpumodes); i++) {
++  thread__find_addr_location(thread, machine, cpumodes[i], type,
++        addr, al);
++  if (al->map)
++   break;
++ }
++}
+diff --git a/tools/perf/util/thread.h b/tools/perf/util/thread.h
+index 5b856bf..9a07074 100644
+--- a/tools/perf/util/thread.h
++++ b/tools/perf/util/thread.h
+@@ -58,6 +58,11 @@ void thread__find_addr_location(struct thread *thread, struct machine *machine,
+     u8 cpumode, enum map_type type, u64 addr,
+     struct addr_location *al);
+ 
++void thread__find_cpumode_addr_location(struct thread *thread,
++     struct machine *machine,
++     enum map_type type, u64 addr,
++     struct addr_location *al);
++
+ static inline void *thread__priv(struct thread *thread)
+ {
+  return thread->priv;
+-- 
+1.7.1

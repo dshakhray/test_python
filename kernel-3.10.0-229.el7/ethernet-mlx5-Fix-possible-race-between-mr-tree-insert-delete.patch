@@ -1,0 +1,80 @@
+From 59bfdfc207613b9d27f5e32e9b07283e9f3af30d Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:01:36 -0400
+Subject: [ethernet] mlx5: Fix possible race between mr tree insert/delete
+
+Message-id: <39f9cf9b8fe61ff3a261220ef3e87fc0d24b0131.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93688
+O-Subject: [Patch RHEL7.1 V1 160/197] mlx5_core: Fix possible race between mr tree insert/delete
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Sagi Grimberg <sagig@mellanox.com>
+
+In mlx5_core_destroy_mkey(), we must first remove the mr from the
+radix tree and then destroy it.  Otherwise we might hit a race if the
+key was reallocated and we attempted to insert it to the radix tree.
+
+Also handle radix tree insert/delete failures.
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Reviewed-by: Eli Cohen <elic@dev.mellanox.co.il>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 6ef07a9f369742a7b18c77484411cff0bd790291)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/mr.c b/drivers/net/ethernet/mellanox/mlx5/core/mr.c
+index ba0401d..184c361 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mr.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mr.c
+@@ -94,6 +94,11 @@ int mlx5_core_create_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr,
+  write_lock_irq(&table->lock);
+  err = radix_tree_insert(&table->tree, mlx5_base_mkey(mr->key), mr);
+  write_unlock_irq(&table->lock);
++ if (err) {
++  mlx5_core_warn(dev, "failed radix tree insert of mr 0x%x, %d\n",
++          mlx5_base_mkey(mr->key), err);
++  mlx5_core_destroy_mkey(dev, mr);
++ }
+ 
+  return err;
+ }
+@@ -104,12 +109,22 @@ int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr)
+  struct mlx5_mr_table *table = &dev->priv.mr_table;
+  struct mlx5_destroy_mkey_mbox_in in;
+  struct mlx5_destroy_mkey_mbox_out out;
++ struct mlx5_core_mr *deleted_mr;
+  unsigned long flags;
+  int err;
+ 
+  memset(&in, 0, sizeof(in));
+  memset(&out, 0, sizeof(out));
+ 
++ write_lock_irqsave(&table->lock, flags);
++ deleted_mr = radix_tree_delete(&table->tree, mlx5_base_mkey(mr->key));
++ write_unlock_irqrestore(&table->lock, flags);
++ if (!deleted_mr) {
++  mlx5_core_warn(dev, "failed radix tree delete of mr 0x%x\n",
++          mlx5_base_mkey(mr->key));
++  return -ENOENT;
++ }
++
+  in.hdr.opcode = cpu_to_be16(MLX5_CMD_OP_DESTROY_MKEY);
+  in.mkey = cpu_to_be32(mlx5_mkey_to_idx(mr->key));
+  err = mlx5_cmd_exec(dev, &in, sizeof(in), &out, sizeof(out));
+@@ -119,10 +134,6 @@ int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev, struct mlx5_core_mr *mr)
+  if (out.hdr.status)
+   return mlx5_cmd_status_to_err(&out.hdr);
+ 
+- write_lock_irqsave(&table->lock, flags);
+- radix_tree_delete(&table->tree, mlx5_base_mkey(mr->key));
+- write_unlock_irqrestore(&table->lock, flags);
+-
+  return err;
+ }
+ EXPORT_SYMBOL(mlx5_core_destroy_mkey);
+-- 
+1.7.1

@@ -1,0 +1,76 @@
+From 484b1d73276f69f75af3889e88d10ea1376d6d1e Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 10:12:43 -0400
+Subject: [fs] ext4: fix extent merging in ext4_ext_shift_path_extents()
+
+Message-id: <1414059176-6044-20-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98285
+O-Subject: [RHEL 7.1 PATCH 19/32] ext4: fix extent merging in ext4_ext_shift_path_extents()
+Bugzilla: 1150171
+
+BZ 1150171
+https://bugzilla.redhat.com/show_bug.cgi?id=1150171
+
+BREW 8149772
+https://brewweb.devel.redhat.com/taskinfo?taskID=8149772
+
+Upstream commit 6dd834effc12ba71092d9d1e4944530234b58ab1
+
+ There is a bug in ext4_ext_shift_path_extents() where if we actually
+ manage to merge a extent we would skip shifting the next extent. This
+ will result in in one extent in the extent tree not being properly
+ shifted.
+
+ This is causing failure in various xfstests tests using fsx or fsstress
+ with collapse range support. It will also cause file system corruption
+ which looks something like:
+
+  e2fsck 1.42.9 (4-Feb-2014)
+  Pass 1: Checking inodes, blocks, and sizes
+  Inode 20 has out of order extents
+         (invalid logical block 3, physical block 492938, len 2)
+  Clear? yes
+  ...
+
+ when running e2fsck.
+
+ It's also very easily reproducible just by running fsx without any
+ parameters. I can usually hit the problem within a minute.
+
+ Fix it by increasing ex_start only if we're not merging the extent.
+
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Reviewed-by: Namjae Jeon <namjae.jeon@samsung.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 962d5b9..9afed1f 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -5241,13 +5241,14 @@ ext4_ext_shift_path_extents(struct ext4_ext_path *path, ext4_lblk_t shift,
+ 
+    while (ex_start <= ex_last) {
+     le32_add_cpu(&ex_start->ee_block, -shift);
+-    if (ex_start >
+-     EXT_FIRST_EXTENT(path[depth].p_hdr)) {
+-     if (ext4_ext_try_to_merge_right(inode,
+-      path, ex_start - 1))
+-      ex_last--;
+-    }
+-    ex_start++;
++    /* Try to merge to the left. */
++    if ((ex_start >
++         EXT_FIRST_EXTENT(path[depth].p_hdr)) &&
++        ext4_ext_try_to_merge_right(inode,
++       path, ex_start - 1))
++     ex_last--;
++    else
++     ex_start++;
+    }
+    err = ext4_ext_dirty(handle, inode, path + depth);
+    if (err)
+-- 
+1.7.1

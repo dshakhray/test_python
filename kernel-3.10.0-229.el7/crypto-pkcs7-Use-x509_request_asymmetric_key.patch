@@ -1,0 +1,194 @@
+From dd4a1b21380bef20c197426cbb32385318232f7e Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Tue, 19 Aug 2014 22:03:02 -0400
+Subject: [crypto] pkcs7: Use x509_request_asymmetric_key()
+
+Message-id: <1408485785-777-31-git-send-email-vgoyal@redhat.com>
+Patchwork-id: 88378
+O-Subject: [RHEL7.1 PATCH 30/33] PKCS#7: Use x509_request_asymmetric_key()
+Bugzilla: 1129779
+RH-Acked-by: David Howells <dhowells@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+BZ:1129779
+
+commit 5ce43ad28262115a1eab866392f8cfb985094160
+Author: David Howells <dhowells@redhat.com>
+Date: Mon, 28 Jul 2014 14:11:32 +0100
+
+pkcs7_request_asymmetric_key() and x509_request_asymmetric_key() do the same
+thing, the latter being a copy of the former created by the IMA folks, so drop
+the PKCS#7 version as the X.509 location is more general.
+
+Whilst we're at it, rename the arguments of x509_request_asymmetric_key() to
+better reflect what the values being passed in are intended to match on an
+X.509 cert.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Acked-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/crypto/asymmetric_keys/pkcs7_trust.c b/crypto/asymmetric_keys/pkcs7_trust.c
+index b6b0451..e666eb0 100644
+--- a/crypto/asymmetric_keys/pkcs7_trust.c
++++ b/crypto/asymmetric_keys/pkcs7_trust.c
+@@ -20,55 +20,6 @@
+ #include "public_key.h"
+ #include "pkcs7_parser.h"
+ 
+-/*
+- * Request an asymmetric key.
+- */
+-static struct key *pkcs7_request_asymmetric_key(
+- struct key *keyring,
+- const char *signer, size_t signer_len,
+- const char *authority, size_t auth_len)
+-{
+- key_ref_t key;
+- char *id;
+-
+- kenter(",%zu,,%zu", signer_len, auth_len);
+-
+- /* Construct an identifier. */
+- id = kmalloc(signer_len + 2 + auth_len + 1, GFP_KERNEL);
+- if (!id)
+-  return ERR_PTR(-ENOMEM);
+-
+- memcpy(id, signer, signer_len);
+- id[signer_len + 0] = ':';
+- id[signer_len + 1] = ' ';
+- memcpy(id + signer_len + 2, authority, auth_len);
+- id[signer_len + 2 + auth_len] = 0;
+-
+- pr_debug("Look up: \"%s\"\n", id);
+-
+- key = keyring_search(make_key_ref(keyring, 1),
+-        &key_type_asymmetric, id);
+- if (IS_ERR(key))
+-  pr_debug("Request for module key '%s' err %ld\n",
+-    id, PTR_ERR(key));
+- kfree(id);
+-
+- if (IS_ERR(key)) {
+-  switch (PTR_ERR(key)) {
+-   /* Hide some search errors */
+-  case -EACCES:
+-  case -ENOTDIR:
+-  case -EAGAIN:
+-   return ERR_PTR(-ENOKEY);
+-  default:
+-   return ERR_CAST(key);
+-  }
+- }
+-
+- pr_devel("<==%s() = 0 [%x]\n", __func__, key_serial(key_ref_to_ptr(key)));
+- return key_ref_to_ptr(key);
+-}
+-
+ /**
+  * Check the trust on one PKCS#7 SignedInfo block.
+  */
+@@ -98,10 +49,8 @@ int pkcs7_validate_trust_one(struct pkcs7_message *pkcs7,
+   /* Look to see if this certificate is present in the trusted
+    * keys.
+    */
+-  key = pkcs7_request_asymmetric_key(
+-   trust_keyring,
+-   x509->subject, strlen(x509->subject),
+-   x509->fingerprint, strlen(x509->fingerprint));
++  key = x509_request_asymmetric_key(trust_keyring, x509->subject,
++        x509->fingerprint);
+   if (!IS_ERR(key))
+    /* One of the X.509 certificates in the PKCS#7 message
+     * is apparently the same as one we already trust.
+@@ -133,10 +82,8 @@ int pkcs7_validate_trust_one(struct pkcs7_message *pkcs7,
+   return -ENOKEY;
+  }
+ 
+- key = pkcs7_request_asymmetric_key(
+-  trust_keyring,
+-  last->issuer, strlen(last->issuer),
+-  last->authority, strlen(last->authority));
++ key = x509_request_asymmetric_key(trust_keyring, last->issuer,
++       last->authority);
+  if (IS_ERR(key))
+   return PTR_ERR(key) == -ENOMEM ? -ENOMEM : -ENOKEY;
+  x509 = last;
+diff --git a/crypto/asymmetric_keys/x509_public_key.c b/crypto/asymmetric_keys/x509_public_key.c
+index cdb26ec..18c3890 100644
+--- a/crypto/asymmetric_keys/x509_public_key.c
++++ b/crypto/asymmetric_keys/x509_public_key.c
+@@ -43,35 +43,41 @@ static int __init ca_keys_setup(char *str)
+ __setup("ca_keys=", ca_keys_setup);
+ #endif
+ 
+-/*
+- * Find a key in the given keyring by issuer and authority.
++/**
++ * x509_request_asymmetric_key - Request a key by X.509 certificate params.
++ * @keyring: The keys to search.
++ * @subject: The name of the subject to whom the key belongs.
++ * @key_id: The subject key ID as a hex string.
++ *
++ * Find a key in the given keyring by subject name and key ID.  These might,
++ * for instance, be the issuer name and the authority key ID of an X.509
++ * certificate that needs to be verified.
+  */
+-static struct key *x509_request_asymmetric_key(struct key *keyring,
+-            const char *signer,
+-            const char *authority)
++struct key *x509_request_asymmetric_key(struct key *keyring,
++     const char *subject,
++     const char *key_id)
+ {
+  key_ref_t key;
+- size_t signer_len = strlen(signer), auth_len = strlen(authority);
++ size_t subject_len = strlen(subject), key_id_len = strlen(key_id);
+  char *id;
+ 
+- /* Construct an identifier. */
+- id = kmalloc(signer_len + 2 + auth_len + 1, GFP_KERNEL);
++ /* Construct an identifier "<subjname>:<keyid>". */
++ id = kmalloc(subject_len + 2 + key_id_len + 1, GFP_KERNEL);
+  if (!id)
+   return ERR_PTR(-ENOMEM);
+ 
+- memcpy(id, signer, signer_len);
+- id[signer_len + 0] = ':';
+- id[signer_len + 1] = ' ';
+- memcpy(id + signer_len + 2, authority, auth_len);
+- id[signer_len + 2 + auth_len] = 0;
++ memcpy(id, subject, subject_len);
++ id[subject_len + 0] = ':';
++ id[subject_len + 1] = ' ';
++ memcpy(id + subject_len + 2, key_id, key_id_len);
++ id[subject_len + 2 + key_id_len] = 0;
+ 
+  pr_debug("Look up: \"%s\"\n", id);
+ 
+  key = keyring_search(make_key_ref(keyring, 1),
+         &key_type_asymmetric, id);
+  if (IS_ERR(key))
+-  pr_debug("Request for module key '%s' err %ld\n",
+-    id, PTR_ERR(key));
++  pr_debug("Request for key '%s' err %ld\n", id, PTR_ERR(key));
+  kfree(id);
+ 
+  if (IS_ERR(key)) {
+diff --git a/include/crypto/public_key.h b/include/crypto/public_key.h
+index fc09732..0d164c6 100644
+--- a/include/crypto/public_key.h
++++ b/include/crypto/public_key.h
+@@ -98,4 +98,8 @@ struct key;
+ extern int verify_signature(const struct key *key,
+        const struct public_key_signature *sig);
+ 
++extern struct key *x509_request_asymmetric_key(struct key *keyring,
++            const char *issuer,
++            const char *key_id);
++
+ #endif /* _LINUX_PUBLIC_KEY_H */
+-- 
+1.7.1

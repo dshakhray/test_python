@@ -1,0 +1,93 @@
+From 4a18ffcdde0589046c88f83070a8f088ee4dcd5b Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 23 Oct 2014 20:01:28 -0400
+Subject: [md] dm-thin: factor out remap_and_issue_overwrite
+
+Message-id: <1414094494-22068-19-git-send-email-snitzer@redhat.com>
+Patchwork-id: 98355
+O-Subject: [RHEL7.2 PATCH 18/24] dm thin: factor out remap_and_issue_overwrite
+Bugzilla: 1156164
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1156164
+
+Upstream linux-dm.git commit 1b0e8f95c6b16f92da73f42b99251c8aab4382eb
+Author: Mike Snitzer <snitzer@redhat.com>
+Date:   Thu Oct 9 19:20:21 2014 -0400
+
+    dm thin: factor out remap_and_issue_overwrite
+
+    Purely cleanup of duplicated code, no functional change.
+
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index b1078b4..d775ff5 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -884,6 +884,20 @@ static void ll_zero(struct thin_c *tc, struct dm_thin_new_mapping *m,
+  }
+ }
+ 
++static void remap_and_issue_overwrite(struct thin_c *tc, struct bio *bio,
++          dm_block_t data_block,
++          struct dm_thin_new_mapping *m)
++{
++ struct pool *pool = tc->pool;
++ struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
++
++ h->overwrite_mapping = m;
++ m->bio = bio;
++ save_and_set_endio(bio, &m->saved_bi_end_io, overwrite_endio);
++ inc_all_io_entry(pool, bio);
++ remap_and_issue(tc, bio, data_block);
++}
++
+ /*
+  * A partial copy also needs to zero the uncopied region.
+  */
+@@ -918,15 +932,9 @@ static void schedule_copy(struct thin_c *tc, dm_block_t virt_block,
+   * If the whole block of data is being overwritten, we can issue the
+   * bio immediately. Otherwise we use kcopyd to clone the data first.
+   */
+- if (io_overwrites_block(pool, bio)) {
+-  struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
+-
+-  h->overwrite_mapping = m;
+-  m->bio = bio;
+-  save_and_set_endio(bio, &m->saved_bi_end_io, overwrite_endio);
+-  inc_all_io_entry(pool, bio);
+-  remap_and_issue(tc, bio, data_dest);
+- } else {
++ if (io_overwrites_block(pool, bio))
++  remap_and_issue_overwrite(tc, bio, data_dest, m);
++ else {
+   struct dm_io_region from, to;
+ 
+   from.bdev = origin->bdev;
+@@ -995,16 +1003,10 @@ static void schedule_zero(struct thin_c *tc, dm_block_t virt_block,
+  if (!pool->pf.zero_new_blocks)
+   process_prepared_mapping(m);
+ 
+- else if (io_overwrites_block(pool, bio)) {
+-  struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
+-
+-  h->overwrite_mapping = m;
+-  m->bio = bio;
+-  save_and_set_endio(bio, &m->saved_bi_end_io, overwrite_endio);
+-  inc_all_io_entry(pool, bio);
+-  remap_and_issue(tc, bio, data_block);
++ else if (io_overwrites_block(pool, bio))
++  remap_and_issue_overwrite(tc, bio, data_block, m);
+ 
+- } else
++ else
+   ll_zero(tc, m,
+    data_block * pool->sectors_per_block,
+    (data_block + 1) * pool->sectors_per_block);
+-- 
+1.7.1

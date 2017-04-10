@@ -1,0 +1,304 @@
+From 1e22396c72f1c9c50627c2495e4e5238e33f1675 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Mon, 3 Nov 2014 07:52:29 -0500
+Subject: [infiniband] iser: Protect iser state machine with a mutex
+
+Message-id: <c78bd3cb4f46cf0b37c6aee7cc8c503a02132e74.1415000301.git.avadai@redhat.com>
+Patchwork-id: 98700
+O-Subject: [Patch RHEL7.1 31/37] IB/iser: Protect iser state machine with a mutex
+Bugzilla: 1107622
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Doug Ledford <dledford@redhat.com>
+
+From: Ariel Nahum <arieln@mellanox.com>
+
+The iser connection state lookups and transitions are not fully protected.
+
+Some transitions are protected with a spinlock, and in some cases the
+state is accessed unprotected due to specific assumptions of the flow.
+
+Introduce a new mutex to protect the connection state access. We use a
+mutex since we need to also include a scheduling operations executed
+under the state lock.
+
+Each state transition/condition and its corresponding action will be
+protected with the state mutex.
+
+The rdma_cm events handler acquires the mutex when handling connection
+events. Since iser connection state can transition to DOWN
+concurrently during connection establishment, we bailout from
+addr/route resolution events when the state is not PENDING.
+
+This addresses a scenario where ep_poll retries expire during CMA
+connection establishment. In this case ep_disconnect is invoked while
+CMA events keep coming (address/route resolution, connected, etc...).
+
+Signed-off-by: Ariel Nahum <arieln@mellanox.com>
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 504130c039f917aba8b145fe8ea99be95e662fca)
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.c b/drivers/infiniband/ulp/iser/iscsi_iser.c
+index d7acd4b..3dc853c 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@ -632,10 +632,13 @@ iscsi_iser_ep_poll(struct iscsi_endpoint *ep, int timeout_ms)
+         msecs_to_jiffies(timeout_ms));
+ 
+  /* if conn establishment failed, return error code to iscsi */
+- if (!rc &&
+-     (ib_conn->state == ISER_CONN_TERMINATING ||
+-      ib_conn->state == ISER_CONN_DOWN))
+-  rc = -1;
++ if (rc == 0) {
++  mutex_lock(&ib_conn->state_mutex);
++  if (ib_conn->state == ISER_CONN_TERMINATING ||
++      ib_conn->state == ISER_CONN_DOWN)
++   rc = -1;
++  mutex_unlock(&ib_conn->state_mutex);
++ }
+ 
+  iser_info("ib conn %p rc = %d\n", ib_conn, rc);
+ 
+@@ -654,6 +657,7 @@ iscsi_iser_ep_disconnect(struct iscsi_endpoint *ep)
+ 
+  ib_conn = ep->dd_data;
+  iser_info("ep %p ib conn %p state %d\n", ep, ib_conn, ib_conn->state);
++ mutex_lock(&ib_conn->state_mutex);
+  iser_conn_terminate(ib_conn);
+ 
+  /*
+@@ -664,7 +668,10 @@ iscsi_iser_ep_disconnect(struct iscsi_endpoint *ep)
+  if (ib_conn->iscsi_conn) {
+   INIT_WORK(&ib_conn->release_work, iser_release_work);
+   queue_work(release_wq, &ib_conn->release_work);
++  mutex_unlock(&ib_conn->state_mutex);
+  } else {
++  ib_conn->state = ISER_CONN_DOWN;
++  mutex_unlock(&ib_conn->state_mutex);
+   iser_conn_release(ib_conn);
+  }
+  iscsi_destroy_endpoint(ep);
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.h b/drivers/infiniband/ulp/iser/iscsi_iser.h
+index 37e9284..c7efc5a 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@ -335,6 +335,7 @@ struct iser_conn {
+  char         name[ISER_OBJECT_NAME_SIZE];
+  struct work_struct      release_work;
+  struct completion      stop_completion;
++ struct mutex       state_mutex;
+  struct list_head      conn_list;       /* entry in ig conn list */
+ 
+  char          *login_buf;
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index a5372c6..6e7e54d 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -565,16 +565,17 @@ static void iser_device_try_release(struct iser_device *device)
+  mutex_unlock(&ig.device_list_mutex);
+ }
+ 
++/**
++ * Called with state mutex held
++ **/
+ static int iser_conn_state_comp_exch(struct iser_conn *ib_conn,
+          enum iser_ib_conn_state comp,
+          enum iser_ib_conn_state exch)
+ {
+  int ret;
+ 
+- spin_lock_bh(&ib_conn->lock);
+  if ((ret = (ib_conn->state == comp)))
+   ib_conn->state = exch;
+- spin_unlock_bh(&ib_conn->lock);
+  return ret;
+ }
+ 
+@@ -591,6 +592,10 @@ void iser_release_work(struct work_struct *work)
+  wait_event_interruptible(ib_conn->wait,
+      ib_conn->state == ISER_CONN_DOWN);
+ 
++ mutex_lock(&ib_conn->state_mutex);
++ ib_conn->state = ISER_CONN_DOWN;
++ mutex_unlock(&ib_conn->state_mutex);
++
+  iser_conn_release(ib_conn);
+ }
+ 
+@@ -601,17 +606,21 @@ void iser_conn_release(struct iser_conn *ib_conn)
+ {
+  struct iser_device  *device = ib_conn->device;
+ 
+- BUG_ON(ib_conn->state == ISER_CONN_UP);
+-
+  mutex_lock(&ig.connlist_mutex);
+  list_del(&ib_conn->conn_list);
+  mutex_unlock(&ig.connlist_mutex);
++
++ mutex_lock(&ib_conn->state_mutex);
++ BUG_ON(ib_conn->state != ISER_CONN_DOWN);
++
+  iser_free_rx_descriptors(ib_conn);
+  iser_free_ib_conn_res(ib_conn);
+  ib_conn->device = NULL;
+  /* on EVENT_ADDR_ERROR there's no device yet for this conn */
+  if (device != NULL)
+   iser_device_try_release(device);
++ mutex_unlock(&ib_conn->state_mutex);
++
+  /* if cma handler context, the caller actually destroy the id */
+  if (ib_conn->cma_id != NULL) {
+   rdma_destroy_id(ib_conn->cma_id);
+@@ -639,6 +648,9 @@ void iser_conn_terminate(struct iser_conn *ib_conn)
+     ib_conn,err);
+ }
+ 
++/**
++ * Called with state mutex held
++ **/
+ static void iser_connect_error(struct rdma_cm_id *cma_id)
+ {
+  struct iser_conn *ib_conn;
+@@ -649,12 +661,20 @@ static void iser_connect_error(struct rdma_cm_id *cma_id)
+  wake_up_interruptible(&ib_conn->wait);
+ }
+ 
++/**
++ * Called with state mutex held
++ **/
+ static void iser_addr_handler(struct rdma_cm_id *cma_id)
+ {
+  struct iser_device *device;
+  struct iser_conn   *ib_conn;
+  int    ret;
+ 
++ ib_conn = (struct iser_conn *)cma_id->context;
++ if (ib_conn->state != ISER_CONN_PENDING)
++  /* bailout */
++  return;
++
+  device = iser_device_find_by_ib_device(cma_id);
+  if (!device) {
+   iser_err("device lookup/creation failed\n");
+@@ -662,7 +682,6 @@ static void iser_addr_handler(struct rdma_cm_id *cma_id)
+   return;
+  }
+ 
+- ib_conn = (struct iser_conn *)cma_id->context;
+  ib_conn->device = device;
+ 
+  /* connection T10-PI support */
+@@ -686,6 +705,9 @@ static void iser_addr_handler(struct rdma_cm_id *cma_id)
+  }
+ }
+ 
++/**
++ * Called with state mutex held
++ **/
+ static void iser_route_handler(struct rdma_cm_id *cma_id)
+ {
+  struct rdma_conn_param conn_param;
+@@ -694,6 +716,10 @@ static void iser_route_handler(struct rdma_cm_id *cma_id)
+  struct iser_conn *ib_conn = (struct iser_conn *)cma_id->context;
+  struct iser_device *device = ib_conn->device;
+ 
++ if (ib_conn->state != ISER_CONN_PENDING)
++  /* bailout */
++  return;
++
+  ret = iser_create_ib_conn_res((struct iser_conn *)cma_id->context);
+  if (ret)
+   goto failure;
+@@ -727,6 +753,11 @@ static void iser_connected_handler(struct rdma_cm_id *cma_id)
+  struct ib_qp_attr attr;
+  struct ib_qp_init_attr init_attr;
+ 
++ ib_conn = (struct iser_conn *)cma_id->context;
++ if (ib_conn->state != ISER_CONN_PENDING)
++  /* bailout */
++  return;
++
+  (void)ib_query_qp(cma_id->qp, &attr, ~0, &init_attr);
+  iser_info("remote qpn:%x my qpn:%x\n", attr.dest_qp_num, cma_id->qp->qp_num);
+ 
+@@ -761,9 +792,13 @@ static void iser_disconnected_handler(struct rdma_cm_id *cma_id)
+ 
+ static int iser_cma_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+ {
++ struct iser_conn *ib_conn;
++
++ ib_conn = (struct iser_conn *)cma_id->context;
+  iser_info("event %d status %d conn %p id %p\n",
+     event->event, event->status, cma_id->context, cma_id);
+ 
++ mutex_lock(&ib_conn->state_mutex);
+  switch (event->event) {
+  case RDMA_CM_EVENT_ADDR_RESOLVED:
+   iser_addr_handler(cma_id);
+@@ -791,6 +826,7 @@ static int iser_cma_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *eve
+   iser_err("Unexpected RDMA CM event (%d)\n", event->event);
+   break;
+  }
++ mutex_unlock(&ib_conn->state_mutex);
+  return 0;
+ }
+ 
+@@ -803,6 +839,7 @@ void iser_conn_init(struct iser_conn *ib_conn)
+  init_completion(&ib_conn->stop_completion);
+  INIT_LIST_HEAD(&ib_conn->conn_list);
+  spin_lock_init(&ib_conn->lock);
++ mutex_init(&ib_conn->state_mutex);
+ }
+ 
+  /**
+@@ -816,6 +853,8 @@ int iser_connect(struct iser_conn   *ib_conn,
+ {
+  int err = 0;
+ 
++ mutex_lock(&ib_conn->state_mutex);
++
+  sprintf(ib_conn->name, "%pISp", dst_addr);
+ 
+  iser_info("connecting to: %s\n", ib_conn->name);
+@@ -849,6 +888,7 @@ int iser_connect(struct iser_conn   *ib_conn,
+    goto connect_failure;
+   }
+  }
++ mutex_unlock(&ib_conn->state_mutex);
+ 
+  mutex_lock(&ig.connlist_mutex);
+  list_add(&ib_conn->conn_list, &ig.connlist);
+@@ -860,6 +900,7 @@ id_failure:
+ addr_failure:
+  ib_conn->state = ISER_CONN_DOWN;
+ connect_failure:
++ mutex_unlock(&ib_conn->state_mutex);
+  iser_conn_release(ib_conn);
+  return err;
+ }
+@@ -1044,11 +1085,13 @@ static void iser_handle_comp_error(struct iser_tx_desc *desc,
+ 
+  if (ib_conn->post_recv_buf_count == 0 &&
+      atomic_read(&ib_conn->post_send_buf_count) == 0) {
+-  /* getting here when the state is UP means that the conn is *
+-   * being terminated asynchronously from the iSCSI layer's   *
+-   * perspective.                                             */
+-  if (iser_conn_state_comp_exch(ib_conn, ISER_CONN_UP,
+-      ISER_CONN_TERMINATING))
++  /**
++   * getting here when the state is UP means that the conn is
++   * being terminated asynchronously from the iSCSI layer's
++   * perspective. It is safe to peek at the connection state
++   * since iscsi_conn_failure is allowed to be called twice.
++   **/
++  if (ib_conn->state == ISER_CONN_UP)
+    iscsi_conn_failure(ib_conn->iscsi_conn,
+         ISCSI_ERR_CONN_FAILED);
+ 
+-- 
+1.7.1

@@ -1,0 +1,118 @@
+From 7ebff8783366a088a27114efd126cee8f51f7c92 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:20:27 -0400
+Subject: [fs] nfsd: add a forget_clients "get" routine with proper locking
+
+Message-id: <1410898849-22126-144-git-send-email-bfields@redhat.com>
+Patchwork-id: 95838
+O-Subject: [Patch RHEL7 143/165] nfsd: add a forget_clients "get" routine with proper locking
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jlayton@primarydata.com>
+
+Add a new "get" routine for forget_clients that relies on the
+client_lock instead of the client_mutex.
+
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 7ec0e36f1a35c9c241726f6639178fafda654e09
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/fault_inject.c b/fs/nfsd/fault_inject.c
+index b115990..a0387fd 100644
+--- a/fs/nfsd/fault_inject.c
++++ b/fs/nfsd/fault_inject.c
+@@ -134,11 +134,10 @@ void nfsd_fault_inject_cleanup(void)
+ static struct nfsd_fault_inject_op inject_ops[] = {
+  {
+   .file     = "forget_clients",
+-  .get   = nfsd_inject_get,
++  .get   = nfsd_inject_print_clients,
+   .set_val  = nfsd_inject_set,
+   .set_clnt = nfsd_inject_set_client,
+   .forget   = nfsd_forget_client,
+-  .print    = nfsd_print_client,
+  },
+  {
+   .file     = "forget_locks",
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 2cb5590..2225e11 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -5723,6 +5723,28 @@ nfs4_check_open_reclaim(clientid_t *clid,
+ }
+ 
+ #ifdef CONFIG_NFSD_FAULT_INJECTION
++u64
++nfsd_inject_print_clients(struct nfsd_fault_inject_op *op)
++{
++ struct nfs4_client *clp;
++ u64 count = 0;
++ struct nfsd_net *nn = net_generic(current->nsproxy->net_ns,
++       nfsd_net_id);
++ char buf[INET6_ADDRSTRLEN];
++
++ if (!nfsd_netns_ready(nn))
++  return 0;
++
++ spin_lock(&nn->client_lock);
++ list_for_each_entry(clp, &nn->client_lru, cl_lru) {
++  rpc_ntop((struct sockaddr *)&clp->cl_addr, buf, sizeof(buf));
++  pr_info("NFS Client: %s\n", buf);
++  ++count;
++ }
++ spin_unlock(&nn->client_lock);
++
++ return count;
++}
+ 
+ u64 nfsd_forget_client(struct nfs4_client *clp, u64 max)
+ {
+@@ -5738,14 +5760,6 @@ u64 nfsd_forget_client(struct nfs4_client *clp, u64 max)
+  return 1;
+ }
+ 
+-u64 nfsd_print_client(struct nfs4_client *clp, u64 num)
+-{
+- char buf[INET6_ADDRSTRLEN];
+- rpc_ntop((struct sockaddr *)&clp->cl_addr, buf, sizeof(buf));
+- printk(KERN_INFO "NFS Client: %s\n", buf);
+- return 1;
+-}
+-
+ static void nfsd_print_count(struct nfs4_client *clp, unsigned int count,
+         const char *type)
+ {
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index 0b23450..7c7580e 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -471,18 +471,20 @@ extern void nfsd4_record_grace_done(struct nfsd_net *nn, time_t boot_time);
+ 
+ /* nfs fault injection functions */
+ #ifdef CONFIG_NFSD_FAULT_INJECTION
++struct nfsd_fault_inject_op;
++
+ int nfsd_fault_inject_init(void);
+ void nfsd_fault_inject_cleanup(void);
+ u64 nfsd_for_n_state(u64, u64 (*)(struct nfs4_client *, u64));
+ struct nfs4_client *nfsd_find_client(struct sockaddr_storage *, size_t);
+ 
++u64 nfsd_inject_print_clients(struct nfsd_fault_inject_op *op);
+ u64 nfsd_forget_client(struct nfs4_client *, u64);
+ u64 nfsd_forget_client_locks(struct nfs4_client*, u64);
+ u64 nfsd_forget_client_openowners(struct nfs4_client *, u64);
+ u64 nfsd_forget_client_delegations(struct nfs4_client *, u64);
+ u64 nfsd_recall_client_delegations(struct nfs4_client *, u64);
+ 
+-u64 nfsd_print_client(struct nfs4_client *, u64);
+ u64 nfsd_print_client_locks(struct nfs4_client *, u64);
+ u64 nfsd_print_client_openowners(struct nfs4_client *, u64);
+ u64 nfsd_print_client_delegations(struct nfs4_client *, u64);
+-- 
+1.7.1

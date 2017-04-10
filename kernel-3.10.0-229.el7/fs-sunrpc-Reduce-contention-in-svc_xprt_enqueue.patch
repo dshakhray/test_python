@@ -1,0 +1,102 @@
+From eb28a4d5902d1a33dd754cc8b9640dab69aa07e9 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:19:29 -0400
+Subject: [fs] sunrpc: Reduce contention in svc_xprt_enqueue()
+
+Message-id: <1410898849-22126-86-git-send-email-bfields@redhat.com>
+Patchwork-id: 95784
+O-Subject: [Patch RHEL7 085/165] SUNRPC: Reduce contention in svc_xprt_enqueue()
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+Ensure that all calls to svc_xprt_enqueue() except svc_xprt_received()
+check the value of XPT_BUSY, before attempting to grab spinlocks etc.
+This is to avoid situations such as the following "perf" trace,
+which shows heavy contention on the pool spinlock:
+
+    54.15%            nfsd  [kernel.kallsyms]        [k] _raw_spin_lock_bh
+                      |
+                      --- _raw_spin_lock_bh
+                         |
+                         |--71.43%-- svc_xprt_enqueue
+                         |          |
+                         |          |--50.31%-- svc_reserve
+                         |          |
+                         |          |--31.35%-- svc_xprt_received
+                         |          |
+                         |          |--18.34%-- svc_tcp_data_ready
+...
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 0971374e2818eef6ebdbd7a37acf6ab7e98ac06c
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/sunrpc/svc_xprt.c b/net/sunrpc/svc_xprt.c
+index b4737fb..9cfa391 100644
+--- a/net/sunrpc/svc_xprt.c
++++ b/net/sunrpc/svc_xprt.c
+@@ -23,6 +23,7 @@ static int svc_deferred_recv(struct svc_rqst *rqstp);
+ static struct cache_deferred_req *svc_defer(struct cache_req *req);
+ static void svc_age_temp_xprts(unsigned long closure);
+ static void svc_delete_xprt(struct svc_xprt *xprt);
++static void svc_xprt_do_enqueue(struct svc_xprt *xprt);
+ 
+ /* apparently the "standard" is that clients close
+  * idle connections after 5 minutes, servers after
+@@ -222,11 +223,12 @@ static void svc_xprt_received(struct svc_xprt *xprt)
+  if (!test_bit(XPT_BUSY, &xprt->xpt_flags))
+   return;
+  /* As soon as we clear busy, the xprt could be closed and
+-  * 'put', so we need a reference to call svc_xprt_enqueue with:
++  * 'put', so we need a reference to call svc_xprt_do_enqueue with:
+   */
+  svc_xprt_get(xprt);
++ smp_mb__before_atomic();
+  clear_bit(XPT_BUSY, &xprt->xpt_flags);
+- svc_xprt_enqueue(xprt);
++ svc_xprt_do_enqueue(xprt);
+  svc_xprt_put(xprt);
+ }
+ 
+@@ -335,12 +337,7 @@ static bool svc_xprt_has_something_to_do(struct svc_xprt *xprt)
+  return false;
+ }
+ 
+-/*
+- * Queue up a transport with data pending. If there are idle nfsd
+- * processes, wake 'em up.
+- *
+- */
+-void svc_xprt_enqueue(struct svc_xprt *xprt)
++static void svc_xprt_do_enqueue(struct svc_xprt *xprt)
+ {
+  struct svc_pool *pool;
+  struct svc_rqst *rqstp;
+@@ -398,6 +395,18 @@ void svc_xprt_enqueue(struct svc_xprt *xprt)
+ out_unlock:
+  spin_unlock_bh(&pool->sp_lock);
+ }
++
++/*
++ * Queue up a transport with data pending. If there are idle nfsd
++ * processes, wake 'em up.
++ *
++ */
++void svc_xprt_enqueue(struct svc_xprt *xprt)
++{
++ if (test_bit(XPT_BUSY, &xprt->xpt_flags))
++  return;
++ svc_xprt_do_enqueue(xprt);
++}
+ EXPORT_SYMBOL_GPL(svc_xprt_enqueue);
+ 
+ /*
+-- 
+1.7.1

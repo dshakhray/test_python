@@ -1,0 +1,118 @@
+From 58c46cb3a7664bcee3fbff5eadd9c0f2860fe50f Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:23:29 -0400
+Subject: [net] crush: eliminate CRUSH_MAX_SET result size limitation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-103-git-send-email-sweil@redhat.com>
+Patchwork-id: 89577
+O-Subject: [PATCH 102/303] crush: eliminate CRUSH_MAX_SET result size limitation
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+This is only present to size the temporary scratch arrays that we put on
+the stack.  Let the caller allocate them as they wish and remove the
+limitation.
+
+Reflects ceph.git commit 1cfe140bf2dab99517589a82a916f4c75b9492d1.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit e8ef19c4ad161768e1d8309d5ae18481c098eb81)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/crush/crush.h b/include/linux/crush/crush.h
+index 09561a0..83543c5 100644
+--- a/include/linux/crush/crush.h
++++ b/include/linux/crush/crush.h
+@@ -21,7 +21,6 @@
+ 
+ 
+ #define CRUSH_MAX_DEPTH 10  /* max crush hierarchy depth */
+-#define CRUSH_MAX_SET   10  /* max size of a mapping result */
+ 
+ 
+ /*
+diff --git a/include/linux/crush/mapper.h b/include/linux/crush/mapper.h
+index 69310b0..eab3674 100644
+--- a/include/linux/crush/mapper.h
++++ b/include/linux/crush/mapper.h
+@@ -14,6 +14,7 @@ extern int crush_find_rule(const struct crush_map *map, int ruleset, int type, i
+ extern int crush_do_rule(const struct crush_map *map,
+     int ruleno,
+     int x, int *result, int result_max,
+-    const __u32 *weights, int weight_max);
++    const __u32 *weights, int weight_max,
++    int *scratch);
+ 
+ #endif
+diff --git a/net/ceph/crush/mapper.c b/net/ceph/crush/mapper.c
+index 82cab7d..dcf48bc 100644
+--- a/net/ceph/crush/mapper.c
++++ b/net/ceph/crush/mapper.c
+@@ -478,15 +478,17 @@ reject:
+  * @result_max: maximum result size
+  * @weight: weight vector (for map leaves)
+  * @weight_max: size of weight vector
++ * @scratch: scratch vector for private use; must be >= 3 * result_max
+  */
+ int crush_do_rule(const struct crush_map *map,
+     int ruleno, int x, int *result, int result_max,
+-    const __u32 *weight, int weight_max)
++    const __u32 *weight, int weight_max,
++    int *scratch)
+ {
+  int result_len;
+- int a[CRUSH_MAX_SET];
+- int b[CRUSH_MAX_SET];
+- int c[CRUSH_MAX_SET];
++ int *a = scratch;
++ int *b = scratch + result_max;
++ int *c = scratch + result_max*2;
+  int recurse_to_leaf;
+  int *w;
+  int wsize = 0;
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index 6477a68..8b1a6b4 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -1110,6 +1110,16 @@ int ceph_calc_ceph_pg(struct ceph_pg *pg, const char *oid,
+ }
+ EXPORT_SYMBOL(ceph_calc_ceph_pg);
+ 
++static int crush_do_rule_ary(const struct crush_map *map, int ruleno, int x,
++        int *result, int result_max,
++        const __u32 *weight, int weight_max)
++{
++ int scratch[result_max * 3];
++
++ return crush_do_rule(map, ruleno, x, result, result_max,
++        weight, weight_max, scratch);
++}
++
+ /*
+  * Calculate raw osd vector for the given pgid.  Return pointer to osd
+  * array, or NULL on failure.
+@@ -1163,9 +1173,9 @@ static int *calc_pg_raw(struct ceph_osdmap *osdmap, struct ceph_pg pgid,
+           pool->pgp_num_mask) +
+    (unsigned)pgid.pool;
+  }
+- r = crush_do_rule(osdmap->crush, ruleno, pps, osds,
+-     min_t(int, pool->size, *num),
+-     osdmap->osd_weight, osdmap->max_osd);
++ r = crush_do_rule_ary(osdmap->crush, ruleno, pps,
++         osds, min_t(int, pool->size, *num),
++         osdmap->osd_weight, osdmap->max_osd);
+  if (r < 0) {
+   pr_err("error %d from crush rule: pool %lld ruleset %d type %d"
+          " size %d\n", r, pgid.pool, pool->crush_ruleset,
+-- 
+1.7.1

@@ -1,0 +1,112 @@
+From 425d41f1d5a33d505f9125d3ae049dc23c8e2bb3 Mon Sep 17 00:00:00 2001
+From: Michal Schmidt <mschmidt@redhat.com>
+Date: Fri, 5 Sep 2014 19:49:44 -0400
+Subject: [ethernet] bnx2x: Check for UNDI in uncommon branch
+
+Message-id: <1409946615-5862-40-git-send-email-mschmidt@redhat.com>
+Patchwork-id: 91583
+O-Subject: [RHEL7.1 PATCH 39/70] bnx2x: Check for UNDI in uncommon branch
+Bugzilla: 1094099 1089402
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+BZ: https://bugzilla.redhat.com/show_bug.cgi?id=1089402
+BZ: https://bugzilla.redhat.com/show_bug.cgi?id=1094099
+
+Upstream commit:
+commit b17b0ca1642c23f0cd4e4cf52cdb9970798f3501
+Author: Yuval Mintz <Yuval.Mintz@qlogic.com>
+Date:   Thu Jun 12 07:55:31 2014 +0300
+
+    bnx2x: Check for UNDI in uncommon branch
+
+    If L2FW utilized by the UNDI driver has the same version number as that
+    of the regular FW, a driver loading after UNDI and receiving an uncommon
+    answer from management will mistakenly assume the loaded FW matches its
+    own requirement and try to exist the flow via FLR.
+
+    Signed-off-by: Yuval Mintz <yuval.mintz@qlogic.com>
+    Signed-off-by: Ariel Elior <ariel.elior@qlogic.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+index cf14218..c506135 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -10053,6 +10053,24 @@ static void bnx2x_prev_unload_close_mac(struct bnx2x *bp,
+ #define BCM_5710_UNDI_FW_MF_VERS (0x05)
+ #define BNX2X_PREV_UNDI_MF_PORT(p) (BAR_TSTRORM_INTMEM + 0x150c + ((p) << 4))
+ #define BNX2X_PREV_UNDI_MF_FUNC(f) (BAR_TSTRORM_INTMEM + 0x184c + ((f) << 4))
++
++static bool bnx2x_prev_is_after_undi(struct bnx2x *bp)
++{
++ /* UNDI marks its presence in DORQ -
++  * it initializes CID offset for normal bell to 0x7
++  */
++ if (!(REG_RD(bp, MISC_REG_RESET_REG_1) &
++     MISC_REGISTERS_RESET_REG_1_RST_DORQ))
++  return false;
++
++ if (REG_RD(bp, DORQ_REG_NORM_CID_OFST) == 0x7) {
++  BNX2X_DEV_INFO("UNDI previously loaded\n");
++  return true;
++ }
++
++ return false;
++}
++
+ static bool bnx2x_prev_unload_undi_fw_supports_mf(struct bnx2x *bp)
+ {
+  u8 major, minor, version;
+@@ -10302,6 +10320,10 @@ static int bnx2x_prev_unload_uncommon(struct bnx2x *bp)
+ 
+  BNX2X_DEV_INFO("Path is unmarked\n");
+ 
++ /* Cannot proceed with FLR if UNDI is loaded, since FW does not match */
++ if (bnx2x_prev_is_after_undi(bp))
++  goto out;
++
+  /* If function has FLR capabilities, and existing FW version matches
+   * the one required, then FLR will be sufficient to clean any residue
+   * left by previous driver
+@@ -10322,6 +10344,7 @@ static int bnx2x_prev_unload_uncommon(struct bnx2x *bp)
+ 
+  BNX2X_DEV_INFO("Could not FLR\n");
+ 
++out:
+  /* Close the MCP request, return failure*/
+  rc = bnx2x_prev_mcp_done(bp);
+  if (!rc)
+@@ -10360,19 +10383,13 @@ static int bnx2x_prev_unload_common(struct bnx2x *bp)
+   /* close LLH filters towards the BRB */
+   bnx2x_set_rx_filter(&bp->link_params, 0);
+ 
+-  /* Check if the UNDI driver was previously loaded
+-   * UNDI driver initializes CID offset for normal bell to 0x7
+-   */
+-  if (reset_reg & MISC_REGISTERS_RESET_REG_1_RST_DORQ) {
+-   tmp_reg = REG_RD(bp, DORQ_REG_NORM_CID_OFST);
+-   if (tmp_reg == 0x7) {
+-    BNX2X_DEV_INFO("UNDI previously loaded\n");
+-    prev_undi = true;
+-    /* clear the UNDI indication */
+-    REG_WR(bp, DORQ_REG_NORM_CID_OFST, 0);
+-    /* clear possible idle check errors */
+-    REG_RD(bp, NIG_REG_NIG_INT_STS_CLR_0);
+-   }
++  /* Check if the UNDI driver was previously loaded */
++  if (bnx2x_prev_is_after_undi(bp)) {
++   prev_undi = true;
++   /* clear the UNDI indication */
++   REG_WR(bp, DORQ_REG_NORM_CID_OFST, 0);
++   /* clear possible idle check errors */
++   REG_RD(bp, NIG_REG_NIG_INT_STS_CLR_0);
+   }
+   if (!CHIP_IS_E1x(bp))
+    /* block FW from writing to host */
+-- 
+1.7.1

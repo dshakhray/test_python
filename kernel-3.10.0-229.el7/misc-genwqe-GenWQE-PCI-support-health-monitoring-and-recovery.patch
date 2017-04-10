@@ -1,0 +1,2399 @@
+From 1f1f58d7c75928be84a8379b466138f07efac809 Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Mon, 13 Oct 2014 22:29:49 -0400
+Subject: [misc] genwqe: GenWQE PCI support, health monitoring and recovery
+
+Message-id: <1413239416-7778-2-git-send-email-gduarte@redhat.com>
+Patchwork-id: 97531
+O-Subject: [RHEL7.1 PATCH BZ 1088491 01/28 v2] GenWQE PCI support, health monitoring and recovery
+Bugzilla: 1088491
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1088491
+Upstream Status: 12eb4683251ebfb12afba9c56556fade7a3d7372
+
+commit 12eb4683251ebfb12afba9c56556fade7a3d7372
+Author: Frank Haverkamp <haver@linux.vnet.ibm.com>
+Date:   Mon Dec 9 13:30:39 2013 +0100
+
+    GenWQE PCI support, health monitoring and recovery
+
+    Module initialization and PCIe setup. Card health monitoring and
+    recovery functionality. Character device creation and deletion are
+    controlled from here.
+
+    Signed-off-by: Frank Haverkamp <haver@linux.vnet.ibm.com>
+    Co-authors: Joerg-Stephan Vogt <jsvogt@de.ibm.com>,
+                Michael Jung <MIJUNG@de.ibm.com>,
+                Michael Ruettger <michael@ibmra.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ create mode 100644 drivers/misc/genwqe/card_base.c
+ create mode 100644 drivers/misc/genwqe/card_base.h
+ create mode 100644 drivers/misc/genwqe/genwqe_driver.h
+ create mode 100644 include/uapi/linux/genwqe/genwqe_card.h
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/misc/genwqe/card_base.c b/drivers/misc/genwqe/card_base.c
+new file mode 100644
+index 0000000..74d51c9
+--- /dev/null
++++ b/drivers/misc/genwqe/card_base.c
+@@ -0,0 +1,1205 @@
++/**
++ * IBM Accelerator Family 'GenWQE'
++ *
++ * (C) Copyright IBM Corp. 2013
++ *
++ * Author: Frank Haverkamp <haver@linux.vnet.ibm.com>
++ * Author: Joerg-Stephan Vogt <jsvogt@de.ibm.com>
++ * Author: Michael Jung <mijung@de.ibm.com>
++ * Author: Michael Ruettger <michael@ibmra.de>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License (version 2 only)
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ */
++
++/*
++ * Module initialization and PCIe setup. Card health monitoring and
++ * recovery functionality. Character device creation and deletion are
++ * controlled from here.
++ */
++
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/pci.h>
++#include <linux/err.h>
++#include <linux/aer.h>
++#include <linux/string.h>
++#include <linux/sched.h>
++#include <linux/wait.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/module.h>
++#include <linux/notifier.h>
++#include <linux/device.h>
++#include <linux/log2.h>
++#include <linux/genwqe/genwqe_card.h>
++
++#include "card_base.h"
++#include "card_ddcb.h"
++
++MODULE_AUTHOR("Frank Haverkamp <haver@linux.vnet.ibm.com>");
++MODULE_AUTHOR("Michael Ruettger <michael@ibmra.de>");
++MODULE_AUTHOR("Joerg-Stephan Vogt <jsvogt@de.ibm.com>");
++MODULE_AUTHOR("Michal Jung <mijung@de.ibm.com>");
++
++MODULE_DESCRIPTION("GenWQE Card");
++MODULE_VERSION(DRV_VERS_STRING);
++MODULE_LICENSE("GPL");
++
++static char genwqe_driver_name[] = GENWQE_DEVNAME;
++static struct class *class_genwqe;
++static struct dentry *debugfs_genwqe;
++static struct genwqe_dev *genwqe_devices[GENWQE_CARD_NO_MAX];
++
++/* PCI structure for identifying device by PCI vendor and device ID */
++static DEFINE_PCI_DEVICE_TABLE(genwqe_device_table) = {
++ { .vendor      = PCI_VENDOR_ID_IBM,
++   .device      = PCI_DEVICE_GENWQE,
++   .subvendor   = PCI_SUBVENDOR_ID_IBM,
++   .subdevice   = PCI_SUBSYSTEM_ID_GENWQE5,
++   .class       = (PCI_CLASSCODE_GENWQE5 << 8),
++   .class_mask  = ~0,
++   .driver_data = 0 },
++
++ /* Initial SR-IOV bring-up image */
++ { .vendor      = PCI_VENDOR_ID_IBM,
++   .device      = PCI_DEVICE_GENWQE,
++   .subvendor   = PCI_SUBVENDOR_ID_IBM_SRIOV,
++   .subdevice   = PCI_SUBSYSTEM_ID_GENWQE5_SRIOV,
++   .class       = (PCI_CLASSCODE_GENWQE5_SRIOV << 8),
++   .class_mask  = ~0,
++   .driver_data = 0 },
++
++ { .vendor      = PCI_VENDOR_ID_IBM,  /* VF Vendor ID */
++   .device      = 0x0000,  /* VF Device ID */
++   .subvendor   = PCI_SUBVENDOR_ID_IBM_SRIOV,
++   .subdevice   = PCI_SUBSYSTEM_ID_GENWQE5_SRIOV,
++   .class       = (PCI_CLASSCODE_GENWQE5_SRIOV << 8),
++   .class_mask  = ~0,
++   .driver_data = 0 },
++
++ /* Fixed up image */
++ { .vendor      = PCI_VENDOR_ID_IBM,
++   .device      = PCI_DEVICE_GENWQE,
++   .subvendor   = PCI_SUBVENDOR_ID_IBM_SRIOV,
++   .subdevice   = PCI_SUBSYSTEM_ID_GENWQE5,
++   .class       = (PCI_CLASSCODE_GENWQE5_SRIOV << 8),
++   .class_mask  = ~0,
++   .driver_data = 0 },
++
++ { .vendor      = PCI_VENDOR_ID_IBM,  /* VF Vendor ID */
++   .device      = 0x0000,  /* VF Device ID */
++   .subvendor   = PCI_SUBVENDOR_ID_IBM_SRIOV,
++   .subdevice   = PCI_SUBSYSTEM_ID_GENWQE5,
++   .class       = (PCI_CLASSCODE_GENWQE5_SRIOV << 8),
++   .class_mask  = ~0,
++   .driver_data = 0 },
++
++ /* Even one more ... */
++ { .vendor      = PCI_VENDOR_ID_IBM,
++   .device      = PCI_DEVICE_GENWQE,
++   .subvendor   = PCI_SUBVENDOR_ID_IBM,
++   .subdevice   = PCI_SUBSYSTEM_ID_GENWQE5_NEW,
++   .class       = (PCI_CLASSCODE_GENWQE5 << 8),
++   .class_mask  = ~0,
++   .driver_data = 0 },
++
++ { 0, }   /* 0 terminated list. */
++};
++
++MODULE_DEVICE_TABLE(pci, genwqe_device_table);
++
++/**
++ * genwqe_dev_alloc() - Create and prepare a new card descriptor
++ *
++ * Return: Pointer to card descriptor, or ERR_PTR(err) on error
++ */
++static struct genwqe_dev *genwqe_dev_alloc(void)
++{
++ unsigned int i = 0, j;
++ struct genwqe_dev *cd;
++
++ for (i = 0; i < GENWQE_CARD_NO_MAX; i++) {
++  if (genwqe_devices[i] == NULL)
++   break;
++ }
++ if (i >= GENWQE_CARD_NO_MAX)
++  return ERR_PTR(-ENODEV);
++
++ cd = kzalloc(sizeof(struct genwqe_dev), GFP_KERNEL);
++ if (!cd)
++  return ERR_PTR(-ENOMEM);
++
++ cd->card_idx = i;
++ cd->class_genwqe = class_genwqe;
++ cd->debugfs_genwqe = debugfs_genwqe;
++
++ init_waitqueue_head(&cd->queue_waitq);
++
++ spin_lock_init(&cd->file_lock);
++ INIT_LIST_HEAD(&cd->file_list);
++
++ cd->card_state = GENWQE_CARD_UNUSED;
++ spin_lock_init(&cd->print_lock);
++
++ cd->ddcb_software_timeout = genwqe_ddcb_software_timeout;
++ cd->kill_timeout = genwqe_kill_timeout;
++
++ for (j = 0; j < GENWQE_MAX_VFS; j++)
++  cd->vf_jobtimeout_msec[j] = genwqe_vf_jobtimeout_msec;
++
++ genwqe_devices[i] = cd;
++ return cd;
++}
++
++static void genwqe_dev_free(struct genwqe_dev *cd)
++{
++ if (!cd)
++  return;
++
++ genwqe_devices[cd->card_idx] = NULL;
++ kfree(cd);
++}
++
++/**
++ * genwqe_bus_reset() - Card recovery
++ *
++ * pci_reset_function() will recover the device and ensure that the
++ * registers are accessible again when it completes with success. If
++ * not, the card will stay dead and registers will be unaccessible
++ * still.
++ */
++static int genwqe_bus_reset(struct genwqe_dev *cd)
++{
++ int bars, rc = 0;
++ struct pci_dev *pci_dev = cd->pci_dev;
++ void __iomem *mmio;
++
++ if (cd->err_inject & GENWQE_INJECT_BUS_RESET_FAILURE)
++  return -EIO;
++
++ mmio = cd->mmio;
++ cd->mmio = NULL;
++ pci_iounmap(pci_dev, mmio);
++
++ bars = pci_select_bars(pci_dev, IORESOURCE_MEM);
++ pci_release_selected_regions(pci_dev, bars);
++
++ /*
++  * Firmware/BIOS might change memory mapping during bus reset.
++  * Settings like enable bus-mastering, ... are backuped and
++  * restored by the pci_reset_function().
++  */
++ dev_dbg(&pci_dev->dev, "[%s] pci_reset function ...\n", __func__);
++ rc = pci_reset_function(pci_dev);
++ if (rc) {
++  dev_err(&pci_dev->dev,
++   "[%s] err: failed reset func (rc %d)\n", __func__, rc);
++  return rc;
++ }
++ dev_dbg(&pci_dev->dev, "[%s] done with rc=%d\n", __func__, rc);
++
++ /*
++  * Here is the right spot to clear the register read
++  * failure. pci_bus_reset() does this job in real systems.
++  */
++ cd->err_inject &= ~(GENWQE_INJECT_HARDWARE_FAILURE |
++       GENWQE_INJECT_GFIR_FATAL |
++       GENWQE_INJECT_GFIR_INFO);
++
++ rc = pci_request_selected_regions(pci_dev, bars, genwqe_driver_name);
++ if (rc) {
++  dev_err(&pci_dev->dev,
++   "[%s] err: request bars failed (%d)\n", __func__, rc);
++  return -EIO;
++ }
++
++ cd->mmio = pci_iomap(pci_dev, 0, 0);
++ if (cd->mmio == NULL) {
++  dev_err(&pci_dev->dev,
++   "[%s] err: mapping BAR0 failed\n", __func__);
++  return -ENOMEM;
++ }
++ return 0;
++}
++
++/*
++ * Hardware circumvention section. Certain bitstreams in our test-lab
++ * had different kinds of problems. Here is where we adjust those
++ * bitstreams to function will with this version of our device driver.
++ *
++ * Thise circumventions are applied to the physical function only.
++ * The magical numbers below are identifying development/manufacturing
++ * versions of the bitstream used on the card.
++ *
++ * Turn off error reporting for old/manufacturing images.
++ */
++
++bool genwqe_need_err_masking(struct genwqe_dev *cd)
++{
++ return (cd->slu_unitcfg & 0xFFFF0ull) < 0x32170ull;
++}
++
++static void genwqe_tweak_hardware(struct genwqe_dev *cd)
++{
++ struct pci_dev *pci_dev = cd->pci_dev;
++
++ /* Mask FIRs for development images */
++ if (((cd->slu_unitcfg & 0xFFFF0ull) >= 0x32000ull) &&
++     ((cd->slu_unitcfg & 0xFFFF0ull) <= 0x33250ull)) {
++  dev_warn(&pci_dev->dev,
++    "FIRs masked due to bitstream %016llx.%016llx\n",
++    cd->slu_unitcfg, cd->app_unitcfg);
++
++  __genwqe_writeq(cd, IO_APP_SEC_LEM_DEBUG_OVR,
++    0xFFFFFFFFFFFFFFFFull);
++
++  __genwqe_writeq(cd, IO_APP_ERR_ACT_MASK,
++    0x0000000000000000ull);
++ }
++}
++
++/**
++ * genwqe_recovery_on_fatal_gfir_required() - Version depended actions
++ *
++ * Bitstreams older than 2013-02-17 have a bug where fatal GFIRs must
++ * be ignored. This is e.g. true for the bitstream we gave to the card
++ * manufacturer, but also for some old bitstreams we released to our
++ * test-lab.
++ */
++int genwqe_recovery_on_fatal_gfir_required(struct genwqe_dev *cd)
++{
++ return (cd->slu_unitcfg & 0xFFFF0ull) >= 0x32170ull;
++}
++
++int genwqe_flash_readback_fails(struct genwqe_dev *cd)
++{
++ return (cd->slu_unitcfg & 0xFFFF0ull) < 0x32170ull;
++}
++
++/**
++ * genwqe_T_psec() - Calculate PF/VF timeout register content
++ *
++ * Note: From a design perspective it turned out to be a bad idea to
++ * use codes here to specifiy the frequency/speed values. An old
++ * driver cannot understand new codes and is therefore always a
++ * problem. Better is to measure out the value or put the
++ * speed/frequency directly into a register which is always a valid
++ * value for old as well as for new software.
++ */
++/* T = 1/f */
++static int genwqe_T_psec(struct genwqe_dev *cd)
++{
++ u16 speed; /* 1/f -> 250,  200,  166,  175 */
++ static const int T[] = { 4000, 5000, 6000, 5714 };
++
++ speed = (u16)((cd->slu_unitcfg >> 28) & 0x0full);
++ if (speed >= ARRAY_SIZE(T))
++  return -1; /* illegal value */
++
++ return T[speed];
++}
++
++/**
++ * genwqe_setup_pf_jtimer() - Setup PF hardware timeouts for DDCB execution
++ *
++ * Do this _after_ card_reset() is called. Otherwise the values will
++ * vanish. The settings need to be done when the queues are inactive.
++ *
++ * The max. timeout value is 2^(10+x) * T (6ns for 166MHz) * 15/16.
++ * The min. timeout value is 2^(10+x) * T (6ns for 166MHz) * 14/16.
++ */
++static bool genwqe_setup_pf_jtimer(struct genwqe_dev *cd)
++{
++ u32 T = genwqe_T_psec(cd);
++ u64 x;
++
++ if (genwqe_pf_jobtimeout_msec == 0)
++  return false;
++
++ /* PF: large value needed, flash update 2sec per block */
++ x = ilog2(genwqe_pf_jobtimeout_msec *
++    16000000000uL/(T * 15)) - 10;
++
++ genwqe_write_vreg(cd, IO_SLC_VF_APPJOB_TIMEOUT,
++     0xff00 | (x & 0xff), 0);
++ return true;
++}
++
++/**
++ * genwqe_setup_vf_jtimer() - Setup VF hardware timeouts for DDCB execution
++ */
++static bool genwqe_setup_vf_jtimer(struct genwqe_dev *cd)
++{
++ struct pci_dev *pci_dev = cd->pci_dev;
++ unsigned int vf;
++ u32 T = genwqe_T_psec(cd);
++ u64 x;
++
++ for (vf = 0; vf < pci_sriov_get_totalvfs(pci_dev); vf++) {
++
++  if (cd->vf_jobtimeout_msec[vf] == 0)
++   continue;
++
++  x = ilog2(cd->vf_jobtimeout_msec[vf] *
++     16000000000uL/(T * 15)) - 10;
++
++  genwqe_write_vreg(cd, IO_SLC_VF_APPJOB_TIMEOUT,
++      0xff00 | (x & 0xff), vf + 1);
++ }
++ return true;
++}
++
++static int genwqe_ffdc_buffs_alloc(struct genwqe_dev *cd)
++{
++ unsigned int type, e = 0;
++
++ for (type = 0; type < GENWQE_DBG_UNITS; type++) {
++  switch (type) {
++  case GENWQE_DBG_UNIT0:
++   e = genwqe_ffdc_buff_size(cd, 0);
++   break;
++  case GENWQE_DBG_UNIT1:
++   e = genwqe_ffdc_buff_size(cd, 1);
++   break;
++  case GENWQE_DBG_UNIT2:
++   e = genwqe_ffdc_buff_size(cd, 2);
++   break;
++  case GENWQE_DBG_REGS:
++   e = GENWQE_FFDC_REGS;
++   break;
++  }
++
++  /* currently support only the debug units mentioned here */
++  cd->ffdc[type].entries = e;
++  cd->ffdc[type].regs = kmalloc(e * sizeof(struct genwqe_reg),
++           GFP_KERNEL);
++  /*
++   * regs == NULL is ok, the using code treats this as no regs,
++   * Printing warning is ok in this case.
++   */
++ }
++ return 0;
++}
++
++static void genwqe_ffdc_buffs_free(struct genwqe_dev *cd)
++{
++ unsigned int type;
++
++ for (type = 0; type < GENWQE_DBG_UNITS; type++) {
++  kfree(cd->ffdc[type].regs);
++  cd->ffdc[type].regs = NULL;
++ }
++}
++
++static int genwqe_read_ids(struct genwqe_dev *cd)
++{
++ int err = 0;
++ int slu_id;
++ struct pci_dev *pci_dev = cd->pci_dev;
++
++ cd->slu_unitcfg = __genwqe_readq(cd, IO_SLU_UNITCFG);
++ if (cd->slu_unitcfg == IO_ILLEGAL_VALUE) {
++  dev_err(&pci_dev->dev,
++   "err: SLUID=%016llx\n", cd->slu_unitcfg);
++  err = -EIO;
++  goto out_err;
++ }
++
++ slu_id = genwqe_get_slu_id(cd);
++ if (slu_id < GENWQE_SLU_ARCH_REQ || slu_id == 0xff) {
++  dev_err(&pci_dev->dev,
++   "err: incompatible SLU Architecture %u\n", slu_id);
++  err = -ENOENT;
++  goto out_err;
++ }
++
++ cd->app_unitcfg = __genwqe_readq(cd, IO_APP_UNITCFG);
++ if (cd->app_unitcfg == IO_ILLEGAL_VALUE) {
++  dev_err(&pci_dev->dev,
++   "err: APPID=%016llx\n", cd->app_unitcfg);
++  err = -EIO;
++  goto out_err;
++ }
++ genwqe_read_app_id(cd, cd->app_name, sizeof(cd->app_name));
++
++ /*
++  * Is access to all registers possible? If we are a VF the
++  * answer is obvious. If we run fully virtualized, we need to
++  * check if we can access all registers. If we do not have
++  * full access we will cause an UR and some informational FIRs
++  * in the PF, but that should not harm.
++  */
++ if (pci_dev->is_virtfn)
++  cd->is_privileged = 0;
++ else
++  cd->is_privileged = (__genwqe_readq(cd, IO_SLU_BITSTREAM)
++         != IO_ILLEGAL_VALUE);
++
++ out_err:
++ return err;
++}
++
++static int genwqe_start(struct genwqe_dev *cd)
++{
++ int err;
++ struct pci_dev *pci_dev = cd->pci_dev;
++
++ err = genwqe_read_ids(cd);
++ if (err)
++  return err;
++
++ if (genwqe_is_privileged(cd)) {
++  /* do this after the tweaks. alloc fail is acceptable */
++  genwqe_ffdc_buffs_alloc(cd);
++  genwqe_stop_traps(cd);
++
++  /* Collect registers e.g. FIRs, UNITIDs, traces ... */
++  genwqe_read_ffdc_regs(cd, cd->ffdc[GENWQE_DBG_REGS].regs,
++          cd->ffdc[GENWQE_DBG_REGS].entries, 0);
++
++  genwqe_ffdc_buff_read(cd, GENWQE_DBG_UNIT0,
++          cd->ffdc[GENWQE_DBG_UNIT0].regs,
++          cd->ffdc[GENWQE_DBG_UNIT0].entries);
++
++  genwqe_ffdc_buff_read(cd, GENWQE_DBG_UNIT1,
++          cd->ffdc[GENWQE_DBG_UNIT1].regs,
++          cd->ffdc[GENWQE_DBG_UNIT1].entries);
++
++  genwqe_ffdc_buff_read(cd, GENWQE_DBG_UNIT2,
++          cd->ffdc[GENWQE_DBG_UNIT2].regs,
++          cd->ffdc[GENWQE_DBG_UNIT2].entries);
++
++  genwqe_start_traps(cd);
++
++  if (cd->card_state == GENWQE_CARD_FATAL_ERROR) {
++   dev_warn(&pci_dev->dev,
++     "[%s] chip reload/recovery!\n", __func__);
++
++   /*
++    * Stealth Mode: Reload chip on either hot
++    * reset or PERST.
++    */
++   cd->softreset = 0x7Cull;
++   __genwqe_writeq(cd, IO_SLC_CFGREG_SOFTRESET,
++           cd->softreset);
++
++   err = genwqe_bus_reset(cd);
++   if (err != 0) {
++    dev_err(&pci_dev->dev,
++     "[%s] err: bus reset failed!\n",
++     __func__);
++    goto out;
++   }
++
++   /*
++    * Re-read the IDs because
++    * it could happen that the bitstream load
++    * failed!
++    */
++   err = genwqe_read_ids(cd);
++   if (err)
++    goto out;
++  }
++ }
++
++ err = genwqe_setup_service_layer(cd);  /* does a reset to the card */
++ if (err != 0) {
++  dev_err(&pci_dev->dev,
++   "[%s] err: could not setup servicelayer!\n", __func__);
++  err = -ENODEV;
++  goto out;
++ }
++
++ if (genwqe_is_privileged(cd)) {  /* code is running _after_ reset */
++  genwqe_tweak_hardware(cd);
++
++  genwqe_setup_pf_jtimer(cd);
++  genwqe_setup_vf_jtimer(cd);
++ }
++
++ err = genwqe_device_create(cd);
++ if (err < 0) {
++  dev_err(&pci_dev->dev,
++   "err: chdev init failed! (err=%d)\n", err);
++  goto out_release_service_layer;
++ }
++ return 0;
++
++ out_release_service_layer:
++ genwqe_release_service_layer(cd);
++ out:
++ if (genwqe_is_privileged(cd))
++  genwqe_ffdc_buffs_free(cd);
++ return -EIO;
++}
++
++/**
++ * genwqe_stop() - Stop card operation
++ *
++ * Recovery notes:
++ *   As long as genwqe_thread runs we might access registers during
++ *   error data capture. Same is with the genwqe_health_thread.
++ *   When genwqe_bus_reset() fails this function might called two times:
++ *   first by the genwqe_health_thread() and later by genwqe_remove() to
++ *   unbind the device. We must be able to survive that.
++ *
++ * This function must be robust enough to be called twice.
++ */
++static int genwqe_stop(struct genwqe_dev *cd)
++{
++ genwqe_finish_queue(cd);     /* no register access */
++ genwqe_device_remove(cd);     /* device removed, procs killed */
++ genwqe_release_service_layer(cd);   /* here genwqe_thread is stopped */
++
++ if (genwqe_is_privileged(cd)) {
++  pci_disable_sriov(cd->pci_dev); /* access pci config space */
++  genwqe_ffdc_buffs_free(cd);
++ }
++
++ return 0;
++}
++
++/**
++ * genwqe_recover_card() - Try to recover the card if it is possible
++ *
++ * If fatal_err is set no register access is possible anymore. It is
++ * likely that genwqe_start fails in that situation. Proper error
++ * handling is required in this case.
++ *
++ * genwqe_bus_reset() will cause the pci code to call genwqe_remove()
++ * and later genwqe_probe() for all virtual functions.
++ */
++static int genwqe_recover_card(struct genwqe_dev *cd, int fatal_err)
++{
++ int rc;
++ struct pci_dev *pci_dev = cd->pci_dev;
++
++ genwqe_stop(cd);
++
++ /*
++  * Make sure chip is not reloaded to maintain FFDC. Write SLU
++  * Reset Register, CPLDReset field to 0.
++  */
++ if (!fatal_err) {
++  cd->softreset = 0x70ull;
++  __genwqe_writeq(cd, IO_SLC_CFGREG_SOFTRESET, cd->softreset);
++ }
++
++ rc = genwqe_bus_reset(cd);
++ if (rc != 0) {
++  dev_err(&pci_dev->dev,
++   "[%s] err: card recovery impossible!\n", __func__);
++  return rc;
++ }
++
++ rc = genwqe_start(cd);
++ if (rc < 0) {
++  dev_err(&pci_dev->dev,
++   "[%s] err: failed to launch device!\n", __func__);
++  return rc;
++ }
++ return 0;
++}
++
++static int genwqe_health_check_cond(struct genwqe_dev *cd, u64 *gfir)
++{
++ *gfir = __genwqe_readq(cd, IO_SLC_CFGREG_GFIR);
++ return (*gfir & GFIR_ERR_TRIGGER) &&
++  genwqe_recovery_on_fatal_gfir_required(cd);
++}
++
++/**
++ * genwqe_fir_checking() - Check the fault isolation registers of the card
++ *
++ * If this code works ok, can be tried out with help of the genwqe_poke tool:
++ *   sudo ./tools/genwqe_poke 0x8 0xfefefefefef
++ *
++ * Now the relevant FIRs/sFIRs should be printed out and the driver should
++ * invoke recovery (devices are removed and readded).
++ */
++static u64 genwqe_fir_checking(struct genwqe_dev *cd)
++{
++ int j, iterations = 0;
++ u64 mask, fir, fec, uid, gfir, gfir_masked, sfir, sfec;
++ u32 fir_addr, fir_clr_addr, fec_addr, sfir_addr, sfec_addr;
++ struct pci_dev *pci_dev = cd->pci_dev;
++
++ healthMonitor:
++ iterations++;
++ if (iterations > 16) {
++  dev_err(&pci_dev->dev, "* exit looping after %d times\n",
++   iterations);
++  goto fatal_error;
++ }
++
++ gfir = __genwqe_readq(cd, IO_SLC_CFGREG_GFIR);
++ if (gfir != 0x0)
++  dev_err(&pci_dev->dev, "* 0x%08x 0x%016llx\n",
++        IO_SLC_CFGREG_GFIR, gfir);
++ if (gfir == IO_ILLEGAL_VALUE)
++  goto fatal_error;
++
++ /*
++  * Avoid printing when to GFIR bit is on prevents contignous
++  * printout e.g. for the following bug:
++  *   FIR set without a 2ndary FIR/FIR cannot be cleared
++  * Comment out the following if to get the prints:
++  */
++ if (gfir == 0)
++  return 0;
++
++ gfir_masked = gfir & GFIR_ERR_TRIGGER;  /* fatal errors */
++
++ for (uid = 0; uid < GENWQE_MAX_UNITS; uid++) { /* 0..2 in zEDC */
++
++  /* read the primary FIR (pfir) */
++  fir_addr = (uid << 24) + 0x08;
++  fir = __genwqe_readq(cd, fir_addr);
++  if (fir == 0x0)
++   continue;  /* no error in this unit */
++
++  dev_err(&pci_dev->dev, "* 0x%08x 0x%016llx\n", fir_addr, fir);
++  if (fir == IO_ILLEGAL_VALUE)
++   goto fatal_error;
++
++  /* read primary FEC */
++  fec_addr = (uid << 24) + 0x18;
++  fec = __genwqe_readq(cd, fec_addr);
++
++  dev_err(&pci_dev->dev, "* 0x%08x 0x%016llx\n", fec_addr, fec);
++  if (fec == IO_ILLEGAL_VALUE)
++   goto fatal_error;
++
++  for (j = 0, mask = 1ULL; j < 64; j++, mask <<= 1) {
++
++   /* secondary fir empty, skip it */
++   if ((fir & mask) == 0x0)
++    continue;
++
++   sfir_addr = (uid << 24) + 0x100 + 0x08 * j;
++   sfir = __genwqe_readq(cd, sfir_addr);
++
++   if (sfir == IO_ILLEGAL_VALUE)
++    goto fatal_error;
++   dev_err(&pci_dev->dev,
++    "* 0x%08x 0x%016llx\n", sfir_addr, sfir);
++
++   sfec_addr = (uid << 24) + 0x300 + 0x08 * j;
++   sfec = __genwqe_readq(cd, sfec_addr);
++
++   if (sfec == IO_ILLEGAL_VALUE)
++    goto fatal_error;
++   dev_err(&pci_dev->dev,
++    "* 0x%08x 0x%016llx\n", sfec_addr, sfec);
++
++   gfir = __genwqe_readq(cd, IO_SLC_CFGREG_GFIR);
++   if (gfir == IO_ILLEGAL_VALUE)
++    goto fatal_error;
++
++   /* gfir turned on during routine! get out and
++      start over. */
++   if ((gfir_masked == 0x0) &&
++       (gfir & GFIR_ERR_TRIGGER)) {
++    goto healthMonitor;
++   }
++
++   /* do not clear if we entered with a fatal gfir */
++   if (gfir_masked == 0x0) {
++
++    /* NEW clear by mask the logged bits */
++    sfir_addr = (uid << 24) + 0x100 + 0x08 * j;
++    __genwqe_writeq(cd, sfir_addr, sfir);
++
++    dev_dbg(&pci_dev->dev,
++     "[HM] Clearing  2ndary FIR 0x%08x "
++     "with 0x%016llx\n", sfir_addr, sfir);
++
++    /*
++     * note, these cannot be error-Firs
++     * since gfir_masked is 0 after sfir
++     * was read. Also, it is safe to do
++     * this write if sfir=0. Still need to
++     * clear the primary. This just means
++     * there is no secondary FIR.
++     */
++
++    /* clear by mask the logged bit. */
++    fir_clr_addr = (uid << 24) + 0x10;
++    __genwqe_writeq(cd, fir_clr_addr, mask);
++
++    dev_dbg(&pci_dev->dev,
++     "[HM] Clearing primary FIR 0x%08x "
++     "with 0x%016llx\n", fir_clr_addr,
++     mask);
++   }
++  }
++ }
++ gfir = __genwqe_readq(cd, IO_SLC_CFGREG_GFIR);
++ if (gfir == IO_ILLEGAL_VALUE)
++  goto fatal_error;
++
++ if ((gfir_masked == 0x0) && (gfir & GFIR_ERR_TRIGGER)) {
++  /*
++   * Check once more that it didn't go on after all the
++   * FIRS were cleared.
++   */
++  dev_dbg(&pci_dev->dev, "ACK! Another FIR! Recursing %d!\n",
++   iterations);
++  goto healthMonitor;
++ }
++ return gfir_masked;
++
++ fatal_error:
++ return IO_ILLEGAL_VALUE;
++}
++
++/**
++ * genwqe_health_thread() - Health checking thread
++ *
++ * This thread is only started for the PF of the card.
++ *
++ * This thread monitors the health of the card. A critical situation
++ * is when we read registers which contain -1 (IO_ILLEGAL_VALUE). In
++ * this case we need to be recovered from outside. Writing to
++ * registers will very likely not work either.
++ *
++ * This thread must only exit if kthread_should_stop() becomes true.
++ *
++ * Condition for the health-thread to trigger:
++ *   a) when a kthread_stop() request comes in or
++ *   b) a critical GFIR occured
++ *
++ * Informational GFIRs are checked and potentially printed in
++ * health_check_interval seconds.
++ */
++static int genwqe_health_thread(void *data)
++{
++ int rc, should_stop = 0;
++ struct genwqe_dev *cd = data;
++ struct pci_dev *pci_dev = cd->pci_dev;
++ u64 gfir, gfir_masked, slu_unitcfg, app_unitcfg;
++
++ while (!kthread_should_stop()) {
++  rc = wait_event_interruptible_timeout(cd->health_waitq,
++    (genwqe_health_check_cond(cd, &gfir) ||
++     (should_stop = kthread_should_stop())),
++    genwqe_health_check_interval * HZ);
++
++  if (should_stop)
++   break;
++
++  if (gfir == IO_ILLEGAL_VALUE) {
++   dev_err(&pci_dev->dev,
++    "[%s] GFIR=%016llx\n", __func__, gfir);
++   goto fatal_error;
++  }
++
++  slu_unitcfg = __genwqe_readq(cd, IO_SLU_UNITCFG);
++  if (slu_unitcfg == IO_ILLEGAL_VALUE) {
++   dev_err(&pci_dev->dev,
++    "[%s] SLU_UNITCFG=%016llx\n",
++    __func__, slu_unitcfg);
++   goto fatal_error;
++  }
++
++  app_unitcfg = __genwqe_readq(cd, IO_APP_UNITCFG);
++  if (app_unitcfg == IO_ILLEGAL_VALUE) {
++   dev_err(&pci_dev->dev,
++    "[%s] APP_UNITCFG=%016llx\n",
++    __func__, app_unitcfg);
++   goto fatal_error;
++  }
++
++  gfir = __genwqe_readq(cd, IO_SLC_CFGREG_GFIR);
++  if (gfir == IO_ILLEGAL_VALUE) {
++   dev_err(&pci_dev->dev,
++    "[%s] %s: GFIR=%016llx\n", __func__,
++    (gfir & GFIR_ERR_TRIGGER) ? "err" : "info",
++    gfir);
++   goto fatal_error;
++  }
++
++  gfir_masked = genwqe_fir_checking(cd);
++  if (gfir_masked == IO_ILLEGAL_VALUE)
++   goto fatal_error;
++
++  /*
++   * GFIR ErrorTrigger bits set => reset the card!
++   * Never do this for old/manufacturing images!
++   */
++  if ((gfir_masked) && !cd->skip_recovery &&
++      genwqe_recovery_on_fatal_gfir_required(cd)) {
++
++   cd->card_state = GENWQE_CARD_FATAL_ERROR;
++
++   rc = genwqe_recover_card(cd, 0);
++   if (rc < 0) {
++    /* FIXME Card is unusable and needs unbind! */
++    goto fatal_error;
++   }
++  }
++
++  cd->last_gfir = gfir;
++  cond_resched();
++ }
++
++ return 0;
++
++ fatal_error:
++ dev_err(&pci_dev->dev,
++  "[%s] card unusable. Please trigger unbind!\n", __func__);
++
++ /* Bring down logical devices to inform user space via udev remove. */
++ cd->card_state = GENWQE_CARD_FATAL_ERROR;
++ genwqe_stop(cd);
++
++ /* genwqe_bus_reset failed(). Now wait for genwqe_remove(). */
++ while (!kthread_should_stop())
++  cond_resched();
++
++ return -EIO;
++}
++
++static int genwqe_health_check_start(struct genwqe_dev *cd)
++{
++ int rc;
++
++ if (genwqe_health_check_interval <= 0)
++  return 0; /* valid for disabling the service */
++
++ /* moved before request_irq() */
++ /* init_waitqueue_head(&cd->health_waitq); */
++
++ cd->health_thread = kthread_run(genwqe_health_thread, cd,
++     GENWQE_DEVNAME "%d_health",
++     cd->card_idx);
++ if (IS_ERR(cd->health_thread)) {
++  rc = PTR_ERR(cd->health_thread);
++  cd->health_thread = NULL;
++  return rc;
++ }
++ return 0;
++}
++
++static int genwqe_health_thread_running(struct genwqe_dev *cd)
++{
++ return cd->health_thread != NULL;
++}
++
++static int genwqe_health_check_stop(struct genwqe_dev *cd)
++{
++ int rc;
++
++ if (!genwqe_health_thread_running(cd))
++  return -EIO;
++
++ rc = kthread_stop(cd->health_thread);
++ cd->health_thread = NULL;
++ return 0;
++}
++
++/**
++ * genwqe_pci_setup() - Allocate PCIe related resources for our card
++ */
++static int genwqe_pci_setup(struct genwqe_dev *cd)
++{
++ int err, bars;
++ struct pci_dev *pci_dev = cd->pci_dev;
++
++ bars = pci_select_bars(pci_dev, IORESOURCE_MEM);
++ err = pci_enable_device_mem(pci_dev);
++ if (err) {
++  dev_err(&pci_dev->dev,
++   "err: failed to enable pci memory (err=%d)\n", err);
++  goto err_out;
++ }
++
++ /* Reserve PCI I/O and memory resources */
++ err = pci_request_selected_regions(pci_dev, bars, genwqe_driver_name);
++ if (err) {
++  dev_err(&pci_dev->dev,
++   "[%s] err: request bars failed (%d)\n", __func__, err);
++  err = -EIO;
++  goto err_disable_device;
++ }
++
++ /* check for 64-bit DMA address supported (DAC) */
++ if (!pci_set_dma_mask(pci_dev, DMA_BIT_MASK(64))) {
++  err = pci_set_consistent_dma_mask(pci_dev, DMA_BIT_MASK(64));
++  if (err) {
++   dev_err(&pci_dev->dev,
++    "err: DMA64 consistent mask error\n");
++   err = -EIO;
++   goto out_release_resources;
++  }
++ /* check for 32-bit DMA address supported (SAC) */
++ } else if (!pci_set_dma_mask(pci_dev, DMA_BIT_MASK(32))) {
++  err = pci_set_consistent_dma_mask(pci_dev, DMA_BIT_MASK(32));
++  if (err) {
++   dev_err(&pci_dev->dev,
++    "err: DMA32 consistent mask error\n");
++   err = -EIO;
++   goto out_release_resources;
++  }
++ } else {
++  dev_err(&pci_dev->dev,
++   "err: neither DMA32 nor DMA64 supported\n");
++  err = -EIO;
++  goto out_release_resources;
++ }
++
++ pci_set_master(pci_dev);
++ pci_enable_pcie_error_reporting(pci_dev);
++
++ /* request complete BAR-0 space (length = 0) */
++ cd->mmio_len = pci_resource_len(pci_dev, 0);
++ cd->mmio = pci_iomap(pci_dev, 0, 0);
++ if (cd->mmio == NULL) {
++  dev_err(&pci_dev->dev,
++   "[%s] err: mapping BAR0 failed\n", __func__);
++  err = -ENOMEM;
++  goto out_release_resources;
++ }
++
++ cd->num_vfs = pci_sriov_get_totalvfs(pci_dev);
++
++ err = genwqe_read_ids(cd);
++ if (err)
++  goto out_iounmap;
++
++ return 0;
++
++ out_iounmap:
++ pci_iounmap(pci_dev, cd->mmio);
++ out_release_resources:
++ pci_release_selected_regions(pci_dev, bars);
++ err_disable_device:
++ pci_disable_device(pci_dev);
++ err_out:
++ return err;
++}
++
++/**
++ * genwqe_pci_remove() - Free PCIe related resources for our card
++ */
++static void genwqe_pci_remove(struct genwqe_dev *cd)
++{
++ int bars;
++ struct pci_dev *pci_dev = cd->pci_dev;
++
++ if (cd->mmio)
++  pci_iounmap(pci_dev, cd->mmio);
++
++ bars = pci_select_bars(pci_dev, IORESOURCE_MEM);
++ pci_release_selected_regions(pci_dev, bars);
++ pci_disable_device(pci_dev);
++}
++
++/**
++ * genwqe_probe() - Device initialization
++ * @pdev: PCI device information struct
++ *
++ * Callable for multiple cards. This function is called on bind.
++ *
++ * Return: 0 if succeeded, < 0 when failed
++ */
++static int genwqe_probe(struct pci_dev *pci_dev,
++   const struct pci_device_id *id)
++{
++ int err;
++ struct genwqe_dev *cd;
++
++ genwqe_init_crc32();
++
++ cd = genwqe_dev_alloc();
++ if (IS_ERR(cd)) {
++  dev_err(&pci_dev->dev, "err: could not alloc mem (err=%d)!\n",
++   (int)PTR_ERR(cd));
++  return PTR_ERR(cd);
++ }
++
++ dev_set_drvdata(&pci_dev->dev, cd);
++ cd->pci_dev = pci_dev;
++
++ err = genwqe_pci_setup(cd);
++ if (err < 0) {
++  dev_err(&pci_dev->dev,
++   "err: problems with PCI setup (err=%d)\n", err);
++  goto out_free_dev;
++ }
++
++ err = genwqe_start(cd);
++ if (err < 0) {
++  dev_err(&pci_dev->dev,
++   "err: cannot start card services! (err=%d)\n", err);
++  goto out_pci_remove;
++ }
++
++ if (genwqe_is_privileged(cd)) {
++  err = genwqe_health_check_start(cd);
++  if (err < 0) {
++   dev_err(&pci_dev->dev,
++    "err: cannot start health checking! "
++    "(err=%d)\n", err);
++   goto out_stop_services;
++  }
++ }
++ return 0;
++
++ out_stop_services:
++ genwqe_stop(cd);
++ out_pci_remove:
++ genwqe_pci_remove(cd);
++ out_free_dev:
++ genwqe_dev_free(cd);
++ return err;
++}
++
++/**
++ * genwqe_remove() - Called when device is removed (hot-plugable)
++ *
++ * Or when driver is unloaded respecitively when unbind is done.
++ */
++static void genwqe_remove(struct pci_dev *pci_dev)
++{
++ struct genwqe_dev *cd = dev_get_drvdata(&pci_dev->dev);
++
++ genwqe_health_check_stop(cd);
++
++ /*
++  * genwqe_stop() must survive if it is called twice
++  * sequentially. This happens when the health thread calls it
++  * and fails on genwqe_bus_reset().
++  */
++ genwqe_stop(cd);
++ genwqe_pci_remove(cd);
++ genwqe_dev_free(cd);
++}
++
++/*
++ * genwqe_err_error_detected() - Error detection callback
++ *
++ * This callback is called by the PCI subsystem whenever a PCI bus
++ * error is detected.
++ */
++static pci_ers_result_t genwqe_err_error_detected(struct pci_dev *pci_dev,
++       enum pci_channel_state state)
++{
++ struct genwqe_dev *cd;
++
++ dev_err(&pci_dev->dev, "[%s] state=%d\n", __func__, state);
++
++ if (pci_dev == NULL)
++  return PCI_ERS_RESULT_NEED_RESET;
++
++ cd = dev_get_drvdata(&pci_dev->dev);
++ if (cd == NULL)
++  return PCI_ERS_RESULT_NEED_RESET;
++
++ switch (state) {
++ case pci_channel_io_normal:
++  return PCI_ERS_RESULT_CAN_RECOVER;
++ case pci_channel_io_frozen:
++  return PCI_ERS_RESULT_NEED_RESET;
++ case pci_channel_io_perm_failure:
++  return PCI_ERS_RESULT_DISCONNECT;
++ }
++
++ return PCI_ERS_RESULT_NEED_RESET;
++}
++
++static pci_ers_result_t genwqe_err_result_none(struct pci_dev *dev)
++{
++ return PCI_ERS_RESULT_NONE;
++}
++
++static void genwqe_err_resume(struct pci_dev *dev)
++{
++}
++
++static int genwqe_sriov_configure(struct pci_dev *dev, int numvfs)
++{
++ struct genwqe_dev *cd = dev_get_drvdata(&dev->dev);
++
++ if (numvfs > 0) {
++  genwqe_setup_vf_jtimer(cd);
++  pci_enable_sriov(dev, numvfs);
++  return numvfs;
++ }
++ if (numvfs == 0) {
++  pci_disable_sriov(dev);
++  return 0;
++ }
++ return 0;
++}
++
++static struct pci_error_handlers genwqe_err_handler = {
++ .error_detected = genwqe_err_error_detected,
++ .mmio_enabled = genwqe_err_result_none,
++ .link_reset = genwqe_err_result_none,
++ .slot_reset = genwqe_err_result_none,
++ .resume  = genwqe_err_resume,
++};
++
++static struct pci_driver genwqe_driver = {
++ .name   = genwqe_driver_name,
++ .id_table = genwqe_device_table,
++ .probe   = genwqe_probe,
++ .remove   = genwqe_remove,
++ .sriov_configure = genwqe_sriov_configure,
++ .err_handler = &genwqe_err_handler,
++};
++
++/**
++ * genwqe_init_module() - Driver registration and initialization
++ */
++static int __init genwqe_init_module(void)
++{
++ int rc;
++
++ class_genwqe = class_create(THIS_MODULE, GENWQE_DEVNAME);
++ if (IS_ERR(class_genwqe)) {
++  pr_err("[%s] create class failed\n", __func__);
++  return -ENOMEM;
++ }
++
++ debugfs_genwqe = debugfs_create_dir(GENWQE_DEVNAME, NULL);
++ if (!debugfs_genwqe) {
++  rc = -ENOMEM;
++  goto err_out;
++ }
++
++ rc = pci_register_driver(&genwqe_driver);
++ if (rc != 0) {
++  pr_err("[%s] pci_reg_driver (rc=%d)\n", __func__, rc);
++  goto err_out0;
++ }
++
++ return rc;
++
++ err_out0:
++ debugfs_remove(debugfs_genwqe);
++ err_out:
++ class_destroy(class_genwqe);
++ return rc;
++}
++
++/**
++ * genwqe_exit_module() - Driver exit
++ */
++static void __exit genwqe_exit_module(void)
++{
++ pci_unregister_driver(&genwqe_driver);
++ debugfs_remove(debugfs_genwqe);
++ class_destroy(class_genwqe);
++}
++
++module_init(genwqe_init_module);
++module_exit(genwqe_exit_module);
+diff --git a/drivers/misc/genwqe/card_base.h b/drivers/misc/genwqe/card_base.h
+new file mode 100644
+index 0000000..41953e3
+--- /dev/null
++++ b/drivers/misc/genwqe/card_base.h
+@@ -0,0 +1,556 @@
++#ifndef __CARD_BASE_H__
++#define __CARD_BASE_H__
++
++/**
++ * IBM Accelerator Family 'GenWQE'
++ *
++ * (C) Copyright IBM Corp. 2013
++ *
++ * Author: Frank Haverkamp <haver@linux.vnet.ibm.com>
++ * Author: Joerg-Stephan Vogt <jsvogt@de.ibm.com>
++ * Author: Michael Jung <mijung@de.ibm.com>
++ * Author: Michael Ruettger <michael@ibmra.de>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License (version 2 only)
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ */
++
++/*
++ * Interfaces within the GenWQE module. Defines genwqe_card and
++ * ddcb_queue as well as ddcb_requ.
++ */
++
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/cdev.h>
++#include <linux/stringify.h>
++#include <linux/pci.h>
++#include <linux/semaphore.h>
++#include <linux/uaccess.h>
++#include <linux/io.h>
++#include <linux/version.h>
++#include <linux/debugfs.h>
++
++#include <linux/genwqe/genwqe_card.h>
++#include "genwqe_driver.h"
++
++#define GENWQE_MSI_IRQS   4  /* Just one supported, no MSIx */
++#define GENWQE_FLAG_MSI_ENABLED  (1 << 0)
++
++#define GENWQE_MAX_VFS   15 /* maximum 15 VFs are possible */
++#define GENWQE_MAX_FUNCS  16 /* 1 PF and 15 VFs */
++#define GENWQE_CARD_NO_MAX  (16 * GENWQE_MAX_FUNCS)
++
++/* Compile parameters, some of them appear in debugfs for later adjustment */
++#define genwqe_ddcb_max   32 /* DDCBs on the work-queue */
++#define genwqe_polling_enabled  0  /* in case of irqs not working */
++#define genwqe_ddcb_software_timeout 10 /* timeout per DDCB in seconds */
++#define genwqe_kill_timeout  8  /* time until process gets killed */
++#define genwqe_vf_jobtimeout_msec 250  /* 250 msec */
++#define genwqe_pf_jobtimeout_msec 8000 /* 8 sec should be ok */
++#define genwqe_health_check_interval 4 /* <= 0: disabled */
++
++/* Sysfs attribute groups used when we create the genwqe device */
++extern const struct attribute_group *genwqe_attribute_groups[];
++
++/*
++ * Config space for Genwqe5 A7:
++ * 00:[14 10 4b 04]40 00 10 00[00 00 00 12]00 00 00 00
++ * 10: 0c 00 00 f0 07 3c 00 00 00 00 00 00 00 00 00 00
++ * 20: 00 00 00 00 00 00 00 00 00 00 00 00[14 10 4b 04]
++ * 30: 00 00 00 00 50 00 00 00 00 00 00 00 00 00 00 00
++ */
++#define PCI_DEVICE_GENWQE  0x044b /* Genwqe DeviceID */
++
++#define PCI_SUBSYSTEM_ID_GENWQE5 0x035f /* Genwqe A5 Subsystem-ID */
++#define PCI_SUBSYSTEM_ID_GENWQE5_NEW 0x044b /* Genwqe A5 Subsystem-ID */
++#define PCI_CLASSCODE_GENWQE5  0x1200 /* UNKNOWN */
++
++#define PCI_SUBVENDOR_ID_IBM_SRIOV 0x0000
++#define PCI_SUBSYSTEM_ID_GENWQE5_SRIOV 0x0000 /* Genwqe A5 Subsystem-ID */
++#define PCI_CLASSCODE_GENWQE5_SRIOV 0x1200 /* UNKNOWN */
++
++#define GENWQE_SLU_ARCH_REQ  2 /* Required SLU architecture level */
++
++/**
++ * struct genwqe_reg - Genwqe data dump functionality
++ */
++struct genwqe_reg {
++ u32 addr;
++ u32 idx;
++ u64 val;
++};
++
++/*
++ * enum genwqe_dbg_type - Specify chip unit to dump/debug
++ */
++enum genwqe_dbg_type {
++ GENWQE_DBG_UNIT0 = 0,  /* captured before prev errs cleared */
++ GENWQE_DBG_UNIT1 = 1,
++ GENWQE_DBG_UNIT2 = 2,
++ GENWQE_DBG_UNIT3 = 3,
++ GENWQE_DBG_UNIT4 = 4,
++ GENWQE_DBG_UNIT5 = 5,
++ GENWQE_DBG_UNIT6 = 6,
++ GENWQE_DBG_UNIT7 = 7,
++ GENWQE_DBG_REGS  = 8,
++ GENWQE_DBG_DMA   = 9,
++ GENWQE_DBG_UNITS = 10, /* max number of possible debug units  */
++};
++
++/* Software error injection to simulate card failures */
++#define GENWQE_INJECT_HARDWARE_FAILURE 0x00000001 /* injects -1 reg reads */
++#define GENWQE_INJECT_BUS_RESET_FAILURE 0x00000002 /* pci_bus_reset fail */
++#define GENWQE_INJECT_GFIR_FATAL 0x00000004 /* GFIR = 0x0000ffff */
++#define GENWQE_INJECT_GFIR_INFO  0x00000008 /* GFIR = 0xffff0000 */
++
++/*
++ * Genwqe card description and management data.
++ *
++ * Error-handling in case of card malfunction
++ * ------------------------------------------
++ *
++ * If the card is detected to be defective the outside environment
++ * will cause the PCI layer to call deinit (the cleanup function for
++ * probe). This is the same effect like doing a unbind/bind operation
++ * on the card.
++ *
++ * The genwqe card driver implements a health checking thread which
++ * verifies the card function. If this detects a problem the cards
++ * device is being shutdown and restarted again, along with a reset of
++ * the card and queue.
++ *
++ * All functions accessing the card device return either -EIO or -ENODEV
++ * code to indicate the malfunction to the user. The user has to close
++ * the file descriptor and open a new one, once the card becomes
++ * available again.
++ *
++ * If the open file descriptor is setup to receive SIGIO, the signal is
++ * genereated for the application which has to provide a handler to
++ * react on it. If the application does not close the open
++ * file descriptor a SIGKILL is send to enforce freeing the cards
++ * resources.
++ *
++ * I did not find a different way to prevent kernel problems due to
++ * reference counters for the cards character devices getting out of
++ * sync. The character device deallocation does not block, even if
++ * there is still an open file descriptor pending. If this pending
++ * descriptor is closed, the data structures used by the character
++ * device is reinstantiated, which will lead to the reference counter
++ * dropping below the allowed values.
++ *
++ * Card recovery
++ * -------------
++ *
++ * To test the internal driver recovery the following command can be used:
++ *   sudo sh -c 'echo 0xfffff > /sys/class/genwqe/genwqe0_card/err_inject'
++ */
++
++
++/**
++ * struct dma_mapping_type - Mapping type definition
++ *
++ * To avoid memcpying data arround we use user memory directly. To do
++ * this we need to pin/swap-in the memory and request a DMA address
++ * for it.
++ */
++enum dma_mapping_type {
++ GENWQE_MAPPING_RAW = 0,  /* contignous memory buffer */
++ GENWQE_MAPPING_SGL_TEMP, /* sglist dynamically used */
++ GENWQE_MAPPING_SGL_PINNED, /* sglist used with pinning */
++};
++
++/**
++ * struct dma_mapping - Information about memory mappings done by the driver
++ */
++struct dma_mapping {
++ enum dma_mapping_type type;
++
++ void *u_vaddr;   /* user-space vaddr/non-aligned */
++ void *k_vaddr;   /* kernel-space vaddr/non-aligned */
++ dma_addr_t dma_addr;  /* physical DMA address */
++
++ struct page **page_list; /* list of pages used by user buff */
++ dma_addr_t *dma_list;  /* list of dma addresses per page */
++ unsigned int nr_pages;  /* number of pages */
++ unsigned int size;  /* size in bytes */
++
++ struct list_head card_list; /* list of usr_maps for card */
++ struct list_head pin_list; /* list of pinned memory for dev */
++};
++
++static inline void genwqe_mapping_init(struct dma_mapping *m,
++           enum dma_mapping_type type)
++{
++ memset(m, 0, sizeof(*m));
++ m->type = type;
++}
++
++/**
++ * struct ddcb_queue - DDCB queue data
++ * @ddcb_max:          Number of DDCBs on the queue
++ * @ddcb_next:         Next free DDCB
++ * @ddcb_act:          Next DDCB supposed to finish
++ * @ddcb_seq:          Sequence number of last DDCB
++ * @ddcbs_in_flight:   Currently enqueued DDCBs
++ * @ddcbs_completed:   Number of already completed DDCBs
++ * @busy:              Number of -EBUSY returns
++ * @ddcb_daddr:        DMA address of first DDCB in the queue
++ * @ddcb_vaddr:        Kernel virtual address of first DDCB in the queue
++ * @ddcb_req:          Associated requests (one per DDCB)
++ * @ddcb_waitqs:       Associated wait queues (one per DDCB)
++ * @ddcb_lock:         Lock to protect queuing operations
++ * @ddcb_waitq:        Wait on next DDCB finishing
++ */
++
++struct ddcb_queue {
++ int ddcb_max;   /* amount of DDCBs  */
++ int ddcb_next;   /* next available DDCB num */
++ int ddcb_act;   /* DDCB to be processed */
++ u16 ddcb_seq;   /* slc seq num */
++ unsigned int ddcbs_in_flight; /* number of ddcbs in processing */
++ unsigned int ddcbs_completed;
++ unsigned int ddcbs_max_in_flight;
++ unsigned int busy;  /* how many times -EBUSY? */
++
++ dma_addr_t ddcb_daddr;  /* DMA address */
++ struct ddcb *ddcb_vaddr; /* kernel virtual addr for DDCBs */
++ struct ddcb_requ **ddcb_req; /* ddcb processing parameter */
++ wait_queue_head_t *ddcb_waitqs; /* waitqueue per ddcb */
++
++ spinlock_t ddcb_lock;  /* exclusive access to queue */
++ wait_queue_head_t ddcb_waitq; /* wait for ddcb processing */
++
++ /* registers or the respective queue to be used */
++ u32 IO_QUEUE_CONFIG;
++ u32 IO_QUEUE_STATUS;
++ u32 IO_QUEUE_SEGMENT;
++ u32 IO_QUEUE_INITSQN;
++ u32 IO_QUEUE_WRAP;
++ u32 IO_QUEUE_OFFSET;
++ u32 IO_QUEUE_WTIME;
++ u32 IO_QUEUE_ERRCNTS;
++ u32 IO_QUEUE_LRW;
++};
++
++/*
++ * GFIR, SLU_UNITCFG, APP_UNITCFG
++ *   8 Units with FIR/FEC + 64 * 2ndary FIRS/FEC.
++ */
++#define GENWQE_FFDC_REGS (3 + (8 * (2 + 2 * 64)))
++
++struct genwqe_ffdc {
++ unsigned int entries;
++ struct genwqe_reg *regs;
++};
++
++/**
++ * struct genwqe_dev - GenWQE device information
++ * @card_state:       Card operation state, see above
++ * @ffdc:             First Failure Data Capture buffers for each unit
++ * @card_thread:      Working thread to operate the DDCB queue
++ * @card_waitq:       Wait queue used in card_thread
++ * @queue:            DDCB queue
++ * @health_thread:    Card monitoring thread (only for PFs)
++ * @health_waitq:     Wait queue used in health_thread
++ * @pci_dev:          Associated PCI device (function)
++ * @mmio:             Base address of 64-bit register space
++ * @mmio_len:         Length of register area
++ * @file_lock:        Lock to protect access to file_list
++ * @file_list:        List of all processes with open GenWQE file descriptors
++ *
++ * This struct contains all information needed to communicate with a
++ * GenWQE card. It is initialized when a GenWQE device is found and
++ * destroyed when it goes away. It holds data to maintain the queue as
++ * well as data needed to feed the user interfaces.
++ */
++struct genwqe_dev {
++ enum genwqe_card_state card_state;
++ spinlock_t print_lock;
++
++ int card_idx;   /* card index 0..CARD_NO_MAX-1 */
++ u64 flags;   /* general flags */
++
++ /* FFDC data gathering */
++ struct genwqe_ffdc ffdc[GENWQE_DBG_UNITS];
++
++ /* DDCB workqueue */
++ struct task_struct *card_thread;
++ wait_queue_head_t queue_waitq;
++ struct ddcb_queue queue; /* genwqe DDCB queue */
++ unsigned int irqs_processed;
++
++ /* Card health checking thread */
++ struct task_struct *health_thread;
++ wait_queue_head_t health_waitq;
++
++ /* char device */
++ dev_t  devnum_genwqe;  /* major/minor num card */
++ struct class *class_genwqe; /* reference to class object */
++ struct device *dev;  /* for device creation */
++ struct cdev cdev_genwqe; /* char device for card */
++
++ struct dentry *debugfs_root; /* debugfs card root directory */
++ struct dentry *debugfs_genwqe; /* debugfs driver root directory */
++
++ /* pci resources */
++ struct pci_dev *pci_dev; /* PCI device */
++ void __iomem *mmio;  /* BAR-0 MMIO start */
++ unsigned long mmio_len;
++ u16 num_vfs;
++ u32 vf_jobtimeout_msec[GENWQE_MAX_VFS];
++ int is_privileged;  /* access to all regs possible */
++
++ /* config regs which we need often */
++ u64 slu_unitcfg;
++ u64 app_unitcfg;
++ u64 softreset;
++ u64 err_inject;
++ u64 last_gfir;
++ char app_name[5];
++
++ spinlock_t file_lock;  /* lock for open files */
++ struct list_head file_list; /* list of open files */
++
++ /* debugfs parameters */
++ int ddcb_software_timeout; /* wait until DDCB times out */
++ int skip_recovery;  /* circumvention if recovery fails */
++ int kill_timeout;  /* wait after sending SIGKILL */
++};
++
++/**
++ * enum genwqe_requ_state - State of a DDCB execution request
++ */
++enum genwqe_requ_state {
++ GENWQE_REQU_NEW      = 0,
++ GENWQE_REQU_ENQUEUED = 1,
++ GENWQE_REQU_TAPPED   = 2,
++ GENWQE_REQU_FINISHED = 3,
++ GENWQE_REQU_STATE_MAX,
++};
++
++/**
++ * struct ddcb_requ - Kernel internal representation of the DDCB request
++ * @cmd:          User space representation of the DDCB execution request
++ */
++struct ddcb_requ {
++ /* kernel specific content */
++ enum genwqe_requ_state req_state; /* request status */
++ int num;     /* ddcb_no for this request */
++ struct ddcb_queue *queue;   /* associated queue */
++
++ struct dma_mapping  dma_mappings[DDCB_FIXUPS];
++ struct sg_entry     *sgl[DDCB_FIXUPS];
++ dma_addr_t     sgl_dma_addr[DDCB_FIXUPS];
++ size_t      sgl_size[DDCB_FIXUPS];
++
++ /* kernel/user shared content */
++ struct genwqe_ddcb_cmd cmd; /* ddcb_no for this request */
++ struct genwqe_debug_data debug_data;
++};
++
++/**
++ * struct genwqe_file - Information for open GenWQE devices
++ */
++struct genwqe_file {
++ struct genwqe_dev *cd;
++ struct genwqe_driver *client;
++ struct file *filp;
++
++ struct fasync_struct *async_queue;
++ struct task_struct *owner;
++ struct list_head list;  /* entry in list of open files */
++
++ spinlock_t map_lock;  /* lock for dma_mappings */
++ struct list_head map_list; /* list of dma_mappings */
++
++ spinlock_t pin_lock;  /* lock for pinned memory */
++ struct list_head pin_list; /* list of pinned memory */
++};
++
++int  genwqe_setup_service_layer(struct genwqe_dev *cd); /* for PF only */
++int  genwqe_finish_queue(struct genwqe_dev *cd);
++int  genwqe_release_service_layer(struct genwqe_dev *cd);
++
++/**
++ * genwqe_get_slu_id() - Read Service Layer Unit Id
++ * Return: 0x00: Development code
++ *         0x01: SLC1 (old)
++ *         0x02: SLC2 (sept2012)
++ *         0x03: SLC2 (feb2013, generic driver)
++ */
++static inline int genwqe_get_slu_id(struct genwqe_dev *cd)
++{
++ return (int)((cd->slu_unitcfg >> 32) & 0xff);
++}
++
++int  genwqe_ddcbs_in_flight(struct genwqe_dev *cd);
++
++u8   genwqe_card_type(struct genwqe_dev *cd);
++int  genwqe_card_reset(struct genwqe_dev *cd);
++int  genwqe_set_interrupt_capability(struct genwqe_dev *cd, int count);
++void genwqe_reset_interrupt_capability(struct genwqe_dev *cd);
++
++int  genwqe_device_create(struct genwqe_dev *cd);
++int  genwqe_device_remove(struct genwqe_dev *cd);
++
++/* debugfs */
++int  genwqe_init_debugfs(struct genwqe_dev *cd);
++void genqwe_exit_debugfs(struct genwqe_dev *cd);
++
++int  genwqe_read_softreset(struct genwqe_dev *cd);
++
++/* Hardware Circumventions */
++int  genwqe_recovery_on_fatal_gfir_required(struct genwqe_dev *cd);
++int  genwqe_flash_readback_fails(struct genwqe_dev *cd);
++
++/**
++ * genwqe_write_vreg() - Write register in VF window
++ * @cd:    genwqe device
++ * @reg:   register address
++ * @val:   value to write
++ * @func:  0: PF, 1: VF0, ..., 15: VF14
++ */
++int genwqe_write_vreg(struct genwqe_dev *cd, u32 reg, u64 val, int func);
++
++/**
++ * genwqe_read_vreg() - Read register in VF window
++ * @cd:    genwqe device
++ * @reg:   register address
++ * @func:  0: PF, 1: VF0, ..., 15: VF14
++ *
++ * Return: content of the register
++ */
++u64 genwqe_read_vreg(struct genwqe_dev *cd, u32 reg, int func);
++
++/* FFDC Buffer Management */
++int  genwqe_ffdc_buff_size(struct genwqe_dev *cd, int unit_id);
++int  genwqe_ffdc_buff_read(struct genwqe_dev *cd, int unit_id,
++      struct genwqe_reg *regs, unsigned int max_regs);
++int  genwqe_read_ffdc_regs(struct genwqe_dev *cd, struct genwqe_reg *regs,
++      unsigned int max_regs, int all);
++int  genwqe_ffdc_dump_dma(struct genwqe_dev *cd,
++     struct genwqe_reg *regs, unsigned int max_regs);
++
++int  genwqe_init_debug_data(struct genwqe_dev *cd,
++       struct genwqe_debug_data *d);
++
++void genwqe_init_crc32(void);
++int  genwqe_read_app_id(struct genwqe_dev *cd, char *app_name, int len);
++
++/* Memory allocation/deallocation; dma address handling */
++int  genwqe_user_vmap(struct genwqe_dev *cd, struct dma_mapping *m,
++        void *uaddr, unsigned long size,
++        struct ddcb_requ *req);
++
++int  genwqe_user_vunmap(struct genwqe_dev *cd, struct dma_mapping *m,
++   struct ddcb_requ *req);
++
++struct sg_entry *genwqe_alloc_sgl(struct genwqe_dev *cd, int num_pages,
++     dma_addr_t *dma_addr, size_t *sgl_size);
++
++void genwqe_free_sgl(struct genwqe_dev *cd, struct sg_entry *sg_list,
++      dma_addr_t dma_addr, size_t size);
++
++int genwqe_setup_sgl(struct genwqe_dev *cd,
++      unsigned long offs,
++      unsigned long size,
++      struct sg_entry *sgl, /* genwqe sgl */
++      dma_addr_t dma_addr, size_t sgl_size,
++      dma_addr_t *dma_list, int page_offs, int num_pages);
++
++int genwqe_check_sgl(struct genwqe_dev *cd, struct sg_entry *sg_list,
++       int size);
++
++static inline bool dma_mapping_used(struct dma_mapping *m)
++{
++ if (!m)
++  return 0;
++ return m->size != 0;
++}
++
++/**
++ * __genwqe_execute_ddcb() - Execute DDCB request with addr translation
++ *
++ * This function will do the address translation changes to the DDCBs
++ * according to the definitions required by the ATS field. It looks up
++ * the memory allocation buffer or does vmap/vunmap for the respective
++ * user-space buffers, inclusive page pinning and scatter gather list
++ * buildup and teardown.
++ */
++int  __genwqe_execute_ddcb(struct genwqe_dev *cd,
++      struct genwqe_ddcb_cmd *cmd);
++
++/**
++ * __genwqe_execute_raw_ddcb() - Execute DDCB request without addr translation
++ *
++ * This version will not do address translation or any modifcation of
++ * the DDCB data. It is used e.g. for the MoveFlash DDCB which is
++ * entirely prepared by the driver itself. That means the appropriate
++ * DMA addresses are already in the DDCB and do not need any
++ * modification.
++ */
++int  __genwqe_execute_raw_ddcb(struct genwqe_dev *cd,
++          struct genwqe_ddcb_cmd *cmd);
++
++int  __genwqe_enqueue_ddcb(struct genwqe_dev *cd, struct ddcb_requ *req);
++int  __genwqe_wait_ddcb(struct genwqe_dev *cd, struct ddcb_requ *req);
++int  __genwqe_purge_ddcb(struct genwqe_dev *cd, struct ddcb_requ *req);
++
++/* register access */
++int __genwqe_writeq(struct genwqe_dev *cd, u64 byte_offs, u64 val);
++u64 __genwqe_readq(struct genwqe_dev *cd, u64 byte_offs);
++int __genwqe_writel(struct genwqe_dev *cd, u64 byte_offs, u32 val);
++u32 __genwqe_readl(struct genwqe_dev *cd, u64 byte_offs);
++
++void *__genwqe_alloc_consistent(struct genwqe_dev *cd, size_t size,
++     dma_addr_t *dma_handle);
++void __genwqe_free_consistent(struct genwqe_dev *cd, size_t size,
++         void *vaddr, dma_addr_t dma_handle);
++
++/* Base clock frequency in MHz */
++int  genwqe_base_clock_frequency(struct genwqe_dev *cd);
++
++/* Before FFDC is captured the traps should be stopped. */
++void genwqe_stop_traps(struct genwqe_dev *cd);
++void genwqe_start_traps(struct genwqe_dev *cd);
++
++/* Hardware circumvention */
++bool genwqe_need_err_masking(struct genwqe_dev *cd);
++
++/**
++ * genwqe_is_privileged() - Determine operation mode for PCI function
++ *
++ * On Intel with SRIOV support we see:
++ *   PF: is_physfn = 1 is_virtfn = 0
++ *   VF: is_physfn = 0 is_virtfn = 1
++ *
++ * On Systems with no SRIOV support _and_ virtualized systems we get:
++ *       is_physfn = 0 is_virtfn = 0
++ *
++ * Other vendors have individual pci device ids to distinguish between
++ * virtual function drivers and physical function drivers. GenWQE
++ * unfortunately has just on pci device id for both, VFs and PF.
++ *
++ * The following code is used to distinguish if the card is running in
++ * privileged mode, either as true PF or in a virtualized system with
++ * full register access e.g. currently on PowerPC.
++ *
++ * if (pci_dev->is_virtfn)
++ *          cd->is_privileged = 0;
++ *  else
++ *          cd->is_privileged = (__genwqe_readq(cd, IO_SLU_BITSTREAM)
++ *     != IO_ILLEGAL_VALUE);
++ */
++static inline int genwqe_is_privileged(struct genwqe_dev *cd)
++{
++ return cd->is_privileged;
++}
++
++#endif /* __CARD_BASE_H__ */
+diff --git a/drivers/misc/genwqe/genwqe_driver.h b/drivers/misc/genwqe/genwqe_driver.h
+new file mode 100644
+index 0000000..a157203
+--- /dev/null
++++ b/drivers/misc/genwqe/genwqe_driver.h
+@@ -0,0 +1,74 @@
++#ifndef __GENWQE_DRIVER_H__
++#define __GENWQE_DRIVER_H__
++
++/**
++ * IBM Accelerator Family 'GenWQE'
++ *
++ * (C) Copyright IBM Corp. 2013
++ *
++ * Author: Frank Haverkamp <haver@linux.vnet.ibm.com>
++ * Author: Joerg-Stephan Vogt <jsvogt@de.ibm.com>
++ * Author: Michael Jung <mijung@de.ibm.com>
++ * Author: Michael Ruettger <michael@ibmra.de>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License (version 2 only)
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/types.h>
++#include <linux/stddef.h>
++#include <linux/cdev.h>
++#include <linux/list.h>
++#include <linux/kthread.h>
++#include <linux/scatterlist.h>
++#include <linux/iommu.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <asm/byteorder.h>
++
++#include <linux/genwqe/genwqe_card.h>
++
++#define DRV_VERS_STRING  "2.0.0"
++
++/*
++ * Static minor number assignement, until we decide/implement
++ * something dynamic.
++ */
++#define GENWQE_MAX_MINOR 128 /* up to 128 possible genwqe devices */
++
++/**
++ * genwqe_requ_alloc() - Allocate a new DDCB execution request
++ *
++ * This data structure contains the user visiable fields of the DDCB
++ * to be executed.
++ *
++ * Return: ptr to genwqe_ddcb_cmd data structure
++ */
++struct genwqe_ddcb_cmd *ddcb_requ_alloc(void);
++
++/**
++ * ddcb_requ_free() - Free DDCB execution request.
++ * @req:       ptr to genwqe_ddcb_cmd data structure.
++ */
++void ddcb_requ_free(struct genwqe_ddcb_cmd *req);
++
++u32  genwqe_crc32(u8 *buff, size_t len, u32 init);
++
++static inline void genwqe_hexdump(struct pci_dev *pci_dev,
++      const void *buff, unsigned int size)
++{
++ char prefix[32];
++
++ scnprintf(prefix, sizeof(prefix), "%s %s: ",
++    GENWQE_DEVNAME, pci_name(pci_dev));
++ dynamic_hex_dump(prefix, DUMP_PREFIX_OFFSET, 16, 1, buff, size, true);
++}
++
++#endif /* __GENWQE_DRIVER_H__ */
+diff --git a/include/uapi/linux/genwqe/genwqe_card.h b/include/uapi/linux/genwqe/genwqe_card.h
+new file mode 100644
+index 0000000..795e957
+--- /dev/null
++++ b/include/uapi/linux/genwqe/genwqe_card.h
+@@ -0,0 +1,500 @@
++#ifndef __GENWQE_CARD_H__
++#define __GENWQE_CARD_H__
++
++/**
++ * IBM Accelerator Family 'GenWQE'
++ *
++ * (C) Copyright IBM Corp. 2013
++ *
++ * Author: Frank Haverkamp <haver@linux.vnet.ibm.com>
++ * Author: Joerg-Stephan Vogt <jsvogt@de.ibm.com>
++ * Author: Michael Jung <mijung@de.ibm.com>
++ * Author: Michael Ruettger <michael@ibmra.de>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License (version 2 only)
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ */
++
++/*
++ * User-space API for the GenWQE card. For debugging and test purposes
++ * the register addresses are included here too.
++ */
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++/* Basename of sysfs, debugfs and /dev interfaces */
++#define GENWQE_DEVNAME   "genwqe"
++
++#define GENWQE_TYPE_ALTERA_230  0x00 /* GenWQE4 Stratix-IV-230 */
++#define GENWQE_TYPE_ALTERA_530  0x01 /* GenWQE4 Stratix-IV-530 */
++#define GENWQE_TYPE_ALTERA_A4  0x02 /* GenWQE5 A4 Stratix-V-A4 */
++#define GENWQE_TYPE_ALTERA_A7  0x03 /* GenWQE5 A7 Stratix-V-A7 */
++
++/* MMIO Unit offsets: Each UnitID occupies a defined address range */
++#define GENWQE_UID_OFFS(uid)  ((uid) << 24)
++#define GENWQE_SLU_OFFS   GENWQE_UID_OFFS(0)
++#define GENWQE_HSU_OFFS   GENWQE_UID_OFFS(1)
++#define GENWQE_APP_OFFS   GENWQE_UID_OFFS(2)
++#define GENWQE_MAX_UNITS  3
++
++/* Common offsets per UnitID */
++#define IO_EXTENDED_ERROR_POINTER 0x00000048
++#define IO_ERROR_INJECT_SELECTOR 0x00000060
++#define IO_EXTENDED_DIAG_SELECTOR 0x00000070
++#define IO_EXTENDED_DIAG_READ_MBX 0x00000078
++#define IO_EXTENDED_DIAG_MAP(ring) (0x00000500 | ((ring) << 3))
++
++#define GENWQE_EXTENDED_DIAG_SELECTOR(ring, trace) (((ring) << 8) | (trace))
++
++/* UnitID 0: Service Layer Unit (SLU) */
++
++/* SLU: Unit Configuration Register */
++#define IO_SLU_UNITCFG   0x00000000
++#define IO_SLU_UNITCFG_TYPE_MASK 0x000000000ff00000 /* 27:20 */
++
++/* SLU: Fault Isolation Register (FIR) (ac_slu_fir) */
++#define IO_SLU_FIR   0x00000008 /* read only, wr direct */
++#define IO_SLU_FIR_CLR   0x00000010 /* read and clear */
++
++/* SLU: First Error Capture Register (FEC/WOF) */
++#define IO_SLU_FEC   0x00000018
++
++#define IO_SLU_ERR_ACT_MASK  0x00000020
++#define IO_SLU_ERR_ATTN_MASK  0x00000028
++#define IO_SLU_FIRX1_ACT_MASK  0x00000030
++#define IO_SLU_FIRX0_ACT_MASK  0x00000038
++#define IO_SLU_SEC_LEM_DEBUG_OVR 0x00000040
++#define IO_SLU_EXTENDED_ERR_PTR  0x00000048
++#define IO_SLU_COMMON_CONFIG  0x00000060
++
++#define IO_SLU_FLASH_FIR  0x00000108
++#define IO_SLU_SLC_FIR   0x00000110
++#define IO_SLU_RIU_TRAP   0x00000280
++#define IO_SLU_FLASH_FEC  0x00000308
++#define IO_SLU_SLC_FEC   0x00000310
++
++/*
++ * The  Virtual Function's Access is from offset 0x00010000
++ * The Physical Function's Access is from offset 0x00050000
++ * Single Shared Registers exists only at offset 0x00060000
++ *
++ * SLC: Queue Virtual Window Window for accessing into a specific VF
++ * queue. When accessing the 0x10000 space using the 0x50000 address
++ * segment, the value indicated here is used to specify which VF
++ * register is decoded. This register, and the 0x50000 register space
++ * can only be accessed by the PF. Example, if this register is set to
++ * 0x2, then a read from 0x50000 is the same as a read from 0x10000
++ * from VF=2.
++ */
++
++/* SLC: Queue Segment */
++#define IO_SLC_QUEUE_SEGMENT  0x00010000
++#define IO_SLC_VF_QUEUE_SEGMENT  0x00050000
++
++/* SLC: Queue Offset */
++#define IO_SLC_QUEUE_OFFSET  0x00010008
++#define IO_SLC_VF_QUEUE_OFFSET  0x00050008
++
++/* SLC: Queue Configuration */
++#define IO_SLC_QUEUE_CONFIG  0x00010010
++#define IO_SLC_VF_QUEUE_CONFIG  0x00050010
++
++/* SLC: Job Timout/Only accessible for the PF */
++#define IO_SLC_APPJOB_TIMEOUT  0x00010018
++#define IO_SLC_VF_APPJOB_TIMEOUT 0x00050018
++#define TIMEOUT_250MS   0x0000000f
++#define HEARTBEAT_DISABLE  0x0000ff00
++
++/* SLC: Queue InitSequence Register */
++#define IO_SLC_QUEUE_INITSQN  0x00010020
++#define IO_SLC_VF_QUEUE_INITSQN  0x00050020
++
++/* SLC: Queue Wrap */
++#define IO_SLC_QUEUE_WRAP  0x00010028
++#define IO_SLC_VF_QUEUE_WRAP  0x00050028
++
++/* SLC: Queue Status */
++#define IO_SLC_QUEUE_STATUS  0x00010100
++#define IO_SLC_VF_QUEUE_STATUS  0x00050100
++
++/* SLC: Queue Working Time */
++#define IO_SLC_QUEUE_WTIME  0x00010030
++#define IO_SLC_VF_QUEUE_WTIME  0x00050030
++
++/* SLC: Queue Error Counts */
++#define IO_SLC_QUEUE_ERRCNTS  0x00010038
++#define IO_SLC_VF_QUEUE_ERRCNTS  0x00050038
++
++/* SLC: Queue Loast Response Word */
++#define IO_SLC_QUEUE_LRW  0x00010040
++#define IO_SLC_VF_QUEUE_LRW  0x00050040
++
++/* SLC: Freerunning Timer */
++#define IO_SLC_FREE_RUNNING_TIMER 0x00010108
++#define IO_SLC_VF_FREE_RUNNING_TIMER 0x00050108
++
++/* SLC: Queue Virtual Access Region */
++#define IO_PF_SLC_VIRTUAL_REGION 0x00050000
++
++/* SLC: Queue Virtual Window */
++#define IO_PF_SLC_VIRTUAL_WINDOW 0x00060000
++
++/* SLC: DDCB Application Job Pending [n] (n=0:63) */
++#define IO_PF_SLC_JOBPEND(n)  (0x00061000 + 8*(n))
++#define IO_SLC_JOBPEND(n)  IO_PF_SLC_JOBPEND(n)
++
++/* SLC: Parser Trap RAM [n] (n=0:31) */
++#define IO_SLU_SLC_PARSE_TRAP(n) (0x00011000 + 8*(n))
++
++/* SLC: Dispatcher Trap RAM [n] (n=0:31) */
++#define IO_SLU_SLC_DISP_TRAP(n) (0x00011200 + 8*(n))
++
++/* Global Fault Isolation Register (GFIR) */
++#define IO_SLC_CFGREG_GFIR  0x00020000
++#define GFIR_ERR_TRIGGER  0x0000ffff
++
++/* SLU: Soft Reset Register */
++#define IO_SLC_CFGREG_SOFTRESET  0x00020018
++
++/* SLU: Misc Debug Register */
++#define IO_SLC_MISC_DEBUG  0x00020060
++#define IO_SLC_MISC_DEBUG_CLR  0x00020068
++#define IO_SLC_MISC_DEBUG_SET  0x00020070
++
++/* Temperature Sensor Reading */
++#define IO_SLU_TEMPERATURE_SENSOR 0x00030000
++#define IO_SLU_TEMPERATURE_CONFIG 0x00030008
++
++/* Voltage Margining Control */
++#define IO_SLU_VOLTAGE_CONTROL  0x00030080
++#define IO_SLU_VOLTAGE_NOMINAL  0x00000000
++#define IO_SLU_VOLTAGE_DOWN5  0x00000006
++#define IO_SLU_VOLTAGE_UP5  0x00000007
++
++/* Direct LED Control Register */
++#define IO_SLU_LEDCONTROL  0x00030100
++
++/* SLU: Flashbus Direct Access -A5 */
++#define IO_SLU_FLASH_DIRECTACCESS 0x00040010
++
++/* SLU: Flashbus Direct Access2 -A5 */
++#define IO_SLU_FLASH_DIRECTACCESS2 0x00040020
++
++/* SLU: Flashbus Command Interface -A5 */
++#define IO_SLU_FLASH_CMDINTF  0x00040030
++
++/* SLU: BitStream Loaded */
++#define IO_SLU_BITSTREAM  0x00040040
++
++/* This Register has a switch which will change the CAs to UR */
++#define IO_HSU_ERR_BEHAVIOR  0x01001010
++
++#define IO_SLC2_SQB_TRAP  0x00062000
++#define IO_SLC2_QUEUE_MANAGER_TRAP 0x00062008
++#define IO_SLC2_FLS_MASTER_TRAP  0x00062010
++
++/* UnitID 1: HSU Registers */
++#define IO_HSU_UNITCFG   0x01000000
++#define IO_HSU_FIR   0x01000008
++#define IO_HSU_FIR_CLR   0x01000010
++#define IO_HSU_FEC   0x01000018
++#define IO_HSU_ERR_ACT_MASK  0x01000020
++#define IO_HSU_ERR_ATTN_MASK  0x01000028
++#define IO_HSU_FIRX1_ACT_MASK  0x01000030
++#define IO_HSU_FIRX0_ACT_MASK  0x01000038
++#define IO_HSU_SEC_LEM_DEBUG_OVR 0x01000040
++#define IO_HSU_EXTENDED_ERR_PTR  0x01000048
++#define IO_HSU_COMMON_CONFIG  0x01000060
++
++/* UnitID 2: Application Unit (APP) */
++#define IO_APP_UNITCFG   0x02000000
++#define IO_APP_FIR   0x02000008
++#define IO_APP_FIR_CLR   0x02000010
++#define IO_APP_FEC   0x02000018
++#define IO_APP_ERR_ACT_MASK  0x02000020
++#define IO_APP_ERR_ATTN_MASK  0x02000028
++#define IO_APP_FIRX1_ACT_MASK  0x02000030
++#define IO_APP_FIRX0_ACT_MASK  0x02000038
++#define IO_APP_SEC_LEM_DEBUG_OVR 0x02000040
++#define IO_APP_EXTENDED_ERR_PTR  0x02000048
++#define IO_APP_COMMON_CONFIG  0x02000060
++
++#define IO_APP_DEBUG_REG_01  0x02010000
++#define IO_APP_DEBUG_REG_02  0x02010008
++#define IO_APP_DEBUG_REG_03  0x02010010
++#define IO_APP_DEBUG_REG_04  0x02010018
++#define IO_APP_DEBUG_REG_05  0x02010020
++#define IO_APP_DEBUG_REG_06  0x02010028
++#define IO_APP_DEBUG_REG_07  0x02010030
++#define IO_APP_DEBUG_REG_08  0x02010038
++#define IO_APP_DEBUG_REG_09  0x02010040
++#define IO_APP_DEBUG_REG_10  0x02010048
++#define IO_APP_DEBUG_REG_11  0x02010050
++#define IO_APP_DEBUG_REG_12  0x02010058
++#define IO_APP_DEBUG_REG_13  0x02010060
++#define IO_APP_DEBUG_REG_14  0x02010068
++#define IO_APP_DEBUG_REG_15  0x02010070
++#define IO_APP_DEBUG_REG_16  0x02010078
++#define IO_APP_DEBUG_REG_17  0x02010080
++#define IO_APP_DEBUG_REG_18  0x02010088
++
++/* Read/write from/to registers */
++struct genwqe_reg_io {
++ __u64 num;  /* register offset/address */
++ __u64 val64;
++};
++
++/*
++ * All registers of our card will return values not equal this values.
++ * If we see IO_ILLEGAL_VALUE on any of our MMIO register reads, the
++ * card can be considered as unusable. It will need recovery.
++ */
++#define IO_ILLEGAL_VALUE  0xffffffffffffffffull
++
++/*
++ * Generic DDCB execution interface.
++ *
++ * This interface is a first prototype resulting from discussions we
++ * had with other teams which wanted to use the Genwqe card. It allows
++ * to issue a DDCB request in a generic way. The request will block
++ * until it finishes or time out with error.
++ *
++ * Some DDCBs require DMA addresses to be specified in the ASIV
++ * block. The interface provies the capability to let the kernel
++ * driver know where those addresses are by specifying the ATS field,
++ * such that it can replace the user-space addresses with appropriate
++ * DMA addresses or DMA addresses of a scatter gather list which is
++ * dynamically created.
++ *
++ * Our hardware will refuse DDCB execution if the ATS field is not as
++ * expected. That means the DDCB execution engine in the chip knows
++ * where it expects DMA addresses within the ASIV part of the DDCB and
++ * will check that against the ATS field definition. Any invalid or
++ * unknown ATS content will lead to DDCB refusal.
++ */
++
++/* Genwqe chip Units */
++#define DDCB_ACFUNC_SLU   0x00  /* chip service layer unit */
++#define DDCB_ACFUNC_APP   0x01  /* chip application */
++
++/* DDCB return codes (RETC) */
++#define DDCB_RETC_IDLE   0x0000 /* Unexecuted/DDCB created */
++#define DDCB_RETC_PENDING  0x0101 /* Pending Execution */
++#define DDCB_RETC_COMPLETE  0x0102 /* Cmd complete. No error */
++#define DDCB_RETC_FAULT   0x0104 /* App Err, recoverable */
++#define DDCB_RETC_ERROR   0x0108 /* App Err, non-recoverable */
++#define DDCB_RETC_FORCED_ERROR  0x01ff /* overwritten by driver  */
++
++#define DDCB_RETC_UNEXEC  0x0110 /* Unexe/Removed from queue */
++#define DDCB_RETC_TERM   0x0120 /* Terminated */
++#define DDCB_RETC_RES0   0x0140 /* Reserved */
++#define DDCB_RETC_RES1   0x0180 /* Reserved */
++
++/* DDCB Command Options (CMDOPT) */
++#define DDCB_OPT_ECHO_FORCE_NO  0x0000 /* ECHO DDCB */
++#define DDCB_OPT_ECHO_FORCE_102  0x0001 /* force return code */
++#define DDCB_OPT_ECHO_FORCE_104  0x0002
++#define DDCB_OPT_ECHO_FORCE_108  0x0003
++
++#define DDCB_OPT_ECHO_FORCE_110  0x0004 /* only on PF ! */
++#define DDCB_OPT_ECHO_FORCE_120  0x0005
++#define DDCB_OPT_ECHO_FORCE_140  0x0006
++#define DDCB_OPT_ECHO_FORCE_180  0x0007
++
++#define DDCB_OPT_ECHO_COPY_NONE  (0 << 5)
++#define DDCB_OPT_ECHO_COPY_ALL  (1 << 5)
++
++/* Definitions of Service Layer Commands */
++#define SLCMD_ECHO_SYNC   0x00 /* PF/VF */
++#define SLCMD_MOVE_FLASH  0x06 /* PF only */
++#define SLCMD_MOVE_FLASH_FLAGS_MODE 0x03 /* bit 0 and 1 used for mode */
++#define SLCMD_MOVE_FLASH_FLAGS_DLOAD 0 /* mode: download  */
++#define SLCMD_MOVE_FLASH_FLAGS_EMUL 1 /* mode: emulation */
++#define SLCMD_MOVE_FLASH_FLAGS_UPLOAD 2 /* mode: upload    */
++#define SLCMD_MOVE_FLASH_FLAGS_VERIFY 3 /* mode: verify    */
++#define SLCMD_MOVE_FLASH_FLAG_NOTAP (1 << 2)/* just dump DDCB and exit */
++#define SLCMD_MOVE_FLASH_FLAG_POLL (1 << 3)/* wait for RETC >= 0102   */
++#define SLCMD_MOVE_FLASH_FLAG_PARTITION (1 << 4)
++#define SLCMD_MOVE_FLASH_FLAG_ERASE (1 << 5)
++
++enum genwqe_card_state {
++ GENWQE_CARD_UNUSED = 0,
++ GENWQE_CARD_USED = 1,
++ GENWQE_CARD_FATAL_ERROR = 2,
++ GENWQE_CARD_STATE_MAX,
++};
++
++/* common struct for chip image exchange */
++struct genwqe_bitstream {
++ __u64 data_addr;  /* pointer to image data */
++ __u32 size;   /* size of image file */
++ __u32 crc;   /* crc of this image */
++ __u64 target_addr;  /* starting address in Flash */
++ __u32 partition;  /* '0', '1', or 'v' */
++ __u32 uid;   /* 1=host/x=dram */
++
++ __u64 slu_id;   /* informational/sim: SluID */
++ __u64 app_id;   /* informational/sim: AppID */
++
++ __u16 retc;   /* returned from processing */
++ __u16 attn;   /* attention code from processing */
++ __u32 progress;   /* progress code from processing */
++};
++
++/* Issuing a specific DDCB command */
++#define DDCB_LENGTH   256 /* for debug data */
++#define DDCB_ASIV_LENGTH  104 /* len of the DDCB ASIV array */
++#define DDCB_ASIV_LENGTH_ATS  96  /* ASIV in ATS architecture */
++#define DDCB_ASV_LENGTH   64  /* len of the DDCB ASV array  */
++#define DDCB_FIXUPS   12  /* maximum number of fixups */
++
++struct genwqe_debug_data {
++ char driver_version[64];
++ __u64 slu_unitcfg;
++ __u64 app_unitcfg;
++
++ __u8  ddcb_before[DDCB_LENGTH];
++ __u8  ddcb_prev[DDCB_LENGTH];
++ __u8  ddcb_finished[DDCB_LENGTH];
++};
++
++/*
++ * Address Translation Specification (ATS) definitions
++ *
++ * Each 4 bit within the ATS 64-bit word specify the required address
++ * translation at the defined offset.
++ *
++ * 63 LSB
++ *         6666.5555.5555.5544.4444.4443.3333.3333 ... 11
++ *         3210.9876.5432.1098.7654.3210.9876.5432 ... 1098.7654.3210
++ *
++ * offset: 0x00 0x08 0x10 0x18 0x20 0x28 0x30 0x38 ... 0x68 0x70 0x78
++ *         res  res  res  res  ASIV ...
++ * The first 4 entries in the ATS word are reserved. The following nibbles
++ * each describe at an 8 byte offset the format of the required data.
++ */
++#define ATS_TYPE_DATA   0x0ull /* data  */
++#define ATS_TYPE_FLAT_RD  0x4ull /* flat buffer read only */
++#define ATS_TYPE_FLAT_RDWR  0x5ull /* flat buffer read/write */
++#define ATS_TYPE_SGL_RD   0x6ull /* sgl read only */
++#define ATS_TYPE_SGL_RDWR  0x7ull /* sgl read/write */
++
++#define ATS_SET_FLAGS(_struct, _field, _flags)    \
++ (((_flags) & 0xf) << (44 - (4 * (offsetof(_struct, _field) / 8))))
++
++#define ATS_GET_FLAGS(_ats, _byte_offs)     \
++ (((_ats)   >> (44 - (4 * ((_byte_offs) / 8)))) & 0xf)
++
++/**
++ * struct genwqe_ddcb_cmd - User parameter for generic DDCB commands
++ *
++ * On the way into the kernel the driver will read the whole data
++ * structure. On the way out the driver will not copy the ASIV data
++ * back to user-space.
++ */
++struct genwqe_ddcb_cmd {
++ /* START of data copied to/from driver */
++ __u64 next_addr;  /* chaining genwqe_ddcb_cmd */
++ __u64 flags;   /* reserved */
++
++ __u8  acfunc;   /* accelerators functional unit */
++ __u8  cmd;   /* command to execute */
++ __u8  asiv_length;  /* used parameter length */
++ __u8  asv_length;  /* length of valid return values  */
++ __u16 cmdopts;   /* command options */
++ __u16 retc;   /* return code from processing    */
++
++ __u16 attn;   /* attention code from processing */
++ __u16 vcrc;   /* variant crc16 */
++ __u32 progress;   /* progress code from processing  */
++
++ __u64 deque_ts;   /* dequeue time stamp */
++ __u64 cmplt_ts;   /* completion time stamp */
++ __u64 disp_ts;   /* SW processing start */
++
++ /* move to end and avoid copy-back */
++ __u64 ddata_addr;  /* collect debug data */
++
++ /* command specific values */
++ __u8  asv[DDCB_ASV_LENGTH];
++
++ /* END of data copied from driver */
++ union {
++  struct {
++   __u64 ats;
++   __u8  asiv[DDCB_ASIV_LENGTH_ATS];
++  };
++  /* used for flash update to keep it backward compatible */
++  __u8 __asiv[DDCB_ASIV_LENGTH];
++ };
++ /* END of data copied to driver */
++};
++
++#define GENWQE_IOC_CODE     0xa5
++
++/* Access functions */
++#define GENWQE_READ_REG64   _IOR(GENWQE_IOC_CODE, 30, struct genwqe_reg_io)
++#define GENWQE_WRITE_REG64  _IOW(GENWQE_IOC_CODE, 31, struct genwqe_reg_io)
++#define GENWQE_READ_REG32   _IOR(GENWQE_IOC_CODE, 32, struct genwqe_reg_io)
++#define GENWQE_WRITE_REG32  _IOW(GENWQE_IOC_CODE, 33, struct genwqe_reg_io)
++#define GENWQE_READ_REG16   _IOR(GENWQE_IOC_CODE, 34, struct genwqe_reg_io)
++#define GENWQE_WRITE_REG16  _IOW(GENWQE_IOC_CODE, 35, struct genwqe_reg_io)
++
++#define GENWQE_GET_CARD_STATE _IOR(GENWQE_IOC_CODE, 36, enum genwqe_card_state)
++
++/**
++ * struct genwqe_mem - Memory pinning/unpinning information
++ * @addr:          virtual user space address
++ * @size:          size of the area pin/dma-map/unmap
++ * direction:      0: read/1: read and write
++ *
++ * Avoid pinning and unpinning of memory pages dynamically. Instead
++ * the idea is to pin the whole buffer space required for DDCB
++ * opertionas in advance. The driver will reuse this pinning and the
++ * memory associated with it to setup the sglists for the DDCB
++ * requests without the need to allocate and free memory or map and
++ * unmap to get the DMA addresses.
++ *
++ * The inverse operation needs to be called after the pinning is not
++ * needed anymore. The pinnings else the pinnings will get removed
++ * after the device is closed. Note that pinnings will required
++ * memory.
++ */
++struct genwqe_mem {
++ __u64 addr;
++ __u64 size;
++ __u64 direction;
++ __u64 flags;
++};
++
++#define GENWQE_PIN_MEM       _IOWR(GENWQE_IOC_CODE, 40, struct genwqe_mem)
++#define GENWQE_UNPIN_MEM      _IOWR(GENWQE_IOC_CODE, 41, struct genwqe_mem)
++
++/*
++ * Generic synchronous DDCB execution interface.
++ * Synchronously execute a DDCB.
++ *
++ * Return: 0 on success or negative error code.
++ *         -EINVAL: Invalid parameters (ASIV_LEN, ASV_LEN, illegal fixups
++ *                  no mappings found/could not create mappings
++ *         -EFAULT: illegal addresses in fixups, purging failed
++ *         -EBADMSG: enqueing failed, retc != DDCB_RETC_COMPLETE
++ */
++#define GENWQE_EXECUTE_DDCB     \
++ _IOWR(GENWQE_IOC_CODE, 50, struct genwqe_ddcb_cmd)
++
++#define GENWQE_EXECUTE_RAW_DDCB     \
++ _IOWR(GENWQE_IOC_CODE, 51, struct genwqe_ddcb_cmd)
++
++/* Service Layer functions (PF only) */
++#define GENWQE_SLU_UPDATE  _IOWR(GENWQE_IOC_CODE, 80, struct genwqe_bitstream)
++#define GENWQE_SLU_READ    _IOWR(GENWQE_IOC_CODE, 81, struct genwqe_bitstream)
++
++#endif /* __GENWQE_CARD_H__ */
+-- 
+1.7.1

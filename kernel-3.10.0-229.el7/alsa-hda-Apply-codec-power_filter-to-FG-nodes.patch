@@ -1,0 +1,159 @@
+From 15f966506246e1cf664597fc868e670d062bf154 Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:13:49 -0400
+Subject: [alsa] hda: Apply codec power_filter to FG nodes
+
+Message-id: <140972823573-34-patchset-jkysela@redhat.com>
+Patchwork-id: 90734
+O-Subject: [RHEL 7.1 PATCH 033/442] ALSA: hda - Apply codec power_filter to FG nodes
+Bugzilla: 1112200
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+Apply the codec->power_filter to the FG nodes in general for reducing
+hackish set_power_state ops override in patch_sigmatel.c.
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+(picked from kernel: dfc6e469b6d1ee5e8c71fa398b7b58fbb600dad8)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/sound/pci/hda/hda_codec.c b/sound/pci/hda/hda_codec.c
+index ab2a991..ec4536c 100644
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@ -3927,6 +3927,8 @@ unsigned int snd_hda_codec_eapd_power_filter(struct hda_codec *codec,
+           hda_nid_t nid,
+           unsigned int power_state)
+ {
++ if (nid == codec->afg || nid == codec->mfg)
++  return power_state;
+  if (power_state == AC_PWRST_D3 &&
+      get_wcaps_type(get_wcaps(codec, nid)) == AC_WID_PIN &&
+      (snd_hda_query_pin_caps(codec, nid) & AC_PINCAP_EAPD)) {
+@@ -3965,9 +3967,13 @@ static unsigned int hda_set_power_state(struct hda_codec *codec,
+    codec->patch_ops.set_power_state(codec, fg,
+         power_state);
+   else {
+-   snd_hda_codec_read(codec, fg, flags,
+-        AC_VERB_SET_POWER_STATE,
+-        power_state);
++   state = power_state;
++   if (codec->power_filter)
++    state = codec->power_filter(codec, fg, state);
++   if (state == power_state || power_state != AC_PWRST_D3)
++    snd_hda_codec_read(codec, fg, flags,
++         AC_VERB_SET_POWER_STATE,
++         state);
+    snd_hda_codec_set_power_to_all(codec, fg, power_state);
+   }
+   state = hda_sync_power_state(codec, fg, power_state);
+diff --git a/sound/pci/hda/hda_generic.c b/sound/pci/hda/hda_generic.c
+index 7513089..8321a97 100644
+--- a/sound/pci/hda/hda_generic.c
++++ b/sound/pci/hda/hda_generic.c
+@@ -4312,11 +4312,11 @@ static int check_auto_mic_availability(struct hda_codec *codec)
+ }
+ 
+ /* power_filter hook; make inactive widgets into power down */
+-static unsigned int snd_hda_gen_path_power_filter(struct hda_codec *codec,
++unsigned int snd_hda_gen_path_power_filter(struct hda_codec *codec,
+         hda_nid_t nid,
+         unsigned int power_state)
+ {
+- if (power_state != AC_PWRST_D0)
++ if (power_state != AC_PWRST_D0 || nid == codec->afg)
+   return power_state;
+  if (get_wcaps_type(get_wcaps(codec, nid)) >= AC_WID_POWER)
+   return power_state;
+@@ -4324,6 +4324,7 @@ static unsigned int snd_hda_gen_path_power_filter(struct hda_codec *codec,
+   return power_state;
+  return AC_PWRST_D3;
+ }
++EXPORT_SYMBOL_GPL(snd_hda_gen_path_power_filter);
+ 
+ /* mute all aamix inputs initially; parse up to the first leaves */
+ static void mute_all_mixer_nid(struct hda_codec *codec, hda_nid_t mix)
+diff --git a/sound/pci/hda/hda_generic.h b/sound/pci/hda/hda_generic.h
+index 0929a06..07f7672 100644
+--- a/sound/pci/hda/hda_generic.h
++++ b/sound/pci/hda/hda_generic.h
+@@ -335,5 +335,8 @@ void snd_hda_gen_update_outputs(struct hda_codec *codec);
+ #ifdef CONFIG_PM
+ int snd_hda_gen_check_power_status(struct hda_codec *codec, hda_nid_t nid);
+ #endif
++unsigned int snd_hda_gen_path_power_filter(struct hda_codec *codec,
++        hda_nid_t nid,
++        unsigned int power_state);
+ 
+ #endif /* __SOUND_HDA_GENERIC_H */
+diff --git a/sound/pci/hda/patch_sigmatel.c b/sound/pci/hda/patch_sigmatel.c
+index 088a5af..6998cf2 100644
+--- a/sound/pci/hda/patch_sigmatel.c
++++ b/sound/pci/hda/patch_sigmatel.c
+@@ -368,6 +368,17 @@ static int stac_vrefout_set(struct hda_codec *codec,
+  return 1;
+ }
+ 
++/* prevent codec AFG to D3 state when vref-out pin is used for mute LED */
++/* this hook is set in stac_setup_gpio() */
++static unsigned int stac_vref_led_power_filter(struct hda_codec *codec,
++            hda_nid_t nid,
++            unsigned int power_state)
++{
++ if (nid == codec->afg && power_state == AC_PWRST_D3)
++  return AC_PWRST_D1;
++ return snd_hda_gen_path_power_filter(codec, nid, power_state);
++}
++
+ /* update mute-LED accoring to the master switch */
+ static void stac_update_led_status(struct hda_codec *codec, int enabled)
+ {
+@@ -4260,30 +4271,8 @@ static int stac_suspend(struct hda_codec *codec)
+  stac_shutup(codec);
+  return 0;
+ }
+-
+-static void stac_set_power_state(struct hda_codec *codec, hda_nid_t fg,
+-     unsigned int power_state)
+-{
+- unsigned int afg_power_state = power_state;
+- struct sigmatel_spec *spec = codec->spec;
+-
+- if (power_state == AC_PWRST_D3) {
+-  if (spec->vref_mute_led_nid) {
+-   /* with vref-out pin used for mute led control
+-    * codec AFG is prevented from D3 state
+-    */
+-   afg_power_state = AC_PWRST_D1;
+-  }
+-  /* this delay seems necessary to avoid click noise at power-down */
+-  msleep(100);
+- }
+- snd_hda_codec_read(codec, fg, 0, AC_VERB_SET_POWER_STATE,
+-   afg_power_state);
+- snd_hda_codec_set_power_to_all(codec, fg, power_state);
+-}
+ #else
+ #define stac_suspend  NULL
+-#define stac_set_power_state NULL
+ #endif /* CONFIG_PM */
+ 
+ static const struct hda_codec_ops stac_patch_ops = {
+@@ -4466,8 +4455,7 @@ static void stac_setup_gpio(struct hda_codec *codec)
+    spec->gpio_dir |= spec->gpio_led;
+    spec->gpio_data |= spec->gpio_led;
+   } else {
+-   codec->patch_ops.set_power_state =
+-     stac_set_power_state;
++   codec->power_filter = stac_vref_led_power_filter;
+   }
+  }
+ 
+-- 
+1.7.1

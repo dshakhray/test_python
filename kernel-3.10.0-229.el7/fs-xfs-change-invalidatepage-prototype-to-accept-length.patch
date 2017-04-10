@@ -1,0 +1,105 @@
+From 1d981b4d45f64eb29856769d08f8e9a79b79db49 Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Thu, 23 Oct 2014 19:39:01 -0400
+Subject: [fs] xfs: change invalidatepage prototype to accept length
+
+Message-id: <1414093144-51675-2-git-send-email-bfoster@redhat.com>
+Patchwork-id: 98334
+O-Subject: [RHEL7.1 PATCH 1/4] [xfs] mm: change invalidatepage prototype to accept length
+Bugzilla: 1032968
+RH-Acked-by: Carlos Maiolino <cmaiolino@redhat.com>
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+- Partial backport, XFS bits only.
+- Use rhel7-specific ->invalidatepage_range() aop and set associated
+  superblock fs_flags bit (kABI).
+
+commit d47992f86b307985b3215bcf141d56d1849d71df
+Author: Lukas Czerner <lczerner@redhat.com>
+Date:   Tue May 21 23:17:23 2013 -0400
+
+    mm: change invalidatepage prototype to accept length
+
+    Currently there is no way to truncate partial page where the end
+    truncate point is not at the end of the page. This is because it was not
+    needed and the functionality was enough for file system truncate
+    operation to work properly. However more file systems now support punch
+    hole feature and it can benefit from mm supporting truncating page just
+    up to the certain point.
+
+    Specifically, with this functionality truncate_inode_pages_range() can
+    be changed so it supports truncating partial page at the end of the
+    range (currently it will BUG_ON() if 'end' is not at the end of the
+    page).
+
+    This commit changes the invalidatepage() address space operation
+    prototype to accept range to be invalidated and update all the instances
+    for it.
+
+    We also change the block_invalidatepage() in the same way and actually
+    make a use of the new length argument implementing range invalidation.
+
+    Actual file system implementations will follow except the file systems
+    where the changes are really simple and should not change the behaviour
+    in any way .Implementation for truncate_page_range() which will be able
+    to accept page unaligned ranges will follow as well.
+
+    Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Hugh Dickins <hughd@google.com>
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index a509bce..cc09ab8 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -872,10 +872,11 @@ xfs_cluster_write(
+ STATIC void
+ xfs_vm_invalidatepage(
+  struct page  *page,
+- unsigned long  offset)
++ unsigned int  offset,
++ unsigned int  length)
+ {
+  trace_xfs_invalidatepage(page->mapping->host, page, offset);
+- block_invalidatepage(page, offset);
++ block_invalidatepage_range(page, offset, PAGE_CACHE_SIZE - offset);
+ }
+ 
+ /*
+@@ -939,7 +940,7 @@ next_buffer:
+ 
+  xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ out_invalidate:
+- xfs_vm_invalidatepage(page, 0);
++ xfs_vm_invalidatepage(page, 0, PAGE_CACHE_SIZE);
+  return;
+ }
+ 
+@@ -1793,7 +1794,7 @@ const struct address_space_operations xfs_address_space_operations = {
+  .writepages  = xfs_vm_writepages,
+  .set_page_dirty  = xfs_vm_set_page_dirty,
+  .releasepage  = xfs_vm_releasepage,
+- .invalidatepage  = xfs_vm_invalidatepage,
++ .invalidatepage_range = xfs_vm_invalidatepage,
+  .write_begin  = xfs_vm_write_begin,
+  .write_end  = xfs_vm_write_end,
+  .bmap   = xfs_vm_bmap,
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index c1c7252..3323632 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -1563,7 +1563,8 @@ static struct file_system_type xfs_fs_type = {
+  .name   = "xfs",
+  .mount   = xfs_fs_mount,
+  .kill_sb  = kill_block_super,
+- .fs_flags  = FS_REQUIRES_DEV | FS_HAS_RM_XQUOTA,
++ .fs_flags  = FS_REQUIRES_DEV | FS_HAS_RM_XQUOTA |
++      FS_HAS_INVALIDATE_RANGE,
+ };
+ MODULE_ALIAS_FS("xfs");
+ 
+-- 
+1.7.1

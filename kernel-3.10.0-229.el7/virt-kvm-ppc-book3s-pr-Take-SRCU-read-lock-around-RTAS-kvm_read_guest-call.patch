@@ -1,0 +1,67 @@
+From 82bee06015525ae4689282e86657aed572d0c9bd Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:12:29 -0400
+Subject: [virt] kvm/ppc: book3s/pr - Take SRCU read lock around RTAS kvm_read_guest() call
+
+Message-id: <1410765214-16377-14-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94714
+O-Subject: [PATCH 13/78] KVM: PPC: Book3S PR: Take SRCU read lock around RTAS kvm_read_guest() call
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1123145
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit ef1af2e29622ff3403926ae801a2b10da075a2de
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Sat Jul 19 17:59:35 2014 +1000
+
+    KVM: PPC: Book3S PR: Take SRCU read lock around RTAS kvm_read_guest() call
+
+    This does for PR KVM what c9438092cae4 ("KVM: PPC: Book3S HV: Take SRCU
+    read lock around kvm_read_guest() call") did for HV KVM, that is,
+    eliminate a "suspicious rcu_dereference_check() usage!" warning by
+    taking the SRCU lock around the call to kvmppc_rtas_hcall().
+
+    It also fixes a return of RESUME_HOST to return EMULATE_FAIL instead,
+    since kvmppc_h_pr() is supposed to return EMULATE_* values.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_pr_papr.c b/arch/powerpc/kvm/book3s_pr_papr.c
+index eccf9cc..2cff838 100644
+--- a/arch/powerpc/kvm/book3s_pr_papr.c
++++ b/arch/powerpc/kvm/book3s_pr_papr.c
+@@ -258,6 +258,8 @@ static int kvmppc_h_pr_xics_hcall(struct kvm_vcpu *vcpu, u32 cmd)
+ 
+ int kvmppc_h_pr(struct kvm_vcpu *vcpu, unsigned long cmd)
+ {
++ int rc, idx;
++
+  if (cmd <= MAX_HCALL_OPCODE &&
+      !test_bit(cmd/4, vcpu->kvm->arch.enabled_hcalls))
+   return EMULATE_FAIL;
+@@ -290,8 +292,11 @@ int kvmppc_h_pr(struct kvm_vcpu *vcpu, unsigned long cmd)
+   break;
+  case H_RTAS:
+   if (list_empty(&vcpu->kvm->arch.rtas_tokens))
+-   return RESUME_HOST;
+-  if (kvmppc_rtas_hcall(vcpu))
++   break;
++  idx = srcu_read_lock(&vcpu->kvm->srcu);
++  rc = kvmppc_rtas_hcall(vcpu);
++  srcu_read_unlock(&vcpu->kvm->srcu, idx);
++  if (rc)
+    break;
+   kvmppc_set_gpr(vcpu, 3, 0);
+   return EMULATE_DONE;
+-- 
+1.7.1

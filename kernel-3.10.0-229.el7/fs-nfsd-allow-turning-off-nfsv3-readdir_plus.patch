@@ -1,0 +1,100 @@
+From e012f058a0fece963b0036370d02baf9bbc18e5c Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Wed, 7 Jan 2015 15:45:58 -0500
+Subject: [fs] nfsd: allow turning off nfsv3 readdir_plus
+
+Message-id: <1420645558-22455-1-git-send-email-steved@redhat.com>
+Patchwork-id: 102516
+O-Subject: [RHEL7.1 PATCH 1/1] nfsd: allow turning off nfsv3 readdir_plus
+Bugzilla: 1178949
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Rajesh Ghanekar <Rajesh_Ghanekar@symantec.com>
+
+One of our customer's application only needs file names, not file
+attributes. With directories having 10K+ inodes (assuming buffer cache
+has directory blocks cached having file names, but inode cache is
+limited and hence need eviction of older cached inodes), older inodes
+are evicted periodically. So if they keep on doing readdir(2) from NSF
+client on multiple directories, some directory's files are periodically
+removed from inode cache and hence new readdir(2) on same directory
+requires disk access to bring back inodes again to inode cache.
+
+As READDIRPLUS request fetches attributes also, doing getattr on each
+file on server, it causes unnecessary disk accesses. If READDIRPLUS on
+NFS client is returned with -ENOTSUPP, NFS client uses READDIR request
+which just gets the names of the files in a directory, not attributes,
+hence avoiding disk accesses on server.
+
+There's already a corresponding client-side mount option, but an export
+option reduces the need for configuration across multiple clients.
+
+This flag affects NFSv3 only.  If it turns out it's needed for NFSv4 as
+well then we may have to figure out how to extend the behavior to NFSv4,
+but it's not currently obvious how to do that.
+
+Signed-off-by: Rajesh Ghanekar <rajesh_ghanekar@symantec.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream Id: 18c01ab30288d9d0a7d80b08b659531f37ed379d
+Bugzilla: 1178949
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/export.c b/fs/nfsd/export.c
+index 72ffd7c..30a739d 100644
+--- a/fs/nfsd/export.c
++++ b/fs/nfsd/export.c
+@@ -1145,6 +1145,7 @@ static struct flags {
+  { NFSEXP_ALLSQUASH, {"all_squash", ""}},
+  { NFSEXP_ASYNC, {"async", "sync"}},
+  { NFSEXP_GATHERED_WRITES, {"wdelay", "no_wdelay"}},
++ { NFSEXP_NOREADDIRPLUS, {"nordirplus", ""}},
+  { NFSEXP_NOHIDE, {"nohide", ""}},
+  { NFSEXP_CROSSMOUNT, {"crossmnt", ""}},
+  { NFSEXP_NOSUBTREECHECK, {"no_subtree_check", ""}},
+diff --git a/fs/nfsd/nfs3proc.c b/fs/nfsd/nfs3proc.c
+index fa2525b..247b06f 100644
+--- a/fs/nfsd/nfs3proc.c
++++ b/fs/nfsd/nfs3proc.c
+@@ -471,6 +471,14 @@ nfsd3_proc_readdirplus(struct svc_rqst *rqstp, struct nfsd3_readdirargs *argp,
+  resp->buflen = resp->count;
+  resp->rqstp = rqstp;
+  offset = argp->cookie;
++
++ nfserr = fh_verify(rqstp, &resp->fh, S_IFDIR, NFSD_MAY_NOP);
++ if (nfserr)
++  RETURN_STATUS(nfserr);
++
++ if (resp->fh.fh_export->ex_flags & NFSEXP_NOREADDIRPLUS)
++  RETURN_STATUS(nfserr_notsupp);
++
+  nfserr = nfsd_readdir(rqstp, &resp->fh,
+          &offset,
+          &resp->common,
+diff --git a/include/uapi/linux/nfsd/export.h b/include/uapi/linux/nfsd/export.h
+index cf47c31..584b6ef 100644
+--- a/include/uapi/linux/nfsd/export.h
++++ b/include/uapi/linux/nfsd/export.h
+@@ -28,7 +28,8 @@
+ #define NFSEXP_ALLSQUASH 0x0008
+ #define NFSEXP_ASYNC  0x0010
+ #define NFSEXP_GATHERED_WRITES 0x0020
+-/* 40 80 100 currently unused */
++#define NFSEXP_NOREADDIRPLUS    0x0040
++/* 80 100 currently unused */
+ #define NFSEXP_NOHIDE  0x0200
+ #define NFSEXP_NOSUBTREECHECK 0x0400
+ #define NFSEXP_NOAUTHNLM 0x0800  /* Don't authenticate NLM requests - just trust */
+@@ -47,7 +48,7 @@
+  */
+ #define NFSEXP_V4ROOT  0x10000
+ /* All flags that we claim to support.  (Note we don't support NOACL.) */
+-#define NFSEXP_ALLFLAGS  0x17E3F
++#define NFSEXP_ALLFLAGS  0x1FE7F
+ 
+ /* The flags that may vary depending on security flavor: */
+ #define NFSEXP_SECINFO_FLAGS (NFSEXP_READONLY | NFSEXP_ROOTSQUASH \
+-- 
+1.7.1

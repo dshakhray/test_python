@@ -1,0 +1,116 @@
+From abbecee61fe12b636ef7930edc21a4d38890b2b6 Mon Sep 17 00:00:00 2001
+From: John Greene <jogreene@redhat.com>
+Date: Thu, 14 Aug 2014 14:42:25 -0400
+Subject: [ethernet] e1000e: Add code to check return values on NVM accesses
+
+Message-id: <1408027348-9610-32-git-send-email-jogreene@redhat.com>
+Patchwork-id: 87717
+O-Subject: [RHEL7.1 PATCH 31/34] e1000e: Add code to check return values on NVM accesses
+Bugzilla: 1091119
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+BZ: 1091119
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7834849
+Tested: By me. Acceptable. See BZ for details
+
+Adding code to check and respond to previously ignored return values
+from NVM access functions.
+
+Issue discovered through static analysis.
+
+Signed-off-by: Dave Ertman <david.m.ertman@intel.com>
+Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 491a04d2812b0a665bda34ea39875833dc7a1aaf)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/e1000e/manage.c b/drivers/net/ethernet/intel/e1000e/manage.c
+index cb37ff1..5885603 100644
+--- a/drivers/net/ethernet/intel/e1000e/manage.c
++++ b/drivers/net/ethernet/intel/e1000e/manage.c
+@@ -327,9 +327,12 @@ bool e1000e_enable_mng_pass_thru(struct e1000_hw *hw)
+  } else if ((hw->mac.type == e1000_82574) ||
+      (hw->mac.type == e1000_82583)) {
+   u16 data;
++  s32 ret_val;
+ 
+   factps = er32(FACTPS);
+-  e1000_read_nvm(hw, NVM_INIT_CONTROL2_REG, 1, &data);
++  ret_val = e1000_read_nvm(hw, NVM_INIT_CONTROL2_REG, 1, &data);
++  if (ret_val)
++   return false;
+ 
+   if (!(factps & E1000_FACTPS_MNGCG) &&
+       ((data & E1000_NVM_INIT_CTRL2_MNGM) ==
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index 4c2e523..da4372d 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -6687,6 +6687,7 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+  int bars, i, err, pci_using_dac;
+  u16 eeprom_data = 0;
+  u16 eeprom_apme_mask = E1000_EEPROM_APME;
++ s32 rval = 0;
+ 
+  if (ei->flags2 & FLAG2_DISABLE_ASPM_L0S)
+   aspm_disable_flag = PCIE_LINK_STATE_L0S;
+@@ -6925,15 +6926,19 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+  } else if (adapter->flags & FLAG_APME_IN_CTRL3) {
+   if (adapter->flags & FLAG_APME_CHECK_PORT_B &&
+       (adapter->hw.bus.func == 1))
+-   e1000_read_nvm(&adapter->hw, NVM_INIT_CONTROL3_PORT_B,
+-           1, &eeprom_data);
++   rval = e1000_read_nvm(&adapter->hw,
++           NVM_INIT_CONTROL3_PORT_B,
++           1, &eeprom_data);
+   else
+-   e1000_read_nvm(&adapter->hw, NVM_INIT_CONTROL3_PORT_A,
+-           1, &eeprom_data);
++   rval = e1000_read_nvm(&adapter->hw,
++           NVM_INIT_CONTROL3_PORT_A,
++           1, &eeprom_data);
+  }
+ 
+  /* fetch WoL from EEPROM */
+- if (eeprom_data & eeprom_apme_mask)
++ if (rval)
++  e_dbg("NVM read error getting WoL initial values: %d\n", rval);
++ else if (eeprom_data & eeprom_apme_mask)
+   adapter->eeprom_wol |= E1000_WUFC_MAG;
+ 
+  /* now that we have the eeprom settings, apply the special cases
+@@ -6952,7 +6957,12 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+   device_wakeup_enable(&pdev->dev);
+ 
+  /* save off EEPROM version number */
+- e1000_read_nvm(&adapter->hw, 5, 1, &adapter->eeprom_vers);
++ rval = e1000_read_nvm(&adapter->hw, 5, 1, &adapter->eeprom_vers);
++
++ if (rval) {
++  e_dbg("NVM read error getting EEPROM version: %d\n", rval);
++  adapter->eeprom_vers = 0;
++ }
+ 
+  /* reset the hardware with the new settings */
+  e1000e_reset(adapter);
+diff --git a/drivers/net/ethernet/intel/e1000e/nvm.c b/drivers/net/ethernet/intel/e1000e/nvm.c
+index a9a976f..f7aeb5f 100644
+--- a/drivers/net/ethernet/intel/e1000e/nvm.c
++++ b/drivers/net/ethernet/intel/e1000e/nvm.c
+@@ -327,8 +327,10 @@ s32 e1000e_read_nvm_eerd(struct e1000_hw *hw, u16 offset, u16 words, u16 *data)
+ 
+   ew32(EERD, eerd);
+   ret_val = e1000e_poll_eerd_eewr_done(hw, E1000_NVM_POLL_READ);
+-  if (ret_val)
++  if (ret_val) {
++   e_dbg("NVM read error: %d\n", ret_val);
+    break;
++  }
+ 
+   data[i] = (er32(EERD) >> E1000_NVM_RW_REG_DATA);
+  }
+-- 
+1.7.1

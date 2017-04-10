@@ -1,0 +1,117 @@
+From f91f2c26ce8f6c10f04a379422ea8a1e7cc83f6c Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:01:32 -0400
+Subject: [usb] ehci: use amd_chipset_type to filter for usb subsystem hang bug
+
+Message-id: <1410887463-20674-21-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95183
+O-Subject: [RHEL7 PATCH 020/591] usb: ehci: use amd_chipset_type to filter for usb subsystem hang bug
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 3ad145b62a15c86150dd0cc229a39a3120d462f9
+Author: Huang Rui <ray.huang@amd.com>
+Date:   Thu Oct 3 23:37:12 2013 +0800
+
+    usb: ehci: use amd_chipset_type to filter for usb subsystem hang bug
+
+    Commit "usb: pci-quirks: refactor AMD quirk to abstract AMD chipset types"
+    introduced a new AMD chipset type to filter AMD platforms with different
+    chipsets.
+
+    According to a recent thread [1], this patch updates USB subsystem hang
+    symptom quirk which is observed on AMD all SB600 and SB700 revision
+    0x3a/0x3b. And make it use the new chipset type to represent.
+
+    [1] http://marc.info/?l=linux-usb&m=138012321616452&w=2
+
+    Signed-off-by: Huang Rui <ray.huang@amd.com>
+    Acked-by: Alan Stern <stern@rowland.harvard.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/host/ehci-pci.c b/drivers/usb/host/ehci-pci.c
+index 854c2ec..3e86bf4 100644
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -58,8 +58,6 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
+ {
+  struct ehci_hcd  *ehci = hcd_to_ehci(hcd);
+  struct pci_dev  *pdev = to_pci_dev(hcd->self.controller);
+- struct pci_dev  *p_smbus;
+- u8   rev;
+  u32   temp;
+  int   retval;
+ 
+@@ -175,22 +173,12 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
+   /* SB600 and old version of SB700 have a bug in EHCI controller,
+    * which causes usb devices lose response in some cases.
+    */
+-  if ((pdev->device == 0x4386) || (pdev->device == 0x4396)) {
+-   p_smbus = pci_get_device(PCI_VENDOR_ID_ATI,
+-       PCI_DEVICE_ID_ATI_SBX00_SMBUS,
+-       NULL);
+-   if (!p_smbus)
+-    break;
+-   rev = p_smbus->revision;
+-   if ((pdev->device == 0x4386) || (rev == 0x3a)
+-       || (rev == 0x3b)) {
+-    u8 tmp;
+-    ehci_info(ehci, "applying AMD SB600/SB700 USB "
+-     "freeze workaround\n");
+-    pci_read_config_byte(pdev, 0x53, &tmp);
+-    pci_write_config_byte(pdev, 0x53, tmp | (1<<3));
+-   }
+-   pci_dev_put(p_smbus);
++  if ((pdev->device == 0x4386 || pdev->device == 0x4396) &&
++    usb_amd_hang_symptom_quirk()) {
++   u8 tmp;
++   ehci_info(ehci, "applying AMD SB600/SB700 USB freeze workaround\n");
++   pci_read_config_byte(pdev, 0x53, &tmp);
++   pci_write_config_byte(pdev, 0x53, tmp | (1<<3));
+   }
+   break;
+  case PCI_VENDOR_ID_NETMOS:
+diff --git a/drivers/usb/host/pci-quirks.c b/drivers/usb/host/pci-quirks.c
+index 443b61d..e670882 100644
+--- a/drivers/usb/host/pci-quirks.c
++++ b/drivers/usb/host/pci-quirks.c
+@@ -262,6 +262,19 @@ int usb_hcd_amd_remote_wakeup_quirk(struct pci_dev *pdev)
+ }
+ EXPORT_SYMBOL_GPL(usb_hcd_amd_remote_wakeup_quirk);
+ 
++bool usb_amd_hang_symptom_quirk(void)
++{
++ u8 rev;
++
++ usb_amd_find_chipset_info();
++ rev = amd_chipset.sb_type.rev;
++ /* SB600 and old version of SB700 have hang symptom bug */
++ return amd_chipset.sb_type.gen == AMD_CHIPSET_SB600 ||
++   (amd_chipset.sb_type.gen == AMD_CHIPSET_SB700 &&
++    rev >= 0x3a && rev <= 0x3b);
++}
++EXPORT_SYMBOL_GPL(usb_amd_hang_symptom_quirk);
++
+ /*
+  * The hardware normally enables the A-link power management feature, which
+  * lets the system lower the power consumption in idle states.
+diff --git a/drivers/usb/host/pci-quirks.h b/drivers/usb/host/pci-quirks.h
+index ed6700d..820f532 100644
+--- a/drivers/usb/host/pci-quirks.h
++++ b/drivers/usb/host/pci-quirks.h
+@@ -5,6 +5,7 @@
+ void uhci_reset_hc(struct pci_dev *pdev, unsigned long base);
+ int uhci_check_and_reset_hc(struct pci_dev *pdev, unsigned long base);
+ int usb_amd_find_chipset_info(void);
++bool usb_amd_hang_symptom_quirk(void);
+ void usb_amd_dev_put(void);
+ void usb_amd_quirk_pll_disable(void);
+ void usb_amd_quirk_pll_enable(void);
+-- 
+1.7.1

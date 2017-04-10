@@ -1,0 +1,454 @@
+From 677ea3b7ec5d728a6a93de4c1f2dc0c1d2e6d373 Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:06:01 -0400
+Subject: [ethernet] qlcnic: Interrupt code cleanup
+
+Message-id: <1408626422-3941-78-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88645
+O-Subject: [PATCH RHEL 7.1 077/138] qlcnic: Interrupt code cleanup
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Manish chopra <manish.chopra@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id 2cc5752e49d72e955277231e6f462a7f6263aa22
+
+o Added hardware ops for interrupt enable/disable functions
+
+Signed-off-by: Manish Chopra <manish.chopra@qlogic.com>
+Signed-off-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+index 7ad6348..dcd7872 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+@@ -1756,6 +1756,14 @@ struct qlcnic_hardware_ops {
+  pci_ers_result_t (*io_slot_reset) (struct pci_dev *);
+  void (*io_resume) (struct pci_dev *);
+  void (*get_beacon_state)(struct qlcnic_adapter *);
++ void (*enable_sds_intr) (struct qlcnic_adapter *,
++     struct qlcnic_host_sds_ring *);
++ void (*disable_sds_intr) (struct qlcnic_adapter *,
++      struct qlcnic_host_sds_ring *);
++ void (*enable_tx_intr) (struct qlcnic_adapter *,
++    struct qlcnic_host_tx_ring *);
++ void (*disable_tx_intr) (struct qlcnic_adapter *,
++     struct qlcnic_host_tx_ring *);
+ };
+ 
+ extern struct qlcnic_nic_template qlcnic_vf_ops;
+@@ -2029,6 +2037,54 @@ static inline bool qlcnic_check_multi_tx(struct qlcnic_adapter *adapter)
+  return test_bit(__QLCNIC_MULTI_TX_UNIQUE, &adapter->state);
+ }
+ 
++static inline void
++qlcnic_82xx_enable_tx_intr(struct qlcnic_adapter *adapter,
++      struct qlcnic_host_tx_ring *tx_ring)
++{
++ if (qlcnic_check_multi_tx(adapter) &&
++     !adapter->ahw->diag_test)
++  writel(0x0, tx_ring->crb_intr_mask);
++}
++
++static inline void
++qlcnic_82xx_disable_tx_intr(struct qlcnic_adapter *adapter,
++       struct qlcnic_host_tx_ring *tx_ring)
++{
++ if (qlcnic_check_multi_tx(adapter) &&
++     !adapter->ahw->diag_test)
++  writel(1, tx_ring->crb_intr_mask);
++}
++
++static inline void
++qlcnic_83xx_enable_tx_intr(struct qlcnic_adapter *adapter,
++      struct qlcnic_host_tx_ring *tx_ring)
++{
++ writel(0, tx_ring->crb_intr_mask);
++}
++
++static inline void
++qlcnic_83xx_disable_tx_intr(struct qlcnic_adapter *adapter,
++       struct qlcnic_host_tx_ring *tx_ring)
++{
++ writel(1, tx_ring->crb_intr_mask);
++}
++
++/* Enable MSI-x and INT-x interrupts */
++static inline void
++qlcnic_83xx_enable_sds_intr(struct qlcnic_adapter *adapter,
++       struct qlcnic_host_sds_ring *sds_ring)
++{
++ writel(0, sds_ring->crb_intr_mask);
++}
++
++/* Disable MSI-x and INT-x interrupts */
++static inline void
++qlcnic_83xx_disable_sds_intr(struct qlcnic_adapter *adapter,
++        struct qlcnic_host_sds_ring *sds_ring)
++{
++ writel(1, sds_ring->crb_intr_mask);
++}
++
+ static inline void qlcnic_disable_multi_tx(struct qlcnic_adapter *adapter)
+ {
+  test_and_clear_bit(__QLCNIC_MULTI_TX_UNIQUE, &adapter->state);
+@@ -2038,10 +2094,10 @@ static inline void qlcnic_disable_multi_tx(struct qlcnic_adapter *adapter)
+ /* When operating in a muti tx mode, driver needs to write 0x1
+  * to src register, instead of 0x0 to disable receiving interrupt.
+  */
+-static inline void qlcnic_disable_int(struct qlcnic_host_sds_ring *sds_ring)
++static inline void
++qlcnic_82xx_disable_sds_intr(struct qlcnic_adapter *adapter,
++        struct qlcnic_host_sds_ring *sds_ring)
+ {
+- struct qlcnic_adapter *adapter = sds_ring->adapter;
+-
+  if (qlcnic_check_multi_tx(adapter) &&
+      !adapter->ahw->diag_test &&
+      (adapter->flags & QLCNIC_MSIX_ENABLED))
+@@ -2050,13 +2106,42 @@ static inline void qlcnic_disable_int(struct qlcnic_host_sds_ring *sds_ring)
+   writel(0, sds_ring->crb_intr_mask);
+ }
+ 
++static inline void qlcnic_enable_sds_intr(struct qlcnic_adapter *adapter,
++       struct qlcnic_host_sds_ring *sds_ring)
++{
++ if (adapter->ahw->hw_ops->enable_sds_intr)
++  adapter->ahw->hw_ops->enable_sds_intr(adapter, sds_ring);
++}
++
++static inline void
++qlcnic_disable_sds_intr(struct qlcnic_adapter *adapter,
++   struct qlcnic_host_sds_ring *sds_ring)
++{
++ if (adapter->ahw->hw_ops->disable_sds_intr)
++  adapter->ahw->hw_ops->disable_sds_intr(adapter, sds_ring);
++}
++
++static inline void qlcnic_enable_tx_intr(struct qlcnic_adapter *adapter,
++      struct qlcnic_host_tx_ring *tx_ring)
++{
++ if (adapter->ahw->hw_ops->enable_tx_intr)
++  adapter->ahw->hw_ops->enable_tx_intr(adapter, tx_ring);
++}
++
++static inline void qlcnic_disable_tx_intr(struct qlcnic_adapter *adapter,
++       struct qlcnic_host_tx_ring *tx_ring)
++{
++ if (adapter->ahw->hw_ops->disable_tx_intr)
++  adapter->ahw->hw_ops->disable_tx_intr(adapter, tx_ring);
++}
++
+ /* When operating in a muti tx mode, driver needs to write 0x0
+  * to src register, instead of 0x1 to enable receiving interrupts.
+  */
+-static inline void qlcnic_enable_int(struct qlcnic_host_sds_ring *sds_ring)
++static inline void
++qlcnic_82xx_enable_sds_intr(struct qlcnic_adapter *adapter,
++       struct qlcnic_host_sds_ring *sds_ring)
+ {
+- struct qlcnic_adapter *adapter = sds_ring->adapter;
+-
+  if (qlcnic_check_multi_tx(adapter) &&
+      !adapter->ahw->diag_test &&
+      (adapter->flags & QLCNIC_MSIX_ENABLED))
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+index 27cd454..29ec127 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+@@ -199,6 +199,11 @@ static struct qlcnic_hardware_ops qlcnic_83xx_hw_ops = {
+  .io_slot_reset   = qlcnic_83xx_io_slot_reset,
+  .io_resume   = qlcnic_83xx_io_resume,
+  .get_beacon_state  = qlcnic_83xx_get_beacon_state,
++ .enable_sds_intr  = qlcnic_83xx_enable_sds_intr,
++ .disable_sds_intr  = qlcnic_83xx_disable_sds_intr,
++ .enable_tx_intr   = qlcnic_83xx_enable_tx_intr,
++ .disable_tx_intr  = qlcnic_83xx_disable_tx_intr,
++
+ };
+ 
+ static struct qlcnic_nic_template qlcnic_83xx_ops = {
+@@ -345,20 +350,6 @@ static inline void qlcnic_83xx_set_legacy_intr_mask(struct qlcnic_adapter *adapt
+   writel(1, adapter->tgt_mask_reg);
+ }
+ 
+-/* Enable MSI-x and INT-x interrupts */
+-void qlcnic_83xx_enable_intr(struct qlcnic_adapter *adapter,
+-        struct qlcnic_host_sds_ring *sds_ring)
+-{
+- writel(0, sds_ring->crb_intr_mask);
+-}
+-
+-/* Disable MSI-x and INT-x interrupts */
+-void qlcnic_83xx_disable_intr(struct qlcnic_adapter *adapter,
+-         struct qlcnic_host_sds_ring *sds_ring)
+-{
+- writel(1, sds_ring->crb_intr_mask);
+-}
+-
+ static inline void qlcnic_83xx_enable_legacy_msix_mbx_intr(struct qlcnic_adapter
+           *adapter)
+ {
+@@ -496,7 +487,7 @@ irqreturn_t qlcnic_83xx_tmp_intr(int irq, void *data)
+ 
+ done:
+  adapter->ahw->diag_cnt++;
+- qlcnic_83xx_enable_intr(adapter, sds_ring);
++ qlcnic_enable_sds_intr(adapter, sds_ring);
+ 
+  return IRQ_HANDLED;
+ }
+@@ -1360,7 +1351,7 @@ static int qlcnic_83xx_diag_alloc_res(struct net_device *netdev, int test,
+  if (adapter->ahw->diag_test == QLCNIC_INTERRUPT_TEST) {
+   for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
+    sds_ring = &adapter->recv_ctx->sds_rings[ring];
+-   qlcnic_83xx_enable_intr(adapter, sds_ring);
++   qlcnic_enable_sds_intr(adapter, sds_ring);
+   }
+  }
+ 
+@@ -1385,7 +1376,7 @@ static void qlcnic_83xx_diag_free_res(struct net_device *netdev,
+   for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
+    sds_ring = &adapter->recv_ctx->sds_rings[ring];
+    if (adapter->flags & QLCNIC_MSIX_ENABLED)
+-    qlcnic_83xx_disable_intr(adapter, sds_ring);
++    qlcnic_disable_sds_intr(adapter, sds_ring);
+   }
+  }
+ 
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+index a5ca3f4..220166f 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+@@ -584,10 +584,6 @@ void qlcnic_83xx_disable_mbx_intr(struct qlcnic_adapter *);
+ irqreturn_t qlcnic_83xx_clear_legacy_intr(struct qlcnic_adapter *);
+ irqreturn_t qlcnic_83xx_intr(int, void *);
+ irqreturn_t qlcnic_83xx_tmp_intr(int, void *);
+-void qlcnic_83xx_enable_intr(struct qlcnic_adapter *,
+-        struct qlcnic_host_sds_ring *);
+-void qlcnic_83xx_disable_intr(struct qlcnic_adapter *,
+-        struct qlcnic_host_sds_ring *);
+ void qlcnic_83xx_check_vf(struct qlcnic_adapter *,
+      const struct pci_device_id *);
+ int qlcnic_83xx_config_default_opmode(struct qlcnic_adapter *);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+index 32b0f97..9469cf6 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+@@ -131,35 +131,6 @@ static struct sk_buff *qlcnic_process_rxbuf(struct qlcnic_adapter *,
+          struct qlcnic_host_rds_ring *,
+          u16, u16);
+ 
+-static inline void qlcnic_enable_tx_intr(struct qlcnic_adapter *adapter,
+-      struct qlcnic_host_tx_ring *tx_ring)
+-{
+- if (qlcnic_check_multi_tx(adapter) &&
+-     !adapter->ahw->diag_test)
+-  writel(0x0, tx_ring->crb_intr_mask);
+-}
+-
+-
+-static inline void qlcnic_disable_tx_int(struct qlcnic_adapter *adapter,
+-      struct qlcnic_host_tx_ring *tx_ring)
+-{
+- if (qlcnic_check_multi_tx(adapter) &&
+-     !adapter->ahw->diag_test)
+-  writel(1, tx_ring->crb_intr_mask);
+-}
+-
+-static inline void qlcnic_83xx_enable_tx_intr(struct qlcnic_adapter *adapter,
+-           struct qlcnic_host_tx_ring *tx_ring)
+-{
+- writel(0, tx_ring->crb_intr_mask);
+-}
+-
+-static inline void qlcnic_83xx_disable_tx_intr(struct qlcnic_adapter *adapter,
+-     struct qlcnic_host_tx_ring *tx_ring)
+-{
+- writel(1, tx_ring->crb_intr_mask);
+-}
+-
+ static inline u8 qlcnic_mac_hash(u64 mac, u16 vlan)
+ {
+  return (u8)((mac & 0xff) ^ ((mac >> 40) & 0xff) ^ (vlan & 0xff));
+@@ -884,7 +855,7 @@ static int qlcnic_poll(struct napi_struct *napi, int budget)
+  if ((work_done < budget) && tx_complete) {
+   napi_complete(&sds_ring->napi);
+   if (test_bit(__QLCNIC_DEV_UP, &adapter->state)) {
+-   qlcnic_enable_int(sds_ring);
++   qlcnic_enable_sds_intr(adapter, sds_ring);
+    qlcnic_enable_tx_intr(adapter, tx_ring);
+   }
+  }
+@@ -925,7 +896,7 @@ static int qlcnic_rx_poll(struct napi_struct *napi, int budget)
+  if (work_done < budget) {
+   napi_complete(&sds_ring->napi);
+   if (test_bit(__QLCNIC_DEV_UP, &adapter->state))
+-   qlcnic_enable_int(sds_ring);
++   qlcnic_enable_sds_intr(adapter, sds_ring);
+  }
+ 
+  return work_done;
+@@ -1556,7 +1527,7 @@ void qlcnic_82xx_napi_enable(struct qlcnic_adapter *adapter)
+  for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
+   sds_ring = &recv_ctx->sds_rings[ring];
+   napi_enable(&sds_ring->napi);
+-  qlcnic_enable_int(sds_ring);
++  qlcnic_enable_sds_intr(adapter, sds_ring);
+  }
+ 
+  if (qlcnic_check_multi_tx(adapter) &&
+@@ -1582,7 +1553,7 @@ void qlcnic_82xx_napi_disable(struct qlcnic_adapter *adapter)
+ 
+  for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
+   sds_ring = &recv_ctx->sds_rings[ring];
+-  qlcnic_disable_int(sds_ring);
++  qlcnic_disable_sds_intr(adapter, sds_ring);
+   napi_synchronize(&sds_ring->napi);
+   napi_disable(&sds_ring->napi);
+  }
+@@ -1592,7 +1563,7 @@ void qlcnic_82xx_napi_disable(struct qlcnic_adapter *adapter)
+      qlcnic_check_multi_tx(adapter)) {
+   for (ring = 0; ring < adapter->drv_tx_rings; ring++) {
+    tx_ring = &adapter->tx_ring[ring];
+-   qlcnic_disable_tx_int(adapter, tx_ring);
++   qlcnic_disable_tx_intr(adapter, tx_ring);
+    napi_synchronize(&tx_ring->napi);
+    napi_disable(&tx_ring->napi);
+   }
+@@ -1855,7 +1826,7 @@ static int qlcnic_83xx_msix_sriov_vf_poll(struct napi_struct *napi, int budget)
+  work_done = qlcnic_83xx_process_rcv_ring(sds_ring, budget);
+  if ((work_done < budget) && tx_complete) {
+   napi_complete(&sds_ring->napi);
+-  qlcnic_83xx_enable_intr(adapter, sds_ring);
++  qlcnic_enable_sds_intr(adapter, sds_ring);
+  }
+ 
+  return work_done;
+@@ -1878,7 +1849,7 @@ static int qlcnic_83xx_poll(struct napi_struct *napi, int budget)
+  work_done = qlcnic_83xx_process_rcv_ring(sds_ring, budget);
+  if ((work_done < budget) && tx_complete) {
+   napi_complete(&sds_ring->napi);
+-  qlcnic_83xx_enable_intr(adapter, sds_ring);
++  qlcnic_enable_sds_intr(adapter, sds_ring);
+  }
+ 
+  return work_done;
+@@ -1897,7 +1868,7 @@ static int qlcnic_83xx_msix_tx_poll(struct napi_struct *napi, int budget)
+  if (work_done) {
+   napi_complete(&tx_ring->napi);
+   if (test_bit(__QLCNIC_DEV_UP , &adapter->state))
+-   qlcnic_83xx_enable_tx_intr(adapter, tx_ring);
++   qlcnic_enable_tx_intr(adapter, tx_ring);
+  }
+ 
+  return work_done;
+@@ -1915,7 +1886,7 @@ static int qlcnic_83xx_rx_poll(struct napi_struct *napi, int budget)
+  if (work_done < budget) {
+   napi_complete(&sds_ring->napi);
+   if (test_bit(__QLCNIC_DEV_UP, &adapter->state))
+-   qlcnic_83xx_enable_intr(adapter, sds_ring);
++   qlcnic_enable_sds_intr(adapter, sds_ring);
+  }
+ 
+  return work_done;
+@@ -1935,7 +1906,7 @@ void qlcnic_83xx_napi_enable(struct qlcnic_adapter *adapter)
+   sds_ring = &recv_ctx->sds_rings[ring];
+   napi_enable(&sds_ring->napi);
+   if (adapter->flags & QLCNIC_MSIX_ENABLED)
+-   qlcnic_83xx_enable_intr(adapter, sds_ring);
++   qlcnic_enable_sds_intr(adapter, sds_ring);
+  }
+ 
+  if ((adapter->flags & QLCNIC_MSIX_ENABLED) &&
+@@ -1943,7 +1914,7 @@ void qlcnic_83xx_napi_enable(struct qlcnic_adapter *adapter)
+   for (ring = 0; ring < adapter->drv_tx_rings; ring++) {
+    tx_ring = &adapter->tx_ring[ring];
+    napi_enable(&tx_ring->napi);
+-   qlcnic_83xx_enable_tx_intr(adapter, tx_ring);
++   qlcnic_enable_tx_intr(adapter, tx_ring);
+   }
+  }
+ }
+@@ -1961,7 +1932,7 @@ void qlcnic_83xx_napi_disable(struct qlcnic_adapter *adapter)
+  for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
+   sds_ring = &recv_ctx->sds_rings[ring];
+   if (adapter->flags & QLCNIC_MSIX_ENABLED)
+-   qlcnic_83xx_disable_intr(adapter, sds_ring);
++   qlcnic_disable_sds_intr(adapter, sds_ring);
+   napi_synchronize(&sds_ring->napi);
+   napi_disable(&sds_ring->napi);
+  }
+@@ -1970,7 +1941,7 @@ void qlcnic_83xx_napi_disable(struct qlcnic_adapter *adapter)
+      !(adapter->flags & QLCNIC_TX_INTR_SHARED)) {
+   for (ring = 0; ring < adapter->drv_tx_rings; ring++) {
+    tx_ring = &adapter->tx_ring[ring];
+-   qlcnic_83xx_disable_tx_intr(adapter, tx_ring);
++   qlcnic_disable_tx_intr(adapter, tx_ring);
+    napi_synchronize(&tx_ring->napi);
+    napi_disable(&tx_ring->napi);
+   }
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index c5a2f6e..20b47ce 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -558,6 +558,10 @@ static struct qlcnic_hardware_ops qlcnic_hw_ops = {
+  .io_slot_reset   = qlcnic_82xx_io_slot_reset,
+  .io_resume   = qlcnic_82xx_io_resume,
+  .get_beacon_state  = qlcnic_82xx_get_beacon_state,
++ .enable_sds_intr  = qlcnic_82xx_enable_sds_intr,
++ .disable_sds_intr  = qlcnic_82xx_disable_sds_intr,
++ .enable_tx_intr   = qlcnic_82xx_enable_tx_intr,
++ .disable_tx_intr  = qlcnic_82xx_disable_tx_intr,
+ };
+ 
+ static int qlcnic_check_multi_tx_capability(struct qlcnic_adapter *adapter)
+@@ -1876,7 +1880,7 @@ void qlcnic_diag_free_res(struct net_device *netdev, int drv_sds_rings)
+  if (adapter->ahw->diag_test == QLCNIC_INTERRUPT_TEST) {
+   for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
+    sds_ring = &adapter->recv_ctx->sds_rings[ring];
+-   qlcnic_disable_int(sds_ring);
++   qlcnic_disable_sds_intr(adapter, sds_ring);
+   }
+  }
+ 
+@@ -1977,7 +1981,7 @@ int qlcnic_diag_alloc_res(struct net_device *netdev, int test)
+  if (adapter->ahw->diag_test == QLCNIC_INTERRUPT_TEST) {
+   for (ring = 0; ring < adapter->drv_sds_rings; ring++) {
+    sds_ring = &adapter->recv_ctx->sds_rings[ring];
+-   qlcnic_enable_int(sds_ring);
++   qlcnic_enable_sds_intr(adapter, sds_ring);
+   }
+  }
+ 
+@@ -2869,7 +2873,7 @@ static irqreturn_t qlcnic_tmp_intr(int irq, void *data)
+ 
+ done:
+  adapter->ahw->diag_cnt++;
+- qlcnic_enable_int(sds_ring);
++ qlcnic_enable_sds_intr(adapter, sds_ring);
+  return IRQ_HANDLED;
+ }
+ 
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+index db819e1..17a1ca2 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+@@ -71,6 +71,8 @@ static struct qlcnic_hardware_ops qlcnic_sriov_vf_hw_ops = {
+  .change_l2_filter  = qlcnic_83xx_change_l2_filter,
+  .get_board_info   = qlcnic_83xx_get_port_info,
+  .free_mac_list   = qlcnic_sriov_vf_free_mac_list,
++ .enable_sds_intr  = qlcnic_83xx_enable_sds_intr,
++ .disable_sds_intr  = qlcnic_83xx_disable_sds_intr,
+ };
+ 
+ static struct qlcnic_nic_template qlcnic_sriov_vf_ops = {
+-- 
+1.7.1

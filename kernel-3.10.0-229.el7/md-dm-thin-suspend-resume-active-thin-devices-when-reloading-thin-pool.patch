@@ -1,0 +1,125 @@
+From 2f6265f29d45912f4482ced1bb3e2326f54162a4 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Sat, 22 Nov 2014 23:56:53 -0500
+Subject: [md] dm-thin: suspend/resume active thin devices when reloading thin-pool
+
+Message-id: <1416700613-25142-14-git-send-email-snitzer@redhat.com>
+Patchwork-id: 100848
+O-Subject: [RHEL7.1 PATCH 13/13] dm thin: suspend_resume active thin devices when reloading thin-pool
+Bugzilla: 1165246
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1165246
+
+Upstream linux-dm.git commit 583024d248f486e21479d1912aa2093565455770
+Author: Mike Snitzer <snitzer@redhat.com>
+Date:   Tue Oct 28 20:58:45 2014 -0400
+
+    dm thin: suspend/resume active thin devices when reloading thin-pool
+
+    Before this change it was expected that userspace would first suspend
+    all active thin devices, reload/resize the thin-pool target, then resume
+    all active thin devices.  Now the thin-pool suspend/resume will trigger
+    the suspend/resume of all active thins via appropriate calls to
+    dm_internal_suspend and dm_internal_resume.
+
+    Store the mapped_device for each thin device in struct thin_c to make
+    these calls possible.
+
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Acked-by: Joe Thornber <ejt@redhat.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index be581ea..06ceecf 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -292,6 +292,8 @@ struct thin_c {
+ 
+  struct pool *pool;
+  struct dm_thin_device *td;
++ struct mapped_device *thin_md;
++
+  bool requeue_mode:1;
+  spinlock_t lock;
+  struct list_head deferred_cells;
+@@ -3107,19 +3109,48 @@ static int pool_preresume(struct dm_target *ti)
+  return 0;
+ }
+ 
++static void pool_suspend_active_thins(struct pool *pool)
++{
++ struct thin_c *tc;
++
++ /* Suspend all active thin devices */
++ tc = get_first_thin(pool);
++ while (tc) {
++  dm_internal_suspend_noflush(tc->thin_md);
++  tc = get_next_thin(pool, tc);
++ }
++}
++
++static void pool_resume_active_thins(struct pool *pool)
++{
++ struct thin_c *tc;
++
++ /* Resume all active thin devices */
++ tc = get_first_thin(pool);
++ while (tc) {
++  dm_internal_resume(tc->thin_md);
++  tc = get_next_thin(pool, tc);
++ }
++}
++
+ static void pool_resume(struct dm_target *ti)
+ {
+  struct pool_c *pt = ti->private;
+  struct pool *pool = pt->pool;
+  unsigned long flags;
+ 
++ /*
++  * Must requeue active_thins' bios and then resume
++  * active_thins _before_ clearing 'suspend' flag.
++  */
++ requeue_bios(pool);
++ pool_resume_active_thins(pool);
++
+  spin_lock_irqsave(&pool->lock, flags);
+  pool->low_water_triggered = false;
+  pool->suspended = false;
+  spin_unlock_irqrestore(&pool->lock, flags);
+ 
+- requeue_bios(pool);
+-
+  do_waker(&pool->waker.work);
+ }
+ 
+@@ -3132,6 +3163,8 @@ static void pool_presuspend(struct dm_target *ti)
+  spin_lock_irqsave(&pool->lock, flags);
+  pool->suspended = true;
+  spin_unlock_irqrestore(&pool->lock, flags);
++
++ pool_suspend_active_thins(pool);
+ }
+ 
+ static void pool_presuspend_undo(struct dm_target *ti)
+@@ -3140,6 +3173,8 @@ static void pool_presuspend_undo(struct dm_target *ti)
+  struct pool *pool = pt->pool;
+  unsigned long flags;
+ 
++ pool_resume_active_thins(pool);
++
+  spin_lock_irqsave(&pool->lock, flags);
+  pool->suspended = false;
+  spin_unlock_irqrestore(&pool->lock, flags);
+@@ -3690,6 +3725,7 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
+   r = -ENOMEM;
+   goto out_unlock;
+  }
++ tc->thin_md = dm_table_get_md(ti->table);
+  spin_lock_init(&tc->lock);
+  INIT_LIST_HEAD(&tc->deferred_cells);
+  bio_list_init(&tc->deferred_bio_list);
+-- 
+1.7.1

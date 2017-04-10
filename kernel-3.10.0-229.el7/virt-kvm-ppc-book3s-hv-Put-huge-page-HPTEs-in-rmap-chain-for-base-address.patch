@@ -1,0 +1,89 @@
+From a6ff5692a1d62478a9a0a20eed0ebf7a05fa8891 Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:12:51 -0400
+Subject: [virt] kvm/ppc: book3s/hv - Put huge-page HPTEs in rmap chain for base address
+
+Message-id: <1410765214-16377-36-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94727
+O-Subject: [PATCH 35/78] KVM: PPC: Book3S HV: Put huge-page HPTEs in rmap chain for base address
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1123145
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit 1066f7724c73fca9ddb978c7f5b7411c54032047
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Mon May 26 19:48:37 2014 +1000
+
+    KVM: PPC: Book3S HV: Put huge-page HPTEs in rmap chain for base address
+
+    Currently, when a huge page is faulted in for a guest, we select the
+    rmap chain to insert the HPTE into based on the guest physical address
+    that the guest tried to access.  Since there is an rmap chain for each
+    system page, there are many rmap chains for the area covered by a huge
+    page (e.g. 256 for 16MB pages when PAGE_SIZE = 64kB), and the huge-page
+    HPTE could end up in any one of them.
+
+    For consistency, and to make the huge-page HPTEs easier to find, we now
+    put huge-page HPTEs in the rmap chain corresponding to the base address
+    of the huge page.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index b858db3..68468d6 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -585,6 +585,7 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+  struct kvm *kvm = vcpu->kvm;
+  unsigned long *hptep, hpte[3], r;
+  unsigned long mmu_seq, psize, pte_size;
++ unsigned long gpa_base, gfn_base;
+  unsigned long gpa, gfn, hva, pfn;
+  struct kvm_memory_slot *memslot;
+  unsigned long *rmap;
+@@ -623,7 +624,9 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 
+  /* Translate the logical address and get the page */
+  psize = hpte_page_size(hpte[0], r);
+- gpa = (r & HPTE_R_RPN & ~(psize - 1)) | (ea & (psize - 1));
++ gpa_base = r & HPTE_R_RPN & ~(psize - 1);
++ gfn_base = gpa_base >> PAGE_SHIFT;
++ gpa = gpa_base | (ea & (psize - 1));
+  gfn = gpa >> PAGE_SHIFT;
+  memslot = gfn_to_memslot(kvm, gfn);
+ 
+@@ -635,6 +638,13 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+  if (!kvm->arch.using_mmu_notifiers)
+   return -EFAULT;  /* should never get here */
+ 
++ /*
++  * This should never happen, because of the slot_is_aligned()
++  * check in kvmppc_do_h_enter().
++  */
++ if (gfn_base < memslot->base_gfn)
++  return -EFAULT;
++
+  /* used to check for invalidations in progress */
+  mmu_seq = kvm->mmu_notifier_seq;
+  smp_rmb();
+@@ -727,7 +737,8 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+   goto out_unlock;
+  hpte[0] = (hpte[0] & ~HPTE_V_ABSENT) | HPTE_V_VALID;
+ 
+- rmap = &memslot->arch.rmap[gfn - memslot->base_gfn];
++ /* Always put the HPTE in the rmap chain for the page base address */
++ rmap = &memslot->arch.rmap[gfn_base - memslot->base_gfn];
+  lock_rmap(rmap);
+ 
+  /* Check if we might have been invalidated; let the guest retry if so */
+-- 
+1.7.1

@@ -1,0 +1,92 @@
+From 3d26bf8961ba47375f0968dee748e092db1bc52b Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 10:12:33 -0400
+Subject: [fs] ext4: move falloc collapse range check into the filesystem methods
+
+Message-id: <1414059176-6044-10-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98282
+O-Subject: [RHEL 7.1 PATCH 09/32] fs: move falloc collapse range check into the filesystem methods
+Bugzilla: 1150171
+
+BZ 1150171
+https://bugzilla.redhat.com/show_bug.cgi?id=1150171
+
+BREW 8149772
+https://brewweb.devel.redhat.com/taskinfo?taskID=8149772
+
+Upstream commit 23fffa925ea2c9a2bcb1a4453e2c542635aa3545
+
+ Currently in do_fallocate in collapse range case we're checking
+ whether offset + len is not bigger than i_size.  However there is
+ nothing which would prevent i_size from changing so the check is
+ pointless.  It should be done in the file system itself and the file
+ system needs to make sure that i_size is not going to change.  The
+ i_size check for the other fallocate modes are also done in the
+ filesystems.
+
+ As it is now we can easily crash the kernel by having two processes
+ doing truncate and fallocate collapse range at the same time.  This
+ can be reproduced on ext4 and it is theoretically possible on xfs even
+ though I was not able to trigger it with this simple test.
+
+ This commit removes the check from do_fallocate and adds it to the
+ file system.
+
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Acked-by: Dave Chinner <david@fromorbit.com>
+ Reviewed-by: Christoph Hellwig <hch@lst.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index fd3003f..f6c09d6 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -5364,8 +5364,6 @@ int ext4_collapse_range(struct inode *inode, loff_t offset, loff_t len)
+  loff_t new_size;
+  int ret;
+ 
+- BUG_ON(offset + len > i_size_read(inode));
+-
+  /* Collapse range works only on fs block size aligned offsets. */
+  if (offset & (EXT4_BLOCK_SIZE(sb) - 1) ||
+      len & (EXT4_BLOCK_SIZE(sb) - 1))
+@@ -5400,6 +5398,15 @@ int ext4_collapse_range(struct inode *inode, loff_t offset, loff_t len)
+   goto out_mutex;
+  }
+ 
++ /*
++  * There is no need to overlap collapse range with EOF, in which case
++  * it is effectively a truncate operation
++  */
++ if (offset + len >= i_size_read(inode)) {
++  ret = -EINVAL;
++  goto out_mutex;
++ }
++
+  if (IS_SWAPFILE(inode)) {
+   ret = -ETXTBSY;
+   goto out_mutex;
+diff --git a/fs/open.c b/fs/open.c
+index 1ef868e..19ae6f9 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -286,14 +286,6 @@ int do_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+  if (((offset + len) > inode->i_sb->s_maxbytes) || ((offset + len) < 0))
+   return -EFBIG;
+ 
+- /*
+-  * There is no need to overlap collapse range with EOF, in which case
+-  * it is effectively a truncate operation
+-  */
+- if ((mode & FALLOC_FL_COLLAPSE_RANGE) &&
+-     (offset + len >= i_size_read(inode)))
+-  return -EINVAL;
+-
+  if (!file->f_op->fallocate)
+   return -EOPNOTSUPP;
+ 
+-- 
+1.7.1

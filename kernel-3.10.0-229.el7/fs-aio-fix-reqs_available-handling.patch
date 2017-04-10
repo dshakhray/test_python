@@ -1,0 +1,352 @@
+From 472ccafa72c1d97546f9f079ff163a0f48673d3a Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Mon, 8 Sep 2014 22:52:55 -0400
+Subject: [fs] aio: fix reqs_available handling
+
+Message-id: <1410216777-18522-7-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 93347
+O-Subject: [RHEL7 PATCH 6/8] aio: fix reqs_available handling
+Bugzilla: 1122092
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+Way back when, Kent authored this change:
+
+  commit 3e845ce01a391d7c5d59ff2f28db5381bf02fa27
+  Author: Kent Overstreet <koverstreet@google.com>
+  Date:   Tue May 7 16:18:51 2013 -0700
+
+    aio: change reqs_active to include unreaped completions
+
+    The aio code tries really hard to avoid having to deal with the
+    completion ringbuffer overflowing.  To do that, it has to keep track of
+    the number of outstanding kiocbs, and the number of completions
+    currently in the ringbuffer - and it's got to check that every time we
+    allocate a kiocb.  Ouch.
+
+    But - we can improve this quite a bit if we just change reqs_active to
+    mean "number of outstanding requests and unreaped completions" - that
+    means kiocb allocation doesn't have to look at the ringbuffer, which is
+    a fairly significant win.
+
+In it, reqs_active now tracks requests *beyond* the point where they
+are completed by aio_complete.  Before this change, we could complete
+tearing down a kioctx once reqs_active went to 0, which happened after
+all ios were complete..  After the change, we wait for reqs_active to
+go to zero still, but that requires both an io completion for each
+active request and polling the ring for completions after each wakeup.
+IOWs, reqs_active is incremented when io is submitted, and decremented
+after io is reaped by io_getevents (or, in the case of an exiting process,
+after we've skipped over completions in the ring).
+
+NOTE that this breaks userspace event reaping, since reqs_active is
+not decremented anywhere except process exit paths.
+
+The benefit of this patch, of course, is preventing the submission and
+completion code paths from touching the same cache lines.
+
+This brings us to the following patch:
+
+  commit f8567a3845ac05bb28f3c1b478ef752762bd39ef
+  Author: Benjamin LaHaise <bcrl@kvack.org>
+  Date:   Tue Jun 24 13:12:55 2014 -0400
+
+    aio: fix aio request leak when events are reaped by userspace
+
+    The aio cleanups and optimizations by kmo that were merged into the 3.10
+    tree added a regression for userspace event reaping.  Specifically, the
+    reference counts are not decremented if the event is reaped in userspace,
+    leading to the application being unable to submit further aio requests.
+    This patch applies to 3.12+.  A separate backport is required for 3.10/3.11.
+    This issue was uncovered as part of CVE-2014-0206.
+
+Here, Ben attempts to fix the user-space event reaping use case.  He
+does this by moving the call to put_reqs_available from the
+io_getevent code path (specifically read_events_ring) BACK into the io
+completion path (aio_complete).  This, of course, is completely
+broken.  It now means that reqs_active no longer tracks all un-reaped
+I/O completions.  It goes back to tracking just outstanding I/O, and
+since we no longer check the ring buffer to see if events have been
+collected before allocating new ones, it means that we can allocate
+more requests than can fit in the ring buffer, and I/O completions can
+come in and wrap the ring buffer (overwriting previous unreaped
+requests)!  The result is a hung task.
+
+In response to this new type of breakage, the following (final?) patch
+was made by ben:
+
+  commit d856f32a86b2b015ab180ab7a55e455ed8d3ccc5
+  Author: Benjamin LaHaise <bcrl@kvack.org>
+  Date:   Sun Aug 24 13:14:05 2014 -0400
+
+    aio: fix reqs_available handling
+
+    As reported by Dan Aloni, commit f8567a3845ac ("aio: fix aio request
+    leak when events are reaped by userspace") introduces a regression when
+    user code attempts to perform io_submit() with more events than are
+    available in the ring buffer.  Reverting that commit would reintroduce a
+    regression when user space event reaping is used.
+
+    Fixing this bug is a bit more involved than the previous attempts to fix
+    this regression.  Since we do not have a single point at which we can
+    count events as being reaped by user space and io_getevents(), we have
+    to track event completion by looking at the number of events left in the
+    event ring.  So long as there are as many events in the ring buffer as
+    there have been completion events generate, we cannot call
+    put_reqs_available().  The code to check for this is now placed in
+    refill_reqs_available().
+
+    A test program from Dan and modified by me for verifying this bug is availab
+    at http://www.kvack.org/~bcrl/20140824-aio_bug.c .
+
+In other words, we're *almost* back to square one.  If you recall (way
+back at the top of this email), calculating the available events in the
+ring buffer was done using this formula:
+    total number of slots - (reqs_active + unreaped events in the ring)
+Now, the new code is a little more efficient in that it doesn't do this
+calculation every time we allocate a kiocb;  it only does it when all
+active requests are either still pending or have been completed by
+userspace but have not been reaped by the kernel and returned to the
+available pool.
+
+This brings us to the patch for RHEL 7.  We don't have the commit that
+changes from accounting reqs_active to reqs_available (they are complements
+of one another).  I tried to pull that patch in, but it ended up changing
+kabi in ways that were difficult or impossible to fix.
+
+So, I've taken the spirit of the patch and reimplemented it.  This means
+that the patch deserves a fair amount of review.
+
+In the rhel 7 version of free_ioctx, we wait for request completions to
+come in, which will then wake us up.  Then, since userspace won't be
+around to reap completions (advancing the head of the ring buffer), we
+do that work in the kernel (at this point we know that there are no more
+users of the ctx, so it's safe).  What I've done is to update reqs_active
+and the head pointer before waiting for wakeups.  This ensures that, in
+the event that there are no more in-flight requests, we account completed
+requests before testing the condition and potentially sleeping forever
+waiting for a completion that already came in.
+
+update_reqs_active and user_update_reqs_active are very similar to the
+refill_reqs_available and user_refill_reqs_available routines, just
+modified to deal with reqs_active.  Other changes should be fairly
+straight-forward, but feel free to ask if you have any question.
+
+Given that I basically had to rewrite this patch, I'd appreciate some
+review on this one.
+
+As with the others, this was tested using aio-stress, the libaio test
+harness, and the xfstests aio tests.
+
+This resolves bug 1122092.
+
+  commit d856f32a86b2b015ab180ab7a55e455ed8d3ccc5
+  Author: Benjamin LaHaise <bcrl@kvack.org>
+  Date:   Sun Aug 24 13:14:05 2014 -0400
+
+    aio: fix reqs_available handling
+
+    As reported by Dan Aloni, commit f8567a3845ac ("aio: fix aio request
+    leak when events are reaped by userspace") introduces a regression when
+    user code attempts to perform io_submit() with more events than are
+    available in the ring buffer.  Reverting that commit would reintroduce a
+    regression when user space event reaping is used.
+
+    Fixing this bug is a bit more involved than the previous attempts to fix
+    this regression.  Since we do not have a single point at which we can
+    count events as being reaped by user space and io_getevents(), we have
+    to track event completion by looking at the number of events left in the
+    event ring.  So long as there are as many events in the ring buffer as
+    there have been completion events generate, we cannot call
+    put_reqs_available().  The code to check for this is now placed in
+    refill_reqs_available().
+
+    A test program from Dan and modified by me for verifying this bug is available
+    at http://www.kvack.org/~bcrl/20140824-aio_bug.c .
+
+    Reported-by: Dan Aloni <dan@kernelim.com>
+    Signed-off-by: Benjamin LaHaise <bcrl@kvack.org>
+    Acked-by: Dan Aloni <dan@kernelim.com>
+    Cc: Kent Overstreet <kmo@daterainc.com>
+    Cc: Mateusz Guzik <mguzik@redhat.com>
+    Cc: Petr Matousek <pmatouse@redhat.com>
+    Cc: stable@vger.kernel.org      # v3.16 and anything that f8567a3845ac was backported to
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/aio.c b/fs/aio.c
+index b779f3b..0b311a8 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -93,7 +93,10 @@ struct kioctx {
+  struct work_struct rcu_work;
+ 
+  struct {
+-  atomic_t reqs_active;
++  atomic_t reqs_active; /* tracks an io request from the
++           * time it's allocated until the
++           * time the corresponding io_event
++           * is consumed by userspace */
+  } ____cacheline_aligned_in_smp;
+ 
+  struct {
+@@ -113,6 +116,7 @@ struct kioctx {
+ 
+  struct {
+   unsigned tail;
++  unsigned completed_events;
+   spinlock_t completion_lock;
+  } ____cacheline_aligned_in_smp;
+ 
+@@ -134,6 +138,9 @@ static struct vfsmount *aio_mnt;
+ static const struct file_operations aio_ring_fops;
+ static const struct address_space_operations aio_ctx_aops;
+ 
++static void user_update_reqs_active(struct kioctx *ctx);
++static void update_reqs_active(struct kioctx *ctx, unsigned head, unsigned tail);
++
+ static struct file *aio_private_file(struct kioctx *ctx, loff_t nr_pages)
+ {
+  struct qstr this = QSTR_INIT("[aio]", 5);
+@@ -513,13 +520,15 @@ static void free_ioctx(struct kioctx *ctx)
+  kunmap_atomic(ring);
+ 
+  while (atomic_read(&ctx->reqs_active) > 0) {
+-  wait_event(ctx->wait,
+-    head != ctx->tail ||
+-    atomic_read(&ctx->reqs_active) <= 0);
+-
++  user_update_reqs_active(ctx);
+   avail = (head <= ctx->tail ? ctx->tail : ctx->nr_events) - head;
+   head += avail;
+   head %= ctx->nr_events;
++  atomic_sub(avail, &ctx->reqs_active);
++
++  wait_event(ctx->wait,
++    head != ctx->tail ||
++    atomic_read(&ctx->reqs_active) <= 0);
+  }
+ 
+  WARN_ON(atomic_read(&ctx->reqs_active) < 0);
+@@ -728,6 +737,65 @@ void exit_aio(struct mm_struct *mm)
+  }
+ }
+ 
++/* update_reqs_active
++ *     Updates the reqs_active counter used for tracking the number of
++ *     outstanding requests and its complement, the number of free slots
++ *     in the completion ring.  This can be called from aio_complete()
++ *     (to optimistically updates reqs_active) or from aio_get_req()
++ *     (the we're out of events case).  It must be called holding
++ *     ctx->completion_lock.
++ */
++static void update_reqs_active(struct kioctx *ctx, unsigned head, unsigned tail)
++{
++ unsigned events_in_ring, completed;
++
++ /* Clamp head since userland can write to it. */
++ head %= ctx->nr_events;
++ if (head <= tail)
++  events_in_ring = tail - head;
++ else
++  events_in_ring = ctx->nr_events - (head - tail);
++
++ completed = ctx->completed_events;
++ if (events_in_ring < completed)
++  completed -= events_in_ring;
++ else
++  completed = 0;
++
++ if (!completed)
++  return;
++
++ ctx->completed_events -= completed;
++ atomic_sub(completed, &ctx->reqs_active);
++}
++
++static void user_update_reqs_active(struct kioctx *ctx)
++{
++ spin_lock_irq(&ctx->completion_lock);
++ if (ctx->completed_events) {
++  struct aio_ring *ring;
++  unsigned head;
++
++  /* Access of ring->head may race with aio_read_events_ring()
++   * here, but that's okay since whether we read the old version
++   * or the new version, and either will be valid.  The important
++   * part is that head cannot pass tail since we prevent
++   * aio_complete() from updating tail by holding
++   * ctx->completion_lock.  Even if head is invalid, the check
++   * against ctx->completed_events below will make sure we do the
++   * safe/right thing.
++   */
++  ring = kmap_atomic(ctx->ring_pages[0]);
++  head = ring->head;
++  kunmap_atomic(ring);
++
++  update_reqs_active(ctx, head, ctx->tail);
++ }
++
++ spin_unlock_irq(&ctx->completion_lock);
++}
++
++
+ /* aio_get_req
+  * Allocate a slot for an aio request.  Increments the ki_users count
+  * of the kioctx so that the kioctx stays around until all requests are
+@@ -742,8 +810,11 @@ static inline struct kiocb *aio_get_req(struct kioctx *ctx)
+ {
+  struct kiocb *req;
+ 
+- if (atomic_read(&ctx->reqs_active) >= ctx->nr_events)
+-  return NULL;
++ if (atomic_read(&ctx->reqs_active) >= ctx->nr_events - 1) {
++  user_update_reqs_active(ctx);
++  if (atomic_read(&ctx->reqs_active) >= ctx->nr_events - 1)
++   return NULL;
++ }
+ 
+  if (atomic_inc_return(&ctx->reqs_active) > ctx->nr_events - 1)
+   goto out_put;
+@@ -808,8 +879,8 @@ void aio_complete(struct kiocb *iocb, long res, long res2)
+  struct kioctx *ctx = iocb->ki_ctx;
+  struct aio_ring *ring;
+  struct io_event *ev_page, *event;
++ unsigned tail, pos, head;
+  unsigned long flags;
+- unsigned tail, pos;
+ 
+  /*
+   * Special case handling for sync iocbs:
+@@ -887,10 +958,20 @@ void aio_complete(struct kiocb *iocb, long res, long res2)
+  ctx->tail = tail;
+ 
+  ring = kmap_atomic(ctx->ring_pages[0]);
++ head = ring->head;
+  ring->tail = tail;
+  kunmap_atomic(ring);
+  flush_dcache_page(ctx->ring_pages[0]);
+ 
++ ctx->completed_events++;
++ /*
++  * It doesn't make sense to call update_reqs_active for this
++  * particular completion, b/c userspace hasn't had a chance
++  * to reap it yet.  So only call update_reqs_active if some
++  * other completion came in earlier.
++  */
++ if (ctx->completed_events > 1)
++  update_reqs_active(ctx, head, tail);
+  spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ 
+  pr_debug("added to ring %p at [%u]\n", iocb, tail);
+@@ -906,7 +987,6 @@ void aio_complete(struct kiocb *iocb, long res, long res2)
+ put_rq:
+  /* everything turned out well, dispose of the aiocb. */
+  aio_put_req(iocb);
+- atomic_dec(&ctx->reqs_active);
+ 
+  /*
+   * We have to order our ring_info tail store above and test
+-- 
+1.7.1

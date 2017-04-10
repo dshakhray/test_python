@@ -1,0 +1,186 @@
+From 0343910384db5c6e3865a0977fa897f0a34a972b Mon Sep 17 00:00:00 2001
+From: Rob Clark <rclark@redhat.com>
+Date: Wed, 17 Dec 2014 21:38:31 -0500
+Subject: [drm] i915: Fix locking for intel_enable_pipe_a()
+
+Message-id: <1418852380-13061-21-git-send-email-rclark@redhat.com>
+Patchwork-id: 102155
+O-Subject: [RHEL7 drm 20/89] drm/i915: Fix locking for intel_enable_pipe_a()
+Bugzilla: 1153301
+RH-Acked-by: Jerome Glisse <jglisse@redhat.com>
+RH-Acked-by: Dave Airlie <airlied@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1153301
+Upstream: since v3.16.4
+
+commit ecc68a4b6e38a818f03db0201c07d3a03e6567ea
+
+Author:     Ville Syrjala <ville.syrjala@linux.intel.com>
+AuthorDate: Mon Aug 11 13:15:35 2014 +0300
+Commit:     Rob Clark <rclark@redhat.com>
+CommitDate: Wed Dec 10 17:13:11 2014 -0500
+
+    drm/i915: Fix locking for intel_enable_pipe_a()
+
+    commit 208bf9fdcd3575aa4a5d48b3e0295f7cdaf6fc44 upstream.
+
+    intel_enable_pipe_a() gets called with all the modeset locks already
+    held (by drm_modeset_lock_all()), so trying to grab the same
+    locks using another drm_modeset_acquire_ctx is going to fail miserably.
+
+    Move most of the drm_modeset_acquire_ctx handling (init/drop/fini)
+    out from intel_{get,release}_load_detect_pipe() into the callers
+    (intel_{crt,tv}_detect()). Only the actual locking and backoff
+    handling is left in intel_get_load_detect_pipe(). And in
+    intel_enable_pipe_a() we just share the mode_config.acquire_ctx from
+    drm_modeset_lock_all() which is already holding all the relevant locks.
+
+    It's perfectly legal to lock the same ww_mutex multiple times using the
+    same ww_acquire_ctx. drm_modeset_lock() will convert the returned
+    -EALREADY into 0, so the caller doesn't need to do antyhing special.
+
+    Fixes a hang on resume on my 830.
+
+    Signed-off-by: Ville Syrjala <ville.syrjala@linux.intel.com>
+    Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Signed-off-by: Rob Clark <rclark@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/gpu/drm/i915/intel_crt.c b/drivers/gpu/drm/i915/intel_crt.c
+index 5a045d3..07ec3a6 100644
+--- a/drivers/gpu/drm/i915/intel_crt.c
++++ b/drivers/gpu/drm/i915/intel_crt.c
+@@ -673,16 +673,21 @@ intel_crt_detect(struct drm_connector *connector, bool force)
+   goto out;
+  }
+ 
++ drm_modeset_acquire_init(&ctx, 0);
++
+  /* for pre-945g platforms use load detect */
+  if (intel_get_load_detect_pipe(connector, NULL, &tmp, &ctx)) {
+   if (intel_crt_detect_ddc(connector))
+    status = connector_status_connected;
+   else
+    status = intel_crt_load_detect(crt);
+-  intel_release_load_detect_pipe(connector, &tmp, &ctx);
++  intel_release_load_detect_pipe(connector, &tmp);
+  } else
+   status = connector_status_unknown;
+ 
++ drm_modeset_drop_locks(&ctx);
++ drm_modeset_acquire_fini(&ctx);
++
+ out:
+  intel_display_power_put(dev_priv, power_domain);
+  intel_runtime_pm_put(dev_priv);
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 513c731..db8f15b 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -8340,8 +8340,6 @@ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+         connector->base.id, connector->name,
+         encoder->base.id, encoder->name);
+ 
+- drm_modeset_acquire_init(ctx, 0);
+-
+ retry:
+  ret = drm_modeset_lock(&config->connection_mutex, ctx);
+  if (ret)
+@@ -8456,15 +8454,11 @@ fail_unlock:
+   goto retry;
+  }
+ 
+- drm_modeset_drop_locks(ctx);
+- drm_modeset_acquire_fini(ctx);
+-
+  return false;
+ }
+ 
+ void intel_release_load_detect_pipe(struct drm_connector *connector,
+-        struct intel_load_detect_pipe *old,
+-        struct drm_modeset_acquire_ctx *ctx)
++        struct intel_load_detect_pipe *old)
+ {
+  struct intel_encoder *intel_encoder =
+   intel_attached_encoder(connector);
+@@ -8488,17 +8482,12 @@ void intel_release_load_detect_pipe(struct drm_connector *connector,
+    drm_framebuffer_unreference(old->release_fb);
+   }
+ 
+-  goto unlock;
+   return;
+  }
+ 
+  /* Switch crtc and encoder back off if necessary */
+  if (old->dpms_mode != DRM_MODE_DPMS_ON)
+   connector->funcs->dpms(connector, old->dpms_mode);
+-
+-unlock:
+- drm_modeset_drop_locks(ctx);
+- drm_modeset_acquire_fini(ctx);
+ }
+ 
+ static int i9xx_pll_refclk(struct drm_device *dev,
+@@ -11876,7 +11865,7 @@ static void intel_enable_pipe_a(struct drm_device *dev)
+  struct intel_connector *connector;
+  struct drm_connector *crt = NULL;
+  struct intel_load_detect_pipe load_detect_temp;
+- struct drm_modeset_acquire_ctx ctx;
++ struct drm_modeset_acquire_ctx *ctx = dev->mode_config.acquire_ctx;
+ 
+  /* We can't just switch on the pipe A, we need to set things up with a
+   * proper mode and output configuration. As a gross hack, enable pipe A
+@@ -11893,10 +11882,8 @@ static void intel_enable_pipe_a(struct drm_device *dev)
+  if (!crt)
+   return;
+ 
+- if (intel_get_load_detect_pipe(crt, NULL, &load_detect_temp, &ctx))
+-  intel_release_load_detect_pipe(crt, &load_detect_temp, &ctx);
+-
+-
++ if (intel_get_load_detect_pipe(crt, NULL, &load_detect_temp, ctx))
++  intel_release_load_detect_pipe(crt, &load_detect_temp);
+ }
+ 
+ static bool
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index a91eb79..0b62c2e 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -788,8 +788,7 @@ bool intel_get_load_detect_pipe(struct drm_connector *connector,
+     struct intel_load_detect_pipe *old,
+     struct drm_modeset_acquire_ctx *ctx);
+ void intel_release_load_detect_pipe(struct drm_connector *connector,
+-        struct intel_load_detect_pipe *old,
+-        struct drm_modeset_acquire_ctx *ctx);
++        struct intel_load_detect_pipe *old);
+ int intel_pin_and_fence_fb_obj(struct drm_device *dev,
+           struct drm_i915_gem_object *obj,
+           struct intel_engine_cs *pipelined);
+diff --git a/drivers/gpu/drm/i915/intel_tv.c b/drivers/gpu/drm/i915/intel_tv.c
+index 67c6c9a..71aa61b 100644
+--- a/drivers/gpu/drm/i915/intel_tv.c
++++ b/drivers/gpu/drm/i915/intel_tv.c
+@@ -1323,11 +1323,16 @@ intel_tv_detect(struct drm_connector *connector, bool force)
+   struct intel_load_detect_pipe tmp;
+   struct drm_modeset_acquire_ctx ctx;
+ 
++  drm_modeset_acquire_init(&ctx, 0);
++
+   if (intel_get_load_detect_pipe(connector, &mode, &tmp, &ctx)) {
+    type = intel_tv_detect_type(intel_tv, connector);
+-   intel_release_load_detect_pipe(connector, &tmp, &ctx);
++   intel_release_load_detect_pipe(connector, &tmp);
+   } else
+    return connector_status_unknown;
++
++  drm_modeset_drop_locks(&ctx);
++  drm_modeset_acquire_fini(&ctx);
+  } else
+   return connector->status;
+ 
+-- 
+1.7.1

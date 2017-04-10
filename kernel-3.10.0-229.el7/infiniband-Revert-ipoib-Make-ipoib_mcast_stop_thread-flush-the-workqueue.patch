@@ -1,0 +1,113 @@
+From e21a2aa3bd31f1752204c2c51d6af1e082a9b345 Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 28 Jan 2015 23:10:31 -0500
+Subject: [infiniband] Revert: ipoib: Make ipoib_mcast_stop_thread flush the workqueue
+
+Message-id: <62309489d3343348e28d8663e38980e37ae8c67b.1422486318.git.dledford@redhat.com>
+Patchwork-id: 103871
+O-Subject: [Patch RHEL7 2/8] Revert "[infiniband] ipoib: Make ipoib_mcast_stop_thread flush the workqueue"
+Bugzilla: 1179740
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+This reverts commit 29bb1ec947fbcd2fb093e2154206b2796f4305e6.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 28dc927..45fd10a 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -499,7 +499,7 @@ void ipoib_mcast_send(struct net_device *dev, u8 *daddr, struct sk_buff *skb);
+ 
+ void ipoib_mcast_restart_task(struct work_struct *work);
+ int ipoib_mcast_start_thread(struct net_device *dev);
+-int ipoib_mcast_stop_thread(struct net_device *dev);
++int ipoib_mcast_stop_thread(struct net_device *dev, int flush);
+ 
+ void ipoib_mcast_dev_down(struct net_device *dev);
+ void ipoib_mcast_dev_flush(struct net_device *dev);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_ib.c b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+index 6609678..bfd17d4 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@ -747,7 +747,7 @@ int ipoib_ib_dev_down(struct net_device *dev, int flush)
+  clear_bit(IPOIB_FLAG_OPER_UP, &priv->flags);
+  netif_carrier_off(dev);
+ 
+- ipoib_mcast_stop_thread(dev);
++ ipoib_mcast_stop_thread(dev, flush);
+  ipoib_mcast_dev_flush(dev);
+ 
+  ipoib_flush_paths(dev);
+@@ -1097,7 +1097,7 @@ void ipoib_ib_dev_cleanup(struct net_device *dev)
+   */
+  ipoib_flush_paths(dev);
+ 
+- ipoib_mcast_stop_thread(dev);
++ ipoib_mcast_stop_thread(dev, 1);
+  ipoib_mcast_dev_flush(dev);
+ 
+  ipoib_transport_dev_cleanup(dev);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+index 8a538c0..969ef42 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -656,7 +656,7 @@ int ipoib_mcast_start_thread(struct net_device *dev)
+  return 0;
+ }
+ 
+-int ipoib_mcast_stop_thread(struct net_device *dev)
++int ipoib_mcast_stop_thread(struct net_device *dev, int flush)
+ {
+  struct ipoib_dev_priv *priv = netdev_priv(dev);
+ 
+@@ -667,7 +667,8 @@ int ipoib_mcast_stop_thread(struct net_device *dev)
+  cancel_delayed_work(&priv->mcast_task);
+  mutex_unlock(&mcast_mutex);
+ 
+- flush_workqueue(priv->wq);
++ if (flush)
++  flush_workqueue(priv->wq);
+ 
+  return 0;
+ }
+@@ -845,6 +846,8 @@ void ipoib_mcast_restart_task(struct work_struct *work)
+ 
+  ipoib_dbg_mcast(priv, "restarting multicast task\n");
+ 
++ ipoib_mcast_stop_thread(dev, 0);
++
+  local_irq_save(flags);
+  netif_addr_lock(dev);
+  spin_lock(&priv->lock);
+@@ -941,10 +944,13 @@ void ipoib_mcast_restart_task(struct work_struct *work)
+   * We have to cancel outside of the spinlock, but we have to
+   * take the rtnl lock or else we race with the removal of
+   * entries from the remove list in mcast_dev_flush as part
+-  * of ipoib_stop().  We detect the drop of the ADMIN_UP flag
+-  * to signal that we have hit this particular race, and we
+-  * return since we know we don't need to do anything else
+-  * anyway.
++  * of ipoib_stop() which will call mcast_stop_thread with
++  * flush == 1 while holding the rtnl lock, and the
++  * flush_workqueue won't complete until this restart_mcast_task
++  * completes.  So do like the carrier on task and attempt to
++  * take the rtnl lock, but if we can't before the ADMIN_UP flag
++  * goes away, then just return and know that the remove list will
++  * get flushed later by mcast_stop_thread.
+   */
+  while (!rtnl_trylock()) {
+   if (!test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags))
+@@ -956,9 +962,6 @@ void ipoib_mcast_restart_task(struct work_struct *work)
+   ipoib_mcast_leave(mcast->dev, mcast);
+   ipoib_mcast_free(mcast);
+  }
+- /*
+-  * Restart our join task if needed
+-  */
+  ipoib_mcast_start_thread(dev);
+  rtnl_unlock();
+ }
+-- 
+1.7.1

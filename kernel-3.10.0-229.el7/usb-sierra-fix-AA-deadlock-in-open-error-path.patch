@@ -1,0 +1,73 @@
+From a6c904ca5d29e68a2357ea68353a7592cad25977 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:08:13 -0400
+Subject: [usb] sierra: fix AA deadlock in open error path
+
+Message-id: <1410887463-20674-422-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95343
+O-Subject: [RHEL7 PATCH 421/591] USB: sierra: fix AA deadlock in open error path
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 353fe198602e8b4d1c7bdcceb8e60955087201b1
+Author: Johan Hovold <jhovold@gmail.com>
+Date:   Mon May 26 19:22:50 2014 +0200
+
+    USB: sierra: fix AA deadlock in open error path
+
+    Fix AA deadlock in open error path that would call close() and try to
+    grab the already held disc_mutex.
+
+    Fixes: b9a44bc19f48 ("sierra: driver urb handling improvements")
+
+    Cc: <stable@vger.kernel.org> # v2.6.31
+    Signed-off-by: Johan Hovold <jhovold@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/serial/sierra.c b/drivers/usb/serial/sierra.c
+index 6b192e6..07cbd98 100644
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -816,14 +816,9 @@ static int sierra_open(struct tty_struct *tty, struct usb_serial_port *port)
+    usb_sndbulkpipe(serial->dev, endpoint) | USB_DIR_IN);
+ 
+  err = sierra_submit_rx_urbs(port, GFP_KERNEL);
+- if (err) {
+-  /* get rid of everything as in close */
+-  sierra_close(port);
+-  /* restore balance for autopm */
+-  if (!serial->disconnected)
+-   usb_autopm_put_interface(serial->interface);
+-  return err;
+- }
++ if (err)
++  goto err_submit;
++
+  sierra_send_setup(port);
+ 
+  serial->interface->needs_remote_wakeup = 1;
+@@ -833,6 +828,16 @@ static int sierra_open(struct tty_struct *tty, struct usb_serial_port *port)
+  usb_autopm_put_interface(serial->interface);
+ 
+  return 0;
++
++err_submit:
++ sierra_stop_rx_urbs(port);
++
++ for (i = 0; i < portdata->num_in_urbs; i++) {
++  sierra_release_urb(portdata->in_urbs[i]);
++  portdata->in_urbs[i] = NULL;
++ }
++
++ return err;
+ }
+ 
+ 
+-- 
+1.7.1

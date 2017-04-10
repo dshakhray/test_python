@@ -1,0 +1,194 @@
+From 6b8bc0e702292b8a7adc628bf8cbf29a1880c5e1 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:20:36 -0400
+Subject: [fs] nfs: teach nfs_neg_need_reval to understand LOOKUP_RCU
+
+Message-id: <1411050057-12417-74-git-send-email-steved@redhat.com>
+Patchwork-id: 96212
+O-Subject: [RHEL7.1 PATCH 73/94] NFS: teach nfs_neg_need_reval to understand LOOKUP_RCU
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: NeilBrown <neilb@suse.de>
+
+This requires nfs_check_verifier to take an rcu_walk flag, and requires
+an rcu version of nfs_revalidate_inode which returns -ECHILD rather
+than making an RPC call.
+
+With this, nfs_lookup_revalidate can call nfs_neg_need_reval in
+RCU-walk mode.
+
+We can also move the LOOKUP_RCU check past the nfs_check_verifier()
+call in nfs_lookup_revalidate.
+
+If RCU_WALK prevents nfs_check_verifier or nfs_neg_need_reval from
+doing a full check, they return a status indicating that a revalidation
+is required.  As this revalidation will not be possible in RCU_WALK
+mode, -ECHILD will ultimately be returned, which is the desired result.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 912a108da767ae75cc929d2854e698aff527ec5d
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 0473986..7958d41 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -989,9 +989,13 @@ EXPORT_SYMBOL_GPL(nfs_force_lookup_revalidate);
+  * A check for whether or not the parent directory has changed.
+  * In the case it has, we assume that the dentries are untrustworthy
+  * and may need to be looked up again.
++ * If rcu_walk prevents us from performing a full check, return 0.
+  */
+-static int nfs_check_verifier(struct inode *dir, struct dentry *dentry)
++static int nfs_check_verifier(struct inode *dir, struct dentry *dentry,
++         int rcu_walk)
+ {
++ int ret;
++
+  if (IS_ROOT(dentry))
+   return 1;
+  if (NFS_SERVER(dir)->flags & NFS_MOUNT_LOOKUP_CACHE_NONE)
+@@ -999,7 +1003,11 @@ static int nfs_check_verifier(struct inode *dir, struct dentry *dentry)
+  if (!nfs_verify_change_attribute(dir, dentry->d_time))
+   return 0;
+  /* Revalidate nfsi->cache_change_attribute before we declare a match */
+- if (nfs_revalidate_inode(NFS_SERVER(dir), dir) < 0)
++ if (rcu_walk)
++  ret = nfs_revalidate_inode_rcu(NFS_SERVER(dir), dir);
++ else
++  ret = nfs_revalidate_inode(NFS_SERVER(dir), dir);
++ if (ret < 0)
+   return 0;
+  if (!nfs_verify_change_attribute(dir, dentry->d_time))
+   return 0;
+@@ -1055,6 +1063,9 @@ out_force:
+  *
+  * If parent mtime has changed, we revalidate, else we wait for a
+  * period corresponding to the parent's attribute cache timeout value.
++ *
++ * If LOOKUP_RCU prevents us from performing a full check, return 1
++ * suggesting a reval is needed.
+  */
+ static inline
+ int nfs_neg_need_reval(struct inode *dir, struct dentry *dentry,
+@@ -1065,7 +1076,7 @@ int nfs_neg_need_reval(struct inode *dir, struct dentry *dentry,
+   return 0;
+  if (NFS_SERVER(dir)->flags & NFS_MOUNT_LOOKUP_CACHE_NONEG)
+   return 1;
+- return !nfs_check_verifier(dir, dentry);
++ return !nfs_check_verifier(dir, dentry, flags & LOOKUP_RCU);
+ }
+ 
+ /*
+@@ -1102,11 +1113,11 @@ static int nfs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+  inode = dentry->d_inode;
+ 
+  if (!inode) {
+-  if (flags & LOOKUP_RCU)
+-   return -ECHILD;
+-
+-  if (nfs_neg_need_reval(dir, dentry, flags))
++  if (nfs_neg_need_reval(dir, dentry, flags)) {
++   if (flags & LOOKUP_RCU)
++    return -ECHILD;
+    goto out_bad;
++  }
+   goto out_valid_noent;
+  }
+ 
+@@ -1121,16 +1132,21 @@ static int nfs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+  if (NFS_PROTO(dir)->have_delegation(inode, FMODE_READ))
+   goto out_set_verifier;
+ 
+- if (flags & LOOKUP_RCU)
+-  return -ECHILD;
+-
+  /* Force a full look up iff the parent directory has changed */
+- if (!nfs_is_exclusive_create(dir, flags) && nfs_check_verifier(dir, dentry)) {
++ if (!nfs_is_exclusive_create(dir, flags) &&
++     nfs_check_verifier(dir, dentry, flags & LOOKUP_RCU)) {
++
++  if (flags & LOOKUP_RCU)
++   return -ECHILD;
++
+   if (nfs_lookup_verify_inode(inode, flags))
+    goto out_zap_parent;
+   goto out_valid;
+  }
+ 
++ if (flags & LOOKUP_RCU)
++  return -ECHILD;
++
+  if (NFS_STALE(inode))
+   goto out_bad;
+ 
+@@ -1567,14 +1583,23 @@ static int nfs4_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+   struct dentry *parent;
+   struct inode *dir;
+ 
+-  if (flags & LOOKUP_RCU)
+-   return -ECHILD;
+-
+-  parent = dget_parent(dentry);
+-  dir = parent->d_inode;
++  if (flags & LOOKUP_RCU) {
++   parent = rcu_dereference(dentry);
++   dir = ACCESS_ONCE(parent->d_inode);
++   if (!dir)
++    return -ECHILD;
++  } else {
++   parent = dget_parent(dentry);
++   dir = parent->d_inode;
++  }
+   if (!nfs_neg_need_reval(dir, dentry, flags))
+    ret = 1;
+-  dput(parent);
++  else if (flags & LOOKUP_RCU)
++   ret = -ECHILD;
++  if (!(flags & LOOKUP_RCU))
++   dput(parent);
++  else if (parent != rcu_dereference(dentry))
++   return -ECHILD;
+   goto out;
+  }
+ 
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index 3d01405..7e3f6e4 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -1004,6 +1004,15 @@ int nfs_revalidate_inode(struct nfs_server *server, struct inode *inode)
+ }
+ EXPORT_SYMBOL_GPL(nfs_revalidate_inode);
+ 
++int nfs_revalidate_inode_rcu(struct nfs_server *server, struct inode *inode)
++{
++ if (!(NFS_I(inode)->cache_validity &
++   (NFS_INO_INVALID_ATTR|NFS_INO_INVALID_LABEL))
++   && !nfs_attribute_cache_expired(inode))
++  return NFS_STALE(inode) ? -ESTALE : 0;
++ return -ECHILD;
++}
++
+ static int nfs_invalidate_mapping(struct inode *inode, struct address_space *mapping)
+ {
+  struct nfs_inode *nfsi = NFS_I(inode);
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 358a40c..0a90052 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -352,6 +352,7 @@ extern int nfs_release(struct inode *, struct file *);
+ extern int nfs_attribute_timeout(struct inode *inode);
+ extern int nfs_attribute_cache_expired(struct inode *inode);
+ extern int nfs_revalidate_inode(struct nfs_server *server, struct inode *inode);
++extern int nfs_revalidate_inode_rcu(struct nfs_server *server, struct inode *inode);
+ extern int __nfs_revalidate_inode(struct nfs_server *, struct inode *);
+ extern int nfs_revalidate_mapping(struct inode *inode, struct address_space *mapping);
+ extern int nfs_setattr(struct dentry *, struct iattr *);
+-- 
+1.7.1

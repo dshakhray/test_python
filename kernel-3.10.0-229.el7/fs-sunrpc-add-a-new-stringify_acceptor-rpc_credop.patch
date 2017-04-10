@@ -1,0 +1,151 @@
+From 9ca1c679351ad976945e458f1be1a04d231eedf9 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:19:48 -0400
+Subject: [fs] sunrpc: add a new "stringify_acceptor" rpc_credop
+
+Message-id: <1411050057-12417-26-git-send-email-steved@redhat.com>
+Patchwork-id: 96270
+O-Subject: [RHEL7.1 PATCH 25/94] sunrpc: add a new "stringify_acceptor" rpc_credop
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: Jeff Layton <jlayton@poochiereds.net>
+
+...and add an new rpc_auth function to call it when it exists. This
+is only applicable for AUTH_GSS mechanisms, so we only specify this
+for those sorts of credentials.
+
+Signed-off-by: Jeff Layton <jlayton@poochiereds.net>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: a0337d1ddb5a4bd609e3ff0955551cb240340340
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/sunrpc/auth.h b/include/linux/sunrpc/auth.h
+index 790be14..c683b9a 100644
+--- a/include/linux/sunrpc/auth.h
++++ b/include/linux/sunrpc/auth.h
+@@ -140,6 +140,7 @@ struct rpc_credops {
+       void *, __be32 *, void *);
+  int   (*crkey_timeout)(struct rpc_cred *);
+  bool   (*crkey_to_expire)(struct rpc_cred *);
++ char *   (*crstringify_acceptor)(struct rpc_cred *);
+ };
+ 
+ extern const struct rpc_authops authunix_ops;
+@@ -182,6 +183,7 @@ void   rpcauth_clear_credcache(struct rpc_cred_cache *);
+ int   rpcauth_key_timeout_notify(struct rpc_auth *,
+       struct rpc_cred *);
+ bool   rpcauth_cred_key_to_expire(struct rpc_cred *);
++char *   rpcauth_stringify_acceptor(struct rpc_cred *);
+ 
+ static inline
+ struct rpc_cred * get_rpccred(struct rpc_cred *cred)
+diff --git a/net/sunrpc/auth.c b/net/sunrpc/auth.c
+index 4151590..b3a0697 100644
+--- a/net/sunrpc/auth.c
++++ b/net/sunrpc/auth.c
+@@ -363,6 +363,15 @@ rpcauth_cred_key_to_expire(struct rpc_cred *cred)
+ }
+ EXPORT_SYMBOL_GPL(rpcauth_cred_key_to_expire);
+ 
++char *
++rpcauth_stringify_acceptor(struct rpc_cred *cred)
++{
++ if (!cred->cr_ops->crstringify_acceptor)
++  return NULL;
++ return cred->cr_ops->crstringify_acceptor(cred);
++}
++EXPORT_SYMBOL_GPL(rpcauth_stringify_acceptor);
++
+ /*
+  * Destroy a list of credentials
+  */
+diff --git a/net/sunrpc/auth_gss/auth_gss.c b/net/sunrpc/auth_gss/auth_gss.c
+index b6f3875..1654b13 100644
+--- a/net/sunrpc/auth_gss/auth_gss.c
++++ b/net/sunrpc/auth_gss/auth_gss.c
+@@ -1337,6 +1337,26 @@ gss_cred_init(struct rpc_auth *auth, struct rpc_cred *cred)
+  return err;
+ }
+ 
++static char *
++gss_stringify_acceptor(struct rpc_cred *cred)
++{
++ char *string;
++ struct gss_cred *gss_cred = container_of(cred, struct gss_cred, gc_base);
++ struct xdr_netobj *acceptor = &gss_cred->gc_ctx->gc_acceptor;
++
++ /* no point if there's no string */
++ if (!acceptor->len)
++  return NULL;
++
++ string = kmalloc(acceptor->len + 1, GFP_KERNEL);
++ if (!string)
++  return string;
++
++ memcpy(string, acceptor->data, acceptor->len);
++ string[acceptor->len] = '\0';
++ return string;
++}
++
+ /*
+  * Returns -EACCES if GSS context is NULL or will expire within the
+  * timeout (miliseconds)
+@@ -1914,29 +1934,31 @@ static const struct rpc_authops authgss_ops = {
+ };
+ 
+ static const struct rpc_credops gss_credops = {
+- .cr_name = "AUTH_GSS",
+- .crdestroy = gss_destroy_cred,
+- .cr_init = gss_cred_init,
+- .crbind  = rpcauth_generic_bind_cred,
+- .crmatch = gss_match,
+- .crmarshal = gss_marshal,
+- .crrefresh = gss_refresh,
+- .crvalidate = gss_validate,
+- .crwrap_req = gss_wrap_req,
+- .crunwrap_resp = gss_unwrap_resp,
+- .crkey_timeout = gss_key_timeout,
++ .cr_name  = "AUTH_GSS",
++ .crdestroy  = gss_destroy_cred,
++ .cr_init  = gss_cred_init,
++ .crbind   = rpcauth_generic_bind_cred,
++ .crmatch  = gss_match,
++ .crmarshal  = gss_marshal,
++ .crrefresh  = gss_refresh,
++ .crvalidate  = gss_validate,
++ .crwrap_req  = gss_wrap_req,
++ .crunwrap_resp  = gss_unwrap_resp,
++ .crkey_timeout  = gss_key_timeout,
++ .crstringify_acceptor = gss_stringify_acceptor,
+ };
+ 
+ static const struct rpc_credops gss_nullops = {
+- .cr_name = "AUTH_GSS",
+- .crdestroy = gss_destroy_nullcred,
+- .crbind  = rpcauth_generic_bind_cred,
+- .crmatch = gss_match,
+- .crmarshal = gss_marshal,
+- .crrefresh = gss_refresh_null,
+- .crvalidate = gss_validate,
+- .crwrap_req = gss_wrap_req,
+- .crunwrap_resp = gss_unwrap_resp,
++ .cr_name  = "AUTH_GSS",
++ .crdestroy  = gss_destroy_nullcred,
++ .crbind   = rpcauth_generic_bind_cred,
++ .crmatch  = gss_match,
++ .crmarshal  = gss_marshal,
++ .crrefresh  = gss_refresh_null,
++ .crvalidate  = gss_validate,
++ .crwrap_req  = gss_wrap_req,
++ .crunwrap_resp  = gss_unwrap_resp,
++ .crstringify_acceptor = gss_stringify_acceptor,
+ };
+ 
+ static const struct rpc_pipe_ops gss_upcall_ops_v0 = {
+-- 
+1.7.1

@@ -1,0 +1,123 @@
+From 53a7f70414454eaa48d6b0fcaa1b7b0da46df82c Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:40:21 -0400
+Subject: [alsa] usb-audio: Respond to suspend and resume callbacks for MIDI input
+
+Message-id: <140972823573-410-patchset-jkysela@redhat.com>
+Patchwork-id: 91106
+O-Subject: [RHEL 7.1 PATCH 409/442] ALSA: usb-audio: Respond to suspend and resume callbacks for MIDI input
+Bugzilla: 1112200
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+sound/usb/card.c registers USB suspend and resume but did not previously
+kill the input URBs. This means that USB MIDI devices left open across
+suspend/resume had non-functional input (output still usually worked,
+but it looks like that is another issue). Before this change, we would
+get ESHUTDOWN for each of the input URBs at suspend time, killing input.
+
+Signed-off-by: Adam Goode <agoode@google.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+(picked from kernel: f7881e5e8ef305e62084bf3d31b5b0d827fdf511)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/sound/usb/card.c b/sound/usb/card.c
+index a09e5f3..7ecd0e8 100644
+--- a/sound/usb/card.c
++++ b/sound/usb/card.c
+@@ -680,6 +680,7 @@ static int usb_audio_suspend(struct usb_interface *intf, pm_message_t message)
+  struct snd_usb_audio *chip = usb_get_intfdata(intf);
+  struct snd_usb_stream *as;
+  struct usb_mixer_interface *mixer;
++ struct list_head *p;
+ 
+  if (chip == (void *)-1L)
+   return 0;
+@@ -692,6 +693,9 @@ static int usb_audio_suspend(struct usb_interface *intf, pm_message_t message)
+     as->substream[0].need_setup_ep =
+      as->substream[1].need_setup_ep = true;
+    }
++   list_for_each(p, &chip->midi_list) {
++    snd_usbmidi_suspend(p);
++   }
+   }
+  } else {
+   /*
+@@ -713,6 +717,7 @@ static int __usb_audio_resume(struct usb_interface *intf, bool reset_resume)
+ {
+  struct snd_usb_audio *chip = usb_get_intfdata(intf);
+  struct usb_mixer_interface *mixer;
++ struct list_head *p;
+  int err = 0;
+ 
+  if (chip == (void *)-1L)
+@@ -731,6 +736,10 @@ static int __usb_audio_resume(struct usb_interface *intf, bool reset_resume)
+    goto err_out;
+  }
+ 
++ list_for_each(p, &chip->midi_list) {
++  snd_usbmidi_resume(p);
++ }
++
+  if (!chip->autosuspended)
+   snd_power_change_state(chip->card, SNDRV_CTL_POWER_D0);
+  chip->autosuspended = 0;
+diff --git a/sound/usb/midi.c b/sound/usb/midi.c
+index 9da74d2..9a4e82c 100644
+--- a/sound/usb/midi.c
++++ b/sound/usb/midi.c
+@@ -2187,6 +2187,34 @@ void snd_usbmidi_input_start(struct list_head* p)
+ EXPORT_SYMBOL(snd_usbmidi_input_start);
+ 
+ /*
++ * Prepare for suspend. Typically called from the USB suspend callback.
++ */
++void snd_usbmidi_suspend(struct list_head *p)
++{
++ struct snd_usb_midi *umidi;
++
++ umidi = list_entry(p, struct snd_usb_midi, list);
++ mutex_lock(&umidi->mutex);
++ snd_usbmidi_input_stop(p);
++ mutex_unlock(&umidi->mutex);
++}
++EXPORT_SYMBOL(snd_usbmidi_suspend);
++
++/*
++ * Resume. Typically called from the USB resume callback.
++ */
++void snd_usbmidi_resume(struct list_head *p)
++{
++ struct snd_usb_midi *umidi;
++
++ umidi = list_entry(p, struct snd_usb_midi, list);
++ mutex_lock(&umidi->mutex);
++ snd_usbmidi_input_start(p);
++ mutex_unlock(&umidi->mutex);
++}
++EXPORT_SYMBOL(snd_usbmidi_resume);
++
++/*
+  * Creates and registers everything needed for a MIDI streaming interface.
+  */
+ int snd_usbmidi_create(struct snd_card *card,
+diff --git a/sound/usb/midi.h b/sound/usb/midi.h
+index 2fca80b..46e5b65 100644
+--- a/sound/usb/midi.h
++++ b/sound/usb/midi.h
+@@ -46,5 +46,7 @@ int snd_usbmidi_create(struct snd_card *card,
+ void snd_usbmidi_input_stop(struct list_head* p);
+ void snd_usbmidi_input_start(struct list_head* p);
+ void snd_usbmidi_disconnect(struct list_head *p);
++void snd_usbmidi_suspend(struct list_head *p);
++void snd_usbmidi_resume(struct list_head *p);
+ 
+ #endif /* __USBMIDI_H */
+-- 
+1.7.1

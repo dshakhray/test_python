@@ -1,0 +1,136 @@
+From f99897601e0471e520985ed4ca57d3e36292e012 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:03:10 -0400
+Subject: [usb] wusbcore: add calls to usb_hcd_link_urb_to_ep, usb_hcd_unlink_urb_from_ep, and
+
+Message-id: <1410887463-20674-119-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95148
+O-Subject: [RHEL7 PATCH 118/591] usb: wusbcore: add calls to usb_hcd_link_urb_to_ep, usb_hcd_unlink_urb_from_ep, and
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit b374487ebe8a91d03c07fe361af375e09285c3b0
+Author: Thomas Pugliese <thomas.pugliese@gmail.com>
+Date:   Mon Nov 25 16:17:16 2013 -0600
+
+    usb: wusbcore: add calls to usb_hcd_link_urb_to_ep, usb_hcd_unlink_urb_from_ep, and
+
+    Add calls to usb_hcd_link_urb_to_ep, usb_hcd_unlink_urb_from_ep, and
+    usb_hcd_check_unlink_urb in the appropriate locations.
+
+    Signed-off-by: Thomas Pugliese <thomas.pugliese@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/host/hwa-hc.c b/drivers/usb/host/hwa-hc.c
+index ada0a52..a4ec9e6 100644
+--- a/drivers/usb/host/hwa-hc.c
++++ b/drivers/usb/host/hwa-hc.c
+@@ -224,7 +224,7 @@ static int hwahc_op_urb_dequeue(struct usb_hcd *usb_hcd, struct urb *urb,
+  struct wusbhc *wusbhc = usb_hcd_to_wusbhc(usb_hcd);
+  struct hwahc *hwahc = container_of(wusbhc, struct hwahc, wusbhc);
+ 
+- return wa_urb_dequeue(&hwahc->wa, urb);
++ return wa_urb_dequeue(&hwahc->wa, urb, status);
+ }
+ 
+ /*
+diff --git a/drivers/usb/wusbcore/wa-hc.h b/drivers/usb/wusbcore/wa-hc.h
+index e614f02..5b6ae3a 100644
+--- a/drivers/usb/wusbcore/wa-hc.h
++++ b/drivers/usb/wusbcore/wa-hc.h
+@@ -332,7 +332,7 @@ static inline int rpipe_avail_inc(struct wa_rpipe *rpipe)
+ /* Transferring data */
+ extern int wa_urb_enqueue(struct wahc *, struct usb_host_endpoint *,
+      struct urb *, gfp_t);
+-extern int wa_urb_dequeue(struct wahc *, struct urb *);
++extern int wa_urb_dequeue(struct wahc *, struct urb *, int);
+ extern void wa_handle_notif_xfer(struct wahc *, struct wa_notif_hdr *);
+ 
+ 
+diff --git a/drivers/usb/wusbcore/wa-xfer.c b/drivers/usb/wusbcore/wa-xfer.c
+index ed5abe8..5957e48 100644
+--- a/drivers/usb/wusbcore/wa-xfer.c
++++ b/drivers/usb/wusbcore/wa-xfer.c
+@@ -282,6 +282,7 @@ static void wa_xfer_giveback(struct wa_xfer *xfer)
+ 
+  spin_lock_irqsave(&xfer->wa->xfer_list_lock, flags);
+  list_del_init(&xfer->list_node);
++ usb_hcd_unlink_urb_from_ep(&(xfer->wa->wusb->usb_hcd), xfer->urb);
+  spin_unlock_irqrestore(&xfer->wa->xfer_list_lock, flags);
+  /* FIXME: segmentation broken -- kills DWA */
+  wusbhc_giveback_urb(xfer->wa->wusb, xfer->urb, xfer->result);
+@@ -1730,6 +1731,12 @@ int wa_urb_enqueue(struct wahc *wa, struct usb_host_endpoint *ep,
+   dump_stack();
+  }
+ 
++ spin_lock_irqsave(&wa->xfer_list_lock, my_flags);
++ result = usb_hcd_link_urb_to_ep(&(wa->wusb->usb_hcd), urb);
++ spin_unlock_irqrestore(&wa->xfer_list_lock, my_flags);
++ if (result < 0)
++  goto error_link_urb;
++
+  result = -ENOMEM;
+  xfer = kzalloc(sizeof(*xfer), gfp);
+  if (xfer == NULL)
+@@ -1769,6 +1776,9 @@ int wa_urb_enqueue(struct wahc *wa, struct usb_host_endpoint *ep,
+       __func__, result);
+    wa_put(xfer->wa);
+    wa_xfer_put(xfer);
++   spin_lock_irqsave(&wa->xfer_list_lock, my_flags);
++   usb_hcd_unlink_urb_from_ep(&(wa->wusb->usb_hcd), urb);
++   spin_unlock_irqrestore(&wa->xfer_list_lock, my_flags);
+    return result;
+   }
+  }
+@@ -1777,6 +1787,10 @@ int wa_urb_enqueue(struct wahc *wa, struct usb_host_endpoint *ep,
+ error_dequeued:
+  kfree(xfer);
+ error_kmalloc:
++ spin_lock_irqsave(&wa->xfer_list_lock, my_flags);
++ usb_hcd_unlink_urb_from_ep(&(wa->wusb->usb_hcd), urb);
++ spin_unlock_irqrestore(&wa->xfer_list_lock, my_flags);
++error_link_urb:
+  return result;
+ }
+ EXPORT_SYMBOL_GPL(wa_urb_enqueue);
+@@ -1799,7 +1813,7 @@ EXPORT_SYMBOL_GPL(wa_urb_enqueue);
+  * asynch request] and then make sure we cancel each segment.
+  *
+  */
+-int wa_urb_dequeue(struct wahc *wa, struct urb *urb)
++int wa_urb_dequeue(struct wahc *wa, struct urb *urb, int status)
+ {
+  unsigned long flags, flags2;
+  struct wa_xfer *xfer;
+@@ -1807,6 +1821,14 @@ int wa_urb_dequeue(struct wahc *wa, struct urb *urb)
+  struct wa_rpipe *rpipe;
+  unsigned cnt, done = 0, xfer_abort_pending;
+  unsigned rpipe_ready = 0;
++ int result;
++
++ /* check if it is safe to unlink. */
++ spin_lock_irqsave(&wa->xfer_list_lock, flags);
++ result = usb_hcd_check_unlink_urb(&(wa->wusb->usb_hcd), urb, status);
++ spin_unlock_irqrestore(&wa->xfer_list_lock, flags);
++ if (result)
++  return result;
+ 
+  xfer = urb->hcpriv;
+  if (xfer == NULL) {
+@@ -2172,7 +2194,7 @@ error_complete:
+ 
+ error_bad_seg:
+  spin_unlock_irqrestore(&xfer->lock, flags);
+- wa_urb_dequeue(wa, xfer->urb);
++ wa_urb_dequeue(wa, xfer->urb, -ENOENT);
+  if (printk_ratelimit())
+   dev_err(dev, "xfer %p#%u: bad segment\n", xfer, seg_idx);
+  if (edc_inc(&wa->dti_edc, EDC_MAX_ERRORS, EDC_ERROR_TIMEFRAME)) {
+-- 
+1.7.1

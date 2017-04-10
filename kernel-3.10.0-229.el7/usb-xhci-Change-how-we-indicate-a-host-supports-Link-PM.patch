@@ -1,0 +1,131 @@
+From 38b83f025fde8fdd1cfe7c29f6891dc283e6c685 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:05:47 -0400
+Subject: [usb] xhci: Change how we indicate a host supports Link PM
+
+Message-id: <1410887463-20674-276-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95379
+O-Subject: [RHEL7 PATCH 275/591] usb/xhci: Change how we indicate a host supports Link PM.
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 25cd2882e2fc8bd8ed7acaee0ec979f11feda6d7
+Author: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date:   Fri Jan 17 14:15:44 2014 -0800
+
+    usb/xhci: Change how we indicate a host supports Link PM.
+
+    The xHCI driver currently uses a USB core internal field,
+    udev->lpm_capable, to indicate the xHCI driver knows how to calculate
+    the LPM timeout values.  If this value is set for the host controller
+    udev, it means Link PM can be enabled for child devices under that host.
+
+    Change the code so the xHCI driver isn't mucking with USB core internal
+    fields.  Instead, indicate the xHCI driver doesn't support Link PM on
+    this host by clearing the U1 and U2 exit latencies in the roothub
+    SuperSpeed Extended Capabilities BOS descriptor.
+
+    The code to check for the roothub setting U1 and U2 exit latencies to
+    zero will also disable LPM for external devices that do that same.  This
+    was already effectively done with commit
+    ae8963adb4ad8c5f2a89ca1d99fb7bb721e7599f "usb: Don't enable LPM if the
+    exit latency is zero."  Leave that code in place, so that if a device
+    sets one exit latency value to zero, but the other is set to a valid
+    value, LPM is only enabled for the U1 or U2 state that had the valid
+    value.  This is the same behavior the code had before.
+
+    Also, change messages about missing Link PM information from warning
+    level to info level.  Only print a warning about the first device that
+    doesn't support LPM, to avoid log spam.  Further, cleanup some
+    unnecessary line breaks to help people to grep for the error messages.
+
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+    Cc: Alan Stern <stern@rowland.harvard.edu>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index c5ec48d..69e1ca4 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -141,24 +141,27 @@ int usb_device_supports_lpm(struct usb_device *udev)
+   return 0;
+  }
+ 
+- /* All USB 3.0 must support LPM, but we need their max exit latency
+-  * information from the SuperSpeed Extended Capabilities BOS descriptor.
++ /*
++  * According to the USB 3.0 spec, all USB 3.0 devices must support LPM.
++  * However, there are some that don't, and they set the U1/U2 exit
++  * latencies to zero.
+   */
+  if (!udev->bos->ss_cap) {
+-  dev_warn(&udev->dev, "No LPM exit latency info found.  "
+-    "Power management will be impacted.\n");
++  dev_info(&udev->dev, "No LPM exit latency info found, disabling LPM.\n");
+   return 0;
+  }
+ 
+- /* udev is root hub */
+- if (!udev->parent)
+-  return 1;
++ if (udev->bos->ss_cap->bU1devExitLat == 0 &&
++   udev->bos->ss_cap->bU2DevExitLat == 0) {
++  if (udev->parent)
++   dev_info(&udev->dev, "LPM exit latency is zeroed, disabling LPM.\n");
++  else
++   dev_info(&udev->dev, "We don't know the algorithms for LPM for this host, disabling LPM.\n");
++  return 0;
++ }
+ 
+- if (udev->parent->lpm_capable)
++ if (!udev->parent || udev->parent->lpm_capable)
+   return 1;
+-
+- dev_warn(&udev->dev, "Parent hub missing LPM exit latency info.  "
+-   "Power management will be impacted.\n");
+  return 0;
+ }
+ 
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index 9992fbf..1ad6bc1 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -732,9 +732,11 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+   /* Set the U1 and U2 exit latencies. */
+   memcpy(buf, &usb_bos_descriptor,
+     USB_DT_BOS_SIZE + USB_DT_USB_SS_CAP_SIZE);
+-  temp = readl(&xhci->cap_regs->hcs_params3);
+-  buf[12] = HCS_U1_LATENCY(temp);
+-  put_unaligned_le16(HCS_U2_LATENCY(temp), &buf[13]);
++  if ((xhci->quirks & XHCI_LPM_SUPPORT)) {
++   temp = readl(&xhci->cap_regs->hcs_params3);
++   buf[12] = HCS_U1_LATENCY(temp);
++   put_unaligned_le16(HCS_U2_LATENCY(temp), &buf[13]);
++  }
+ 
+   /* Indicate whether the host has LTM support. */
+   temp = readl(&xhci->cap_regs->hcc_params);
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index 3c898c1..e42c318 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -217,12 +217,6 @@ static int xhci_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
+   goto put_usb3_hcd;
+  /* Roothub already marked as USB 3.0 speed */
+ 
+- /* We know the LPM timeout algorithms for this host, let the USB core
+-  * enable and disable LPM for devices under the USB 3.0 roothub.
+-  */
+- if (xhci->quirks & XHCI_LPM_SUPPORT)
+-  hcd_to_bus(xhci->shared_hcd)->root_hub->lpm_capable = 1;
+-
+  return 0;
+ 
+ put_usb3_hcd:
+-- 
+1.7.1

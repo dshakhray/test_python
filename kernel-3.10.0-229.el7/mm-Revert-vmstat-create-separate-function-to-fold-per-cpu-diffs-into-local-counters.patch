@@ -1,0 +1,117 @@
+From d92aebdf2a23bd2acca4e585701022a857ed860d Mon Sep 17 00:00:00 2001
+From: Larry Woodman <lwoodman@redhat.com>
+Date: Mon, 19 Jan 2015 14:28:54 -0500
+Subject: [mm] Revert: vmstat: create separate function to fold per cpu diffs into local counters
+
+Message-id: <1421677734-17441-5-git-send-email-lwoodman@redhat.com>
+Patchwork-id: 103151
+O-Subject: [RHEL7.1 PATCH 4/4] Revert "[mm] vmstat: create separate function to fold per cpu diffs into local counters"
+Bugzilla: 1179654
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+This reverts commit e9a6b134960f85176540aa8b97c3cbfb5300b98a.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/vmstat.h b/include/linux/vmstat.h
+index 789f8d4..24da963 100644
+--- a/include/linux/vmstat.h
++++ b/include/linux/vmstat.h
+@@ -193,7 +193,7 @@ extern void __inc_zone_state(struct zone *, enum zone_stat_item);
+ extern void dec_zone_state(struct zone *, enum zone_stat_item);
+ extern void __dec_zone_state(struct zone *, enum zone_stat_item);
+ 
+-void cpu_vm_stats_fold(int cpu);
++void refresh_cpu_vm_stats(int);
+ void refresh_zone_stat_thresholds(void);
+ 
+ void drain_zonestat(struct zone *zone, struct per_cpu_pageset *);
+@@ -253,7 +253,6 @@ static inline void __dec_zone_page_state(struct page *page,
+ 
+ static inline void refresh_cpu_vm_stats(int cpu) { }
+ static inline void refresh_zone_stat_thresholds(void) { }
+-static inline void cpu_vm_stats_fold(int cpu) { }
+ 
+ static inline void drain_zonestat(struct zone *zone,
+    struct per_cpu_pageset *pset) { }
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index a5ae973..59b8842 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -5405,7 +5405,7 @@ static int page_alloc_cpu_notify(struct notifier_block *self,
+    * This is only okay since the processor is dead and cannot
+    * race with what we are doing.
+    */
+-  cpu_vm_stats_fold(cpu);
++  refresh_cpu_vm_stats(cpu);
+  }
+  return NOTIFY_OK;
+ }
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 750482b..63f5256 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -415,7 +415,11 @@ EXPORT_SYMBOL(dec_zone_page_state);
+ #endif
+ 
+ /*
+- * Update the zone counters for the current cpu.
++ * Update the zone counters for one cpu.
++ *
++ * The cpu specified must be either the current cpu or a processor that
++ * is not online. If it is the current cpu then the execution thread must
++ * be pinned to the current cpu.
+  *
+  * Note that refresh_cpu_vm_stats strives to only access
+  * node local memory. The per cpu pagesets on remote zones are placed
+@@ -428,7 +432,7 @@ EXPORT_SYMBOL(dec_zone_page_state);
+  * with the global counters. These could cause remote node cache line
+  * bouncing and will have to be only done when necessary.
+  */
+-static void refresh_cpu_vm_stats(int cpu)
++void refresh_cpu_vm_stats(int cpu)
+ {
+  struct zone *zone;
+  int i;
+@@ -490,38 +494,6 @@ static void refresh_cpu_vm_stats(int cpu)
+ }
+ 
+ /*
+- * Fold the data for an offline cpu into the global array.
+- * There cannot be any access by the offline cpu and therefore
+- * synchronization is simplified.
+- */
+-void cpu_vm_stats_fold(int cpu)
+-{
+- struct zone *zone;
+- int i;
+- int global_diff[NR_VM_ZONE_STAT_ITEMS] = { 0, };
+-
+- for_each_populated_zone(zone) {
+-  struct per_cpu_pageset *p;
+-
+-  p = per_cpu_ptr(zone->pageset, cpu);
+-
+-  for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++)
+-   if (p->vm_stat_diff[i]) {
+-    int v;
+-
+-    v = p->vm_stat_diff[i];
+-    p->vm_stat_diff[i] = 0;
+-    atomic_long_add(v, &zone->vm_stat[i]);
+-    global_diff[i] += v;
+-   }
+- }
+-
+- for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++)
+-  if (global_diff[i])
+-   atomic_long_add(global_diff[i], &vm_stat[i]);
+-}
+-
+-/*
+  * this is only called if !populated_zone(zone), which implies no other users of
+  * pset->vm_stat_diff[] exsist.
+  */
+-- 
+1.7.1

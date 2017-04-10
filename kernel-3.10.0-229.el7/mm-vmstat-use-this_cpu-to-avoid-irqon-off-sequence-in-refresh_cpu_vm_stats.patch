@@ -1,0 +1,120 @@
+From b5caf1580ae95cc2fd82de62bfd8fa3815955128 Mon Sep 17 00:00:00 2001
+From: Larry Woodman <lwoodman@redhat.com>
+Date: Tue, 18 Nov 2014 19:49:50 -0500
+Subject: [mm] vmstat: use this_cpu() to avoid irqon/off sequence in refresh_cpu_vm_stats
+
+Message-id: <1416340191-18643-4-git-send-email-lwoodman@redhat.com>
+Patchwork-id: 100256
+O-Subject: [RHEL7.1 PATCH 3/4] vmstat: use this_cpu() to avoid irqon/off sequence in refresh_cpu_vm_stats
+Bugzilla: 1157802
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+RH-Acked-by: Motohiro Kosaki <mkosaki@redhat.com>
+
+commit fbc2edb05354480a88aa39db8a6acb5782fa1a1b
+ Author: Christoph Lameter <cl@linux.com>
+ Date:   Wed Sep 11 14:21:32 2013 -0700
+
+    vmstat: use this_cpu() to avoid irqon/off sequence in refresh_cpu_vm_stats
+
+    Disabling interrupts repeatedly can be avoided in the inner loop if we use
+    a this_cpu operation.
+
+    Signed-off-by: Christoph Lameter <cl@linux.com>
+    Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+    CC: Tejun Heo <tj@kernel.org>
+    Cc: Joonsoo Kim <js1304@gmail.com>
+    Cc: Alexey Dobriyan <adobriyan@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 3f30142..7c6f363 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -437,33 +437,29 @@ static inline void fold_diff(int *diff)
+  * with the global counters. These could cause remote node cache line
+  * bouncing and will have to be only done when necessary.
+  */
+-static void refresh_cpu_vm_stats(int cpu)
++static void refresh_cpu_vm_stats(void)
+ {
+  struct zone *zone;
+  int i;
+  int global_diff[NR_VM_ZONE_STAT_ITEMS] = { 0, };
+ 
+  for_each_populated_zone(zone) {
+-  struct per_cpu_pageset *p;
++  struct per_cpu_pageset __percpu *p = zone->pageset;
+ 
+-  p = per_cpu_ptr(zone->pageset, cpu);
++  for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++) {
++   int v;
+ 
+-  for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++)
+-   if (p->vm_stat_diff[i]) {
+-    unsigned long flags;
+-    int v;
++   v = this_cpu_xchg(p->vm_stat_diff[i], 0);
++   if (v) {
+ 
+-    local_irq_save(flags);
+-    v = p->vm_stat_diff[i];
+-    p->vm_stat_diff[i] = 0;
+-    local_irq_restore(flags);
+     atomic_long_add(v, &zone->vm_stat[i]);
+     global_diff[i] += v;
+ #ifdef CONFIG_NUMA
+     /* 3 seconds idle till flush */
+-    p->expire = 3;
++    __this_cpu_write(p->expire, 3);
+ #endif
+    }
++  }
+   cond_resched();
+ #ifdef CONFIG_NUMA
+   /*
+@@ -473,23 +469,24 @@ static void refresh_cpu_vm_stats(int cpu)
+    * Check if there are pages remaining in this pageset
+    * if not then there is nothing to expire.
+    */
+-  if (!p->expire || !p->pcp.count)
++  if (!__this_cpu_read(p->expire) ||
++          !__this_cpu_read(p->pcp.count))
+    continue;
+ 
+   /*
+    * We never drain zones local to this processor.
+    */
+   if (zone_to_nid(zone) == numa_node_id()) {
+-   p->expire = 0;
++   __this_cpu_write(p->expire, 0);
+    continue;
+   }
+ 
+-  p->expire--;
+-  if (p->expire)
++
++  if (__this_cpu_dec_return(p->expire))
+    continue;
+ 
+-  if (p->pcp.count)
+-   drain_zone_pages(zone, &p->pcp);
++  if (__this_cpu_read(p->pcp.count))
++   drain_zone_pages(zone, __this_cpu_ptr(&p->pcp));
+ #endif
+  }
+  fold_diff(global_diff);
+@@ -1217,7 +1214,7 @@ int sysctl_stat_interval __read_mostly = HZ;
+ 
+ static void vmstat_update(struct work_struct *w)
+ {
+- refresh_cpu_vm_stats(smp_processor_id());
++ refresh_cpu_vm_stats();
+  schedule_delayed_work(&__get_cpu_var(vmstat_work),
+   round_jiffies_relative(sysctl_stat_interval));
+ }
+-- 
+1.7.1

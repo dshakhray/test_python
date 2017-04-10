@@ -1,0 +1,96 @@
+From a7f5c8b9ca052f1654931ab743b082bf05620b86 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:09:31 -0400
+Subject: [usb] separate usb_address0 mutexes for each bus
+
+Message-id: <1410887463-20674-500-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95387
+O-Subject: [RHEL7 PATCH 499/591] USB: separate usb_address0 mutexes for each bus
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 6fecd4f2a58c60028b1a75deefcf111516d3f836
+Author: Todd E Brandt <todd.e.brandt@linux.intel.com>
+Date:   Mon May 19 10:55:32 2014 -0700
+
+    USB: separate usb_address0 mutexes for each bus
+
+    This patch creates a separate instance of the usb_address0 mutex for each USB
+    bus, and attaches it to the usb_bus device struct. This allows devices on
+    separate buses to be enumerated in parallel; saving time.
+
+    In the current code, there is a single, global instance of the usb_address0
+    mutex which is used for all devices on all buses. This isn't completely
+    necessary, as this mutex is only needed to prevent address0 collisions for
+    devices on the *same* bus (usb 2.0 spec, sec 4.6.1). This superfluous coverage
+    can cause additional delay in system resume on systems with multiple hosts
+    (up to several seconds depending on what devices are attached).
+
+    Signed-off-by: Todd Brandt <todd.e.brandt@linux.intel.com>
+    Acked-by: Alan Stern <stern@rowland.harvard.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index 573af72..741f6ea 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -917,6 +917,7 @@ static void usb_bus_init (struct usb_bus *bus)
+  bus->bandwidth_allocated = 0;
+  bus->bandwidth_int_reqs  = 0;
+  bus->bandwidth_isoc_reqs = 0;
++ mutex_init(&bus->usb_address0_mutex);
+ 
+  INIT_LIST_HEAD (&bus->bus_list);
+ }
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 2a9f9cc..4adc5c0 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -4021,8 +4021,6 @@ static int
+ hub_port_init (struct usb_hub *hub, struct usb_device *udev, int port1,
+   int retry_counter)
+ {
+- static DEFINE_MUTEX(usb_address0_mutex);
+-
+  struct usb_device *hdev = hub->hdev;
+  struct usb_hcd  *hcd = bus_to_hcd(hdev->bus);
+  int   i, j, retval;
+@@ -4045,7 +4043,7 @@ hub_port_init (struct usb_hub *hub, struct usb_device *udev, int port1,
+  if (oldspeed == USB_SPEED_LOW)
+   delay = HUB_LONG_RESET_TIME;
+ 
+- mutex_lock(&usb_address0_mutex);
++ mutex_lock(&hdev->bus->usb_address0_mutex);
+ 
+  /* Reset the device; full speed may morph to high speed */
+  /* FIXME a USB 2.0 device may morph into SuperSpeed on reset. */
+@@ -4322,7 +4320,7 @@ fail:
+   hub_port_disable(hub, port1, 0);
+   update_devnum(udev, devnum); /* for disconnect processing */
+  }
+- mutex_unlock(&usb_address0_mutex);
++ mutex_unlock(&hdev->bus->usb_address0_mutex);
+  return retval;
+ }
+ 
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index a4c8406..ccadbb9 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -352,6 +352,8 @@ struct usb_bus {
+  struct usb_bus *hs_companion; /* Companion EHCI bus, if any */
+  struct list_head bus_list; /* list of busses */
+ 
++ struct mutex usb_address0_mutex; /* unaddressed device mutex */
++
+  int bandwidth_allocated; /* on this bus: how much of the time
+       * reserved for periodic (intr/iso)
+       * requests is used, on average?
+-- 
+1.7.1

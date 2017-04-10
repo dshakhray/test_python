@@ -1,0 +1,215 @@
+From d238d0f849dfa7fc5ead592802143eebdacdad18 Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@redhat.com>
+Date: Tue, 7 Oct 2014 20:58:05 -0400
+Subject: [net] ipv4: properly refresh rtable entries on pmtu/redirect events
+
+Message-id: <be8e2aa21248a63fc5ba4fdbc47aebb8b51a7a68.1412712186.git.hannes@redhat.com>
+Patchwork-id: 97141
+O-Subject: [RHEL7.1 net PATCH v2 1/6] ipv4: properly refresh rtable entries on pmtu/redirect events
+Bugzilla: 1150017
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1150017
+Upstream Status: 387aa65a89434abe3128d36d1a6fc3842c94905d
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8075311
+
+Upstream Commit:
+commit 387aa65a89434abe3128d36d1a6fc3842c94905d
+Author: Timo Teras <timo.teras@iki.fi>
+Date:   Mon May 27 20:46:31 2013 +0000
+
+    ipv4: properly refresh rtable entries on pmtu/redirect events
+
+    This reverts commit 05ab86c5 (xfrm4: Invalidate all ipv4 routes on
+    IPsec pmtu events). Flushing all cached entries is not needed.
+
+    Instead, invalidate only the related next hop dsts to recheck for
+    the added next hop exception where needed. This also fixes a subtle
+    race due to bumping generation id's before updating the pmtu.
+
+    Cc: Steffen Klassert <steffen.klassert@secunet.com>
+    Signed-off-by: Timo Teras <timo.teras@iki.fi>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Hannes Frederic Sowa <hannes@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ipv4/ah4.c b/net/ipv4/ah4.c
+index 044aaad..5979c79 100644
+--- a/net/ipv4/ah4.c
++++ b/net/ipv4/ah4.c
+@@ -419,12 +419,9 @@ static int ah4_err(struct sk_buff *skb, u32 info)
+  if (!x)
+   return 0;
+ 
+- if (icmp_hdr(skb)->type == ICMP_DEST_UNREACH) {
+-  atomic_inc(&flow_cache_genid);
+-  rt_genid_bump(net);
+-
++ if (icmp_hdr(skb)->type == ICMP_DEST_UNREACH)
+   ipv4_update_pmtu(skb, net, info, 0, 0, IPPROTO_AH, 0);
+- } else
++ else
+   ipv4_redirect(skb, net, 0, 0, IPPROTO_AH, 0);
+  xfrm_state_put(x);
+ 
+diff --git a/net/ipv4/esp4.c b/net/ipv4/esp4.c
+index 255abac..eadf46c 100644
+--- a/net/ipv4/esp4.c
++++ b/net/ipv4/esp4.c
+@@ -502,12 +502,9 @@ static int esp4_err(struct sk_buff *skb, u32 info)
+  if (!x)
+   return 0;
+ 
+- if (icmp_hdr(skb)->type == ICMP_DEST_UNREACH) {
+-  atomic_inc(&flow_cache_genid);
+-  rt_genid_bump(net);
+-
++ if (icmp_hdr(skb)->type == ICMP_DEST_UNREACH)
+   ipv4_update_pmtu(skb, net, info, 0, 0, IPPROTO_ESP, 0);
+- } else
++ else
+   ipv4_redirect(skb, net, 0, 0, IPPROTO_ESP, 0);
+  xfrm_state_put(x);
+ 
+diff --git a/net/ipv4/ipcomp.c b/net/ipv4/ipcomp.c
+index 1f4fef6..c0855d5 100644
+--- a/net/ipv4/ipcomp.c
++++ b/net/ipv4/ipcomp.c
+@@ -47,12 +47,9 @@ static int ipcomp4_err(struct sk_buff *skb, u32 info)
+  if (!x)
+   return 0;
+ 
+- if (icmp_hdr(skb)->type == ICMP_DEST_UNREACH) {
+-  atomic_inc(&flow_cache_genid);
+-  rt_genid_bump(net);
+-
++ if (icmp_hdr(skb)->type == ICMP_DEST_UNREACH)
+   ipv4_update_pmtu(skb, net, info, 0, 0, IPPROTO_COMP, 0);
+- } else
++ else
+   ipv4_redirect(skb, net, 0, 0, IPPROTO_COMP, 0);
+  xfrm_state_put(x);
+ 
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index d9f68b2..0dbf745 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -594,11 +594,25 @@ static inline u32 fnhe_hashfun(__be32 daddr)
+  return hval & (FNHE_HASH_SIZE - 1);
+ }
+ 
++static void fill_route_from_fnhe(struct rtable *rt, struct fib_nh_exception *fnhe)
++{
++ rt->rt_pmtu = fnhe->fnhe_pmtu;
++ rt->dst.expires = fnhe->fnhe_expires;
++
++ if (fnhe->fnhe_gw) {
++  rt->rt_flags |= RTCF_REDIRECTED;
++  rt->rt_gateway = fnhe->fnhe_gw;
++  rt->rt_uses_gateway = 1;
++ }
++}
++
+ static void update_or_create_fnhe(struct fib_nh *nh, __be32 daddr, __be32 gw,
+       u32 pmtu, unsigned long expires)
+ {
+  struct fnhe_hash_bucket *hash;
+  struct fib_nh_exception *fnhe;
++ struct rtable *rt;
++ unsigned int i;
+  int depth;
+  u32 hval = fnhe_hashfun(daddr);
+ 
+@@ -627,8 +641,12 @@ static void update_or_create_fnhe(struct fib_nh *nh, __be32 daddr, __be32 gw,
+    fnhe->fnhe_gw = gw;
+   if (pmtu) {
+    fnhe->fnhe_pmtu = pmtu;
+-   fnhe->fnhe_expires = expires;
++   fnhe->fnhe_expires = max(1UL, expires);
+   }
++  /* Update all cached dsts too */
++  rt = rcu_dereference(fnhe->fnhe_rth);
++  if (rt)
++   fill_route_from_fnhe(rt, fnhe);
+  } else {
+   if (depth > FNHE_RECLAIM_DEPTH)
+    fnhe = fnhe_oldest(hash);
+@@ -644,6 +662,18 @@ static void update_or_create_fnhe(struct fib_nh *nh, __be32 daddr, __be32 gw,
+   fnhe->fnhe_gw = gw;
+   fnhe->fnhe_pmtu = pmtu;
+   fnhe->fnhe_expires = expires;
++
++  /* Exception created; mark the cached routes for the nexthop
++   * stale, so anyone caching it rechecks if this exception
++   * applies to them.
++   */
++  for_each_possible_cpu(i) {
++   struct rtable __rcu **prt;
++   prt = per_cpu_ptr(nh->nh_pcpu_rth_output, i);
++   rt = rcu_dereference(*prt);
++   if (rt)
++    rt->dst.obsolete = DST_OBSOLETE_KILL;
++  }
+  }
+ 
+  fnhe->fnhe_stamp = jiffies;
+@@ -922,13 +952,6 @@ static void __ip_rt_update_pmtu(struct rtable *rt, struct flowi4 *fl4, u32 mtu)
+  if (mtu < ip_rt_min_pmtu)
+   mtu = ip_rt_min_pmtu;
+ 
+- if (!rt->rt_pmtu) {
+-  dst->obsolete = DST_OBSOLETE_KILL;
+- } else {
+-  rt->rt_pmtu = mtu;
+-  dst->expires = max(1UL, jiffies + ip_rt_mtu_expires);
+- }
+-
+  rcu_read_lock();
+  if (fib_lookup(dev_net(dst->dev), fl4, &res) == 0) {
+   struct fib_nh *nh = &FIB_RES_NH(res);
+@@ -1068,11 +1091,11 @@ static struct dst_entry *ipv4_dst_check(struct dst_entry *dst, u32 cookie)
+   * DST_OBSOLETE_FORCE_CHK which forces validation calls down
+   * into this function always.
+   *
+-  * When a PMTU/redirect information update invalidates a
+-  * route, this is indicated by setting obsolete to
+-  * DST_OBSOLETE_KILL.
++  * When a PMTU/redirect information update invalidates a route,
++  * this is indicated by setting obsolete to DST_OBSOLETE_KILL or
++  * DST_OBSOLETE_DEAD by dst_free().
+   */
+- if (dst->obsolete == DST_OBSOLETE_KILL || rt_is_expired(rt))
++ if (dst->obsolete != DST_OBSOLETE_FORCE_CHK || rt_is_expired(rt))
+   return NULL;
+  return dst;
+ }
+@@ -1220,20 +1243,8 @@ static bool rt_bind_exception(struct rtable *rt, struct fib_nh_exception *fnhe,
+    fnhe->fnhe_pmtu = 0;
+    fnhe->fnhe_expires = 0;
+   }
+-  if (fnhe->fnhe_pmtu) {
+-   unsigned long expires = fnhe->fnhe_expires;
+-   unsigned long diff = expires - jiffies;
+-
+-   if (time_before(jiffies, expires)) {
+-    rt->rt_pmtu = fnhe->fnhe_pmtu;
+-    dst_set_expires(&rt->dst, diff);
+-   }
+-  }
+-  if (fnhe->fnhe_gw) {
+-   rt->rt_flags |= RTCF_REDIRECTED;
+-   rt->rt_gateway = fnhe->fnhe_gw;
+-   rt->rt_uses_gateway = 1;
+-  } else if (!rt->rt_gateway)
++  fill_route_from_fnhe(rt, fnhe);
++  if (!rt->rt_gateway)
+    rt->rt_gateway = daddr;
+ 
+   rcu_assign_pointer(fnhe->fnhe_rth, rt);
+-- 
+1.7.1

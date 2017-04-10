@@ -1,0 +1,82 @@
+From c0adf035ce47312d7039cda7ccff19aec5db8940 Mon Sep 17 00:00:00 2001
+From: Sai Vemuri <svemuri@redhat.com>
+Date: Tue, 16 Dec 2014 22:22:09 -0500
+Subject: [scsi] cxgb4i: fix tx immediate data credit check
+
+Message-id: <1418768535-2637-2-git-send-email-svemuri@redhat.com>
+Patchwork-id: 102105
+O-Subject: [RHEL7.1 PATCH BZ 1174982 1/7] cxgb4i: fix tx immediate data credit check
+Bugzilla: 1174982
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Upstream : https://git.kernel.org/cgit/linux/kernel/git/davem/net-next.git/commit/?id=84944d8cf5d16c281e9389d90de20b9ceb96765e
+
+Only data skbs need the wr header added while control skbs do not. Make sure
+they are treated differently.
+
+Signed-off-by: Karen Xie <kxie@chelsio.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 84944d8cf5d16c281e9389d90de20b9ceb96765e)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
+index 1508125..f119a67 100644
+--- a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
++++ b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
+@@ -171,10 +171,14 @@ static int push_tx_frames(struct cxgbi_sock *, int);
+  * Returns true if a packet can be sent as an offload WR with immediate
+  * data.  We currently use the same limit as for Ethernet packets.
+  */
+-static inline int is_ofld_imm(const struct sk_buff *skb)
++static inline bool is_ofld_imm(const struct sk_buff *skb)
+ {
+- return skb->len <= (MAX_IMM_TX_PKT_LEN -
+-   sizeof(struct fw_ofld_tx_data_wr));
++ int len = skb->len;
++
++ if (likely(cxgbi_skcb_test_flag(skb, SKCBF_TX_NEED_HDR)))
++  len += sizeof(struct fw_ofld_tx_data_wr);
++
++ return len <= MAX_IMM_TX_PKT_LEN;
+ }
+ 
+ static void send_act_open_req(struct cxgbi_sock *csk, struct sk_buff *skb,
+@@ -597,11 +601,15 @@ static int push_tx_frames(struct cxgbi_sock *csk, int req_completion)
+ 
+   skb_reset_transport_header(skb);
+   if (is_ofld_imm(skb))
+-   credits_needed = DIV_ROUND_UP(dlen +
+-     sizeof(struct fw_ofld_tx_data_wr), 16);
++   credits_needed = DIV_ROUND_UP(dlen, 16);
+   else
+-   credits_needed = DIV_ROUND_UP(8*calc_tx_flits_ofld(skb)
+-     + sizeof(struct fw_ofld_tx_data_wr),
++   credits_needed = DIV_ROUND_UP(
++      8 * calc_tx_flits_ofld(skb),
++      16);
++
++  if (likely(cxgbi_skcb_test_flag(skb, SKCBF_TX_NEED_HDR)))
++   credits_needed += DIV_ROUND_UP(
++     sizeof(struct fw_ofld_tx_data_wr),
+      16);
+ 
+   if (csk->wr_cred < credits_needed) {
+diff --git a/drivers/scsi/cxgbi/libcxgbi.h b/drivers/scsi/cxgbi/libcxgbi.h
+index 25dc1dc..1393960 100644
+--- a/drivers/scsi/cxgbi/libcxgbi.h
++++ b/drivers/scsi/cxgbi/libcxgbi.h
+@@ -317,8 +317,8 @@ static inline void cxgbi_skcb_clear_flag(struct sk_buff *skb,
+  __clear_bit(flag, &(cxgbi_skcb_flags(skb)));
+ }
+ 
+-static inline int cxgbi_skcb_test_flag(struct sk_buff *skb,
+-     enum cxgbi_skcb_flags flag)
++static inline int cxgbi_skcb_test_flag(const struct sk_buff *skb,
++           enum cxgbi_skcb_flags flag)
+ {
+  return test_bit(flag, &(cxgbi_skcb_flags(skb)));
+ }
+-- 
+1.7.1

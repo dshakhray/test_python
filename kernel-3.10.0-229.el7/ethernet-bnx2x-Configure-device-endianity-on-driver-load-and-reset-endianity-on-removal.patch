@@ -1,0 +1,123 @@
+From 01177e30c12a67171e32c587af333b74d9b3ecd3 Mon Sep 17 00:00:00 2001
+From: Michal Schmidt <mschmidt@redhat.com>
+Date: Fri, 5 Sep 2014 19:50:15 -0400
+Subject: [ethernet] bnx2x: Configure device endianity on driver load and reset endianity on removal
+
+Message-id: <1409946615-5862-71-git-send-email-mschmidt@redhat.com>
+Patchwork-id: 91598
+O-Subject: [RHEL7.1 PATCH 70/70] bnx2x: Configure device endianity on driver load and reset endianity on removal.
+Bugzilla: 1089402
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+BZ: https://bugzilla.redhat.com/show_bug.cgi?id=1089402
+
+Upstream commit:
+commit 04860eb7d911bbd958463416cc045b69ffdf73b3
+Author: Manish Chopra <manish.chopra@qlogic.com>
+Date:   Tue Sep 2 04:31:25 2014 -0400
+
+    bnx2x: Configure device endianity on driver load and reset endianity on removal.
+
+    Some hosts can be both little and big endian.
+    In certain scenarios a big endian kernel can kexec a little endian kernel.
+
+    This patch fixes this case from both ends:
+    1) Return endianity to original values on shutdown (in case little endian kernel boots after we shutdown).
+    2) Do not rely on HW reset values when loading driver in little endian kernel
+       but configure them explicitly (in case previous kernel was big endian and did not reset the HW).
+
+    Signed-off-by: Manish Chopra <manish.chopra@qlogic.com>
+    Signed-off-by: Ariel Elior <Ariel.Elior@qlogic.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+index 96c4b15..e22c363 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -6868,6 +6868,37 @@ static void bnx2x__common_init_phy(struct bnx2x *bp)
+  bnx2x_release_phy_lock(bp);
+ }
+ 
++static void bnx2x_config_endianity(struct bnx2x *bp, u32 val)
++{
++ REG_WR(bp, PXP2_REG_RQ_QM_ENDIAN_M, val);
++ REG_WR(bp, PXP2_REG_RQ_TM_ENDIAN_M, val);
++ REG_WR(bp, PXP2_REG_RQ_SRC_ENDIAN_M, val);
++ REG_WR(bp, PXP2_REG_RQ_CDU_ENDIAN_M, val);
++ REG_WR(bp, PXP2_REG_RQ_DBG_ENDIAN_M, val);
++
++ /* make sure this value is 0 */
++ REG_WR(bp, PXP2_REG_RQ_HC_ENDIAN_M, 0);
++
++ REG_WR(bp, PXP2_REG_RD_QM_SWAP_MODE, val);
++ REG_WR(bp, PXP2_REG_RD_TM_SWAP_MODE, val);
++ REG_WR(bp, PXP2_REG_RD_SRC_SWAP_MODE, val);
++ REG_WR(bp, PXP2_REG_RD_CDURD_SWAP_MODE, val);
++}
++
++static void bnx2x_set_endianity(struct bnx2x *bp)
++{
++#ifdef __BIG_ENDIAN
++ bnx2x_config_endianity(bp, 1);
++#else
++ bnx2x_config_endianity(bp, 0);
++#endif
++}
++
++static void bnx2x_reset_endianity(struct bnx2x *bp)
++{
++ bnx2x_config_endianity(bp, 0);
++}
++
+ /**
+  * bnx2x_init_hw_common - initialize the HW at the COMMON phase.
+  *
+@@ -6934,23 +6965,7 @@ static int bnx2x_init_hw_common(struct bnx2x *bp)
+ 
+  bnx2x_init_block(bp, BLOCK_PXP2, PHASE_COMMON);
+  bnx2x_init_pxp(bp);
+-
+-#ifdef __BIG_ENDIAN
+- REG_WR(bp, PXP2_REG_RQ_QM_ENDIAN_M, 1);
+- REG_WR(bp, PXP2_REG_RQ_TM_ENDIAN_M, 1);
+- REG_WR(bp, PXP2_REG_RQ_SRC_ENDIAN_M, 1);
+- REG_WR(bp, PXP2_REG_RQ_CDU_ENDIAN_M, 1);
+- REG_WR(bp, PXP2_REG_RQ_DBG_ENDIAN_M, 1);
+- /* make sure this value is 0 */
+- REG_WR(bp, PXP2_REG_RQ_HC_ENDIAN_M, 0);
+-
+-/* REG_WR(bp, PXP2_REG_RD_PBF_SWAP_MODE, 1); */
+- REG_WR(bp, PXP2_REG_RD_QM_SWAP_MODE, 1);
+- REG_WR(bp, PXP2_REG_RD_TM_SWAP_MODE, 1);
+- REG_WR(bp, PXP2_REG_RD_SRC_SWAP_MODE, 1);
+- REG_WR(bp, PXP2_REG_RD_CDURD_SWAP_MODE, 1);
+-#endif
+-
++ bnx2x_set_endianity(bp);
+  bnx2x_ilt_init_page_size(bp, INITOP_SET);
+ 
+  if (CHIP_REV_IS_FPGA(bp) && CHIP_IS_E1H(bp))
+@@ -13440,9 +13455,15 @@ static void __bnx2x_remove(struct pci_dev *pdev,
+  bnx2x_iov_remove_one(bp);
+ 
+  /* Power on: we can't let PCI layer write to us while we are in D3 */
+- if (IS_PF(bp))
++ if (IS_PF(bp)) {
+   bnx2x_set_power_state(bp, PCI_D0);
+ 
++  /* Set endianity registers to reset values in case next driver
++   * boots in different endianty environment.
++   */
++  bnx2x_reset_endianity(bp);
++ }
++
+  /* Disable MSI/MSI-X */
+  bnx2x_disable_msi(bp);
+ 
+-- 
+1.7.1

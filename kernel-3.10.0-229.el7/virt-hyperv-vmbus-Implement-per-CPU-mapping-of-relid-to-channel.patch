@@ -1,0 +1,210 @@
+From 8b6f714d9956e82ff1b3278004a36f0e297ff6f7 Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Thu, 9 Oct 2014 06:13:22 -0400
+Subject: [virt] hyperv/vmbus: Implement per-CPU mapping of relid to channel
+
+Message-id: <1412835210-22435-4-git-send-email-jasowang@redhat.com>
+Patchwork-id: 97285
+O-Subject: [RHEL7.1 PATCH V2 03/11] Drivers: hv: vmbus: Implement per-CPU mapping of relid to channel
+Bugzilla: 1146358
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+
+From: K. Y. Srinivasan <kys@microsoft.com>
+
+Bugzilla: 1146358
+
+Currently the mapping of the relID to channel is done under the protection of a
+single spin lock. Starting with ws2012, each channel is bound to a specific VCPU
+in the guest. Use this binding to eliminate the spin lock by setting up
+per-cpu state for mapping relId to the channel.
+
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 3a28fa35d6658703cd26f9c16aaea0eae06afd40)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index 6f7fdd9..6c8b032 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -149,6 +149,7 @@ static struct vmbus_channel *alloc_channel(void)
+  spin_lock_init(&channel->sc_lock);
+ 
+  INIT_LIST_HEAD(&channel->sc_list);
++ INIT_LIST_HEAD(&channel->percpu_list);
+ 
+  channel->controlwq = create_workqueue("hv_vmbus_ctl");
+  if (!channel->controlwq) {
+@@ -188,7 +189,20 @@ static void free_channel(struct vmbus_channel *channel)
+  queue_work(vmbus_connection.work_queue, &channel->work);
+ }
+ 
++static void percpu_channel_enq(void *arg)
++{
++ struct vmbus_channel *channel = arg;
++ int cpu = smp_processor_id();
++
++ list_add_tail(&channel->percpu_list, &hv_context.percpu_list[cpu]);
++}
+ 
++static void percpu_channel_deq(void *arg)
++{
++ struct vmbus_channel *channel = arg;
++
++ list_del(&channel->percpu_list);
++}
+ 
+ /*
+  * vmbus_process_rescind_offer -
+@@ -210,6 +224,12 @@ static void vmbus_process_rescind_offer(struct work_struct *work)
+  msg.header.msgtype = CHANNELMSG_RELID_RELEASED;
+  vmbus_post_msg(&msg, sizeof(struct vmbus_channel_relid_released));
+ 
++ if (channel->target_cpu != smp_processor_id())
++  smp_call_function_single(channel->target_cpu,
++      percpu_channel_deq, channel, true);
++ else
++  percpu_channel_deq(channel);
++
+  if (channel->primary_channel == NULL) {
+   spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+   list_del(&channel->listentry);
+@@ -245,6 +265,7 @@ static void vmbus_process_offer(struct work_struct *work)
+        work);
+  struct vmbus_channel *channel;
+  bool fnew = true;
++ bool enq = false;
+  int ret;
+  unsigned long flags;
+ 
+@@ -264,12 +285,22 @@ static void vmbus_process_offer(struct work_struct *work)
+   }
+  }
+ 
+- if (fnew)
++ if (fnew) {
+   list_add_tail(&newchannel->listentry,
+          &vmbus_connection.chn_list);
++  enq = true;
++ }
+ 
+  spin_unlock_irqrestore(&vmbus_connection.channel_lock, flags);
+ 
++ if (enq) {
++  if (newchannel->target_cpu != smp_processor_id())
++   smp_call_function_single(newchannel->target_cpu,
++       percpu_channel_enq,
++       newchannel, true);
++  else
++   percpu_channel_enq(newchannel);
++ }
+  if (!fnew) {
+   /*
+    * Check to see if this is a sub-channel.
+@@ -282,6 +313,14 @@ static void vmbus_process_offer(struct work_struct *work)
+    spin_lock_irqsave(&channel->sc_lock, flags);
+    list_add_tail(&newchannel->sc_list, &channel->sc_list);
+    spin_unlock_irqrestore(&channel->sc_lock, flags);
++
++   if (newchannel->target_cpu != smp_processor_id())
++    smp_call_function_single(newchannel->target_cpu,
++        percpu_channel_enq,
++        newchannel, true);
++   else
++    percpu_channel_enq(newchannel);
++
+    newchannel->state = CHANNEL_OPEN_STATE;
+    if (channel->sc_creation_callback != NULL)
+     channel->sc_creation_callback(newchannel);
+diff --git a/drivers/hv/connection.c b/drivers/hv/connection.c
+index e8dcc71..3d96218 100644
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@ -235,6 +235,28 @@ cleanup:
+  return ret;
+ }
+ 
++/*
++ * Map the given relid to the corresponding channel based on the
++ * per-cpu list of channels that have been affinitized to this CPU.
++ * This will be used in the channel callback path as we can do this
++ * mapping in a lock-free fashion.
++ */
++static struct vmbus_channel *pcpu_relid2channel(u32 relid)
++{
++ struct vmbus_channel *channel;
++ struct vmbus_channel *found_channel  = NULL;
++ int cpu = smp_processor_id();
++ struct list_head *pcpu_head = &hv_context.percpu_list[cpu];
++
++ list_for_each_entry(channel, pcpu_head, percpu_list) {
++  if (channel->offermsg.child_relid == relid) {
++   found_channel = channel;
++   break;
++  }
++ }
++
++ return found_channel;
++}
+ 
+ /*
+  * relid2channel - Get the channel object given its
+@@ -286,7 +308,7 @@ static void process_chn_event(u32 relid)
+   * Find the channel based on this relid and invokes the
+   * channel callback to process the event
+   */
+- channel = relid2channel(relid);
++ channel = pcpu_relid2channel(relid);
+ 
+  if (!channel) {
+   pr_err("channel not found for relid - %u\n", relid);
+diff --git a/drivers/hv/hv.c b/drivers/hv/hv.c
+index f0c5e07..d8dedd1 100644
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@ -383,6 +383,8 @@ void hv_synic_init(void *arg)
+   */
+  rdmsrl(HV_X64_MSR_VP_INDEX, vp_index);
+  hv_context.vp_index[cpu] = (u32)vp_index;
++
++ INIT_LIST_HEAD(&hv_context.percpu_list[cpu]);
+  return;
+ }
+ 
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index d84918f..77d52ed 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -510,6 +510,11 @@ struct hv_context {
+   * basis.
+   */
+  struct tasklet_struct *event_dpc[NR_CPUS];
++ /*
++  * To optimize the mapping of relid to channel, maintain
++  * per-cpu list of the channels based on their CPU affinity.
++  */
++ struct list_head percpu_list[NR_CPUS];
+ };
+ 
+ extern struct hv_context hv_context;
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index 46b0bb1..f08d50c 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -1077,6 +1077,11 @@ struct vmbus_channel {
+   * Support per-channel state for use by vmbus drivers.
+   */
+  void *per_channel_state;
++ /*
++  * To support per-cpu lookup mapping of relid to channel,
++  * link up channels based on their CPU affinity.
++  */
++ struct list_head percpu_list;
+ };
+ 
+ static inline void set_channel_read_state(struct vmbus_channel *c, bool state)
+-- 
+1.7.1

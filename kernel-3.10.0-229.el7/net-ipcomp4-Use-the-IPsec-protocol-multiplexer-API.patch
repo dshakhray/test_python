@@ -1,0 +1,121 @@
+From 700f2444b3ed1f80809ae5e5a6a5e558daedc11d Mon Sep 17 00:00:00 2001
+From: Jiri Pirko <jpirko@redhat.com>
+Date: Thu, 7 Aug 2014 07:06:20 -0400
+Subject: [net] ipcomp4: Use the IPsec protocol multiplexer API
+
+Message-id: <1407395194-3809-5-git-send-email-jpirko@redhat.com>
+Patchwork-id: 87518
+O-Subject: [patch rhel7 net 04/18] ipcomp4: Use the IPsec protocol multiplexer API
+Bugzilla: 1091561
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+BZ1091561
+https://brewweb.devel.redhat.com/taskinfo?taskID=7794261
+Tested by jtluka's LNST smoke test recipe
+
+upstream commit d099160e029391de857464d987b141f30434052b
+Author: Steffen Klassert <steffen.klassert@secunet.com>
+Date:   Fri Feb 21 08:41:09 2014 +0100
+
+    ipcomp4: Use the IPsec protocol multiplexer API
+
+    Switch ipcomp4 to use the new IPsec protocol multiplexer.
+
+Signed-off-by: Jiri Pirko <jpirko@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ipv4/ipcomp.c b/net/ipv4/ipcomp.c
+index 59cb8c7..1f4fef6 100644
+--- a/net/ipv4/ipcomp.c
++++ b/net/ipv4/ipcomp.c
+@@ -23,7 +23,7 @@
+ #include <net/protocol.h>
+ #include <net/sock.h>
+ 
+-static void ipcomp4_err(struct sk_buff *skb, u32 info)
++static int ipcomp4_err(struct sk_buff *skb, u32 info)
+ {
+  struct net *net = dev_net(skb->dev);
+  __be32 spi;
+@@ -34,18 +34,18 @@ static void ipcomp4_err(struct sk_buff *skb, u32 info)
+  switch (icmp_hdr(skb)->type) {
+  case ICMP_DEST_UNREACH:
+   if (icmp_hdr(skb)->code != ICMP_FRAG_NEEDED)
+-   return;
++   return 0;
+  case ICMP_REDIRECT:
+   break;
+  default:
+-  return;
++  return 0;
+  }
+ 
+  spi = htonl(ntohs(ipch->cpi));
+  x = xfrm_state_lookup(net, skb->mark, (const xfrm_address_t *)&iph->daddr,
+          spi, IPPROTO_COMP, AF_INET);
+  if (!x)
+-  return;
++  return 0;
+ 
+  if (icmp_hdr(skb)->type == ICMP_DEST_UNREACH) {
+   atomic_inc(&flow_cache_genid);
+@@ -55,6 +55,8 @@ static void ipcomp4_err(struct sk_buff *skb, u32 info)
+  } else
+   ipv4_redirect(skb, net, 0, 0, IPPROTO_COMP, 0);
+  xfrm_state_put(x);
++
++ return 0;
+ }
+ 
+ /* We always hold one tunnel user reference to indicate a tunnel */
+@@ -150,6 +152,11 @@ out:
+  return err;
+ }
+ 
++static int ipcomp4_rcv_cb(struct sk_buff *skb, int err)
++{
++ return 0;
++}
++
+ static const struct xfrm_type ipcomp_type = {
+  .description = "IPCOMP4",
+  .owner  = THIS_MODULE,
+@@ -160,11 +167,12 @@ static const struct xfrm_type ipcomp_type = {
+  .output  = ipcomp_output
+ };
+ 
+-static const struct net_protocol ipcomp4_protocol = {
++static struct xfrm4_protocol ipcomp4_protocol = {
+  .handler = xfrm4_rcv,
++ .input_handler = xfrm_input,
++ .cb_handler = ipcomp4_rcv_cb,
+  .err_handler = ipcomp4_err,
+- .no_policy = 1,
+- .netns_ok = 1,
++ .priority = 0,
+ };
+ 
+ static int __init ipcomp4_init(void)
+@@ -173,7 +181,7 @@ static int __init ipcomp4_init(void)
+   pr_info("%s: can't add xfrm type\n", __func__);
+   return -EAGAIN;
+  }
+- if (inet_add_protocol(&ipcomp4_protocol, IPPROTO_COMP) < 0) {
++ if (xfrm4_protocol_register(&ipcomp4_protocol, IPPROTO_COMP) < 0) {
+   pr_info("%s: can't add protocol\n", __func__);
+   xfrm_unregister_type(&ipcomp_type, AF_INET);
+   return -EAGAIN;
+@@ -183,7 +191,7 @@ static int __init ipcomp4_init(void)
+ 
+ static void __exit ipcomp4_fini(void)
+ {
+- if (inet_del_protocol(&ipcomp4_protocol, IPPROTO_COMP) < 0)
++ if (xfrm4_protocol_deregister(&ipcomp4_protocol, IPPROTO_COMP) < 0)
+   pr_info("%s: can't remove protocol\n", __func__);
+  if (xfrm_unregister_type(&ipcomp_type, AF_INET) < 0)
+   pr_info("%s: can't remove xfrm type\n", __func__);
+-- 
+1.7.1

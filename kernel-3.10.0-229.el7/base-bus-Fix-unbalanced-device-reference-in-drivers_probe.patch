@@ -1,0 +1,89 @@
+From ccaa6d8b55d3997457de01e3c52603243677094e Mon Sep 17 00:00:00 2001
+From: Alex Williamson <alex.williamson@redhat.com>
+Date: Fri, 5 Dec 2014 17:13:43 -0500
+Subject: [base] bus: Fix unbalanced device reference in drivers_probe
+
+Message-id: <20141205171311.754.46267.stgit@gimli.home>
+Patchwork-id: 101162
+O-Subject: [RHEL7.1 kernel PATCH] driver core: Fix unbalanced device reference in drivers_probe
+Bugzilla: 1158862
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+Bugzilla: 1158862
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8336136
+Upstream: 0372ffb35d00288802265586a29c117911d02fb8 (linux-next)
+
+bus_find_device_by_name() acquires a device reference which is never
+released.  This results in an object leak, which on older kernels
+results in failure to release all resources of PCI devices.  libvirt
+uses drivers_probe to re-attach devices to the host after assignment
+and is therefore a common trigger for this leak.
+
+Example:
+
+# cd /sys/bus/pci/
+# dmesg -C
+# echo 1 > devices/0000\:01\:00.0/sriov_numvfs
+# echo 0 > devices/0000\:01\:00.0/sriov_numvfs
+# dmesg | grep 01:10
+ pci 0000:01:10.0: [8086:10ca] type 00 class 0x020000
+ kobject: '0000:01:10.0' (ffff8801d79cd0a8): kobject_add_internal: parent: '0000:00:01.0', set: 'devices'
+ kobject: '0000:01:10.0' (ffff8801d79cd0a8): kobject_uevent_env
+ kobject: '0000:01:10.0' (ffff8801d79cd0a8): fill_kobj_path: path = '/devices/pci0000:00/0000:00:01.0/0000:01:10.0'
+ kobject: '0000:01:10.0' (ffff8801d79cd0a8): kobject_uevent_env
+ kobject: '0000:01:10.0' (ffff8801d79cd0a8): fill_kobj_path: path = '/devices/pci0000:00/0000:00:01.0/0000:01:10.0'
+ kobject: '0000:01:10.0' (ffff8801d79cd0a8): kobject_uevent_env
+ kobject: '0000:01:10.0' (ffff8801d79cd0a8): fill_kobj_path: path = '/devices/pci0000:00/0000:00:01.0/0000:01:10.0'
+ kobject: '0000:01:10.0' (ffff8801d79cd0a8): kobject_cleanup, parent           (null)
+ kobject: '0000:01:10.0' (ffff8801d79cd0a8): calling ktype release
+ kobject: '0000:01:10.0': free name
+
+[kobject freed as expected]
+
+# dmesg -C
+# echo 1 > devices/0000\:01\:00.0/sriov_numvfs
+# echo 0000:01:10.0 > drivers_probe
+# echo 0 > devices/0000\:01\:00.0/sriov_numvfs
+# dmesg | grep 01:10
+ pci 0000:01:10.0: [8086:10ca] type 00 class 0x020000
+ kobject: '0000:01:10.0' (ffff8801d79ce0a8): kobject_add_internal: parent: '0000:00:01.0', set: 'devices'
+ kobject: '0000:01:10.0' (ffff8801d79ce0a8): kobject_uevent_env
+ kobject: '0000:01:10.0' (ffff8801d79ce0a8): fill_kobj_path: path = '/devices/pci0000:00/0000:00:01.0/0000:01:10.0'
+ kobject: '0000:01:10.0' (ffff8801d79ce0a8): kobject_uevent_env
+ kobject: '0000:01:10.0' (ffff8801d79ce0a8): fill_kobj_path: path = '/devices/pci0000:00/0000:00:01.0/0000:01:10.0'
+ kobject: '0000:01:10.0' (ffff8801d79ce0a8): kobject_uevent_env
+ kobject: '0000:01:10.0' (ffff8801d79ce0a8): fill_kobj_path: path = '/devices/pci0000:00/0000:00:01.0/0000:01:10.0'
+
+[no free]
+
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/base/bus.c b/drivers/base/bus.c
+index f099af0..8dbc799 100644
+--- a/drivers/base/bus.c
++++ b/drivers/base/bus.c
+@@ -242,13 +242,15 @@ static ssize_t store_drivers_probe(struct bus_type *bus,
+        const char *buf, size_t count)
+ {
+  struct device *dev;
++ int err = -EINVAL;
+ 
+  dev = bus_find_device_by_name(bus, NULL, buf);
+  if (!dev)
+   return -ENODEV;
+- if (bus_rescan_devices_helper(dev, NULL) != 0)
+-  return -EINVAL;
+- return count;
++ if (bus_rescan_devices_helper(dev, NULL) == 0)
++  err = count;
++ put_device(dev);
++ return err;
+ }
+ 
+ static struct device *next_device(struct klist_iter *i)
+-- 
+1.7.1

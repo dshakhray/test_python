@@ -1,0 +1,78 @@
+From ad817083b7bb730336555b6eea4ed9ca1deb8d33 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:55:19 -0400
+Subject: [fs] ext4: fix BUG_ON in mb_free_blocks()
+
+Message-id: <1414058125-4183-166-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98273
+O-Subject: [RHEL 7.1 PATCH v2 165/171] ext4: fix BUG_ON in mb_free_blocks()
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Theodore Ts'o <tytso@mit.edu>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit c99d1e6e83b06744c75d9f5e491ed495a7086b7b
+
+ If we suffer a block allocation failure (for example due to a memory
+ allocation failure), it's possible that we will call
+ ext4_discard_allocated_blocks() before we've actually allocated any
+ blocks.  In that case, fe_len and fe_start in ac->ac_f_ex will still
+ be zero, and this will result in mb_free_blocks(inode, e4b, 0, 0)
+ triggering the BUG_ON on mb_free_blocks():
+
+  BUG_ON(last >= (sb->s_blocksize << 3));
+
+ Fix this by bailing out of ext4_discard_allocated_blocks() if fs_len
+ is zero.
+
+ Also fix a missing ext4_mb_unload_buddy() call in
+ ext4_discard_allocated_blocks().
+
+ Google-Bug-Id: 16844242
+
+ Fixes: 86f0afd463215fc3e58020493482faa4ac3a4d69
+ Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+ Cc: stable@vger.kernel.org
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
+index 5504348..cb60458 100644
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@ -1406,6 +1406,8 @@ static void mb_free_blocks(struct inode *inode, struct ext4_buddy *e4b,
+  int last = first + count - 1;
+  struct super_block *sb = e4b->bd_sb;
+ 
++ if (WARN_ON(count == 0))
++  return;
+  BUG_ON(last >= (sb->s_blocksize << 3));
+  assert_spin_locked(ext4_group_lock_ptr(sb, e4b->bd_group));
+  /* Don't bother if the block group is corrupt. */
+@@ -3210,6 +3212,8 @@ static void ext4_discard_allocated_blocks(struct ext4_allocation_context *ac)
+  int err;
+ 
+  if (pa == NULL) {
++  if (ac->ac_f_ex.fe_len == 0)
++   return;
+   err = ext4_mb_load_buddy(ac->ac_sb, ac->ac_f_ex.fe_group, &e4b);
+   if (err) {
+    /*
+@@ -3224,6 +3228,7 @@ static void ext4_discard_allocated_blocks(struct ext4_allocation_context *ac)
+   mb_free_blocks(ac->ac_inode, &e4b, ac->ac_f_ex.fe_start,
+           ac->ac_f_ex.fe_len);
+   ext4_unlock_group(ac->ac_sb, ac->ac_f_ex.fe_group);
++  ext4_mb_unload_buddy(&e4b);
+   return;
+  }
+  if (pa->pa_type == MB_INODE_PA)
+-- 
+1.7.1

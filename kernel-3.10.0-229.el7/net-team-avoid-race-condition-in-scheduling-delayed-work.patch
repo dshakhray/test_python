@@ -1,0 +1,79 @@
+From ea21eb88468284ff1cdf05bf63855d23052d9093 Mon Sep 17 00:00:00 2001
+From: Jiri Pirko <jpirko@redhat.com>
+Date: Mon, 6 Oct 2014 12:46:41 -0400
+Subject: [net] team: avoid race condition in scheduling delayed work
+
+Message-id: <1412599601-12412-1-git-send-email-jpirko@redhat.com>
+Patchwork-id: 96907
+O-Subject: [patch rhel7 net] team: avoid race condition in scheduling delayed work
+Bugzilla: 1149239
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+
+BZ1149239
+https://brewweb.devel.redhat.com/taskinfo?taskID=8066089
+
+upstream commit 47549650abd13d873fd2e5fc218db19e21031074
+Author: Joe Lawrence <Joe.Lawrence@stratus.com>
+Date:   Fri Oct 3 09:58:34 2014 -0400
+
+    team: avoid race condition in scheduling delayed work
+
+    When team_notify_peers and team_mcast_rejoin are called, they both reset
+    their respective .count_pending atomic variable. Then when the actual
+    worker function is executed, the variable is atomically decremented.
+    This pattern introduces a potential race condition where the
+    .count_pending rolls over and the worker function keeps rescheduling
+    until .count_pending decrements to zero again:
+
+    THREAD 1                           THREAD 2
+
+    ========                           ========
+    team_notify_peers(teamX)
+      atomic_set count_pending = 1
+      schedule_delayed_work
+                                       team_notify_peers(teamX)
+                                       atomic_set count_pending = 1
+    team_notify_peers_work
+      atomic_dec_and_test
+        count_pending = 0
+      (return)
+                                       schedule_delayed_work
+                                       team_notify_peers_work
+                                       atomic_dec_and_test
+                                         count_pending = -1
+                                       schedule_delayed_work
+                                       (repeat until count_pending = 0)
+
+    Instead of assigning a new value to .count_pending, use atomic_add to
+    tack-on the additional desired worker function invocations.
+
+Signed-off-by: Jiri Pirko <jpirko@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 54a3aed..49c17f1 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -647,7 +647,7 @@ static void team_notify_peers(struct team *team)
+ {
+  if (!team->notify_peers.count || !netif_running(team->dev))
+   return;
+- atomic_set(&team->notify_peers.count_pending, team->notify_peers.count);
++ atomic_add(team->notify_peers.count, &team->notify_peers.count_pending);
+  schedule_delayed_work(&team->notify_peers.dw, 0);
+ }
+ 
+@@ -687,7 +687,7 @@ static void team_mcast_rejoin(struct team *team)
+ {
+  if (!team->mcast_rejoin.count || !netif_running(team->dev))
+   return;
+- atomic_set(&team->mcast_rejoin.count_pending, team->mcast_rejoin.count);
++ atomic_add(team->mcast_rejoin.count, &team->mcast_rejoin.count_pending);
+  schedule_delayed_work(&team->mcast_rejoin.dw, 0);
+ }
+ 
+-- 
+1.7.1

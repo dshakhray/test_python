@@ -1,0 +1,108 @@
+From e0404915e8be66d6eb93299d685d2e6124cf6657 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:07 -0400
+Subject: [x86] perf/p4: Fix counter corruption when using lots of perf groups
+
+Message-id: <1410181752-25631-3-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91682
+O-Subject: [PATCH RHEL7.1 BZ1134356 002/307] perf/x86/p4: Fix counter corruption when using lots of perf groups
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 13beacee817d27a40ffc6f065ea0042685611dd5
+Author: Don Zickus <dzickus@redhat.com>
+Date: Wed Jan 29 14:37:50 2014 -0500
+
+description
+===========
+On a P4 box stressing perf with:
+
+   ./perf record -o perf.data ./perf stat -v ./perf bench all
+
+it was noticed that a slew of unknown NMIs would pop out rather quickly.
+
+Painfully debugging this ancient platform, led me to notice cross cpu counter
+corruption.
+
+The P4 machine is special in that it has 18 counters, half are used for cpu0
+and the other half is for cpu1 (or all 18 if hyperthreading is disabled).  But
+the splitting of the counters has to be actively managed by the software.
+
+In this particular bug, one of the cpu0 specific counters was being used by
+cpu1 and caused all sorts of random unknown nmis.
+
+I am not entirely sure on the corruption path, but what happens is:
+
+ o perf schedules a group with p4_pmu_schedule_events()
+ o inside p4_pmu_schedule_events(), it notices an hwc pointer is being reused
+   but for a different cpu, so it 'swaps' the config bits and returns the
+   updated 'assign' array with a _new_ index.
+ o perf schedules another group with p4_pmu_schedule_events()
+ o inside p4_pmu_schedule_events(), it notices an hwc pointer is being reused
+   (the same one as above) but for the _same_ cpu [BUG!!], so it updates the
+   'assign' array to use the _old_ (wrong cpu) index because the _new_ index is in
+   an earlier part of the 'assign' array (and hasn't been committed yet).
+ o perf commits the transaction using the wrong index and corrupts the other cpu
+
+The [BUG!!] is because the 'hwc->config' is updated but not the 'hwc->idx'.  So
+the check for 'p4_should_swap_ts()' is correct the first time around but
+incorrect the second time around (because hwc->config was updated in between).
+
+I think the spirit of perf was to not modify anything until all the
+transactions had a chance to 'test' if they would succeed, and if so, commit
+atomically.  However, P4 breaks this spirit by touching the hwc->config
+element.
+
+So my fix is to continue the un-perf like breakage, by assigning hwc->idx to -1
+on swap to tell follow up group scheduling to find a new index.
+
+Of course if the transaction fails rolling this back will be difficult, but
+that is not different than how the current code works. :-)  And I wasn't sure
+how much effort to cleanup the code I should do for a platform that is almost
+10 years old by now.
+
+Hence the lazy fix.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/cpu/perf_event_p4.c b/arch/x86/kernel/cpu/perf_event_p4.c
+index 3486e66..f44c34d 100644
+--- a/arch/x86/kernel/cpu/perf_event_p4.c
++++ b/arch/x86/kernel/cpu/perf_event_p4.c
+@@ -1257,7 +1257,24 @@ again:
+    pass++;
+    goto again;
+   }
+-
++  /*
++   * Perf does test runs to see if a whole group can be assigned
++   * together succesfully.  There can be multiple rounds of this.
++   * Unfortunately, p4_pmu_swap_config_ts touches the hwc->config
++   * bits, such that the next round of group assignments will
++   * cause the above p4_should_swap_ts to pass instead of fail.
++   * This leads to counters exclusive to thread0 being used by
++   * thread1.
++   *
++   * Solve this with a cheap hack, reset the idx back to -1 to
++   * force a new lookup (p4_next_cntr) to get the right counter
++   * for the right thread.
++   *
++   * This probably doesn't comply with the general spirit of how
++   * perf wants to work, but P4 is special. :-(
++   */
++  if (p4_should_swap_ts(hwc->config, cpu))
++   hwc->idx = -1;
+   p4_pmu_swap_config_ts(hwc, cpu);
+   if (assign)
+    assign[i] = cntr_idx;
+-- 
+1.7.1

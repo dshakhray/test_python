@@ -1,0 +1,152 @@
+From 3865909505a7166cd19997ef501d9d1a0e0b7320 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:09:32 -0400
+Subject: [usb] usb5303: add support for reference clock specified in device tree
+
+Message-id: <1410887463-20674-501-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95667
+O-Subject: [RHEL7 PATCH 500/591] usb: usb5303: add support for reference clock specified in device tree
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 657d898a9320a7cdb9b94565d75ecf75c25cbf0a
+Author: Marek Szyprowski <m.szyprowski@samsung.com>
+Date:   Thu May 22 13:21:38 2014 +0200
+
+    usb: usb5303: add support for reference clock specified in device tree
+
+    USB3503 chip supports 8 values of reference clock. The value is
+    specified by REF_SEL[1:0] pins and INT_N line. This patch add support
+    for getting 'refclk' clock, enabling it and setting INT_N line according
+    to the value of the gathered clock. If no clock has been specified,
+    driver defaults to the old behaviour (assuming that clock has been
+    specified by REF_SEL pins from primary reference clock frequencies
+    table).
+
+    Signed-off-by: Marek Szyprowski <m.szyprowski@samsung.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/devicetree/bindings/usb/usb3503.txt b/Documentation/devicetree/bindings/usb/usb3503.txt
+index a018da4..221ac0d 100644
+--- a/Documentation/devicetree/bindings/usb/usb3503.txt
++++ b/Documentation/devicetree/bindings/usb/usb3503.txt
+@@ -15,6 +15,14 @@ Optional properties:
+ - reset-gpios: Should specify GPIO for reset.
+ - initial-mode: Should specify initial mode.
+                 (1 for HUB mode, 2 for STANDBY mode)
++- refclk: Clock used for driving REFCLK signal (optional, if not provided
++ the driver assumes that clock signal is always available, its
++ rate is specified by REF_SEL pins and a value from the primary
++ reference clock frequencies table is used)
++- refclk-frequency: Frequency of the REFCLK signal as defined by REF_SEL
++ pins (optional, if not provided, driver will not set rate of the
++ REFCLK signal and assume that a value from the primary reference
++ clock frequencies table is used)
+ 
+ Examples:
+  usb3503@08 {
+diff --git a/drivers/usb/misc/usb3503.c b/drivers/usb/misc/usb3503.c
+index fbcf550..750a5a1 100644
+--- a/drivers/usb/misc/usb3503.c
++++ b/drivers/usb/misc/usb3503.c
+@@ -18,6 +18,7 @@
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+  */
+ 
++#include <linux/clk.h>
+ #include <linux/i2c.h>
+ #include <linux/gpio.h>
+ #include <linux/delay.h>
+@@ -57,10 +58,12 @@ struct usb3503 {
+  enum usb3503_mode mode;
+  struct regmap  *regmap;
+  struct device  *dev;
++ struct clk  *clk;
+  u8 port_off_mask;
+  int gpio_intn;
+  int gpio_reset;
+  int gpio_connect;
++ bool secondary_ref_clk;
+ };
+ 
+ static int usb3503_reset(struct usb3503 *hub, int state)
+@@ -184,8 +187,58 @@ static int usb3503_probe(struct usb3503 *hub)
+   hub->gpio_reset  = pdata->gpio_reset;
+   hub->mode  = pdata->initial_mode;
+  } else if (np) {
++  struct clk *clk;
+   hub->port_off_mask = 0;
+ 
++  clk = devm_clk_get(dev, "refclk");
++  if (IS_ERR(clk) && PTR_ERR(clk) != -ENOENT) {
++   dev_err(dev, "unable to request refclk (%d)\n", err);
++   return PTR_ERR(clk);
++  }
++
++  if (!IS_ERR(clk)) {
++   u32 rate = 0;
++   hub->clk = clk;
++
++   if (!of_property_read_u32(np, "refclk-frequency",
++       &rate)) {
++
++    switch (rate) {
++    case 38400000:
++    case 26000000:
++    case 19200000:
++    case 12000000:
++     hub->secondary_ref_clk = 0;
++     break;
++    case 24000000:
++    case 27000000:
++    case 25000000:
++    case 50000000:
++     hub->secondary_ref_clk = 1;
++     break;
++    default:
++     dev_err(dev,
++      "unsupported reference clock rate (%d)\n",
++      (int) rate);
++     return -EINVAL;
++    }
++    err = clk_set_rate(hub->clk, rate);
++    if (err) {
++     dev_err(dev,
++      "unable to set reference clock rate to %d\n",
++      (int) rate);
++     return err;
++    }
++   }
++
++   err = clk_prepare_enable(hub->clk);
++   if (err) {
++    dev_err(dev,
++     "unable to enable reference clock\n");
++    return err;
++   }
++  }
++
+   property = of_get_property(np, "disabled-ports", &len);
+   if (property && (len / sizeof(u32)) > 0) {
+    int i;
+@@ -213,8 +266,10 @@ static int usb3503_probe(struct usb3503 *hub)
+   dev_err(dev, "Ports disabled with no control interface\n");
+ 
+  if (gpio_is_valid(hub->gpio_intn)) {
+-  err = devm_gpio_request_one(dev, hub->gpio_intn,
+-    GPIOF_OUT_INIT_HIGH, "usb3503 intn");
++  int val = hub->secondary_ref_clk ? GPIOF_OUT_INIT_LOW :
++         GPIOF_OUT_INIT_HIGH;
++  err = devm_gpio_request_one(dev, hub->gpio_intn, val,
++         "usb3503 intn");
+   if (err) {
+    dev_err(dev,
+     "unable to request GPIO %d as connect pin (%d)\n",
+-- 
+1.7.1

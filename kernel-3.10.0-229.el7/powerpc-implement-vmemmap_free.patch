@@ -1,0 +1,150 @@
+From 1da5d820f8341965fe493eb792256df0c65d781f Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Tue, 2 Sep 2014 21:09:18 -0400
+Subject: [powerpc] implement vmemmap_free()
+
+Message-id: <1409692159-32351-4-git-send-email-gduarte@redhat.com>
+Patchwork-id: 90692
+O-Subject: [RHEL7.1 PATCH BZ 1090174 3/4] powerpc: implement vmemmap_free()
+Bugzilla: 1090174
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1090174
+Upstream Status: 71b0bfe4f1608dbabb54a1e964046267a2c7f7b3
+
+commit 71b0bfe4f1608dbabb54a1e964046267a2c7f7b3
+Author: Li Zhong <zhong@linux.vnet.ibm.com>
+Date:   Wed Jun 11 16:23:38 2014 +0800
+
+    powerpc: implement vmemmap_free()
+
+    vmemmap_free() does the opposite of vmemap_populate().
+    This patch also puts vmemmap_free() and vmemmap_list_free() into
+     CONFIG_MEMMORY_HOTPLUG.
+
+    Signed-off-by: Li Zhong <zhong@linux.vnet.ibm.com>
+    Cc: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+    Acked-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/mm/init_64.c b/arch/powerpc/mm/init_64.c
+index b52611a..b275b7a 100644
+--- a/arch/powerpc/mm/init_64.c
++++ b/arch/powerpc/mm/init_64.c
+@@ -298,6 +298,37 @@ static __meminit void vmemmap_list_populate(unsigned long phys,
+  vmemmap_list = vmem_back;
+ }
+ 
++int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
++{
++ unsigned long page_size = 1 << mmu_psize_defs[mmu_vmemmap_psize].shift;
++
++ /* Align to the page size of the linear mapping. */
++ start = _ALIGN_DOWN(start, page_size);
++
++ pr_debug("vmemmap_populate %lx..%lx, node %d\n", start, end, node);
++
++ for (; start < end; start += page_size) {
++  void *p;
++
++  if (vmemmap_populated(start, page_size))
++   continue;
++
++  p = vmemmap_alloc_block(page_size, node);
++  if (!p)
++   return -ENOMEM;
++
++  vmemmap_list_populate(__pa(p), start, node);
++
++  pr_debug("      * %016lx..%016lx allocated at %p\n",
++    start, start + page_size, p);
++
++  vmemmap_create_mapping(start, page_size, __pa(p));
++ }
++
++ return 0;
++}
++
++#ifdef CONFIG_MEMORY_HOTPLUG
+ static unsigned long vmemmap_list_free(unsigned long start)
+ {
+  struct vmemmap_backing *vmem_back, *vmem_back_prev;
+@@ -330,40 +361,52 @@ static unsigned long vmemmap_list_free(unsigned long start)
+  return vmem_back->phys;
+ }
+ 
+-int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
++void __ref vmemmap_free(unsigned long start, unsigned long end)
+ {
+  unsigned long page_size = 1 << mmu_psize_defs[mmu_vmemmap_psize].shift;
+ 
+- /* Align to the page size of the linear mapping. */
+  start = _ALIGN_DOWN(start, page_size);
+ 
+- pr_debug("vmemmap_populate %lx..%lx, node %d\n", start, end, node);
++ pr_debug("vmemmap_free %lx...%lx\n", start, end);
+ 
+  for (; start < end; start += page_size) {
+-  void *p;
++  unsigned long addr;
+ 
++  /*
++   * the section has already be marked as invalid, so
++   * vmemmap_populated() true means some other sections still
++   * in this page, so skip it.
++   */
+   if (vmemmap_populated(start, page_size))
+    continue;
+ 
+-  p = vmemmap_alloc_block(page_size, node);
+-  if (!p)
+-   return -ENOMEM;
+-
+-  vmemmap_list_populate(__pa(p), start, node);
+-
+-  pr_debug("      * %016lx..%016lx allocated at %p\n",
+-    start, start + page_size, p);
+-
+-  vmemmap_create_mapping(start, page_size, __pa(p));
++  addr = vmemmap_list_free(start);
++  if (addr) {
++   struct page *page = pfn_to_page(addr >> PAGE_SHIFT);
++
++   if (PageReserved(page)) {
++    /* allocated from bootmem */
++    if (page_size < PAGE_SIZE) {
++     /*
++      * this shouldn't happen, but if it is
++      * the case, leave the memory there
++      */
++     WARN_ON_ONCE(1);
++    } else {
++     unsigned int nr_pages =
++      1 << get_order(page_size);
++     while (nr_pages--)
++      free_reserved_page(page++);
++    }
++   } else
++    free_pages((unsigned long)(__va(addr)),
++       get_order(page_size));
++
++   vmemmap_remove_mapping(start, page_size);
++  }
+  }
+-
+- return 0;
+-}
+-
+-void vmemmap_free(unsigned long start, unsigned long end)
+-{
+ }
+-
++#endif
+ void register_page_bootmem_memmap(unsigned long section_nr,
+       struct page *start_page, unsigned long size)
+ {
+-- 
+1.7.1

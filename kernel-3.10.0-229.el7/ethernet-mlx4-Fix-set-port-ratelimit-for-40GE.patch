@@ -1,0 +1,115 @@
+From 24f97a0317c35eb3630bff9535088a482da66eda Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:01:29 -0400
+Subject: [ethernet] mlx4: Fix set port ratelimit for 40GE
+
+Message-id: <b0f9ad7089cd44e58e8f8b20c0fd9182a0ba945a.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93734
+O-Subject: [Patch RHEL7.1 V1 153/197] net/mlx4_en: Fix set port ratelimit for 40GE
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Eugenia Emantayev <eugenia@mellanox.com>
+
+In 40GE we can't use the default bw units for set ratelimit (100 Mbps)
+since the max is 255*100 Mbps = 25 Gbps (not suited for 40GE), thus we need 1 Gbps units.
+But for 10GE 1 Gbps units might be too bruit so we use the following solution.
+
+For user set ratelimit <= 25 Gbps:
+        use 100 Mbps units * user_ratelimit (* 10).
+
+For user set ratelimit > 25 Gbps:
+        use 1 Gbps units * user_ratelimit.
+
+For user set unlimited ratelimit (0 Gbps):
+        use 1 Gbps units * MAX_RATELIMIT_DEFAULT (57)
+
+Note: any value > 58 will damage the FW ratelimit computation, so we allow
+      a max and any higher value will be pulled down to 57.
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Eugenia Emantayev <eugenia@mellanox.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 523ece889eeee84a381e16086b81e07a76cff8b6)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4.h b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+index 1d8af73..13fbcd0 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+@@ -62,11 +62,6 @@
+ 
+ #define INIT_HCA_TPT_MW_ENABLE          (1 << 7)
+ 
+-#define MLX4_NUM_UP  8
+-#define MLX4_NUM_TC  8
+-#define MLX4_RATELIMIT_UNITS 3 /* 100 Mbps */
+-#define MLX4_RATELIMIT_DEFAULT 0xffff
+-
+ struct mlx4_set_port_prio2tc_context {
+  u8 prio2tc[4];
+ };
+diff --git a/drivers/net/ethernet/mellanox/mlx4/port.c b/drivers/net/ethernet/mellanox/mlx4/port.c
+index 7ab9717..5d76a60 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/port.c
++++ b/drivers/net/ethernet/mellanox/mlx4/port.c
+@@ -1051,14 +1051,26 @@ int mlx4_SET_PORT_SCHEDULER(struct mlx4_dev *dev, u8 port, u8 *tc_tx_bw,
+ 
+  for (i = 0; i < MLX4_NUM_TC; i++) {
+   struct mlx4_port_scheduler_tc_cfg_be *tc = &context->tc[i];
+-  u16 r = ratelimit && ratelimit[i] ? ratelimit[i] :
+-   MLX4_RATELIMIT_DEFAULT;
++  u16 r;
++
++  if (ratelimit && ratelimit[i]) {
++   if (ratelimit[i] <= MLX4_MAX_100M_UNITS_VAL) {
++    r = ratelimit[i];
++    tc->max_bw_units =
++     htons(MLX4_RATELIMIT_100M_UNITS);
++   } else {
++    r = ratelimit[i]/10;
++    tc->max_bw_units =
++     htons(MLX4_RATELIMIT_1G_UNITS);
++   }
++   tc->max_bw_value = htons(r);
++  } else {
++   tc->max_bw_value = htons(MLX4_RATELIMIT_DEFAULT);
++   tc->max_bw_units = htons(MLX4_RATELIMIT_1G_UNITS);
++  }
+ 
+   tc->pg = htons(pg[i]);
+   tc->bw_precentage = htons(tc_tx_bw[i]);
+-
+-  tc->max_bw_units = htons(MLX4_RATELIMIT_UNITS);
+-  tc->max_bw_value = htons(r);
+  }
+ 
+  in_mod = MLX4_SET_PORT_SCHEDULER << 8 | port;
+diff --git a/include/linux/mlx4/device.h b/include/linux/mlx4/device.h
+index a668d39..05a1247 100644
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@ -48,6 +48,17 @@
+ #define MSIX_LEGACY_SZ  4
+ #define MIN_MSIX_P_PORT  5
+ 
++#define MLX4_NUM_UP   8
++#define MLX4_NUM_TC   8
++#define MLX4_MAX_100M_UNITS_VAL  255 /*
++       * work around: can't set values
++       * greater then this value when
++       * using 100 Mbps units.
++       */
++#define MLX4_RATELIMIT_100M_UNITS 3 /* 100 Mbps */
++#define MLX4_RATELIMIT_1G_UNITS  4 /* 1 Gbps */
++#define MLX4_RATELIMIT_DEFAULT  0x00ff
++
+ #define MLX4_ROCE_MAX_GIDS 128
+ #define MLX4_ROCE_PF_GIDS 16
+ 
+-- 
+1.7.1

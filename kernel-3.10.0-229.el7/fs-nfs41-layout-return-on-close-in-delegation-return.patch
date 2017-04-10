@@ -1,0 +1,90 @@
+From 3ead27619555ebc2fae98b15a1b8e9d4537a1ca2 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:19:43 -0400
+Subject: [fs] nfs41: layout return on close in delegation return
+
+Message-id: <1411050057-12417-21-git-send-email-steved@redhat.com>
+Patchwork-id: 96215
+O-Subject: [RHEL7.1 PATCH 20/94] nfs41: layout return on close in delegation return
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: Peng Tao <tao.peng@primarydata.com>
+
+If file is not opened by anyone, we do layout return on close
+in delegation return.
+
+Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 039b756a2d347bfbcdeb36dde25b6c472f0c4bb6
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index e0b5d8f..0b287c9 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -5030,6 +5030,9 @@ struct nfs4_delegreturndata {
+  unsigned long timestamp;
+  struct nfs_fattr fattr;
+  int rpc_status;
++ struct inode *inode;
++ bool roc;
++ u32 roc_barrier;
+ };
+ 
+ static void nfs4_delegreturn_done(struct rpc_task *task, void *calldata)
+@@ -5043,7 +5046,6 @@ static void nfs4_delegreturn_done(struct rpc_task *task, void *calldata)
+  switch (task->tk_status) {
+  case 0:
+   renew_lease(data->res.server, data->timestamp);
+-  break;
+  case -NFS4ERR_ADMIN_REVOKED:
+  case -NFS4ERR_DELEG_REVOKED:
+  case -NFS4ERR_BAD_STATEID:
+@@ -5051,6 +5053,8 @@ static void nfs4_delegreturn_done(struct rpc_task *task, void *calldata)
+  case -NFS4ERR_STALE_STATEID:
+  case -NFS4ERR_EXPIRED:
+   task->tk_status = 0;
++  if (data->roc)
++   pnfs_roc_set_barrier(data->inode, data->roc_barrier);
+   break;
+  default:
+   if (nfs4_async_handle_error(task, data->res.server, NULL) ==
+@@ -5064,6 +5068,10 @@ static void nfs4_delegreturn_done(struct rpc_task *task, void *calldata)
+ 
+ static void nfs4_delegreturn_release(void *calldata)
+ {
++ struct nfs4_delegreturndata *data = calldata;
++
++ if (data->roc)
++  pnfs_roc_release(data->inode);
+  kfree(calldata);
+ }
+ 
+@@ -5073,6 +5081,10 @@ static void nfs4_delegreturn_prepare(struct rpc_task *task, void *data)
+ 
+  d_data = (struct nfs4_delegreturndata *)data;
+ 
++ if (d_data->roc &&
++     pnfs_roc_drain(d_data->inode, &d_data->roc_barrier, task))
++  return;
++
+  nfs4_setup_sequence(d_data->res.server,
+    &d_data->args.seq_args,
+    &d_data->res.seq_res,
+@@ -5116,6 +5128,9 @@ static int _nfs4_proc_delegreturn(struct inode *inode, struct rpc_cred *cred, co
+  nfs_fattr_init(data->res.fattr);
+  data->timestamp = jiffies;
+  data->rpc_status = 0;
++ data->inode = inode;
++ data->roc = list_empty(&NFS_I(inode)->open_files) ?
++      pnfs_roc(inode) : false;
+ 
+  task_setup_data.callback_data = data;
+  msg.rpc_argp = &data->args;
+-- 
+1.7.1

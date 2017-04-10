@@ -1,0 +1,166 @@
+From b96d0155435b649089fde3e2340eb26b9f46d287 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 22 Sep 2014 12:05:27 -0400
+Subject: [tools] perf: Disable kernel symbol demangling by default
+
+Message-id: <1411387527-31226-3-git-send-email-jolsa@redhat.com>
+Patchwork-id: 96427
+O-Subject: [PATCH RHEL7.1 BZ1140522 2/2] perf tools: Disable kernel symbol demangling by default
+Bugzilla: 1140522
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Petr Holasek <pholasek@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1140522
+https://bugzilla.redhat.com/show_bug.cgi?id=1140522
+
+upstream
+========
+commit 763122ade725592402190f5ff3b8d2edf42b87e8
+Author: Avi Kivity <avi@cloudius-systems.com>
+Date:   Sat Sep 13 07:15:05 2014 +0300
+
+description
+===========
+Some Linux symbols (for example __vt_event_wait) are interpreted by the
+demangler as C++ mangled names, which of course they aren't.
+
+Disable kernel symbol demangling by default to avoid this, and allow
+enabling it with a new option --demangle-kernel for those who wish it.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/Documentation/perf-probe.txt b/tools/perf/Documentation/perf-probe.txt
+index 1513935..aaa869b 100644
+--- a/tools/perf/Documentation/perf-probe.txt
++++ b/tools/perf/Documentation/perf-probe.txt
+@@ -104,6 +104,9 @@ OPTIONS
+  Specify path to the executable or shared library file for user
+  space tracing. Can also be used with --funcs option.
+ 
++--demangle-kernel::
++ Demangle kernel symbols.
++
+ In absence of -m/-x options, perf probe checks if the first argument after
+ the options is an absolute path name. If its an absolute path, perf probe
+ uses it as a target module/target user space binary to probe.
+diff --git a/tools/perf/Documentation/perf-report.txt b/tools/perf/Documentation/perf-report.txt
+index d2b59af..cccb160 100644
+--- a/tools/perf/Documentation/perf-report.txt
++++ b/tools/perf/Documentation/perf-report.txt
+@@ -276,6 +276,9 @@ OPTIONS
+  Demangle symbol names to human readable form. It's enabled by default,
+  disable with --no-demangle.
+ 
++--demangle-kernel::
++ Demangle kernel symbol names to human readable form (for C++ kernels).
++
+ --mem-mode::
+  Use the data addresses of samples in addition to instruction addresses
+  to build the histograms.  To generate meaningful output, the perf.data
+diff --git a/tools/perf/Documentation/perf-top.txt b/tools/perf/Documentation/perf-top.txt
+index 180ae02..f1f728a 100644
+--- a/tools/perf/Documentation/perf-top.txt
++++ b/tools/perf/Documentation/perf-top.txt
+@@ -98,6 +98,9 @@ Default is to monitor all CPUS.
+ --hide_user_symbols::
+         Hide user symbols.
+ 
++--demangle-kernel::
++        Demangle kernel symbols.
++
+ -D::
+ --dump-symtab::
+         Dump the symbol table used for profiling.
+diff --git a/tools/perf/builtin-probe.c b/tools/perf/builtin-probe.c
+index c63fa29..41ee517 100644
+--- a/tools/perf/builtin-probe.c
++++ b/tools/perf/builtin-probe.c
+@@ -373,6 +373,8 @@ __cmd_probe(int argc, const char **argv, const char *prefix __maybe_unused)
+    "target executable name or path", opt_set_target),
+  OPT_BOOLEAN(0, "demangle", &symbol_conf.demangle,
+       "Disable symbol demangling"),
++ OPT_BOOLEAN(0, "demangle-kernel", &symbol_conf.demangle_kernel,
++      "Enable kernel symbol demangling"),
+  OPT_END()
+  };
+  int ret;
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 21d830b..9b39822 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -674,6 +674,8 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
+      "objdump binary to use for disassembly and annotations"),
+  OPT_BOOLEAN(0, "demangle", &symbol_conf.demangle,
+       "Disable symbol demangling"),
++ OPT_BOOLEAN(0, "demangle-kernel", &symbol_conf.demangle_kernel,
++      "Enable kernel symbol demangling"),
+  OPT_BOOLEAN(0, "mem-mode", &report.mem_mode, "mem access profile"),
+  OPT_CALLBACK(0, "percent-limit", &report, "percent",
+        "Don't show entries under that percent", parse_percent_limit),
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index 377971d..470bf24 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -1122,6 +1122,8 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
+       "Interleave source code with assembly code (default)"),
+  OPT_BOOLEAN(0, "asm-raw", &symbol_conf.annotate_asm_raw,
+       "Display raw encoding of assembly instructions (default)"),
++ OPT_BOOLEAN(0, "demangle-kernel", &symbol_conf.demangle_kernel,
++      "Enable kernel symbol demangling"),
+  OPT_STRING(0, "objdump", &objdump_path, "path",
+       "objdump binary to use for disassembly and annotations"),
+  OPT_STRING('M', "disassembler-style", &disassembler_style, "disassembler style",
+diff --git a/tools/perf/util/symbol-elf.c b/tools/perf/util/symbol-elf.c
+index b0c8e98..87f844e 100644
+--- a/tools/perf/util/symbol-elf.c
++++ b/tools/perf/util/symbol-elf.c
+@@ -677,6 +677,11 @@ static u64 ref_reloc(struct kmap *kmap)
+  return 0;
+ }
+ 
++static bool want_demangle(bool is_kernel_sym)
++{
++ return is_kernel_sym ? symbol_conf.demangle_kernel : symbol_conf.demangle;
++}
++
+ int dso__load_sym(struct dso *dso, struct map *map,
+     struct symsrc *syms_ss, struct symsrc *runtime_ss,
+     symbol_filter_t filter, int kmodule)
+@@ -934,7 +939,7 @@ new_symbol:
+    * DWARF DW_compile_unit has this, but we don't always have access
+    * to it...
+    */
+-  if (symbol_conf.demangle) {
++  if (want_demangle(dso->kernel || kmodule)) {
+    int demangle_flags = DMGL_NO_OPTS;
+    if (verbose)
+     demangle_flags = DMGL_PARAMS | DMGL_ANSI;
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index 7b9096f..93eae4b 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -33,6 +33,7 @@ struct symbol_conf symbol_conf = {
+  .try_vmlinux_path = true,
+  .annotate_src  = true,
+  .demangle  = true,
++ .demangle_kernel = false,
+  .cumulate_callchain = true,
+  .symfs   = "",
+ };
+diff --git a/tools/perf/util/symbol.h b/tools/perf/util/symbol.h
+index e79fcf0..3b45235 100644
+--- a/tools/perf/util/symbol.h
++++ b/tools/perf/util/symbol.h
+@@ -119,6 +119,7 @@ struct symbol_conf {
+    annotate_src,
+    event_group,
+    demangle,
++   demangle_kernel,
+    filter_relative;
+  const char *vmlinux_name,
+    *kallsyms_name,
+-- 
+1.7.1

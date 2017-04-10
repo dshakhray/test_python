@@ -1,0 +1,177 @@
+From 22e683e91e35d802344f284f68801db341e95392 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:45 -0400
+Subject: [x86] perf/intel: Protect LBR and extra_regs against KVM lying
+
+Message-id: <1410181752-25631-41-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91714
+O-Subject: [PATCH RHEL7.1 BZ1134356 040/307] perf/x86/intel: Protect LBR and extra_regs against KVM lying
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 338b522ca43cfd32d11a370f4203bcd089c6c877
+Author: Kan Liang <kan.liang@intel.com>
+Date: Mon Jul 14 12:25:56 2014 -0700
+
+description
+===========
+With -cpu host, KVM reports LBR and extra_regs support, if the host has
+support.
+
+When the guest perf driver tries to access LBR or extra_regs MSR,
+it #GPs all MSR accesses,since KVM doesn't handle LBR and extra_regs support.
+So check the related MSRs access right once at initialization time to avoid
+the error access at runtime.
+
+For reproducing the issue, please build the kernel with CONFIG_KVM_INTEL = y
+(for host kernel).
+And CONFIG_PARAVIRT = n and CONFIG_KVM_GUEST = n (for guest kernel).
+Start the guest with -cpu host.
+Run perf record with --branch-any or --branch-filter in guest to trigger LBR
+Run perf stat offcore events (E.g. LLC-loads/LLC-load-misses ...) in guest to
+trigger offcore_rsp #GP
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/cpu/perf_event.c b/arch/x86/kernel/cpu/perf_event.c
+index eab5b35..0e56f2a 100644
+--- a/arch/x86/kernel/cpu/perf_event.c
++++ b/arch/x86/kernel/cpu/perf_event.c
+@@ -118,6 +118,9 @@ static int x86_pmu_extra_regs(u64 config, struct perf_event *event)
+    continue;
+   if (event->attr.config1 & ~er->valid_mask)
+    return -EINVAL;
++  /* Check if the extra msrs can be safely accessed*/
++  if (!er->extra_msr_access)
++   return -ENXIO;
+ 
+   reg->idx = er->idx;
+   reg->config = event->attr.config1;
+diff --git a/arch/x86/kernel/cpu/perf_event.h b/arch/x86/kernel/cpu/perf_event.h
+index ae595e2..499bac6 100644
+--- a/arch/x86/kernel/cpu/perf_event.h
++++ b/arch/x86/kernel/cpu/perf_event.h
+@@ -295,14 +295,16 @@ struct extra_reg {
+  u64   config_mask;
+  u64   valid_mask;
+  int   idx;  /* per_xxx->regs[] reg index */
++ bool   extra_msr_access;
+ };
+ 
+ #define EVENT_EXTRA_REG(e, ms, m, vm, i) { \
+- .event = (e),  \
+- .msr = (ms),  \
+- .config_mask = (m), \
+- .valid_mask = (vm), \
+- .idx = EXTRA_REG_##i, \
++ .event = (e),   \
++ .msr = (ms),   \
++ .config_mask = (m),  \
++ .valid_mask = (vm),  \
++ .idx = EXTRA_REG_##i,  \
++ .extra_msr_access = true, \
+  }
+ 
+ #define INTEL_EVENT_EXTRA_REG(event, msr, vm, idx) \
+diff --git a/arch/x86/kernel/cpu/perf_event_intel.c b/arch/x86/kernel/cpu/perf_event_intel.c
+index b5bd37d..1cbea49 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@ -2178,6 +2178,41 @@ static void intel_snb_check_microcode(void)
+  }
+ }
+ 
++/*
++ * Under certain circumstances, access certain MSR may cause #GP.
++ * The function tests if the input MSR can be safely accessed.
++ */
++static bool check_msr(unsigned long msr, u64 mask)
++{
++ u64 val_old, val_new, val_tmp;
++
++ /*
++  * Read the current value, change it and read it back to see if it
++  * matches, this is needed to detect certain hardware emulators
++  * (qemu/kvm) that don't trap on the MSR access and always return 0s.
++  */
++ if (rdmsrl_safe(msr, &val_old))
++  return false;
++
++ /*
++  * Only change the bits which can be updated by wrmsrl.
++  */
++ val_tmp = val_old ^ mask;
++ if (wrmsrl_safe(msr, val_tmp) ||
++     rdmsrl_safe(msr, &val_new))
++  return false;
++
++ if (val_new != val_tmp)
++  return false;
++
++ /* Here it's sure that the MSR can be safely accessed.
++  * Restore the old value and return.
++  */
++ wrmsrl(msr, val_old);
++
++ return true;
++}
++
+ static __init void intel_sandybridge_quirk(void)
+ {
+  x86_pmu.check_microcode = intel_snb_check_microcode;
+@@ -2267,7 +2302,8 @@ __init int intel_pmu_init(void)
+  union cpuid10_ebx ebx;
+  struct event_constraint *c;
+  unsigned int unused;
+- int version;
++ struct extra_reg *er;
++ int version, i;
+ 
+  if (!cpu_has(&boot_cpu_data, X86_FEATURE_ARCH_PERFMON)) {
+   switch (boot_cpu_data.x86) {
+@@ -2573,6 +2609,34 @@ __init int intel_pmu_init(void)
+   }
+  }
+ 
++ /*
++  * Access LBR MSR may cause #GP under certain circumstances.
++  * E.g. KVM doesn't support LBR MSR
++  * Check all LBT MSR here.
++  * Disable LBR access if any LBR MSRs can not be accessed.
++  */
++ if (x86_pmu.lbr_nr && !check_msr(x86_pmu.lbr_tos, 0x3UL))
++  x86_pmu.lbr_nr = 0;
++ for (i = 0; i < x86_pmu.lbr_nr; i++) {
++  if (!(check_msr(x86_pmu.lbr_from + i, 0xffffUL) &&
++        check_msr(x86_pmu.lbr_to + i, 0xffffUL)))
++   x86_pmu.lbr_nr = 0;
++ }
++
++ /*
++  * Access extra MSR may cause #GP under certain circumstances.
++  * E.g. KVM doesn't support offcore event
++  * Check all extra_regs here.
++  */
++ if (x86_pmu.extra_regs) {
++  for (er = x86_pmu.extra_regs; er->msr; er++) {
++   er->extra_msr_access = check_msr(er->msr, 0x1ffUL);
++   /* Disable LBR select mapping */
++   if ((er->idx == EXTRA_REG_LBR) && !er->extra_msr_access)
++    x86_pmu.lbr_sel_map = NULL;
++  }
++ }
++
+  /* Support full width counters using alternative MSR range */
+  if (x86_pmu.intel_cap.full_width_write) {
+   x86_pmu.max_period = x86_pmu.cntval_mask;
+-- 
+1.7.1

@@ -1,0 +1,102 @@
+From 74e446a75079c9a87c024f90f1227926f024a101 Mon Sep 17 00:00:00 2001
+From: Larry Woodman <lwoodman@redhat.com>
+Date: Fri, 7 Nov 2014 15:41:23 -0500
+Subject: [mm] memory-hotplug: clear pgdat which is allocated by bootmem in try_offline_node()
+
+Message-id: <1415374883-925-1-git-send-email-lwoodman@redhat.com>
+Patchwork-id: 99781
+O-Subject: [RHEL7.1 PATCH] Prevent warning message in free_area_init_node() while hot replacing a system board
+Bugzilla: 1156393
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+RH-Acked-by: Dave Anderson <anderson@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+The attached upstream backport prevents free_area_init_node() from printing a warning
+message when hot adding the same memory after hot removal.
+
+BZ: 1156393
+
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8213935
+
+Testing: FUJITSU tested this on their PRIMEQUEST2800E.
+
+ commit 35dca71c1fad13616d9ea336c05730071793b63a
+ Author: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+ Date:   Wed Oct 29 14:50:40 2014 -0700
+
+    memory-hotplug: clear pgdat which is allocated by bootmem in try_offline_node()
+
+    When hot adding the same memory after hot removal, the following
+    messages are shown:
+
+      WARNING: CPU: 20 PID: 6 at mm/page_alloc.c:4968 free_area_init_node+0x3fe/0x426()
+      ...
+      Call Trace:
+        dump_stack+0x46/0x58
+        warn_slowpath_common+0x81/0xa0
+        warn_slowpath_null+0x1a/0x20
+        free_area_init_node+0x3fe/0x426
+        hotadd_new_pgdat+0x90/0x110
+        add_memory+0xd4/0x200
+        acpi_memory_device_add+0x1aa/0x289
+        acpi_bus_attach+0xfd/0x204
+        acpi_bus_attach+0x178/0x204
+        acpi_bus_scan+0x6a/0x90
+        acpi_device_hotplug+0xe8/0x418
+        acpi_hotplug_work_fn+0x1f/0x2b
+        process_one_work+0x14e/0x3f0
+        worker_thread+0x11b/0x510
+        kthread+0xe1/0x100
+        ret_from_fork+0x7c/0xb0
+
+    The detaled explanation is as follows:
+
+    When hot removing memory, pgdat is set to 0 in try_offline_node().  But
+    if the pgdat is allocated by bootmem allocator, the clearing step is
+    skipped.
+
+    And when hot adding the same memory, the uninitialized pgdat is reused.
+    But free_area_init_node() checks wether pgdat is set to zero.  As a
+    result, free_area_init_node() hits WARN_ON().
+
+    This patch clears pgdat which is allocated by bootmem allocator in
+    try_offline_node().
+
+    Signed-off-by: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+    Cc: Zhang Zhen <zhenzhang.zhang@huawei.com>
+    Cc: Wang Nan <wangnan0@huawei.com>
+    Cc: Tang Chen <tangchen@cn.fujitsu.com>
+    Reviewed-by: Toshi Kani <toshi.kani@hp.com>
+    Cc: Dave Hansen <dave.hansen@intel.com>
+    Cc: David Rientjes <rientjes@google.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 0d75102..ddbad49 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1770,7 +1770,6 @@ void try_offline_node(int nid)
+  unsigned long start_pfn = pgdat->node_start_pfn;
+  unsigned long end_pfn = start_pfn + pgdat->node_spanned_pages;
+  unsigned long pfn;
+- struct page *pgdat_page = virt_to_page(pgdat);
+  int i;
+ 
+  for (pfn = start_pfn; pfn < end_pfn; pfn += PAGES_PER_SECTION) {
+@@ -1799,10 +1798,6 @@ void try_offline_node(int nid)
+  node_set_offline(nid);
+  unregister_one_node(nid);
+ 
+- if (!PageSlab(pgdat_page) && !PageCompound(pgdat_page))
+-  /* node data is allocated from boot memory */
+-  return;
+-
+  /* free waittable in each zone */
+  for (i = 0; i < MAX_NR_ZONES; i++) {
+   struct zone *zone = pgdat->node_zones + i;
+-- 
+1.7.1

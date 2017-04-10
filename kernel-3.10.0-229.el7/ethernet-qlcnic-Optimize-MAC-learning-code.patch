@@ -1,0 +1,90 @@
+From ba4dbab69f114709b0fa1e491d710613429234ac Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:06:36 -0400
+Subject: [ethernet] qlcnic: Optimize MAC learning code
+
+Message-id: <1408626422-3941-113-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88670
+O-Subject: [PATCH RHEL 7.1 112/138] qlcnic: Optimize MAC learning code
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Shahed Shaikh <shahed.shaikh@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id ddfbac07c0e87e221596a439e8fb3937b95db228
+
+* Use rx_mac_learn instead of mac_learn and eSwitch flag check in Rx path of
+  82xx adapter.
+* Check for MAC filter overrun only after driver scans through cached MAC address list.
+  This will help to update the time stamp of cached MAC addresses even if
+  adapter runs out of MAC address filter limit.
+* Remove expensive log thrown by driver when MAC address filters are exhausted
+
+Signed-off-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+index 96d1b18..520f15d 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+@@ -305,7 +305,6 @@ static void qlcnic_send_filter(struct qlcnic_adapter *adapter,
+ {
+  struct vlan_ethhdr *vh = (struct vlan_ethhdr *)(skb->data);
+  struct ethhdr *phdr = (struct ethhdr *)(skb->data);
+- struct net_device *netdev = adapter->netdev;
+  u16 protocol = ntohs(skb->protocol);
+  struct qlcnic_filter *fil, *tmp_fil;
+  struct hlist_head *head;
+@@ -330,13 +329,6 @@ static void qlcnic_send_filter(struct qlcnic_adapter *adapter,
+    return;
+  }
+ 
+- if (adapter->fhash.fnum >= adapter->fhash.fmax) {
+-  adapter->stats.mac_filter_limit_overrun++;
+-  netdev_info(netdev, "Can not add more than %d mac-vlan filters, configured %d\n",
+-       adapter->fhash.fmax, adapter->fhash.fnum);
+-  return;
+- }
+-
+  memcpy(&src_addr, phdr->h_source, ETH_ALEN);
+  hval = qlcnic_mac_hash(src_addr, vlan_id);
+  hindex = hval & (adapter->fhash.fbucket_size - 1);
+@@ -353,6 +345,11 @@ static void qlcnic_send_filter(struct qlcnic_adapter *adapter,
+   }
+  }
+ 
++ if (unlikely(adapter->fhash.fnum >= adapter->fhash.fmax)) {
++  adapter->stats.mac_filter_limit_overrun++;
++  return;
++ }
++
+  fil = kzalloc(sizeof(struct qlcnic_filter), GFP_ATOMIC);
+  if (!fil)
+   return;
+@@ -1215,8 +1212,7 @@ qlcnic_process_rcv(struct qlcnic_adapter *adapter,
+  if (!skb)
+   return buffer;
+ 
+- if (adapter->drv_mac_learn &&
+-     (adapter->flags & QLCNIC_ESWITCH_ENABLED)) {
++ if (adapter->rx_mac_learn) {
+   t_vid = 0;
+   is_lb_pkt = qlcnic_82xx_is_lb_pkt(sts_data0);
+   qlcnic_add_lb_filter(adapter, skb, is_lb_pkt, t_vid);
+@@ -1292,8 +1288,7 @@ qlcnic_process_lro(struct qlcnic_adapter *adapter,
+  if (!skb)
+   return buffer;
+ 
+- if (adapter->drv_mac_learn &&
+-     (adapter->flags & QLCNIC_ESWITCH_ENABLED)) {
++ if (adapter->rx_mac_learn) {
+   t_vid = 0;
+   is_lb_pkt = qlcnic_82xx_is_lb_pkt(sts_data0);
+   qlcnic_add_lb_filter(adapter, skb, is_lb_pkt, t_vid);
+-- 
+1.7.1

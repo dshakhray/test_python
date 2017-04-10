@@ -1,0 +1,62 @@
+From 13067ec2c87759a48d1ce31b2e006cca9447ba15 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:32 -0400
+Subject: [kernel] perf: Fix use after free in perf_remove_from_context()
+
+Message-id: <1410181752-25631-28-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91724
+O-Subject: [PATCH RHEL7.1 BZ1134356 027/307] perf: Fix use after free in perf_remove_from_context()
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit ebf905fc7a6e7c99c53b5afc888d8f950da90aff
+Author: Peter Zijlstra <peterz@infradead.org>
+Date: Thu May 29 19:00:24 2014 +0200
+
+description
+===========
+While that mutex should guard the elements, it doesn't guard against the
+use-after-free that's from list_for_each_entry_rcu().
+__perf_event_exit_task() can actually free the event.
+
+And because list addition/deletion is guarded by both ctx->mutex and
+ctx->lock, holding ctx->mutex is sufficient for reading the list, so we
+don't actually need the rcu list iteration.
+
+Fixes: 3a497f48637e ("perf: Simplify perf_event_exit_task_context()")
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 8d2d235..3e3baf6 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7447,7 +7447,7 @@ __perf_event_exit_task(struct perf_event *child_event,
+ 
+ static void perf_event_exit_task_context(struct task_struct *child, int ctxn)
+ {
+- struct perf_event *child_event;
++ struct perf_event *child_event, *next;
+  struct perf_event_context *child_ctx;
+  unsigned long flags;
+ 
+@@ -7501,7 +7501,7 @@ static void perf_event_exit_task_context(struct task_struct *child, int ctxn)
+   */
+  mutex_lock(&child_ctx->mutex);
+ 
+- list_for_each_entry_rcu(child_event, &child_ctx->event_list, event_entry)
++ list_for_each_entry_safe(child_event, next, &child_ctx->event_list, event_entry)
+   __perf_event_exit_task(child_event, child_ctx, child);
+ 
+  mutex_unlock(&child_ctx->mutex);
+-- 
+1.7.1

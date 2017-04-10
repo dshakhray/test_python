@@ -1,0 +1,115 @@
+From 29fcd815b0f39ad531e5e2fd6aeec866e6da2e18 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:14:55 -0400
+Subject: [net] Save software checksum complete
+
+Message-id: <1409652920-431-33-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90186
+O-Subject: [PATCH 32/57] [RHEL7.1 net] net: Save software checksum complete
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+KABI: wrap new skbuff bitfield member in GENKSYMS,
+it doesn't cause any existing member to change location.
+
+commit 7e3cead5172927732f51fde77fef6f521e22f209
+Author: Tom Herbert <therbert@google.com>
+Date:   Tue Jun 10 18:54:19 2014 -0700
+
+    net: Save software checksum complete
+
+    In skb_checksum complete, if we need to compute the checksum for the
+    packet (via skb_checksum) save the result as CHECKSUM_COMPLETE.
+    Subsequent checksum verification can use this.
+
+    Also, added csum_complete_sw flag to distinguish between software and
+    hardware generated checksum complete, we should always be able to trust
+    the software computation.
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 9c309c8..8ad258d 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -500,8 +500,9 @@ struct sk_buff {
+ #ifndef __GENKSYMS__
+  __u8   encap_hdr_csum:1;
+  __u8   csum_valid:1;
++ __u8   csum_complete_sw:1;
+ #endif
+- /* 4/6 bit hole (depending on ndisc_nodetype presence) */
++ /* 3/5 bit hole (depending on ndisc_nodetype presence) */
+  kmemcheck_bitfield_end(flags2);
+ 
+ #if defined CONFIG_NET_DMA || defined CONFIG_NET_RX_BUSY_POLL
+diff --git a/net/core/datagram.c b/net/core/datagram.c
+index 8ab48cd..7ad0ea2 100644
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -667,11 +667,15 @@ __sum16 __skb_checksum_complete_head(struct sk_buff *skb, int len)
+  __sum16 sum;
+ 
+  sum = csum_fold(skb_checksum(skb, 0, len, skb->csum));
+- if (likely(!sum)) {
+-  if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE))
+-   netdev_rx_csum_fault(skb->dev);
+-  skb->ip_summed = CHECKSUM_UNNECESSARY;
+- }
++ if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) && !sum &&
++     !skb->csum_complete_sw)
++  netdev_rx_csum_fault(skb->dev);
++
++ /* Save checksum complete for later use */
++ skb->csum = sum;
++ skb->ip_summed = CHECKSUM_COMPLETE;
++ skb->csum_complete_sw = 1;
++
+  return sum;
+ }
+ EXPORT_SYMBOL(__skb_checksum_complete_head);
+diff --git a/net/ipv4/gre_offload.c b/net/ipv4/gre_offload.c
+index 24deb39..eb92deb 100644
+--- a/net/ipv4/gre_offload.c
++++ b/net/ipv4/gre_offload.c
+@@ -131,10 +131,12 @@ static __sum16 gro_skb_checksum(struct sk_buff *skb)
+   csum_partial(skb->data, skb_gro_offset(skb), 0));
+  sum = csum_fold(NAPI_GRO_CB(skb)->csum);
+  if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE)) {
+-  if (unlikely(!sum))
++  if (unlikely(!sum) && !skb->csum_complete_sw)
+    netdev_rx_csum_fault(skb->dev);
+- } else
++ } else {
+   skb->ip_summed = CHECKSUM_COMPLETE;
++  skb->csum_complete_sw = 1;
++ }
+ 
+  return sum;
+ }
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 0a648c5..2df87f7 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -173,7 +173,8 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+   return -1;
+  if (csum_fold(desc.csum))
+   return -1;
+- if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE))
++ if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
++     !skb->csum_complete_sw)
+   netdev_rx_csum_fault(skb->dev);
+  return 0;
+ no_checksum:
+-- 
+1.7.1

@@ -1,0 +1,110 @@
+From 5151a0abeed5053e6b7ae1f6899f40036c5dfb7f Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:24:23 -0400
+Subject: [fs] ceph: fix ceph_dir_llseek()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-157-git-send-email-sweil@redhat.com>
+Patchwork-id: 89639
+O-Subject: [PATCH 156/303] ceph: fix ceph_dir_llseek()
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+commit: f0494206076703aaa0c8005eff41c413216ae26b
+
+From: "Yan, Zheng" <zheng.z.yan@intel.com>
+
+Comparing offset with inode->i_sb->s_maxbytes doesn't make sense for
+directory. For a fragmented directory, offset (frag_t, off) can be
+larger than inode->i_sb->s_maxbytes.
+
+At the very beginning of ceph_dir_llseek(), local variable old_offset
+is initialized to parameter offset. This doesn't make sense neither.
+Old_offset should be ceph_make_fpos(fi->frag, fi->next_offset).
+
+Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ fs/ceph/dir.c
+---
+
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index bb5a702..052fd80 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -193,7 +193,7 @@ more:
+   if (err < 0) {
+    /* remember our position */
+    fi->dentry = last;
+-   fi->next_offset = di->offset;
++   fi->next_offset = fpos_off(di->offset);
+   } else {
+    dput(last);
+   }
+@@ -372,9 +372,9 @@ more:
+     fi->next_offset = 0;
+    off = fi->next_offset;
+   }
++  fi->frag = frag;
+   fi->offset = fi->next_offset;
+   fi->last_readdir = req;
+-  fi->frag = frag;
+ 
+   if (req->r_reply_info.dir_end) {
+    kfree(fi->last_name);
+@@ -477,7 +477,7 @@ static loff_t ceph_dir_llseek(struct file *file, loff_t offset, int whence)
+ {
+  struct ceph_file_info *fi = file->private_data;
+  struct inode *inode = file->f_mapping->host;
+- loff_t old_offset = offset;
++ loff_t old_offset = ceph_make_fpos(fi->frag, fi->next_offset);
+  loff_t retval;
+ 
+  mutex_lock(&inode->i_mutex);
+@@ -494,7 +494,7 @@ static loff_t ceph_dir_llseek(struct file *file, loff_t offset, int whence)
+   goto out;
+  }
+ 
+- if (offset >= 0 && offset <= inode->i_sb->s_maxbytes) {
++ if (offset >= 0) {
+   if (offset != file->f_pos) {
+    file->f_pos = offset;
+    file->f_version = 0;
+@@ -507,14 +507,14 @@ static loff_t ceph_dir_llseek(struct file *file, loff_t offset, int whence)
+    * seek to new frag, or seek prior to current chunk.
+    */
+   if (offset == 0 ||
+-      fpos_frag(offset) != fpos_frag(old_offset) ||
++      fpos_frag(offset) != fi->frag ||
+       fpos_off(offset) < fi->offset) {
+    dout("dir_llseek dropping %p content\n", file);
+    reset_readdir(fi);
+   }
+ 
+   /* bump dir_release_count if we did a forward seek */
+-  if (offset > old_offset)
++  if (fpos_cmp(offset, old_offset) > 0)
+    fi->dir_release_count--;
+  }
+ out:
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index a2ffbcc..cf18022 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -561,7 +561,7 @@ struct ceph_file_info {
+ 
+  /* readdir: position within a frag */
+  unsigned offset;       /* offset of last chunk, adjusted for . and .. */
+- u64 next_offset;       /* offset of next chunk (last_name's + 1) */
++ unsigned next_offset;  /* offset of next chunk (last_name's + 1) */
+  char *last_name;       /* last entry in previous chunk */
+  struct dentry *dentry; /* next dentry (for dcache readdir) */
+  int dir_release_count;
+-- 
+1.7.1

@@ -1,0 +1,87 @@
+From 8e5dcf1a9e11b6c4e75daf9cc20f6df84758e23c Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Tue, 9 Dec 2014 20:01:38 -0500
+Subject: [mm] slub: fall back to node_to_mem_node() node if allocating on memoryless node
+
+Message-id: <1418155299-17945-5-git-send-email-gduarte@redhat.com>
+Patchwork-id: 101209
+O-Subject: [RHEL7.1 PATCH BZ 953583 4/5] slub: fall back to node_to_mem_node() node if allocating on memoryless node
+Bugzilla: 953583
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+BZ 953583
+Upstream Status: a561ce00b09e1545953340deb5bef1036d7442de
+
+commit a561ce00b09e1545953340deb5bef1036d7442de
+Author: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Date:   Thu Oct 9 15:26:15 2014 -0700
+
+    slub: fall back to node_to_mem_node() node if allocating on memoryless node
+
+    Update the SLUB code to search for partial slabs on the nearest node with
+    memory in the presence of memoryless nodes.  Additionally, do not consider
+    it to be an ALLOC_NODE_MISMATCH (and deactivate the slab) when a
+    memoryless-node specified allocation goes off-node.
+
+    Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+    Signed-off-by: Nishanth Aravamudan <nacc@linux.vnet.ibm.com>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: Han Pingtian <hanpt@linux.vnet.ibm.com>
+    Cc: Pekka Enberg <penberg@kernel.org>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Anton Blanchard <anton@samba.org>
+    Cc: Christoph Lameter <cl@linux.com>
+    Cc: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/slub.c b/mm/slub.c
+index f1d07b9..ac80dcf 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -1669,7 +1669,12 @@ static void *get_partial(struct kmem_cache *s, gfp_t flags, int node,
+   struct kmem_cache_cpu *c)
+ {
+  void *object;
+- int searchnode = (node == NUMA_NO_NODE) ? numa_mem_id() : node;
++ int searchnode = node;
++
++ if (node == NUMA_NO_NODE)
++  searchnode = numa_mem_id();
++ else if (!node_present_pages(node))
++  searchnode = node_to_mem_node(node);
+ 
+  object = get_partial_node(s, get_node(s, searchnode), c, flags);
+  if (object || node != NUMA_NO_NODE)
+@@ -2242,11 +2247,18 @@ static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
+ redo:
+ 
+  if (unlikely(!node_match(page, node))) {
+-  stat(s, ALLOC_NODE_MISMATCH);
+-  deactivate_slab(s, page, c->freelist);
+-  c->page = NULL;
+-  c->freelist = NULL;
+-  goto new_slab;
++  int searchnode = node;
++
++  if (node != NUMA_NO_NODE && !node_present_pages(node))
++   searchnode = node_to_mem_node(node);
++
++  if (unlikely(!node_match(page, searchnode))) {
++   stat(s, ALLOC_NODE_MISMATCH);
++   deactivate_slab(s, page, c->freelist);
++   c->page = NULL;
++   c->freelist = NULL;
++   goto new_slab;
++  }
+  }
+ 
+  /*
+-- 
+1.7.1

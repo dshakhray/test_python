@@ -1,0 +1,92 @@
+From 1c591d6c1f101019c425b3e5e6f8d75407c769d8 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Thu, 29 Jan 2015 12:58:42 -0500
+Subject: [net] rtnetlink: allow to register ops without ops->setup set
+
+Message-id: <ab7da7fda005a414618f5a38cda617a69b89e6db.1422536321.git.jbenc@redhat.com>
+Patchwork-id: 103882
+O-Subject: [RHEL7.2 net PATCH] rtnetlink: allow to register ops without ops->setup set
+Bugzilla: 1186492
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1186492
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8659845
+Tested: using the reproducer described in bugzilla
+
+This is a patch forgotten when doing the backport of openvswitch
+(bz#1110384). It fixes kernel panic when internal ports are removed using
+the ip tool.
+
+commit b0ab2fabb5b91da99c189db02e91ae10bc8355c5
+Author: Jiri Pirko <jiri@resnulli.us>
+Date:   Thu Jun 26 09:58:25 2014 +0200
+
+    rtnetlink: allow to register ops without ops->setup set
+
+    So far, it is assumed that ops->setup is filled up. But there might be
+    case that ops might make sense even without ->setup. In that case,
+    forbid to newlink and dellink.
+
+    This allows to register simple rtnl link ops containing only ->kind.
+    That allows consistent way of passing device kind (either device-kind or
+    slave-kind) to userspace.
+
+    Signed-off-by: Jiri Pirko <jiri@resnulli.us>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 752d85d..996c694 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -6456,7 +6456,7 @@ static void __net_exit default_device_exit_batch(struct list_head *net_list)
+  rtnl_lock_unregistering(net_list);
+  list_for_each_entry(net, net_list, exit_list) {
+   for_each_netdev_reverse(net, dev) {
+-   if (dev->rtnl_link_ops)
++   if (dev->rtnl_link_ops && dev->rtnl_link_ops->dellink)
+     dev->rtnl_link_ops->dellink(dev, &dev_kill_list);
+    else
+     unregister_netdevice_queue(dev, &dev_kill_list);
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index f9d2b64..187818c 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -299,7 +299,12 @@ int __rtnl_link_register(struct rtnl_link_ops *ops)
+  if (rtnl_link_ops_get(ops->kind))
+   return -EEXIST;
+ 
+- if (!ops->dellink)
++ /* The check for setup is here because if ops
++  * does not have that filled up, it is not possible
++  * to use the ops for creating device. So do not
++  * fill up dellink as well. That disables rtnl_dellink.
++  */
++ if (ops->setup && !ops->dellink)
+   ops->dellink = unregister_netdevice_queue;
+ 
+  list_add_tail(&ops->list, &link_ops);
+@@ -1674,7 +1679,7 @@ static int rtnl_dellink(struct sk_buff *skb, struct nlmsghdr *nlh)
+   return -ENODEV;
+ 
+  ops = dev->rtnl_link_ops;
+- if (!ops)
++ if (!ops || !ops->dellink)
+   return -EOPNOTSUPP;
+ 
+  ops->dellink(dev, &list_kill);
+@@ -1896,6 +1901,9 @@ replay:
+    return -EOPNOTSUPP;
+   }
+ 
++  if (!ops->setup)
++   return -EOPNOTSUPP;
++
+   if (!ifname[0])
+    snprintf(ifname, IFNAMSIZ, "%s%%d", ops->kind);
+ 
+-- 
+1.7.1

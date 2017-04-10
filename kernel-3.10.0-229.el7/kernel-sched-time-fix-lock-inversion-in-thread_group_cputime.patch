@@ -1,0 +1,59 @@
+From 1d3675faee829fa529caead07ce082c043a53d25 Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@redhat.com>
+Date: Fri, 12 Sep 2014 13:21:31 -0400
+Subject: [kernel] sched/time: fix lock inversion in thread_group_cputime
+
+Message-id: <20140912092131.3a7eeaf5@annuminas.surriel.com>
+Patchwork-id: 93945
+O-Subject: [RHEL7 PATCH -v2 9/7] sched,time: fix lock inversion in thread_group_cputime
+Bugzilla: 1120307
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+Fixes bug 1120307
+
+The sig->stats_lock nests inside the tasklist_lock and the
+sighand->siglock in __exit_signal and wait_task_zombie.
+
+However, both of those locks can be taken from irq context,
+which means we need to use the interrupt safe variant of
+read_seqbegin_or_lock. This blocks interrupts when the "lock"
+branch is taken (seq is odd), preventing the lock inversion.
+
+On the first (lockless) pass through the loop, irqs are not
+blocked.
+
+Signed-off-by: Rik van Riel <riel@redhat.com>
+Reported-by: Stanislaw Gruszka <sgruszka@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index 9c76729..4dff8cc 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -289,13 +289,14 @@ void thread_group_cputime(struct task_struct *tsk, struct task_cputime *times)
+  cputime_t utime, stime;
+  struct task_struct *t;
+  unsigned int seq, nextseq;
++ unsigned long flags;
+ 
+  rcu_read_lock();
+  /* Attempt a lockless read on the first round. */
+  nextseq = 0;
+  do {
+   seq = nextseq;
+-  read_seqbegin_or_lock(&sig->stats_lock, &seq);
++  flags = read_seqbegin_or_lock_irqsave(&sig->stats_lock, &seq);
+   times->utime = sig->utime;
+   times->stime = sig->stime;
+   times->sum_exec_runtime = sig->sum_sched_runtime;
+@@ -309,7 +310,7 @@ void thread_group_cputime(struct task_struct *tsk, struct task_cputime *times)
+   /* If lockless access failed, take the lock. */
+   nextseq = 1;
+  } while (need_seqretry(&sig->stats_lock, seq));
+- done_seqretry(&sig->stats_lock, seq);
++ done_seqretry_irqrestore(&sig->stats_lock, seq, flags);
+  rcu_read_unlock();
+ }
+ 
+-- 
+1.7.1

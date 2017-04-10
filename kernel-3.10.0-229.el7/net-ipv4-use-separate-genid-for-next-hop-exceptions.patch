@@ -1,0 +1,132 @@
+From 00738b0a58b05a7398a5c6dcbf984ace3e5c57a8 Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@redhat.com>
+Date: Tue, 7 Oct 2014 20:58:06 -0400
+Subject: [net] ipv4: use separate genid for next hop exceptions
+
+Message-id: <09eab57ee34765eadd84710bba0c218824d7968d.1412712186.git.hannes@redhat.com>
+Patchwork-id: 97142
+O-Subject: [RHEL7.1 net PATCH v2 2/6] ipv4: use separate genid for next hop exceptions
+Bugzilla: 1150017
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1150017
+Upstream Status: 5aad1de5ea2c260b4cd2f70b70e146d55dbbc528
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8075311
+
+Upstream Commit:
+commit 5aad1de5ea2c260b4cd2f70b70e146d55dbbc528
+Author: Timo Teras <timo.teras@iki.fi>
+Date:   Mon May 27 20:46:33 2013 +0000
+
+    ipv4: use separate genid for next hop exceptions
+
+    commit 13d82bf5 (ipv4: Fix flushing of cached routing informations)
+    added the support to flush learned pmtu information.
+
+    However, using rt_genid is quite heavy as it is bumped on route
+    add/change and multicast events amongst other places. These can
+    happen quite often, especially if using dynamic routing protocols.
+
+    While this is ok with routes (as they are just recreated locally),
+    the pmtu information is learned from remote systems and the icmp
+    notification can come with long delays. It is worthy to have separate
+    genid to avoid excessive pmtu resets.
+
+    Cc: Steffen Klassert <steffen.klassert@secunet.com>
+    Signed-off-by: Timo Teras <timo.teras@iki.fi>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Hannes Frederic Sowa <hannes@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index e49db91..44424e9 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -51,6 +51,7 @@ struct rtable;
+ 
+ struct fib_nh_exception {
+  struct fib_nh_exception __rcu *fnhe_next;
++ int    fnhe_genid;
+  __be32    fnhe_daddr;
+  u32    fnhe_pmtu;
+  __be32    fnhe_gw;
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+index a5f0725..69cb611 100644
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -125,6 +125,7 @@ struct net {
+ 
+ #ifndef __GENKSYMS__
+  unsigned int  dev_unreg_count;
++ atomic_t  fnhe_genid;
+ #endif
+ };
+ 
+@@ -348,4 +349,14 @@ static inline void rt_genid_bump(struct net *net)
+  atomic_inc(&net->rt_genid);
+ }
+ 
++static inline int fnhe_genid(struct net *net)
++{
++ return atomic_read(&net->fnhe_genid);
++}
++
++static inline void fnhe_genid_bump(struct net *net)
++{
++ atomic_inc(&net->fnhe_genid);
++}
++
+ #endif /* __NET_NET_NAMESPACE_H */
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 0dbf745..4cc2e72 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -658,6 +658,7 @@ static void update_or_create_fnhe(struct fib_nh *nh, __be32 daddr, __be32 gw,
+    fnhe->fnhe_next = hash->chain;
+    rcu_assign_pointer(hash->chain, fnhe);
+   }
++  fnhe->fnhe_genid = fnhe_genid(dev_net(nh->nh_dev));
+   fnhe->fnhe_daddr = daddr;
+   fnhe->fnhe_gw = gw;
+   fnhe->fnhe_pmtu = pmtu;
+@@ -1237,8 +1238,11 @@ static bool rt_bind_exception(struct rtable *rt, struct fib_nh_exception *fnhe,
+  spin_lock_bh(&fnhe_lock);
+ 
+  if (daddr == fnhe->fnhe_daddr) {
++  int genid = fnhe_genid(dev_net(rt->dst.dev));
+   struct rtable *orig = rcu_dereference(fnhe->fnhe_rth);
+-  if (orig && rt_is_expired(orig)) {
++
++  if (fnhe->fnhe_genid != genid) {
++   fnhe->fnhe_genid = genid;
+    fnhe->fnhe_gw = 0;
+    fnhe->fnhe_pmtu = 0;
+    fnhe->fnhe_expires = 0;
+@@ -2448,8 +2452,11 @@ static int ipv4_sysctl_rtcache_flush(struct ctl_table *__ctl, int write,
+      void __user *buffer,
+      size_t *lenp, loff_t *ppos)
+ {
++ struct net *net = (struct net *)__ctl->extra1;
++
+  if (write) {
+-  rt_cache_flush((struct net *)__ctl->extra1);
++  rt_cache_flush(net);
++  fnhe_genid_bump(net);
+   return 0;
+  }
+ 
+@@ -2624,6 +2631,7 @@ static __net_initdata struct pernet_operations sysctl_route_ops = {
+ static __net_init int rt_genid_init(struct net *net)
+ {
+  atomic_set(&net->rt_genid, 0);
++ atomic_set(&net->fnhe_genid, 0);
+  get_random_bytes(&net->ipv4.dev_addr_genid,
+     sizeof(net->ipv4.dev_addr_genid));
+  return 0;
+-- 
+1.7.1

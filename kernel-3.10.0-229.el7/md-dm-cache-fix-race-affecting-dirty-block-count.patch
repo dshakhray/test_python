@@ -1,0 +1,103 @@
+From afab13a17ec3aa8863199a347f8f7f6cc2a2ebcb Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Wed, 10 Sep 2014 19:04:37 -0400
+Subject: [md] dm-cache: fix race affecting dirty block count
+
+Message-id: <1410375877-6921-1-git-send-email-snitzer@redhat.com>
+Patchwork-id: 93564
+O-Subject: [RHEL7.1 2/1 PATCH] dm cache: fix race affecting dirty block count
+Bugzilla: 1140362
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1140362
+
+Needed to adjust the 5th hunk because DM_CACHE_METADATA_BLOCK_SIZE
+changes were applied to RHEL7 before this commit (which is the
+opposite of upstream).
+
+Upstream commit 44fa816bb778edbab6b6ddaaf24908dd6295937e
+Author: Anssi Hannula <anssi.hannula@iki.fi>
+Date:   Fri Aug 1 11:55:47 2014 -0400
+
+    dm cache: fix race affecting dirty block count
+
+    nr_dirty is updated without locking, causing it to drift so that it is
+    non-zero (either a small positive integer, or a very large one when an
+    underflow occurs) even when there are no actual dirty blocks.  This was
+    due to a race between the workqueue and map function accessing nr_dirty
+    in parallel without proper protection.
+
+    People were seeing under runs due to a race on increment/decrement of
+    nr_dirty, see: https://lkml.org/lkml/2014/6/3/648
+
+    Fix this by using an atomic_t for nr_dirty.
+
+    Reported-by: roma1390@gmail.com
+    Signed-off-by: Anssi Hannula <anssi.hannula@iki.fi>
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Cc: stable@vger.kernel.org
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-cache-target.c b/drivers/md/dm-cache-target.c
+index 41a2e40..57048da 100644
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@ -225,7 +225,7 @@ struct cache {
+  /*
+   * cache_size entries, dirty if set
+   */
+- dm_cblock_t nr_dirty;
++ atomic_t nr_dirty;
+  unsigned long *dirty_bitset;
+ 
+  /*
+@@ -486,7 +486,7 @@ static bool is_dirty(struct cache *cache, dm_cblock_t b)
+ static void set_dirty(struct cache *cache, dm_oblock_t oblock, dm_cblock_t cblock)
+ {
+  if (!test_and_set_bit(from_cblock(cblock), cache->dirty_bitset)) {
+-  cache->nr_dirty = to_cblock(from_cblock(cache->nr_dirty) + 1);
++  atomic_inc(&cache->nr_dirty);
+   policy_set_dirty(cache->policy, oblock);
+  }
+ }
+@@ -495,8 +495,7 @@ static void clear_dirty(struct cache *cache, dm_oblock_t oblock, dm_cblock_t cbl
+ {
+  if (test_and_clear_bit(from_cblock(cblock), cache->dirty_bitset)) {
+   policy_clear_dirty(cache->policy, oblock);
+-  cache->nr_dirty = to_cblock(from_cblock(cache->nr_dirty) - 1);
+-  if (!from_cblock(cache->nr_dirty))
++  if (atomic_dec_return(&cache->nr_dirty) == 0)
+    dm_table_event(cache->ti->table);
+  }
+ }
+@@ -2290,7 +2289,7 @@ static int cache_create(struct cache_args *ca, struct cache **result)
+  atomic_set(&cache->quiescing_ack, 0);
+ 
+  r = -ENOMEM;
+- cache->nr_dirty = 0;
++ atomic_set(&cache->nr_dirty, 0);
+  cache->dirty_bitset = alloc_bitset(from_cblock(cache->cache_size));
+  if (!cache->dirty_bitset) {
+   *error = "could not allocate dirty bitset";
+@@ -2839,7 +2838,7 @@ static void cache_status(struct dm_target *ti, status_type_t type,
+ 
+   residency = policy_residency(cache->policy);
+ 
+-  DMEMIT("%u %llu/%llu %u %llu/%llu %u %u %u %u %u %u %llu ",
++  DMEMIT("%u %llu/%llu %u %llu/%llu %u %u %u %u %u %u %lu ",
+          (unsigned)DM_CACHE_METADATA_BLOCK_SIZE,
+          (unsigned long long)(nr_blocks_metadata - nr_free_blocks_metadata),
+          (unsigned long long)nr_blocks_metadata,
+@@ -2852,7 +2851,7 @@ static void cache_status(struct dm_target *ti, status_type_t type,
+          (unsigned) atomic_read(&cache->stats.write_miss),
+          (unsigned) atomic_read(&cache->stats.demotion),
+          (unsigned) atomic_read(&cache->stats.promotion),
+-         (unsigned long long) from_cblock(cache->nr_dirty));
++         (unsigned long) atomic_read(&cache->nr_dirty));
+ 
+   if (writethrough_mode(&cache->features))
+    DMEMIT("1 writethrough ");
+-- 
+1.7.1

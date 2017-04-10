@@ -1,0 +1,84 @@
+From 43325a3e3ff2640c54841d00a18091342562b0ea Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Thu, 28 Aug 2014 19:16:01 -0400
+Subject: [virt] virtio_blk: base queue-depth on virtqueue ringsize or module param
+
+Message-id: <1409253371-23161-12-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 89856
+O-Subject: [RHEL7 PATCH 11/21] virtio-blk: base queue-depth on virtqueue ringsize or module param
+Bugzilla: 1105698
+RH-Acked-by: Fam Zheng <famz@redhat.com>
+
+This is a backport of the following upstream commit.
+Related to bug 1105698.
+
+  commit fc4324b4597c4eb8907207e82f9a6acec84dd335
+  Author: Rusty Russell <rusty@rustcorp.com.au>
+  Date:   Wed Mar 19 17:08:24 2014 +1030
+
+    virtio-blk: base queue-depth on virtqueue ringsize or module param
+
+    Venkatash spake thus:
+
+      virtio-blk set the default queue depth to 64 requests, which was
+      insufficient for high-IOPS devices. Instead set the blk-queue depth to
+      the device's virtqueue depth divided by two (each I/O requires at least
+      two VQ entries).
+
+    But behold, Ted added a module parameter:
+
+      Also allow the queue depth to be something which can be set at module
+      load time or via a kernel boot-time parameter, for
+      testing/benchmarking purposes.
+
+    And I rewrote it substantially, mainly to take
+    VIRTIO_RING_F_INDIRECT_DESC into account.
+
+    As QEMU sets the vq size for PCI to 128, Venkatash's patch wouldn't
+    have made a change.  This version does (since QEMU also offers
+    VIRTIO_RING_F_INDIRECT_DESC.
+
+    Inspired-by: "Theodore Ts'o" <tytso@mit.edu>
+    Based-on-the-true-story-of: Venkatesh Srinivas <venkateshs@google.com>
+    Cc: "Michael S. Tsirkin" <mst@redhat.com>
+    Cc: virtio-dev@lists.oasis-open.org
+    Cc: virtualization@lists.linux-foundation.org
+    Cc: Frank Swiderski <fes@google.com>
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 0b1c64c..6d8a87f 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -491,10 +491,11 @@ static struct blk_mq_ops virtio_mq_ops = {
+ static struct blk_mq_reg virtio_mq_reg = {
+  .ops  = &virtio_mq_ops,
+  .nr_hw_queues = 1,
+- .queue_depth = 64,
++ .queue_depth = 0, /* Set in virtblk_probe */
+  .numa_node = NUMA_NO_NODE,
+  .flags  = BLK_MQ_F_SHOULD_MERGE,
+ };
++module_param_named(queue_depth, virtio_mq_reg.queue_depth, uint, 0444);
+ 
+ static int virtblk_init_vbr(void *data, struct blk_mq_hw_ctx *hctx,
+         struct request *rq, unsigned int nr)
+@@ -559,6 +560,13 @@ static int virtblk_probe(struct virtio_device *vdev)
+   goto out_free_vq;
+  }
+ 
++ /* Default queue sizing is to fill the ring. */
++ if (!virtio_mq_reg.queue_depth) {
++  virtio_mq_reg.queue_depth = vblk->vq->num_free;
++  /* ... but without indirect descs, we use 2 descs per req */
++  if (!virtio_has_feature(vdev, VIRTIO_RING_F_INDIRECT_DESC))
++   virtio_mq_reg.queue_depth /= 2;
++ }
+  virtio_mq_reg.cmd_size =
+   sizeof(struct virtblk_req) +
+   sizeof(struct scatterlist) * sg_elems;
+-- 
+1.7.1

@@ -1,0 +1,125 @@
+From 1c397d12432aee7d5ed8535f7a81aa2c04933726 Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <jweiner@redhat.com>
+Date: Tue, 28 Oct 2014 13:58:39 -0400
+Subject: [mm] do not walk all of system memory during show_mem
+
+Message-id: <1414504719-16651-1-git-send-email-jweiner@redhat.com>
+Patchwork-id: 98485
+O-Subject: [PATCH RHEL7 BZ1125433] mm: do not walk all of system memory during show_mem
+Bugzilla: 1125433
+RH-Acked-by: Motohiro Kosaki <mkosaki@redhat.com>
+RH-Acked-by: Seth Jennings <sjenning@redhat.com>
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+
+commit c78e93630d15b5f5774213aad9bdc9f52473a89b
+Author: Mel Gorman <mgorman@suse.de>
+Date:   Tue Nov 12 15:08:15 2013 -0800
+
+    mm: do not walk all of system memory during show_mem
+
+    It has been reported on very large machines that show_mem is taking almost
+    5 minutes to display information.  This is a serious problem if there is
+    an OOM storm.  The bulk of the cost is in show_mem doing a very expensive
+    PFN walk to give us the following information
+
+      Total RAM:       Also available as totalram_pages
+      Highmem pages:   Also available as totalhigh_pages
+      Reserved pages:  Can be inferred from the zone structure
+      Shared pages:    PFN walk required
+      Unshared pages:  PFN walk required
+      Quick pages:     Per-cpu walk required
+
+    Only the shared/unshared pages requires a full PFN walk but that
+    information is useless.  It is also inaccurate as page pins of unshared
+    pages would be accounted for as shared.  Even if the information was
+    accurate, I'm struggling to think how the shared/unshared information
+    could be useful for debugging OOM conditions.  Maybe it was useful before
+    rmap existed when reclaiming shared pages was costly but it is less
+    relevant today.
+
+    The PFN walk could be optimised a bit but why bother as the information is
+    useless.  This patch deletes the PFN walker and infers the total RAM,
+    highmem and reserved pages count from struct zone.  It omits the
+    shared/unshared page usage on the grounds that it is useless.  It also
+    corrects the reporting of HighMem as HighMem/MovableOnly as ZONE_MOVABLE
+    has similar problems to HighMem with respect to lowmem/highmem exhaustion.
+
+    Signed-off-by: Mel Gorman <mgorman@suse.de>
+    Cc: David Rientjes <rientjes@google.com>
+    Acked-by: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: Johannes Weiner <jweiner@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/lib/show_mem.c b/lib/show_mem.c
+index b7c7231..5847a49 100644
+--- a/lib/show_mem.c
++++ b/lib/show_mem.c
+@@ -12,8 +12,7 @@
+ void show_mem(unsigned int filter)
+ {
+  pg_data_t *pgdat;
+- unsigned long total = 0, reserved = 0, shared = 0,
+-  nonshared = 0, highmem = 0;
++ unsigned long total = 0, reserved = 0, highmem = 0;
+ 
+  printk("Mem-Info:\n");
+  show_free_areas(filter);
+@@ -22,43 +21,27 @@ void show_mem(unsigned int filter)
+   return;
+ 
+  for_each_online_pgdat(pgdat) {
+-  unsigned long i, flags;
++  unsigned long flags;
++  int zoneid;
+ 
+   pgdat_resize_lock(pgdat, &flags);
+-  for (i = 0; i < pgdat->node_spanned_pages; i++) {
+-   struct page *page;
+-   unsigned long pfn = pgdat->node_start_pfn + i;
+-
+-   if (unlikely(!(i % MAX_ORDER_NR_PAGES)))
+-    touch_nmi_watchdog();
+-
+-   if (!pfn_valid(pfn))
++  for (zoneid = 0; zoneid < MAX_NR_ZONES; zoneid++) {
++   struct zone *zone = &pgdat->node_zones[zoneid];
++   if (!populated_zone(zone))
+     continue;
+ 
+-   page = pfn_to_page(pfn);
+-
+-   if (PageHighMem(page))
+-    highmem++;
++   total += zone->present_pages;
++   reserved = zone->present_pages - zone->managed_pages;
+ 
+-   if (PageReserved(page))
+-    reserved++;
+-   else if (page_count(page) == 1)
+-    nonshared++;
+-   else if (page_count(page) > 1)
+-    shared += page_count(page) - 1;
+-
+-   total++;
++   if (is_highmem_idx(zoneid))
++    highmem += zone->present_pages;
+   }
+   pgdat_resize_unlock(pgdat, &flags);
+  }
+ 
+  printk("%lu pages RAM\n", total);
+-#ifdef CONFIG_HIGHMEM
+- printk("%lu pages HighMem\n", highmem);
+-#endif
++ printk("%lu pages HighMem/MovableOnly\n", highmem);
+  printk("%lu pages reserved\n", reserved);
+- printk("%lu pages shared\n", shared);
+- printk("%lu pages non-shared\n", nonshared);
+ #ifdef CONFIG_QUICKLIST
+  printk("%lu pages in pagetable cache\n",
+   quicklist_total_size());
+-- 
+1.7.1

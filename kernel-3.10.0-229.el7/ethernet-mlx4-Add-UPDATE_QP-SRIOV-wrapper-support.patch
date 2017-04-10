@@ -1,0 +1,198 @@
+From 07a5791eb861bd285ad48e808b1759e6d59c7c77 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:00:55 -0400
+Subject: [ethernet] mlx4: Add UPDATE_QP SRIOV wrapper support
+
+Message-id: <555853d8166f1e6e862cf7bf3494c79c30f98c30.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93728
+O-Subject: [Patch RHEL7.1 V1 119/197] net/mlx4_core: Add UPDATE_QP SRIOV wrapper support
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Matan Barak <matanb@mellanox.com>
+
+This patch adds UPDATE_QP SRIOV wrapper support.
+
+The mechanism is a general one, but currently only source MAC
+index changes are allowed for VFs.
+
+Signed-off-by: Matan Barak <matanb@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ce8d9e0d6746ff67c1870386b7121a4448f21130)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/cmd.c b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+index 357dcb0..161bbc8 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+@@ -1262,12 +1262,12 @@ static struct mlx4_cmd_info cmd_info[] = {
+  },
+  {
+   .opcode = MLX4_CMD_UPDATE_QP,
+-  .has_inbox = false,
++  .has_inbox = true,
+   .has_outbox = false,
+   .out_is_imm = false,
+   .encode_slave_id = false,
+   .verify = NULL,
+-  .wrapper = mlx4_CMD_EPERM_wrapper
++  .wrapper = mlx4_UPDATE_QP_wrapper
+  },
+  {
+   .opcode = MLX4_CMD_GET_OP_REQ,
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4.h b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+index 52c1e7d..9dd1b30 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+@@ -1196,6 +1196,12 @@ int mlx4_QP_ATTACH_wrapper(struct mlx4_dev *dev, int slave,
+       struct mlx4_cmd_mailbox *outbox,
+       struct mlx4_cmd_info *cmd);
+ 
++int mlx4_UPDATE_QP_wrapper(struct mlx4_dev *dev, int slave,
++      struct mlx4_vhcr *vhcr,
++      struct mlx4_cmd_mailbox *inbox,
++      struct mlx4_cmd_mailbox *outbox,
++      struct mlx4_cmd_info *cmd);
++
+ int mlx4_PROMISC_wrapper(struct mlx4_dev *dev, int slave,
+     struct mlx4_vhcr *vhcr,
+     struct mlx4_cmd_mailbox *inbox,
+diff --git a/drivers/net/ethernet/mellanox/mlx4/qp.c b/drivers/net/ethernet/mellanox/mlx4/qp.c
+index 6d63542..c12bb9f 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/qp.c
++++ b/drivers/net/ethernet/mellanox/mlx4/qp.c
+@@ -390,6 +390,41 @@ err_icm:
+ 
+ EXPORT_SYMBOL_GPL(mlx4_qp_alloc);
+ 
++#define MLX4_UPDATE_QP_SUPPORTED_ATTRS MLX4_UPDATE_QP_SMAC
++int mlx4_update_qp(struct mlx4_dev *dev, struct mlx4_qp *qp,
++     enum mlx4_update_qp_attr attr,
++     struct mlx4_update_qp_params *params)
++{
++ struct mlx4_cmd_mailbox *mailbox;
++ struct mlx4_update_qp_context *cmd;
++ u64 pri_addr_path_mask = 0;
++ int err = 0;
++
++ mailbox = mlx4_alloc_cmd_mailbox(dev);
++ if (IS_ERR(mailbox))
++  return PTR_ERR(mailbox);
++
++ cmd = (struct mlx4_update_qp_context *)mailbox->buf;
++
++ if (!attr || (attr & ~MLX4_UPDATE_QP_SUPPORTED_ATTRS))
++  return -EINVAL;
++
++ if (attr & MLX4_UPDATE_QP_SMAC) {
++  pri_addr_path_mask |= 1ULL << MLX4_UPD_QP_PATH_MASK_MAC_INDEX;
++  cmd->qp_context.pri_path.grh_mylmc = params->smac_index;
++ }
++
++ cmd->primary_addr_path_mask = cpu_to_be64(pri_addr_path_mask);
++
++ err = mlx4_cmd(dev, mailbox->dma, qp->qpn & 0xffffff, 0,
++         MLX4_CMD_UPDATE_QP, MLX4_CMD_TIME_CLASS_A,
++         MLX4_CMD_NATIVE);
++
++ mlx4_free_cmd_mailbox(dev, mailbox);
++ return err;
++}
++EXPORT_SYMBOL_GPL(mlx4_update_qp);
++
+ void mlx4_qp_remove(struct mlx4_dev *dev, struct mlx4_qp *qp)
+ {
+  struct mlx4_qp_table *qp_table = &mlx4_priv(dev)->qp_table;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/resource_tracker.c b/drivers/net/ethernet/mellanox/mlx4/resource_tracker.c
+index a95df9d..ce0e249 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/resource_tracker.c
++++ b/drivers/net/ethernet/mellanox/mlx4/resource_tracker.c
+@@ -3895,6 +3895,60 @@ static int add_eth_header(struct mlx4_dev *dev, int slave,
+ 
+ }
+ 
++#define MLX4_UPD_QP_PATH_MASK_SUPPORTED (1ULL << MLX4_UPD_QP_PATH_MASK_MAC_INDEX)
++int mlx4_UPDATE_QP_wrapper(struct mlx4_dev *dev, int slave,
++      struct mlx4_vhcr *vhcr,
++      struct mlx4_cmd_mailbox *inbox,
++      struct mlx4_cmd_mailbox *outbox,
++      struct mlx4_cmd_info *cmd_info)
++{
++ int err;
++ u32 qpn = vhcr->in_modifier & 0xffffff;
++ struct res_qp *rqp;
++ u64 mac;
++ unsigned port;
++ u64 pri_addr_path_mask;
++ struct mlx4_update_qp_context *cmd;
++ int smac_index;
++
++ cmd = (struct mlx4_update_qp_context *)inbox->buf;
++
++ pri_addr_path_mask = be64_to_cpu(cmd->primary_addr_path_mask);
++ if (cmd->qp_mask || cmd->secondary_addr_path_mask ||
++     (pri_addr_path_mask & ~MLX4_UPD_QP_PATH_MASK_SUPPORTED))
++  return -EPERM;
++
++ /* Just change the smac for the QP */
++ err = get_res(dev, slave, qpn, RES_QP, &rqp);
++ if (err) {
++  mlx4_err(dev, "Updating qpn 0x%x for slave %d rejected\n", qpn, slave);
++  return err;
++ }
++
++ port = (rqp->sched_queue >> 6 & 1) + 1;
++ smac_index = cmd->qp_context.pri_path.grh_mylmc;
++ err = mac_find_smac_ix_in_slave(dev, slave, port,
++     smac_index, &mac);
++ if (err) {
++  mlx4_err(dev, "Failed to update qpn 0x%x, MAC is invalid. smac_ix: %d\n",
++    qpn, smac_index);
++  goto err_mac;
++ }
++
++ err = mlx4_cmd(dev, inbox->dma,
++         vhcr->in_modifier, 0,
++         MLX4_CMD_UPDATE_QP, MLX4_CMD_TIME_CLASS_A,
++         MLX4_CMD_NATIVE);
++ if (err) {
++  mlx4_err(dev, "Failed to update qpn on qpn 0x%x, command failed\n", qpn);
++  goto err_mac;
++ }
++
++err_mac:
++ put_res(dev, slave, qpn, RES_QP);
++ return err;
++}
++
+ int mlx4_QP_FLOW_STEERING_ATTACH_wrapper(struct mlx4_dev *dev, int slave,
+       struct mlx4_vhcr *vhcr,
+       struct mlx4_cmd_mailbox *inbox,
+diff --git a/include/linux/mlx4/qp.h b/include/linux/mlx4/qp.h
+index b66e761..7040dc9 100644
+--- a/include/linux/mlx4/qp.h
++++ b/include/linux/mlx4/qp.h
+@@ -421,6 +421,17 @@ struct mlx4_wqe_inline_seg {
+  __be32   byte_count;
+ };
+ 
++enum mlx4_update_qp_attr {
++ MLX4_UPDATE_QP_SMAC  = 1 << 0,
++};
++
++struct mlx4_update_qp_params {
++ u8 smac_index;
++};
++
++int mlx4_update_qp(struct mlx4_dev *dev, struct mlx4_qp *qp,
++     enum mlx4_update_qp_attr attr,
++     struct mlx4_update_qp_params *params);
+ int mlx4_qp_modify(struct mlx4_dev *dev, struct mlx4_mtt *mtt,
+      enum mlx4_qp_state cur_state, enum mlx4_qp_state new_state,
+      struct mlx4_qp_context *context, enum mlx4_qp_optpar optpar,
+-- 
+1.7.1

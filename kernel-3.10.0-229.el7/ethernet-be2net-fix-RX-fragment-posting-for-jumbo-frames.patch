@@ -1,0 +1,124 @@
+From 7de4cd3e16db623d5d70a7581d438fa6315d78bc Mon Sep 17 00:00:00 2001
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Wed, 19 Nov 2014 16:12:51 -0500
+Subject: [ethernet] be2net: fix RX fragment posting for jumbo frames
+
+Message-id: <1416413587-12091-4-git-send-email-ivecera@redhat.com>
+Patchwork-id: 100327
+O-Subject: [RHEL7.1 PATCH 03/19] be2net: fix RX fragment posting for jumbo frames
+Bugzilla: 1165755
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+BZ: #1165755
+
+Upstream commit(s):
+commit c30d72665cce3613ed222215b71dd4b5213169d2
+Author: Ajit Khaparde <ajit.khaparde@emulex.com>
+Date:   Fri Sep 12 17:39:16 2014 +0530
+
+    be2net: fix RX fragment posting for jumbo frames
+
+    In the RX path, the driver currently consumes upto 64 (budget) packets in
+    one NAPI sweep. When the size of the packet received is larger than a
+    fragment size (2K), more than one fragment is consumed for each packet.
+    As the driver currently posts a max of 64 fragments, all the consumed
+    fragments may not be replenished. This can cause avoidable drops in RX path.
+    This patch fixes this by posting a max(consumed_frags, 64) frags. This is
+    done only when there are atleast 64 free slots in the RXQ.
+
+    Signed-off-by: Ajit Khaparde <ajit.khaparde@emulex.com>
+    Signed-off-by: Kalesh AP <kalesh.purayil@emulex.com>
+    Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
+index fbe179d..079e50e 100644
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -1848,7 +1848,7 @@ static inline struct page *be_alloc_pages(u32 size, gfp_t gfp)
+  * Allocate a page, split it to fragments of size rx_frag_size and post as
+  * receive buffers to BE
+  */
+-static void be_post_rx_frags(struct be_rx_obj *rxo, gfp_t gfp)
++static void be_post_rx_frags(struct be_rx_obj *rxo, gfp_t gfp, u32 frags_needed)
+ {
+  struct be_adapter *adapter = rxo->adapter;
+  struct be_rx_page_info *page_info = NULL, *prev_page_info = NULL;
+@@ -1857,10 +1857,10 @@ static void be_post_rx_frags(struct be_rx_obj *rxo, gfp_t gfp)
+  struct device *dev = &adapter->pdev->dev;
+  struct be_eth_rx_d *rxd;
+  u64 page_dmaaddr = 0, frag_dmaaddr;
+- u32 posted, page_offset = 0;
++ u32 posted, page_offset = 0, notify = 0;
+ 
+  page_info = &rxo->page_info_tbl[rxq->head];
+- for (posted = 0; posted < MAX_RX_POST && !page_info->page; posted++) {
++ for (posted = 0; posted < frags_needed && !page_info->page; posted++) {
+   if (!pagep) {
+    pagep = be_alloc_pages(adapter->big_page_size, gfp);
+    if (unlikely(!pagep)) {
+@@ -1916,7 +1916,11 @@ static void be_post_rx_frags(struct be_rx_obj *rxo, gfp_t gfp)
+   atomic_add(posted, &rxq->used);
+   if (rxo->rx_post_starved)
+    rxo->rx_post_starved = false;
+-  be_rxq_notify(adapter, rxq->id, posted);
++  do {
++   notify = min(256u, posted);
++   be_rxq_notify(adapter, rxq->id, notify);
++   posted -= notify;
++  } while (posted);
+  } else if (atomic_read(&rxq->used) == 0) {
+   /* Let be_worker replenish when memory is available */
+   rxo->rx_post_starved = true;
+@@ -2367,6 +2371,7 @@ static int be_process_rx(struct be_rx_obj *rxo, struct napi_struct *napi,
+  struct be_queue_info *rx_cq = &rxo->cq;
+  struct be_rx_compl_info *rxcp;
+  u32 work_done;
++ u32 frags_consumed = 0;
+ 
+  for (work_done = 0; work_done < budget; work_done++) {
+   rxcp = be_rx_compl_get(rxo);
+@@ -2399,6 +2404,7 @@ static int be_process_rx(struct be_rx_obj *rxo, struct napi_struct *napi,
+    be_rx_compl_process(rxo, napi, rxcp);
+ 
+ loop_continue:
++  frags_consumed += rxcp->num_rcvd;
+   be_rx_stats_update(rxo, rxcp);
+  }
+ 
+@@ -2410,7 +2416,9 @@ loop_continue:
+    */
+   if (atomic_read(&rxo->q.used) < RX_FRAGS_REFILL_WM &&
+       !rxo->rx_post_starved)
+-   be_post_rx_frags(rxo, GFP_ATOMIC);
++   be_post_rx_frags(rxo, GFP_ATOMIC,
++      max_t(u32, MAX_RX_POST,
++            frags_consumed));
+  }
+ 
+  return work_done;
+@@ -2892,7 +2900,7 @@ static int be_rx_qs_create(struct be_adapter *adapter)
+ 
+  /* First time posting */
+  for_all_rx_queues(adapter, rxo, i)
+-  be_post_rx_frags(rxo, GFP_KERNEL);
++  be_post_rx_frags(rxo, GFP_KERNEL, MAX_RX_POST);
+  return 0;
+ }
+ 
+@@ -4774,7 +4782,7 @@ static void be_worker(struct work_struct *work)
+    * allocation failures.
+    */
+   if (rxo->rx_post_starved)
+-   be_post_rx_frags(rxo, GFP_KERNEL);
++   be_post_rx_frags(rxo, GFP_KERNEL, MAX_RX_POST);
+  }
+ 
+  be_eqd_update(adapter);
+-- 
+1.7.1

@@ -1,0 +1,76 @@
+From f0a29bd1f0325dae186c6f82a8b9d6e9472691a7 Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Mon, 5 Jan 2015 21:30:08 -0500
+Subject: [powerpc] Add VM_FAULT_HWPOISON handling to powerpc page fault handler
+
+Message-id: <1420493409-15884-2-git-send-email-gduarte@redhat.com>
+Patchwork-id: 102467
+O-Subject: [RHEL7.1 PATCH BZ 1173267 1/2] powerpc: Add VM_FAULT_HWPOISON handling to powerpc page fault handler
+Bugzilla: 1173267
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+
+BZ 1173267
+Upstream Status: 3913fdd7a23d9d8480ce3a6ca9cdf78bf0dec5a0
+
+commit 3913fdd7a23d9d8480ce3a6ca9cdf78bf0dec5a0
+Author: Anton Blanchard <anton@samba.org>
+Date:   Wed Sep 24 16:59:57 2014 +1000
+
+    powerpc: Add VM_FAULT_HWPOISON handling to powerpc page fault handler
+
+    do_page_fault was missing knowledge of HWPOISON, and we would oops
+    if userspace tried to access a poisoned page:
+
+    kernel BUG at arch/powerpc/mm/fault.c:180!
+
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/mm/fault.c b/arch/powerpc/mm/fault.c
+index 2dd69bf..1caee83 100644
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@ -114,7 +114,8 @@ static int store_updates_sp(struct pt_regs *regs)
+ #define MM_FAULT_CONTINUE -1
+ #define MM_FAULT_ERR(sig) (sig)
+ 
+-static int do_sigbus(struct pt_regs *regs, unsigned long address)
++static int do_sigbus(struct pt_regs *regs, unsigned long address,
++       unsigned int fault)
+ {
+  siginfo_t info;
+ 
+@@ -126,6 +127,13 @@ static int do_sigbus(struct pt_regs *regs, unsigned long address)
+   info.si_errno = 0;
+   info.si_code = BUS_ADRERR;
+   info.si_addr = (void __user *)address;
++#ifdef CONFIG_MEMORY_FAILURE
++  if (fault & (VM_FAULT_HWPOISON|VM_FAULT_HWPOISON_LARGE)) {
++   pr_err("MCE: Killing %s:%d due to hardware memory corruption fault at %lx\n",
++    current->comm, current->pid, address);
++   info.si_code = BUS_MCEERR_AR;
++  }
++#endif
+   force_sig_info(SIGBUS, &info, current);
+   return MM_FAULT_RETURN;
+  }
+@@ -170,11 +178,8 @@ static int mm_fault_error(struct pt_regs *regs, unsigned long addr, int fault)
+   return MM_FAULT_RETURN;
+  }
+ 
+- /* Bus error. x86 handles HWPOISON here, we'll add this if/when
+-  * we support the feature in HW
+-  */
+- if (fault & VM_FAULT_SIGBUS)
+-  return do_sigbus(regs, addr);
++ if (fault & (VM_FAULT_SIGBUS|VM_FAULT_HWPOISON|VM_FAULT_HWPOISON_LARGE))
++  return do_sigbus(regs, addr, fault);
+ 
+  /* We don't understand the fault code, this is fatal */
+  BUG();
+-- 
+1.7.1

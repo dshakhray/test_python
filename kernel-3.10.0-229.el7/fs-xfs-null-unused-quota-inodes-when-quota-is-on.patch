@@ -1,0 +1,110 @@
+From 4d538900b08c4a9c06bea5ebfb2fbd2cd9f6a271 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Thu, 9 Oct 2014 21:00:19 -0400
+Subject: [fs] xfs: null unused quota inodes when quota is on
+
+Message-id: <1412888441-4181-26-git-send-email-sandeen@redhat.com>
+Patchwork-id: 97345
+O-Subject: [RHEL7.1 PATCH 25/47] [fs] xfs: null unused quota inodes when quota is on
+Bugzilla: 1145837
+RH-Acked-by: Brian Foster <bfoster@redhat.com>
+RH-Acked-by: Dave Chinner <dchinner@redhat.com>
+
+Bugzilla: 1145837
+Upstream Status: Committed upstream
+Build Info: https://brewweb.devel.redhat.com/taskinfo?taskID=8082426
+Tested: locally using xfstests
+
+Thanks,
+-Eric
+
+    commit 03e01349c654fbdea80d3d9b4ab599244eb55bb7
+    Author: Dave Chinner <dchinner@redhat.com>
+    Date:   Tue Jul 15 07:28:41 2014 +1000
+
+    xfs: null unused quota inodes when quota is on
+
+    When quota is on, it is expected that unused quota inodes have a
+    value of NULLFSINO. The changes to support a separate project quota
+    in 3.12 broken this rule for non-project quota inode enabled
+    filesystem, as the code now refuses to write the group quota inode
+    if neither group or project quotas are enabled. This regression was
+    introduced by commit d892d58 ("xfs: Start using pquotaino from the
+    superblock").
+
+    In this case, we should be writing NULLFSINO rather than nothing to
+    ensure that we leave the group quota inode in a valid state while
+    quotas are enabled.
+
+    Failure to do so doesn't cause a current kernel to break - the
+    separate project quota inodes introduced translation code to always
+    treat a zero inode as NULLFSINO. This was introduced by commit
+    0102629 ("xfs: Initialize all quota inodes to be NULLFSINO") with is
+    also in 3.12 but older kernels do not do this and hence taking a
+    filesystem back to an older kernel can result in quotas failing
+    initialisation at mount time. When that happens, we see this in
+    dmesg:
+
+    [ 1649.215390] XFS (sdb): Mounting Filesystem
+    [ 1649.316894] XFS (sdb): Failed to initialize disk quotas.
+    [ 1649.316902] XFS (sdb): Ending clean mount
+
+    By ensuring that we write NULLFSINO to quota inodes that aren't
+    active, we avoid this problem. We have to be really careful when
+    determining if the quota inodes are active or not, because we don't
+    want to write a NULLFSINO if the quota inodes are active and we
+    simply aren't updating them.
+
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_sb.c b/fs/xfs/xfs_sb.c
+index 8baf61a..cd13e9c 100644
+--- a/fs/xfs/xfs_sb.c
++++ b/fs/xfs/xfs_sb.c
+@@ -491,10 +491,16 @@ xfs_sb_quota_to_disk(
+  }
+ 
+  /*
+-  * GQUOTINO and PQUOTINO cannot be used together in versions
+-  * of superblock that do not have pquotino. from->sb_flags
+-  * tells us which quota is active and should be copied to
+-  * disk.
++  * GQUOTINO and PQUOTINO cannot be used together in versions of
++  * superblock that do not have pquotino. from->sb_flags tells us which
++  * quota is active and should be copied to disk. If neither are active,
++  * make sure we write NULLFSINO to the sb_gquotino field as a quota
++  * inode value of "0" is invalid when the XFS_SB_VERSION_QUOTA feature
++  * bit is set.
++  *
++  * Note that we don't need to handle the sb_uquotino or sb_pquotino here
++  * as they do not require any translation. Hence the main sb field loop
++  * will write them appropriately from the in-core superblock.
+   */
+  if ((*fields & XFS_SB_GQUOTINO) &&
+     (from->sb_qflags & XFS_GQUOTA_ACCT))
+@@ -502,6 +508,17 @@ xfs_sb_quota_to_disk(
+  else if ((*fields & XFS_SB_PQUOTINO) &&
+     (from->sb_qflags & XFS_PQUOTA_ACCT))
+   to->sb_gquotino = cpu_to_be64(from->sb_pquotino);
++ else {
++  /*
++   * We can't rely on just the fields being logged to tell us
++   * that it is safe to write NULLFSINO - we should only do that
++   * if quotas are not actually enabled. Hence only write
++   * NULLFSINO if both in-core quota inodes are NULL.
++   */
++  if (from->sb_gquotino == NULLFSINO &&
++      from->sb_pquotino == NULLFSINO)
++   to->sb_gquotino = cpu_to_be64(NULLFSINO);
++ }
+ 
+  *fields &= ~(XFS_SB_PQUOTINO | XFS_SB_GQUOTINO);
+ }
+-- 
+1.7.1

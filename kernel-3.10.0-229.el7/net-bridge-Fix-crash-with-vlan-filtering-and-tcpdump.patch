@@ -1,0 +1,110 @@
+From d0d7f077b346f4e62ae41d6e3106ed6af0e83619 Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Wed, 10 Sep 2014 15:16:18 -0400
+Subject: [net] bridge: Fix crash with vlan filtering and tcpdump
+
+Message-id: <1410362181-9327-6-git-send-email-vyasevic@redhat.com>
+Patchwork-id: 93480
+O-Subject: [RHEL7 PATCH 5/8] bridge: Fix crash with vlan filtering and tcpdump
+Bugzilla: 1139809
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+
+Bugzilla: 1139809
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7936510
+
+commit fc92f745f8d0d3736ce5afb00a905d7cc61f9c46
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Thu, 27 Mar 2014 21:51:18 -0400
+
+    bridge: Fix crash with vlan filtering and tcpdump
+
+    When the vlan filtering is enabled on the bridge, but
+    the filter is not configured on the bridge device itself,
+    running tcpdump on the bridge device will result in a
+    an Oops with NULL pointer dereference.  The reason
+    is that br_pass_frame_up() will bypass the vlan
+    check because promisc flag is set.  It will then try
+    to get the table pointer and process the packet based
+    on the table.  Since the table pointer is NULL, we oops.
+    Catch this special condition in br_handle_vlan().
+
+    Reported-by: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+    CC: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+    Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+    Acked-by: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ net/bridge/br_input.c
+ - Minor conflict due to older stats structure.
+
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index 7e73c32..67fbea0 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -29,6 +29,7 @@ static int br_pass_frame_up(struct sk_buff *skb)
+  struct net_device *indev, *brdev = BR_INPUT_SKB_CB(skb)->brdev;
+  struct net_bridge *br = netdev_priv(brdev);
+  struct br_cpu_netstats *brstats = this_cpu_ptr(br->stats);
++ struct net_port_vlans *pv;
+ 
+  u64_stats_update_begin(&brstats->syncp);
+  brstats->rx_packets++;
+@@ -39,18 +40,18 @@ static int br_pass_frame_up(struct sk_buff *skb)
+   * packet is allowed except in promisc modue when someone
+   * may be running packet capture.
+   */
++ pv = br_get_vlan_info(br);
+  if (!(brdev->flags & IFF_PROMISC) &&
+-     !br_allowed_egress(br, br_get_vlan_info(br), skb)) {
++     !br_allowed_egress(br, pv, skb)) {
+   kfree_skb(skb);
+   return NET_RX_DROP;
+  }
+ 
+- skb = br_handle_vlan(br, br_get_vlan_info(br), skb);
+- if (!skb)
+-  return NET_RX_DROP;
+-
+  indev = skb->dev;
+  skb->dev = brdev;
++ skb = br_handle_vlan(br, pv, skb);
++ if (!skb)
++  return NET_RX_DROP;
+ 
+  return NF_HOOK(NFPROTO_BRIDGE, NF_BR_LOCAL_IN, skb, indev, NULL,
+          netif_receive_skb);
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index bac6412..8fbf57b 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -128,6 +128,20 @@ struct sk_buff *br_handle_vlan(struct net_bridge *br,
+  if (!br->vlan_enabled)
+   goto out;
+ 
++ /* Vlan filter table must be configured at this point.  The
++  * only exception is the bridge is set in promisc mode and the
++  * packet is destined for the bridge device.  In this case
++  * pass the packet as is.
++  */
++ if (!pv) {
++  if ((br->dev->flags & IFF_PROMISC) && skb->dev == br->dev) {
++   goto out;
++  } else {
++   kfree_skb(skb);
++   return NULL;
++  }
++ }
++
+  /* At this point, we know that the frame was filtered and contains
+   * a valid vlan id.  If the vlan id is set in the untagged bitmap,
+   * send untagged; otherwise, send taged.
+-- 
+1.7.1

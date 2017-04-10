@@ -1,0 +1,84 @@
+From 19fbece53b30ce4fb55a4bbc54e26baad1d203f5 Mon Sep 17 00:00:00 2001
+From: Neil Horman <nhorman@redhat.com>
+Date: Wed, 22 Oct 2014 19:19:20 -0400
+Subject: [scsi] fcoe: Make fcoe_sysfs optional / fix fnic NULL exception
+
+Message-id: <1414005562-16279-7-git-send-email-nhorman@redhat.com>
+Patchwork-id: 98084
+O-Subject: [RHEL7.1 v2 PATCH 6/8] libfcoe: Make fcoe_sysfs optional / fix fnic NULL exception
+Bugzilla: 1087099
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tomas Henzl <thenzl@redhat.com>
+
+fnic doesn't use any of the create/destroy/enable/disable interfaces
+either from the (legacy) module paramaters or the (new) fcoe_sysfs
+interfaces. When fcoe_sysfs was introduced fnic wasn't changed since
+it wasn't using the interfaces. libfcoe incorrectly assumed that that
+all of its users were using fcoe_sysfs and when adding and deleting
+FCFs would assume the existance of a fcoe_ctlr_device. fnic was not
+allocating this structure because it doesn't care about the standard
+user interfaces (fnic starts on link only). If/When libfcoe tried to use
+the fcoe_ctlr_device's lock for the first time a NULL pointer exception
+would be triggered.
+
+Since fnic doesn't care about sysfs or user interfaces, the solution
+is to drop libfcoe's assumption that all drivers are using fcoe_sysfs.
+
+This patch accomplishes this by changing some of the structure
+relationships.
+
+We need a way to determine when a LLD is using fcoe_sysfs or not and
+we can do that by checking for the existance of the fcoe_ctlr_device.
+Prior to this patch, it was assumed that the fcoe_ctlr structure was
+allocated with the fcoe_ctlr_device and immediately followed it in
+memory. To reach the fcoe_ctlr_device we would simply go back in memory
+from the fcoe_ctlr to get the fcoe_ctlr_device.
+
+Since fnic doesn't allocate the fcoe_ctlr_device, we cannot keep that
+assumption. This patch adds a pointer from the fcoe_ctlr to the
+fcoe_ctlr_device. For bnx2fc and fcoe we will continue to allocate the
+two structures together, but then we'll set the ctlr->cdev pointer
+to point at the fcoe_ctlr_device. fnic will not change and will continue
+to allocate the fcoe_ctlr itself, and ctlr->cdev will remain NULL.
+
+When libfcoe adds fcoe_fcf's to the fcoe_ctlr it will check if ctlr->cdev
+is set and only if so will it continue to interact with fcoe_sysfs.
+
+Signed-off-by: Robert Love <robert.w.love@intel.com>
+Acked-by: Neil Horman <nhorman@tuxdriver.com>
+Tested-by: Hiral Patel <hiralpat@cisco.com>
+(cherry picked from commit 9d34876f820d55c94bd0b2a2ed3d2e2976cbd997)
+
+BZ: 1087099
+Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=8150961
+Testing: Tested by Intel
+
+Note: This patch bears little resemblance to its upstream counterpart.  In fact
+it only introduces a problem by removing a mutex unlock that should be there,
+but this patch introduced the problem, and the next commit explicitly fixes
+it, so I'm including it here for completeness
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/fcoe/fcoe_ctlr.c b/drivers/scsi/fcoe/fcoe_ctlr.c
+index eb690a5..2c6b742 100644
+--- a/drivers/scsi/fcoe/fcoe_ctlr.c
++++ b/drivers/scsi/fcoe/fcoe_ctlr.c
+@@ -196,13 +196,13 @@ static int fcoe_sysfs_fcf_add(struct fcoe_fcf *new)
+   * case we want to add the fcoe_fcf to the fcoe_ctlr list, but we
+   * don't want to make sysfs changes.
+   */
++
+  ctlr_dev = fcoe_ctlr_to_ctlr_dev(fip);
+  if (ctlr_dev) {
+   mutex_lock(&ctlr_dev->lock);
+   fcf_dev = fcoe_fcf_device_add(ctlr_dev, temp);
+   if (unlikely(!fcf_dev)) {
+    rc = -ENOMEM;
+-   mutex_unlock(&ctlr_dev->lock);
+    goto out;
+   }
+ 
+-- 
+1.7.1

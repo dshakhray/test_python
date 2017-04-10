@@ -1,0 +1,128 @@
+From da7aba26714b0a110945c93a10acd82bb1fb3b11 Mon Sep 17 00:00:00 2001
+From: Jiri Pirko <jpirko@redhat.com>
+Date: Thu, 7 Aug 2014 07:06:30 -0400
+Subject: [net] vti4: Support inter address family tunneling
+
+Message-id: <1407395194-3809-15-git-send-email-jpirko@redhat.com>
+Patchwork-id: 87528
+O-Subject: [patch rhel7 net 14/18] vti4: Support inter address family tunneling.
+Bugzilla: 1091561
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+BZ1091561
+https://brewweb.devel.redhat.com/taskinfo?taskID=7794261
+Tested by jtluka's LNST smoke test recipe
+
+upstream commit 78a010cca000aafc6a8503eb2be590a533589a27
+Author: Steffen Klassert <steffen.klassert@secunet.com>
+Date:   Fri Feb 21 08:41:10 2014 +0100
+
+    vti4: Support inter address family tunneling.
+
+    With this patch we can tunnel ipv6 traffic via a vti4
+    interface. A vti4 interface can now have an ipv6 address
+    and ipv6 traffic can be routed via a vti4 interface.
+    The resulting traffic is xfrm transformed and tunneled
+    throuhg ipv4 if matching IPsec policies and states are
+    present.
+
+Signed-off-by: Jiri Pirko <jpirko@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ipv4/ip_vti.c b/net/ipv4/ip_vti.c
+index 0f4d7c7..442803b 100644
+--- a/net/ipv4/ip_vti.c
++++ b/net/ipv4/ip_vti.c
+@@ -34,6 +34,7 @@
+ #include <linux/init.h>
+ #include <linux/netfilter_ipv4.h>
+ #include <linux/if_ether.h>
++#include <linux/icmpv6.h>
+ 
+ #include <net/sock.h>
+ #include <net/ip.h>
+@@ -122,31 +123,21 @@ static int vti_rcv_cb(struct sk_buff *skb, int err)
+  return 0;
+ }
+ 
+-/* This function assumes it is being called from dev_queue_xmit()
+- * and that skb is filled properly by that function.
+- */
+-static netdev_tx_t vti_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
++static netdev_tx_t vti_xmit(struct sk_buff *skb, struct net_device *dev,
++       struct flowi *fl)
+ {
+  struct ip_tunnel *tunnel = netdev_priv(dev);
+  struct dst_entry *dst = skb_dst(skb);
+  struct net_device *tdev; /* Device to other host */
+- struct flowi fl;
+  int err;
+ 
+- if (skb->protocol != htons(ETH_P_IP))
+-  goto tx_error;
+-
+- memset(&fl, 0, sizeof(fl));
+- skb->mark = be32_to_cpu(tunnel->parms.o_key);
+- xfrm_decode_session(skb, &fl, AF_INET);
+-
+  if (!dst) {
+   dev->stats.tx_carrier_errors++;
+   goto tx_error_icmp;
+  }
+ 
+  dst_hold(dst);
+- dst = xfrm_lookup(tunnel->net, dst, &fl, NULL, 0);
++ dst = xfrm_lookup(tunnel->net, dst, fl, NULL, 0);
+  if (IS_ERR(dst)) {
+   dev->stats.tx_carrier_errors++;
+   goto tx_error_icmp;
+@@ -178,7 +169,6 @@ static netdev_tx_t vti_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
+    tunnel->err_count = 0;
+  }
+ 
+- memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
+  skb_scrub_packet(skb, !net_eq(tunnel->net, dev_net(dev)));
+  skb_dst_set(skb, dst);
+  skb->dev = skb_dst(skb)->dev;
+@@ -197,6 +187,36 @@ tx_error:
+  return NETDEV_TX_OK;
+ }
+ 
++/* This function assumes it is being called from dev_queue_xmit()
++ * and that skb is filled properly by that function.
++ */
++static netdev_tx_t vti_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++ struct ip_tunnel *tunnel = netdev_priv(dev);
++ struct flowi fl;
++
++ memset(&fl, 0, sizeof(fl));
++
++ skb->mark = be32_to_cpu(tunnel->parms.o_key);
++
++ switch (skb->protocol) {
++ case htons(ETH_P_IP):
++  xfrm_decode_session(skb, &fl, AF_INET);
++  memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
++  break;
++ case htons(ETH_P_IPV6):
++  xfrm_decode_session(skb, &fl, AF_INET6);
++  memset(IP6CB(skb), 0, sizeof(*IP6CB(skb)));
++  break;
++ default:
++  dev->stats.tx_errors++;
++  dev_kfree_skb(skb);
++  return NETDEV_TX_OK;
++ }
++
++ return vti_xmit(skb, dev, &fl);
++}
++
+ static int vti4_err(struct sk_buff *skb, u32 info)
+ {
+  __be32 spi;
+-- 
+1.7.1

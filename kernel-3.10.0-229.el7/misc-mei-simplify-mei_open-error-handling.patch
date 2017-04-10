@@ -1,0 +1,120 @@
+From d2374fd567c3c47235a14ba532ee71d00c57cb82 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 2 May 2014 14:36:48 -0400
+Subject: [misc] mei: simplify mei_open error handling
+
+Message-id: <1399041470-21330-16-git-send-email-prarit@redhat.com>
+Patchwork-id: 79303
+O-Subject: [RHEL7.1 PATCH BZ 1088953 15/77] mei: simplify mei_open error handling
+Bugzilla: 1088953
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1088953
+
+commit e036cc5727eb6d471442d2a9218990aa11215400
+Author: Tomas Winkler <tomas.winkler@intel.com>
+Date:   Mon Sep 16 23:44:46 2013 +0300
+
+    mei: simplify mei_open error handling
+
+    1. Perform simple checks first and only then attempt to allocate cl structure.
+    2. Remove open_handler_count test, this is already checked in mei_cl_link function
+    3. return -EMFILE instead of -ENOENT as expected by user space
+
+    Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Cc: Dean Nelson <dnelson@redhat.com>
+Cc: Stefan Assmann <sassmann@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/misc/mei/client.c b/drivers/misc/mei/client.c
+index fbd319c..88770e0 100644
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -288,7 +288,13 @@ int mei_cl_link(struct mei_cl *cl, int id)
+ 
+  if (id >= MEI_CLIENTS_MAX) {
+   dev_err(&dev->pdev->dev, "id exceded %d", MEI_CLIENTS_MAX) ;
+-  return -ENOENT;
++  return -EMFILE;
++ }
++
++ if (dev->open_handle_count >= MEI_MAX_OPEN_HANDLE_COUNT) {
++  dev_err(&dev->pdev->dev, "open_handle_count exceded %d",
++   MEI_MAX_OPEN_HANDLE_COUNT);
++  return -EMFILE;
+  }
+ 
+  if (dev->open_handle_count >= MEI_MAX_OPEN_HANDLE_COUNT) {
+diff --git a/drivers/misc/mei/main.c b/drivers/misc/mei/main.c
+index 067bb6d..981d025 100644
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@ -60,48 +60,45 @@ static int mei_open(struct inode *inode, struct file *file)
+ 
+  int err;
+ 
+- err = -ENODEV;
+  if (!misc->parent)
+-  goto out;
++  return -ENODEV;
+ 
+  pdev = container_of(misc->parent, struct pci_dev, dev);
+ 
+  dev = pci_get_drvdata(pdev);
+  if (!dev)
+-  goto out;
++  return -ENODEV;
+ 
+  mutex_lock(&dev->device_lock);
+- err = -ENOMEM;
+- cl = mei_cl_allocate(dev);
+- if (!cl)
+-  goto out_unlock;
++
++ cl = NULL;
+ 
+  err = -ENODEV;
+  if (dev->dev_state != MEI_DEV_ENABLED) {
+   dev_dbg(&dev->pdev->dev, "dev_state != MEI_ENABLED  dev_state = %s\n",
+       mei_dev_state_str(dev->dev_state));
+-  goto out_unlock;
+- }
+- err = -EMFILE;
+- if (dev->open_handle_count >= MEI_MAX_OPEN_HANDLE_COUNT) {
+-  dev_err(&dev->pdev->dev, "open_handle_count exceded %d",
+-   MEI_MAX_OPEN_HANDLE_COUNT);
+-  goto out_unlock;
++  goto err_unlock;
+  }
+ 
++ err = -ENOMEM;
++ cl = mei_cl_allocate(dev);
++ if (!cl)
++  goto err_unlock;
++
++ /* open_handle_count check is handled in the mei_cl_link */
+  err = mei_cl_link(cl, MEI_HOST_CLIENT_ID_ANY);
+  if (err)
+-  goto out_unlock;
++  goto err_unlock;
+ 
+  file->private_data = cl;
++
+  mutex_unlock(&dev->device_lock);
+ 
+  return nonseekable_open(inode, file);
+ 
+-out_unlock:
++err_unlock:
+  mutex_unlock(&dev->device_lock);
+  kfree(cl);
+-out:
+  return err;
+ }
+ 
+-- 
+1.7.1

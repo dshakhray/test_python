@@ -1,0 +1,129 @@
+From d1609754199a03b8f5add783b3f5373fb86edd1e Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:23:25 -0400
+Subject: [net] crush: pass weight vector size to map function
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-99-git-send-email-sweil@redhat.com>
+Patchwork-id: 89727
+O-Subject: [PATCH 098/303] crush: pass weight vector size to map function
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+Pass the size of the weight vector into crush_do_rule() to ensure that we
+don't access values past the end.  This can happen if the caller misbehaves
+and passes a weight vector that is smaller than max_devices.
+
+Currently the monitor tries to prevent that from happening, but this will
+gracefully tolerate previous bad osdmaps that got into this state.  It's
+also a bit more defensive.
+
+Reflects ceph.git commit 5922e2c2b8335b5e46c9504349c3a55b7434c01a.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit b3b33b0e43323af4fb697f4378218d3c268d02cd)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/crush/mapper.h b/include/linux/crush/mapper.h
+index 5772dee..69310b0 100644
+--- a/include/linux/crush/mapper.h
++++ b/include/linux/crush/mapper.h
+@@ -14,6 +14,6 @@ extern int crush_find_rule(const struct crush_map *map, int ruleset, int type, i
+ extern int crush_do_rule(const struct crush_map *map,
+     int ruleno,
+     int x, int *result, int result_max,
+-    const __u32 *weights);
++    const __u32 *weights, int weight_max);
+ 
+ #endif
+diff --git a/net/ceph/crush/mapper.c b/net/ceph/crush/mapper.c
+index cbd06a9..18d2cf6 100644
+--- a/net/ceph/crush/mapper.c
++++ b/net/ceph/crush/mapper.c
+@@ -264,8 +264,12 @@ static int crush_bucket_choose(struct crush_bucket *in, int x, int r)
+  * true if device is marked "out" (failed, fully offloaded)
+  * of the cluster
+  */
+-static int is_out(const struct crush_map *map, const __u32 *weight, int item, int x)
++static int is_out(const struct crush_map *map,
++    const __u32 *weight, int weight_max,
++    int item, int x)
+ {
++ if (item >= weight_max)
++  return 1;
+  if (weight[item] >= 0x10000)
+   return 0;
+  if (weight[item] == 0)
+@@ -292,7 +296,7 @@ static int is_out(const struct crush_map *map, const __u32 *weight, int item, in
+  */
+ static int crush_choose(const struct crush_map *map,
+    struct crush_bucket *bucket,
+-   const __u32 *weight,
++   const __u32 *weight, int weight_max,
+    int x, int numrep, int type,
+    int *out, int outpos,
+    int firstn, int recurse_to_leaf,
+@@ -396,7 +400,7 @@ static int crush_choose(const struct crush_map *map,
+      if (item < 0) {
+       if (crush_choose(map,
+         map->buckets[-1-item],
+-        weight,
++        weight, weight_max,
+         x, outpos+1, 0,
+         out2, outpos,
+         firstn, 0,
+@@ -414,6 +418,7 @@ static int crush_choose(const struct crush_map *map,
+      /* out? */
+      if (itemtype == 0)
+       reject = is_out(map, weight,
++        weight_max,
+         item, x);
+      else
+       reject = 0;
+@@ -470,10 +475,12 @@ reject:
+  * @x: hash input
+  * @result: pointer to result vector
+  * @result_max: maximum result size
++ * @weight: weight vector (for map leaves)
++ * @weight_max: size of weight vector
+  */
+ int crush_do_rule(const struct crush_map *map,
+     int ruleno, int x, int *result, int result_max,
+-    const __u32 *weight)
++    const __u32 *weight, int weight_max)
+ {
+  int result_len;
+  int a[CRUSH_MAX_SET];
+@@ -545,7 +552,7 @@ int crush_do_rule(const struct crush_map *map,
+     j = 0;
+     osize += crush_choose(map,
+             map->buckets[-1-w[i]],
+-            weight,
++            weight, weight_max,
+             x, numrep,
+             curstep->arg2,
+             o+osize, j,
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index dbd9a47..6477a68 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -1165,7 +1165,7 @@ static int *calc_pg_raw(struct ceph_osdmap *osdmap, struct ceph_pg pgid,
+  }
+  r = crush_do_rule(osdmap->crush, ruleno, pps, osds,
+      min_t(int, pool->size, *num),
+-     osdmap->osd_weight);
++     osdmap->osd_weight, osdmap->max_osd);
+  if (r < 0) {
+   pr_err("error %d from crush rule: pool %lld ruleset %d type %d"
+          " size %d\n", r, pgid.pool, pool->crush_ruleset,
+-- 
+1.7.1

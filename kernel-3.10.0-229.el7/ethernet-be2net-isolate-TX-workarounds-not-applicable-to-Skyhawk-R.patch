@@ -1,0 +1,99 @@
+From 5ac35d08b3e5307feb43de9544998602a8d15d02 Mon Sep 17 00:00:00 2001
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Mon, 8 Sep 2014 16:13:32 -0400
+Subject: [ethernet] be2net: isolate TX workarounds not applicable to Skyhawk-R
+
+Message-id: <1410192881-30702-10-git-send-email-ivecera@redhat.com>
+Patchwork-id: 92412
+O-Subject: [RHEL7.1 PATCH 09/78] be2net: isolate TX workarounds not applicable to Skyhawk-R
+Bugzilla: 1088575
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+
+BZ: #1088575
+
+Upstream commit(s):
+commit ec495fac119f2eaea8b8c6e6db17ba163c7af1f4
+Author: Vasundhara Volam <vasundhara.volam@emulex.com>
+Date:   Mon Mar 3 14:25:38 2014 +0530
+
+    be2net: isolate TX workarounds not applicable to Skyhawk-R
+
+    Some of TX workarounds in be_xmit_workarounds() routine
+    are not applicable (and result in HW errors) to Skyhawk-R chip.
+    Isolate BE3-R/Lancer specific workarounds to a separate routine.
+
+    Signed-off-by: Vasundhara Volam <vasundhara.volam@emulex.com>
+    Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+    Signed-off-by: Somnath Kotur <somnath.kotur@emulex.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
+index fe910a7..dc42b90 100644
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -913,24 +913,14 @@ static int be_ipv6_tx_stall_chk(struct be_adapter *adapter,
+  return BE3_chip(adapter) && be_ipv6_exthdr_check(skb);
+ }
+ 
+-static struct sk_buff *be_xmit_workarounds(struct be_adapter *adapter,
+-        struct sk_buff *skb,
+-        bool *skip_hw_vlan)
++static struct sk_buff *be_lancer_xmit_workarounds(struct be_adapter *adapter,
++        struct sk_buff *skb,
++        bool *skip_hw_vlan)
+ {
+  struct vlan_ethhdr *veh = (struct vlan_ethhdr *)skb->data;
+  unsigned int eth_hdr_len;
+  struct iphdr *ip;
+ 
+- /* Lancer, SH-R ASICs have a bug wherein Packets that are 32 bytes or less
+-  * may cause a transmit stall on that port. So the work-around is to
+-  * pad short packets (<= 32 bytes) to a 36-byte length.
+-  */
+- if (unlikely(!BEx_chip(adapter) && skb->len <= 32)) {
+-  if (skb_padto(skb, 36))
+-   goto err;
+-  skb->len = 36;
+- }
+-
+  /* For padded packets, BE HW modifies tot_len field in IP header
+   * incorrecly when VLAN tag is inserted by HW.
+   * For padded packets, Lancer computes incorrect checksum.
+@@ -991,6 +981,29 @@ err:
+  return NULL;
+ }
+ 
++static struct sk_buff *be_xmit_workarounds(struct be_adapter *adapter,
++        struct sk_buff *skb,
++        bool *skip_hw_vlan)
++{
++ /* Lancer, SH-R ASICs have a bug wherein Packets that are 32 bytes or
++  * less may cause a transmit stall on that port. So the work-around is
++  * to pad short packets (<= 32 bytes) to a 36-byte length.
++  */
++ if (unlikely(!BEx_chip(adapter) && skb->len <= 32)) {
++  if (skb_padto(skb, 36))
++   return NULL;
++  skb->len = 36;
++ }
++
++ if (BEx_chip(adapter) || lancer_chip(adapter)) {
++  skb = be_lancer_xmit_workarounds(adapter, skb, skip_hw_vlan);
++  if (!skb)
++   return NULL;
++ }
++
++ return skb;
++}
++
+ static netdev_tx_t be_xmit(struct sk_buff *skb, struct net_device *netdev)
+ {
+  struct be_adapter *adapter = netdev_priv(netdev);
+-- 
+1.7.1

@@ -1,0 +1,206 @@
+From 27906256eb47fc114dd722fda1d4f5e71ecf86b4 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:03:27 -0400
+Subject: [usb] wusbcore: fix kernel panic on HWA unplug
+
+Message-id: <1410887463-20674-136-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95274
+O-Subject: [RHEL7 PATCH 135/591] usb: wusbcore: fix kernel panic on HWA unplug
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 618836cc3478aec3dc9a60488bfd43ca93a322bd
+Author: Thomas Pugliese <thomas.pugliese@gmail.com>
+Date:   Fri Feb 28 14:31:55 2014 -0600
+
+    usb: wusbcore: fix kernel panic on HWA unplug
+
+    This patch adds ref counting to sections of code that operate on struct
+    wa_xfer objects that were missing it.  Specifically, error handling
+    cases need to be protected from freeing the xfer while it is still in
+    use elsewhere.  This fixes a kernel panic that can occur when pulling
+    the HWA dongle while data is being transferred to a wireless device.
+
+    Signed-off-by: Thomas Pugliese <thomas.pugliese@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/wusbcore/wa-xfer.c b/drivers/usb/wusbcore/wa-xfer.c
+index 2afa886..a63732f 100644
+--- a/drivers/usb/wusbcore/wa-xfer.c
++++ b/drivers/usb/wusbcore/wa-xfer.c
+@@ -734,6 +734,8 @@ static void wa_seg_dto_cb(struct urb *urb)
+     seg->isoc_frame_offset + seg->isoc_frame_index);
+ 
+    /* resubmit the URB with the next isoc frame. */
++   /* take a ref on resubmit. */
++   wa_xfer_get(xfer);
+    result = usb_submit_urb(seg->dto_urb, GFP_ATOMIC);
+    if (result < 0) {
+     dev_err(dev, "xfer 0x%08X#%u: DTO submit failed: %d\n",
+@@ -761,9 +763,13 @@ static void wa_seg_dto_cb(struct urb *urb)
+   goto error_default;
+  }
+ 
++ /* taken when this URB was submitted. */
++ wa_xfer_put(xfer);
+  return;
+ 
+ error_dto_submit:
++ /* taken on resubmit attempt. */
++ wa_xfer_put(xfer);
+ error_default:
+  spin_lock_irqsave(&xfer->lock, flags);
+  rpipe = xfer->ep->hcpriv;
+@@ -789,7 +795,8 @@ error_default:
+   wa_xfer_completion(xfer);
+  if (rpipe_ready)
+   wa_xfer_delayed_run(rpipe);
+-
++ /* taken when this URB was submitted. */
++ wa_xfer_put(xfer);
+ }
+ 
+ /*
+@@ -856,6 +863,8 @@ static void wa_seg_iso_pack_desc_cb(struct urb *urb)
+   if (rpipe_ready)
+    wa_xfer_delayed_run(rpipe);
+  }
++ /* taken when this URB was submitted. */
++ wa_xfer_put(xfer);
+ }
+ 
+ /*
+@@ -932,6 +941,8 @@ static void wa_seg_tr_cb(struct urb *urb)
+   if (rpipe_ready)
+    wa_xfer_delayed_run(rpipe);
+  }
++ /* taken when this URB was submitted. */
++ wa_xfer_put(xfer);
+ }
+ 
+ /*
+@@ -1319,30 +1330,41 @@ static int __wa_seg_submit(struct wa_rpipe *rpipe, struct wa_xfer *xfer,
+  /* default to done unless we encounter a multi-frame isoc segment. */
+  *dto_done = 1;
+ 
++ /*
++  * Take a ref for each segment urb so the xfer cannot disappear until
++  * all of the callbacks run.
++  */
++ wa_xfer_get(xfer);
+  /* submit the transfer request. */
++ seg->status = WA_SEG_SUBMITTED;
+  result = usb_submit_urb(&seg->tr_urb, GFP_ATOMIC);
+  if (result < 0) {
+   pr_err("%s: xfer %p#%u: REQ submit failed: %d\n",
+          __func__, xfer, seg->index, result);
+-  goto error_seg_submit;
++  wa_xfer_put(xfer);
++  goto error_tr_submit;
+  }
+  /* submit the isoc packet descriptor if present. */
+  if (seg->isoc_pack_desc_urb) {
++  wa_xfer_get(xfer);
+   result = usb_submit_urb(seg->isoc_pack_desc_urb, GFP_ATOMIC);
+   seg->isoc_frame_index = 0;
+   if (result < 0) {
+    pr_err("%s: xfer %p#%u: ISO packet descriptor submit failed: %d\n",
+           __func__, xfer, seg->index, result);
++   wa_xfer_put(xfer);
+    goto error_iso_pack_desc_submit;
+   }
+  }
+  /* submit the out data if this is an out request. */
+  if (seg->dto_urb) {
+   struct wahc *wa = xfer->wa;
++  wa_xfer_get(xfer);
+   result = usb_submit_urb(seg->dto_urb, GFP_ATOMIC);
+   if (result < 0) {
+    pr_err("%s: xfer %p#%u: DTO submit failed: %d\n",
+           __func__, xfer, seg->index, result);
++   wa_xfer_put(xfer);
+    goto error_dto_submit;
+   }
+   /*
+@@ -1354,7 +1376,6 @@ static int __wa_seg_submit(struct wa_rpipe *rpipe, struct wa_xfer *xfer,
+    && (seg->isoc_frame_count > 1))
+    *dto_done = 0;
+  }
+- seg->status = WA_SEG_SUBMITTED;
+  rpipe_avail_dec(rpipe);
+  return 0;
+ 
+@@ -1362,7 +1383,7 @@ error_dto_submit:
+  usb_unlink_urb(seg->isoc_pack_desc_urb);
+ error_iso_pack_desc_submit:
+  usb_unlink_urb(&seg->tr_urb);
+-error_seg_submit:
++error_tr_submit:
+  seg->status = WA_SEG_ERROR;
+  seg->result = result;
+  *dto_done = 1;
+@@ -1394,6 +1415,12 @@ static int __wa_xfer_delayed_run(struct wa_rpipe *rpipe, int *dto_waiting)
+      list_node);
+   list_del(&seg->list_node);
+   xfer = seg->xfer;
++  /*
++   * Get a reference to the xfer in case the callbacks for the
++   * URBs submitted by __wa_seg_submit attempt to complete
++   * the xfer before this function completes.
++   */
++  wa_xfer_get(xfer);
+   result = __wa_seg_submit(rpipe, xfer, seg, &dto_done);
+   /* release the dto resource if this RPIPE is done with it. */
+   if (dto_done)
+@@ -1405,10 +1432,15 @@ static int __wa_xfer_delayed_run(struct wa_rpipe *rpipe, int *dto_waiting)
+    spin_unlock_irqrestore(&rpipe->seg_lock, flags);
+    spin_lock_irqsave(&xfer->lock, flags);
+    __wa_xfer_abort(xfer);
++   /*
++    * This seg was marked as submitted when it was put on
++    * the RPIPE seg_list.  Mark it done.
++    */
+    xfer->segs_done++;
+    spin_unlock_irqrestore(&xfer->lock, flags);
+    spin_lock_irqsave(&rpipe->seg_lock, flags);
+   }
++  wa_xfer_put(xfer);
+  }
+  /*
+   * Mark this RPIPE as waiting if dto was not acquired, there are
+@@ -1593,12 +1625,19 @@ static int wa_urb_enqueue_b(struct wa_xfer *xfer)
+   dev_err(&(urb->dev->dev), "%s: error_xfer_setup\n", __func__);
+   goto error_xfer_setup;
+  }
++ /*
++  * Get a xfer reference since __wa_xfer_submit starts asynchronous
++  * operations that may try to complete the xfer before this function
++  * exits.
++  */
++ wa_xfer_get(xfer);
+  result = __wa_xfer_submit(xfer);
+  if (result < 0) {
+   dev_err(&(urb->dev->dev), "%s: error_xfer_submit\n", __func__);
+   goto error_xfer_submit;
+  }
+  spin_unlock_irqrestore(&xfer->lock, flags);
++ wa_xfer_put(xfer);
+  return 0;
+ 
+  /*
+@@ -1624,6 +1663,7 @@ error_xfer_submit:
+  spin_unlock_irqrestore(&xfer->lock, flags);
+  if (done)
+   wa_xfer_completion(xfer);
++ wa_xfer_put(xfer);
+  /* return success since the completion routine will run. */
+  return 0;
+ }
+-- 
+1.7.1

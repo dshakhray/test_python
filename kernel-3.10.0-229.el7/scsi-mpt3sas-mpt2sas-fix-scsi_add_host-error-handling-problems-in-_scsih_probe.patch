@@ -1,0 +1,120 @@
+From 753c92e2fc02432ddfc15a0c6ecbdb40c7bbe12d Mon Sep 17 00:00:00 2001
+From: Tomas Henzl <thenzl@redhat.com>
+Date: Thu, 16 Oct 2014 16:02:12 -0400
+Subject: [scsi] mpt3sas, mpt2sas: fix scsi_add_host error handling problems in _scsih_probe
+
+Message-id: <1413475335-14737-30-git-send-email-thenzl@redhat.com>
+Patchwork-id: 97606
+O-Subject: [RHEL7.1 e-stor PATCH 29/32] mpt3sas, mpt2sas: fix scsi_add_host error handling problems in _scsih_probe
+Bugzilla: 1088524
+RH-Acked-by: Maurizio Lombardi <mlombard@redhat.com>
+RH-Acked-by: Rob Evers <revers@redhat.com>
+
+In _scsih_probe, propagate the return value from scsi_add_host.
+In mpt3sas, avoid calling list_del twice if that returns an
+error, which causes list_del corruption warnings if an error
+is returned.
+
+Tested with blk-mq and scsi-mq patches to properly cleanup
+from and propagate blk_mq_init_rq_map errors.
+
+Signed-off-by: Robert Elliott <elliott@hp.com>
+Acked-by: Sreekanth Reddy <Sreekanth.Reddy@avagotech.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit b65f1d4da7df44835bd0a2452332e253a5c66d9b)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/mpt2sas/mpt2sas_scsih.c b/drivers/scsi/mpt2sas/mpt2sas_scsih.c
+index 231ec34..992a224 100644
+--- a/drivers/scsi/mpt2sas/mpt2sas_scsih.c
++++ b/drivers/scsi/mpt2sas/mpt2sas_scsih.c
+@@ -8147,6 +8147,7 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+  struct MPT2SAS_ADAPTER *ioc;
+  struct Scsi_Host *shost;
++ int rv;
+ 
+  shost = scsi_host_alloc(&scsih_driver_template,
+      sizeof(struct MPT2SAS_ADAPTER));
+@@ -8242,6 +8243,7 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  if (!ioc->firmware_event_thread) {
+   printk(MPT2SAS_ERR_FMT "failure at %s:%d/%s()!\n",
+       ioc->name, __FILE__, __LINE__, __func__);
++  rv = -ENODEV;
+   goto out_thread_fail;
+  }
+ 
+@@ -8249,6 +8251,7 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  if ((mpt2sas_base_attach(ioc))) {
+   printk(MPT2SAS_ERR_FMT "failure at %s:%d/%s()!\n",
+       ioc->name, __FILE__, __LINE__, __func__);
++  rv = -ENODEV;
+   goto out_attach_fail;
+  }
+ 
+@@ -8266,7 +8269,8 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  } else
+   ioc->hide_drives = 0;
+ 
+- if ((scsi_add_host(shost, &pdev->dev))) {
++ rv = scsi_add_host(shost, &pdev->dev);
++ if (rv) {
+   printk(MPT2SAS_ERR_FMT "failure at %s:%d/%s()!\n",
+       ioc->name, __FILE__, __LINE__, __func__);
+   goto out_add_shost_fail;
+@@ -8283,7 +8287,7 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  out_thread_fail:
+  list_del(&ioc->list);
+  scsi_host_put(shost);
+- return -ENODEV;
++ return rv;
+ }
+ 
+ #ifdef CONFIG_PM
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_scsih.c b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+index 601cf5a..8955b1d 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@ -7781,6 +7781,7 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+  struct MPT3SAS_ADAPTER *ioc;
+  struct Scsi_Host *shost;
++ int rv;
+ 
+  shost = scsi_host_alloc(&scsih_driver_template,
+      sizeof(struct MPT3SAS_ADAPTER));
+@@ -7873,6 +7874,7 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  if (!ioc->firmware_event_thread) {
+   pr_err(MPT3SAS_FMT "failure at %s:%d/%s()!\n",
+       ioc->name, __FILE__, __LINE__, __func__);
++  rv = -ENODEV;
+   goto out_thread_fail;
+  }
+ 
+@@ -7880,12 +7882,13 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  if ((mpt3sas_base_attach(ioc))) {
+   pr_err(MPT3SAS_FMT "failure at %s:%d/%s()!\n",
+       ioc->name, __FILE__, __LINE__, __func__);
++  rv = -ENODEV;
+   goto out_attach_fail;
+  }
+- if ((scsi_add_host(shost, &pdev->dev))) {
++ rv = scsi_add_host(shost, &pdev->dev);
++ if (rv) {
+   pr_err(MPT3SAS_FMT "failure at %s:%d/%s()!\n",
+       ioc->name, __FILE__, __LINE__, __func__);
+-  list_del(&ioc->list);
+   goto out_add_shost_fail;
+  }
+ 
+@@ -7898,7 +7901,7 @@ out_add_shost_fail:
+  out_thread_fail:
+  list_del(&ioc->list);
+  scsi_host_put(shost);
+- return -ENODEV;
++ return rv;
+ }
+ 
+ #ifdef CONFIG_PM
+-- 
+1.7.1

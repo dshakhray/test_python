@@ -1,0 +1,179 @@
+From 49a157abe313d821813c8ffb96bf2a5634a88c37 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:01:25 -0400
+Subject: [usb] fix substandard locking for the sysfs files
+
+Message-id: <1410887463-20674-14-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95101
+O-Subject: [RHEL7 PATCH 013/591] USB: fix substandard locking for the sysfs files
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 232275a089dfd2e77377a85f11d0a4e3ca60e612
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Tue Sep 24 15:43:39 2013 -0400
+
+    USB: fix substandard locking for the sysfs files
+
+    This patch straightens out some locking issues in the USB sysfs
+    interface:
+
+     Deauthorization will destroy existing configurations.
+     Attributes that read from udev->actconfig need to lock the
+     device to prevent races.  Likewise for the rawdescriptor
+     values.
+
+     Attributes that access an interface's current alternate
+     setting should use ACCESS_ONCE() to obtain the cur_altsetting
+     pointer, to protect against concurrent altsetting changes.
+
+     The supports_autosuspend() attribute routine accesses values
+     from an interface's driver, so it should lock the interface
+     (rather than the usb_device) to protect against concurrent
+     unbinds.  Once this is done, the routine can be simplified
+     considerably.
+
+    Scalar values that are stored directly in the usb_device structure are
+    always available.  They do not require any locking.  The same is true
+    of the cached interface string descriptor, because it is not
+    deallocated until the usb_host_interface structure is destroyed.
+
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    CC: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/sysfs.c b/drivers/usb/core/sysfs.c
+index 6d2c8ed..59cb5f9 100644
+--- a/drivers/usb/core/sysfs.c
++++ b/drivers/usb/core/sysfs.c
+@@ -23,14 +23,16 @@ static ssize_t field##_show(struct device *dev,    \
+ {         \
+  struct usb_device *udev;     \
+  struct usb_host_config *actconfig;    \
++ ssize_t rc = 0;       \
+          \
+  udev = to_usb_device(dev);     \
++ usb_lock_device(udev);      \
+  actconfig = udev->actconfig;     \
+  if (actconfig)       \
+-  return sprintf(buf, format_string,   \
++  rc = sprintf(buf, format_string,   \
+     actconfig->desc.field);   \
+- else        \
+-  return 0;      \
++ usb_unlock_device(udev);     \
++ return rc;       \
+ }         \
+ 
+ #define usb_actconfig_attr(field, format_string)  \
+@@ -45,12 +47,15 @@ static ssize_t bMaxPower_show(struct device *dev,
+ {
+  struct usb_device *udev;
+  struct usb_host_config *actconfig;
++ ssize_t rc = 0;
+ 
+  udev = to_usb_device(dev);
++ usb_lock_device(udev);
+  actconfig = udev->actconfig;
+- if (!actconfig)
+-  return 0;
+- return sprintf(buf, "%dmA\n", usb_get_max_power(udev, actconfig));
++ if (actconfig)
++  rc = sprintf(buf, "%dmA\n", usb_get_max_power(udev, actconfig));
++ usb_unlock_device(udev);
++ return rc;
+ }
+ static DEVICE_ATTR_RO(bMaxPower);
+ 
+@@ -59,12 +64,15 @@ static ssize_t configuration_show(struct device *dev,
+ {
+  struct usb_device *udev;
+  struct usb_host_config *actconfig;
++ ssize_t rc = 0;
+ 
+  udev = to_usb_device(dev);
++ usb_lock_device(udev);
+  actconfig = udev->actconfig;
+- if ((!actconfig) || (!actconfig->string))
+-  return 0;
+- return sprintf(buf, "%s\n", actconfig->string);
++ if (actconfig && actconfig->string)
++  rc = sprintf(buf, "%s\n", actconfig->string);
++ usb_unlock_device(udev);
++ return rc;
+ }
+ static DEVICE_ATTR_RO(configuration);
+ 
+@@ -764,6 +772,7 @@ read_descriptors(struct file *filp, struct kobject *kobj,
+   * Following that are the raw descriptor entries for all the
+   * configurations (config plus subsidiary descriptors).
+   */
++ usb_lock_device(udev);
+  for (cfgno = -1; cfgno < udev->descriptor.bNumConfigurations &&
+    nleft > 0; ++cfgno) {
+   if (cfgno < 0) {
+@@ -784,6 +793,7 @@ read_descriptors(struct file *filp, struct kobject *kobj,
+    off -= srclen;
+   }
+  }
++ usb_unlock_device(udev);
+  return count - nleft;
+ }
+ 
+@@ -870,9 +880,7 @@ static ssize_t interface_show(struct device *dev, struct device_attribute *attr,
+  char *string;
+ 
+  intf = to_usb_interface(dev);
+- string = intf->cur_altsetting->string;
+- barrier();  /* The altsetting might change! */
+-
++ string = ACCESS_ONCE(intf->cur_altsetting->string);
+  if (!string)
+   return 0;
+  return sprintf(buf, "%s\n", string);
+@@ -888,7 +896,7 @@ static ssize_t modalias_show(struct device *dev, struct device_attribute *attr,
+ 
+  intf = to_usb_interface(dev);
+  udev = interface_to_usbdev(intf);
+- alt = intf->cur_altsetting;
++ alt = ACCESS_ONCE(intf->cur_altsetting);
+ 
+  return sprintf(buf, "usb:v%04Xp%04Xd%04Xdc%02Xdsc%02Xdp%02X"
+    "ic%02Xisc%02Xip%02Xin%02X\n",
+@@ -909,23 +917,14 @@ static ssize_t supports_autosuspend_show(struct device *dev,
+       struct device_attribute *attr,
+       char *buf)
+ {
+- struct usb_interface *intf;
+- struct usb_device *udev;
+- int ret;
++ int s;
+ 
+- intf = to_usb_interface(dev);
+- udev = interface_to_usbdev(intf);
+-
+- usb_lock_device(udev);
++ device_lock(dev);
+  /* Devices will be autosuspended even when an interface isn't claimed */
+- if (!intf->dev.driver ||
+-   to_usb_driver(intf->dev.driver)->supports_autosuspend)
+-  ret = sprintf(buf, "%u\n", 1);
+- else
+-  ret = sprintf(buf, "%u\n", 0);
+- usb_unlock_device(udev);
++ s = (!dev->driver || to_usb_driver(dev->driver)->supports_autosuspend);
++ device_unlock(dev);
+ 
+- return ret;
++ return sprintf(buf, "%u\n", s);
+ }
+ static DEVICE_ATTR_RO(supports_autosuspend);
+ 
+-- 
+1.7.1

@@ -1,0 +1,183 @@
+From 2b520979cc971d9ed915c6e4b38d971ca09f1b54 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 24 Oct 2014 20:28:13 -0400
+Subject: [net] openvswitch: Remove pkt_key from OVS_CB
+
+Message-id: <74e20c999c8839e0c9f8a318204580ccd8c9c080.1414182116.git.jbenc@redhat.com>
+Patchwork-id: 98455
+O-Subject: [RHEL7.1 net PATCH 05/11] openvswitch: Remove pkt_key from OVS_CB
+Bugzilla: 1110384
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110384
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8159383
+
+commit 2ff3e4e4868675da1024175215991fa6d9856731
+Author: Pravin B Shelar <pshelar@nicira.com>
+Date:   Mon Sep 15 19:15:28 2014 -0700
+
+    openvswitch: Remove pkt_key from OVS_CB
+
+    OVS keeps pointer to packet key in skb->cb, but the packet key is
+    store on stack. This could make code bit tricky. So it is better to
+    get rid of the pointer.
+
+    Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index df79994..0008afc 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -38,6 +38,7 @@
+ #include "vport.h"
+ 
+ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
++         struct sw_flow_key *key,
+          const struct nlattr *attr, int len);
+ 
+ static int make_writable(struct sk_buff *skb, int write_len)
+@@ -410,16 +411,14 @@ static int do_output(struct datapath *dp, struct sk_buff *skb, int out_port)
+ }
+ 
+ static int output_userspace(struct datapath *dp, struct sk_buff *skb,
+-       const struct nlattr *attr)
++       struct sw_flow_key *key, const struct nlattr *attr)
+ {
+  struct dp_upcall_info upcall;
+  const struct nlattr *a;
+  int rem;
+ 
+- BUG_ON(!OVS_CB(skb)->pkt_key);
+-
+  upcall.cmd = OVS_PACKET_CMD_ACTION;
+- upcall.key = OVS_CB(skb)->pkt_key;
++ upcall.key = key;
+  upcall.userdata = NULL;
+  upcall.portid = 0;
+ 
+@@ -445,7 +444,7 @@ static bool last_action(const struct nlattr *a, int rem)
+ }
+ 
+ static int sample(struct datapath *dp, struct sk_buff *skb,
+-    const struct nlattr *attr)
++    struct sw_flow_key *key, const struct nlattr *attr)
+ {
+  const struct nlattr *acts_list = NULL;
+  const struct nlattr *a;
+@@ -493,7 +492,7 @@ static int sample(struct datapath *dp, struct sk_buff *skb,
+   * return the error code and let the caller (also
+   * do_execute_actions()) free skb on error.
+   */
+- return do_execute_actions(dp, sample_skb, a, rem);
++ return do_execute_actions(dp, sample_skb, key, a, rem);
+ }
+ 
+ static int execute_set_action(struct sk_buff *skb,
+@@ -544,6 +543,7 @@ static int execute_set_action(struct sk_buff *skb,
+ 
+ /* Execute a list of actions against 'skb'. */
+ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
++         struct sw_flow_key *key,
+          const struct nlattr *attr, int len)
+ {
+  /* Every output action needs a separate clone of 'skb', but the common
+@@ -569,7 +569,7 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+    break;
+ 
+   case OVS_ACTION_ATTR_USERSPACE:
+-   output_userspace(dp, skb, a);
++   output_userspace(dp, skb, key, a);
+    break;
+ 
+   case OVS_ACTION_ATTR_PUSH_VLAN:
+@@ -587,7 +587,7 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+    break;
+ 
+   case OVS_ACTION_ATTR_SAMPLE:
+-   err = sample(dp, skb, a);
++   err = sample(dp, skb, key, a);
+    if (unlikely(err)) /* skb already freed. */
+     return err;
+    break;
+@@ -608,10 +608,12 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+ }
+ 
+ /* Execute a list of actions against 'skb'. */
+-int ovs_execute_actions(struct datapath *dp, struct sk_buff *skb)
++int ovs_execute_actions(struct datapath *dp, struct sk_buff *skb,
++   struct sw_flow_key *key)
+ {
+  struct sw_flow_actions *acts = rcu_dereference(OVS_CB(skb)->flow->sf_acts);
+ 
+  OVS_CB(skb)->tun_key = NULL;
+- return do_execute_actions(dp, skb, acts->actions, acts->actions_len);
++ return do_execute_actions(dp, skb, key,
++      acts->actions, acts->actions_len);
+ }
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 1e14d67..bae10a6 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -275,10 +275,9 @@ void ovs_dp_process_received_packet(struct vport *p, struct sk_buff *skb)
+  }
+ 
+  OVS_CB(skb)->flow = flow;
+- OVS_CB(skb)->pkt_key = &key;
+ 
+  ovs_flow_stats_update(OVS_CB(skb)->flow, key.tp.flags, skb);
+- ovs_execute_actions(dp, skb);
++ ovs_execute_actions(dp, skb, &key);
+  stats_counter = &stats->n_hit;
+ 
+ out:
+@@ -570,7 +569,6 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+   goto err_flow_free;
+ 
+  OVS_CB(packet)->flow = flow;
+- OVS_CB(packet)->pkt_key = &flow->key;
+  packet->priority = flow->key.phy.priority;
+  packet->mark = flow->key.phy.skb_mark;
+ 
+@@ -581,7 +579,7 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+   goto err_unlock;
+ 
+  local_bh_disable();
+- err = ovs_execute_actions(dp, packet);
++ err = ovs_execute_actions(dp, packet, &flow->key);
+  local_bh_enable();
+  rcu_read_unlock();
+ 
+diff --git a/net/openvswitch/datapath.h b/net/openvswitch/datapath.h
+index 701b573..b576483 100644
+--- a/net/openvswitch/datapath.h
++++ b/net/openvswitch/datapath.h
+@@ -95,13 +95,11 @@ struct datapath {
+ /**
+  * struct ovs_skb_cb - OVS data in skb CB
+  * @flow: The flow associated with this packet.  May be %NULL if no flow.
+- * @pkt_key: The flow information extracted from the packet.  Must be nonnull.
+  * @tun_key: Key for the tunnel that encapsulated this packet. NULL if the
+  * packet is not being tunneled.
+  */
+ struct ovs_skb_cb {
+  struct sw_flow  *flow;
+- struct sw_flow_key *pkt_key;
+  struct ovs_key_ipv4_tunnel  *tun_key;
+ };
+ #define OVS_CB(skb) ((struct ovs_skb_cb *)(skb)->cb)
+@@ -191,7 +189,8 @@ int ovs_dp_upcall(struct datapath *, struct sk_buff *,
+ struct sk_buff *ovs_vport_cmd_build_info(struct vport *, u32 pid, u32 seq,
+       u8 cmd);
+ 
+-int ovs_execute_actions(struct datapath *dp, struct sk_buff *skb);
++int ovs_execute_actions(struct datapath *dp, struct sk_buff *skb,
++   struct sw_flow_key *);
+ void ovs_dp_notify_wq(struct work_struct *work);
+ 
+ #define OVS_NLERR(fmt, ...)     \
+-- 
+1.7.1

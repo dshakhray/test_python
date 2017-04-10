@@ -1,0 +1,146 @@
+From 467028a4a154f23a8a79b9d9861c7832a0fba080 Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:36:41 -0400
+Subject: [alsa] hda: Adjust speaker HPF and add LED support for HP Spectre 13
+
+Message-id: <140972823573-357-patchset-jkysela@redhat.com>
+Patchwork-id: 91053
+O-Subject: [RHEL 7.1 PATCH 356/442] ALSA: hda - Adjust speaker HPF and add LED support for HP Spectre 13
+Bugzilla: 1112200
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+HP Spectre 13 has the IDT 92HD95 codec, and BIOS seems to set the
+default high-pass filter in some "safer" range, which results in the
+very soft tone from the built-in speakers in contrast to Windows.
+Also, the mute LED control is missing, since 92HD95 codec still has no
+HP-specific fixups for GPIO setups.
+
+This patch adds these missing features: the HPF is adjusted by the
+vendor-specific verb, and the LED is set up from a DMI string (but
+with the default polarity = 0 assumption due to the incomplete BIOS on
+the given machine).
+
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=74841
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+(picked from kernel: 8b3dfdaf0c25a584cb31d04d2574115cf2d422ab)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/sound/alsa/HD-Audio-Models.txt b/Documentation/sound/alsa/HD-Audio-Models.txt
+index b92ee18..ef2ec7c 100644
+--- a/Documentation/sound/alsa/HD-Audio-Models.txt
++++ b/Documentation/sound/alsa/HD-Audio-Models.txt
+@@ -286,6 +286,11 @@ STAC92HD83*
+   hp-inv-led HP with broken BIOS for inverted mute LED
+   auto  BIOS setup (default)
+ 
++STAC92HD95
++==========
++  hp-led LED support for HP laptops
++  hp-bass Bass HPF setup for HP Spectre 13
++
+ STAC9872
+ ========
+   vaio  VAIO laptop without SPDIF
+diff --git a/sound/pci/hda/patch_sigmatel.c b/sound/pci/hda/patch_sigmatel.c
+index 5267ef2..52bdbdc 100644
+--- a/sound/pci/hda/patch_sigmatel.c
++++ b/sound/pci/hda/patch_sigmatel.c
+@@ -122,6 +122,12 @@ enum {
+ };
+ 
+ enum {
++ STAC_92HD95_HP_LED,
++ STAC_92HD95_HP_BASS,
++ STAC_92HD95_MODELS
++};
++
++enum {
+  STAC_925x_REF,
+  STAC_M1,
+  STAC_M1_2,
+@@ -4128,6 +4134,48 @@ static const struct snd_pci_quirk stac9205_fixup_tbl[] = {
+  {} /* terminator */
+ };
+ 
++static void stac92hd95_fixup_hp_led(struct hda_codec *codec,
++        const struct hda_fixup *fix, int action)
++{
++ struct sigmatel_spec *spec = codec->spec;
++
++ if (action != HDA_FIXUP_ACT_PRE_PROBE)
++  return;
++
++ if (find_mute_led_cfg(codec, spec->default_polarity))
++  codec_dbg(codec, "mute LED gpio %d polarity %d\n",
++    spec->gpio_led,
++    spec->gpio_led_polarity);
++}
++
++static const struct hda_fixup stac92hd95_fixups[] = {
++ [STAC_92HD95_HP_LED] = {
++  .type = HDA_FIXUP_FUNC,
++  .v.func = stac92hd95_fixup_hp_led,
++ },
++ [STAC_92HD95_HP_BASS] = {
++  .type = HDA_FIXUP_VERBS,
++  .v.verbs = (const struct hda_verb[]) {
++   {0x1a, 0x795, 0x00}, /* HPF to 100Hz */
++   {}
++  },
++  .chained = true,
++  .chain_id = STAC_92HD95_HP_LED,
++ },
++};
++
++static const struct snd_pci_quirk stac92hd95_fixup_tbl[] = {
++ SND_PCI_QUIRK(PCI_VENDOR_ID_HP, 0x1911, "HP Spectre 13", STAC_92HD95_HP_BASS),
++ {} /* terminator */
++};
++
++static const struct hda_model_fixup stac92hd95_models[] = {
++ { .id = STAC_92HD95_HP_LED, .name = "hp-led" },
++ { .id = STAC_92HD95_HP_BASS, .name = "hp-bass" },
++ {}
++};
++
++
+ static int stac_parse_auto_config(struct hda_codec *codec)
+ {
+  struct sigmatel_spec *spec = codec->spec;
+@@ -4580,10 +4628,16 @@ static int patch_stac92hd95(struct hda_codec *codec)
+  spec->gen.beep_nid = 0x19; /* digital beep */
+  spec->pwr_nids = stac92hd95_pwr_nids;
+  spec->num_pwrs = ARRAY_SIZE(stac92hd95_pwr_nids);
+- spec->default_polarity = -1; /* no default cfg */
++ spec->default_polarity = 0;
+ 
+  codec->patch_ops = stac_patch_ops;
+ 
++ snd_hda_pick_fixup(codec, stac92hd95_models, stac92hd95_fixup_tbl,
++      stac92hd95_fixups);
++ snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_PRE_PROBE);
++
++ stac_setup_gpio(codec);
++
+  err = stac_parse_auto_config(codec);
+  if (err < 0) {
+   stac_free(codec);
+@@ -4592,6 +4646,8 @@ static int patch_stac92hd95(struct hda_codec *codec)
+ 
+  codec->proc_widget_hook = stac92hd_proc_hook;
+ 
++ snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_PROBE);
++
+  return 0;
+ }
+ 
+-- 
+1.7.1

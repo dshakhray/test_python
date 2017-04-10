@@ -1,0 +1,135 @@
+From 3b463bc3f45f04b4cda6d5881c1c5bb5e6b34220 Mon Sep 17 00:00:00 2001
+From: Marcelo Leitner <mleitner@redhat.com>
+Date: Tue, 21 Oct 2014 16:20:36 -0400
+Subject: [net] netfilter: nf_tables: extend NFT_MSG_DELTABLE to support flushing the ruleset
+
+Message-id: <20141021162036.22888.43262.stgit@localhost.localdomain>
+Patchwork-id: 98002
+O-Subject: [RHEL7 net PATCH 105/124] netfilter: nf_tables: extend NFT_MSG_DELTABLE to support flushing the ruleset
+Bugzilla: 1148041 1155088
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Backport of upstream commit: b9ac12ef099707f405d7478009564302d7ed8393
+
+ commit b9ac12ef099707f405d7478009564302d7ed8393
+ Author: Arturo Borrero <arturo.borrero.glez@gmail.com>
+ Date:   Tue Sep 2 16:42:26 2014 +0200
+
+    netfilter: nf_tables: extend NFT_MSG_DELTABLE to support flushing the ruleset
+
+    This patch extend the NFT_MSG_DELTABLE call to support flushing the entire
+    ruleset.
+
+    The options now are:
+     * No family speficied, no table specified: flush all the ruleset.
+     * Family specified, no table specified: flush all tables in the AF.
+     * Family specified, table specified: flush the given table.
+
+    Signed-off-by: Arturo Borrero Gonzalez <arturo.borrero.glez@gmail.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index d9457ea..92a5fee 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -707,6 +707,67 @@ static int nf_tables_newtable(struct sock *nlsk, struct sk_buff *skb,
+  return 0;
+ }
+ 
++static int nft_flush_table(struct nft_ctx *ctx)
++{
++ int err;
++ struct nft_chain *chain, *nc;
++ struct nft_set *set, *ns;
++
++ list_for_each_entry_safe(chain, nc, &ctx->table->chains, list) {
++  ctx->chain = chain;
++
++  err = nft_delrule_by_chain(ctx);
++  if (err < 0)
++   goto out;
++
++  err = nft_delchain(ctx);
++  if (err < 0)
++   goto out;
++ }
++
++ list_for_each_entry_safe(set, ns, &ctx->table->sets, list) {
++  if (set->flags & NFT_SET_ANONYMOUS &&
++      !list_empty(&set->bindings))
++   continue;
++
++  err = nft_delset(ctx, set);
++  if (err < 0)
++   goto out;
++ }
++
++ err = nft_deltable(ctx);
++out:
++ return err;
++}
++
++static int nft_flush(struct nft_ctx *ctx, int family)
++{
++ struct nft_af_info *afi;
++ struct nft_table *table, *nt;
++ const struct nlattr * const *nla = ctx->nla;
++ int err = 0;
++
++ list_for_each_entry(afi, &ctx->net->nft.af_info, list) {
++  if (family != AF_UNSPEC && afi->family != family)
++   continue;
++
++  ctx->afi = afi;
++  list_for_each_entry_safe(table, nt, &afi->tables, list) {
++   if (nla[NFTA_TABLE_NAME] &&
++       nla_strcmp(nla[NFTA_TABLE_NAME], table->name) != 0)
++    continue;
++
++   ctx->table = table;
++
++   err = nft_flush_table(ctx);
++   if (err < 0)
++    goto out;
++  }
++ }
++out:
++ return err;
++}
++
+ static int nf_tables_deltable(struct sock *nlsk, struct sk_buff *skb,
+          const struct nlmsghdr *nlh,
+          const struct nlattr * const nla[])
+@@ -718,6 +779,10 @@ static int nf_tables_deltable(struct sock *nlsk, struct sk_buff *skb,
+  int family = nfmsg->nfgen_family;
+  struct nft_ctx ctx;
+ 
++ nft_ctx_init(&ctx, skb, nlh, NULL, NULL, NULL, nla);
++ if (family == AF_UNSPEC || nla[NFTA_TABLE_NAME] == NULL)
++  return nft_flush(&ctx, family);
++
+  afi = nf_tables_afinfo_lookup(net, family, false);
+  if (IS_ERR(afi))
+   return PTR_ERR(afi);
+@@ -727,12 +792,11 @@ static int nf_tables_deltable(struct sock *nlsk, struct sk_buff *skb,
+   return PTR_ERR(table);
+  if (table->flags & NFT_TABLE_INACTIVE)
+   return -ENOENT;
+- if (table->use > 0)
+-  return -EBUSY;
+ 
+- nft_ctx_init(&ctx, skb, nlh, afi, table, NULL, nla);
++ ctx.afi = afi;
++ ctx.table = table;
+ 
+- return nft_deltable(&ctx);
++ return nft_flush_table(&ctx);
+ }
+ 
+ static void nf_tables_table_destroy(struct nft_ctx *ctx)
+-- 
+1.7.1

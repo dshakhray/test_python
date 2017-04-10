@@ -1,0 +1,60 @@
+From be0a9f186cc794ba84fa99967787c481c82120fa Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:19:12 -0400
+Subject: [fs] nfsd: bump dl_time when unhashing delegation
+
+Message-id: <1410898849-22126-69-git-send-email-bfields@redhat.com>
+Patchwork-id: 95831
+O-Subject: [Patch RHEL7 068/165] nfsd: bump dl_time when unhashing delegation
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jeff.layton@primarydata.com>
+
+There's a potential race between a lease break and DELEGRETURN call.
+
+Suppose a lease break comes in and queues the workqueue job for a
+delegation, but it doesn't run just yet. Then, a DELEGRETURN comes in
+finds the delegation and calls destroy_delegation on it to unhash it and
+put its primary reference.
+
+Next, the workqueue job runs and queues the delegation back onto the
+del_recall_lru list, issues the CB_RECALL and puts the final reference.
+With that, the final reference to the delegation is put, but it's still
+on the LRU list.
+
+When we go to unhash a delegation, it's because we intend to get rid of
+it soon afterward, so we don't want lease breaks to mess with it once
+that occurs. Fix this by bumping the dl_time whenever we unhash a
+delegation, to ensure that lease breaks don't monkey with it.
+
+I believe this is a regression due to commit 02e1215f9f7 (nfsd: Avoid
+taking state_lock while holding inode lock in nfsd_break_one_deleg).
+Prior to that, the state_lock was held in the lm_break callback itself,
+and that would have prevented this race.
+
+Cc: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: d55a166c961714e18907f4723252f72097cd2d23
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 72da0d4..a3a828d 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -660,6 +660,8 @@ unhash_delegation(struct nfs4_delegation *dp)
+ 
+  spin_lock(&state_lock);
+  dp->dl_stid.sc_type = NFS4_CLOSED_DELEG_STID;
++ /* Ensure that deleg break won't try to requeue it */
++ ++dp->dl_time;
+  spin_lock(&fp->fi_lock);
+  list_del_init(&dp->dl_perclnt);
+  list_del_init(&dp->dl_recall_lru);
+-- 
+1.7.1

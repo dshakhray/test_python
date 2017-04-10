@@ -1,0 +1,143 @@
+From 4dc6e9cb31a9e8282be15bf21e2d7e81c886c3d3 Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:35:31 -0400
+Subject: [alsa] control: Protect user controls against concurrent access
+
+Message-id: <140972823573-341-patchset-jkysela@redhat.com>
+Patchwork-id: 91037
+O-Subject: [RHEL 7.1 PATCH 340/442] ALSA: control: Protect user controls against concurrent access
+Bugzilla: 1112200 1117339
+CVE: CVE-2014-4652
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+The user-control put and get handlers as well as the tlv do not protect against
+concurrent access from multiple threads. Since the state of the control is not
+updated atomically it is possible that either two write operations or a write
+and a read operation race against each other. Both can lead to arbitrary memory
+disclosure. This patch introduces a new lock that protects user-controls from
+concurrent access. Since applications typically access controls sequentially
+than in parallel a single lock per card should be fine.
+
+Signed-off-by: Lars-Peter Clausen <lars@metafoo.de>
+Acked-by: Jaroslav Kysela <perex@perex.cz>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+(picked from kernel: 07f4d9d74a04aa7c72c5dae0ef97565f28f17b92)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/sound/core.h b/include/sound/core.h
+index aac9a85..51c9fa1 100644
+--- a/include/sound/core.h
++++ b/include/sound/core.h
+@@ -116,6 +116,8 @@ struct snd_card {
+  int user_ctl_count;  /* count of all user controls */
+  struct list_head controls; /* all controls for this card */
+  struct list_head ctl_files; /* active control files */
++ struct mutex user_ctl_lock; /* protects user controls against
++        concurrent access */
+ 
+  struct snd_info_entry *proc_root; /* root for soundcard specific files */
+  struct snd_info_entry *proc_id; /* the card id */
+diff --git a/sound/core/control.c b/sound/core/control.c
+index f427535..e8495c4 100644
+--- a/sound/core/control.c
++++ b/sound/core/control.c
+@@ -995,6 +995,7 @@ static int snd_ctl_elem_unlock(struct snd_ctl_file *file,
+ 
+ struct user_element {
+  struct snd_ctl_elem_info info;
++ struct snd_card *card;
+  void *elem_data;  /* element data */
+  unsigned long elem_data_size; /* size of element data in bytes */
+  void *tlv_data;   /* TLV data */
+@@ -1038,7 +1039,9 @@ static int snd_ctl_elem_user_get(struct snd_kcontrol *kcontrol,
+ {
+  struct user_element *ue = kcontrol->private_data;
+ 
++ mutex_lock(&ue->card->user_ctl_lock);
+  memcpy(&ucontrol->value, ue->elem_data, ue->elem_data_size);
++ mutex_unlock(&ue->card->user_ctl_lock);
+  return 0;
+ }
+ 
+@@ -1047,10 +1050,12 @@ static int snd_ctl_elem_user_put(struct snd_kcontrol *kcontrol,
+ {
+  int change;
+  struct user_element *ue = kcontrol->private_data;
+- 
++
++ mutex_lock(&ue->card->user_ctl_lock);
+  change = memcmp(&ucontrol->value, ue->elem_data, ue->elem_data_size) != 0;
+  if (change)
+   memcpy(ue->elem_data, &ucontrol->value, ue->elem_data_size);
++ mutex_unlock(&ue->card->user_ctl_lock);
+  return change;
+ }
+ 
+@@ -1070,19 +1075,32 @@ static int snd_ctl_elem_user_tlv(struct snd_kcontrol *kcontrol,
+   new_data = memdup_user(tlv, size);
+   if (IS_ERR(new_data))
+    return PTR_ERR(new_data);
++  mutex_lock(&ue->card->user_ctl_lock);
+   change = ue->tlv_data_size != size;
+   if (!change)
+    change = memcmp(ue->tlv_data, new_data, size);
+   kfree(ue->tlv_data);
+   ue->tlv_data = new_data;
+   ue->tlv_data_size = size;
++  mutex_unlock(&ue->card->user_ctl_lock);
+  } else {
+-  if (! ue->tlv_data_size || ! ue->tlv_data)
+-   return -ENXIO;
+-  if (size < ue->tlv_data_size)
+-   return -ENOSPC;
++  int ret = 0;
++
++  mutex_lock(&ue->card->user_ctl_lock);
++  if (!ue->tlv_data_size || !ue->tlv_data) {
++   ret = -ENXIO;
++   goto err_unlock;
++  }
++  if (size < ue->tlv_data_size) {
++   ret = -ENOSPC;
++   goto err_unlock;
++  }
+   if (copy_to_user(tlv, ue->tlv_data, ue->tlv_data_size))
+-   return -EFAULT;
++   ret = -EFAULT;
++err_unlock:
++  mutex_unlock(&ue->card->user_ctl_lock);
++  if (ret)
++   return ret;
+  }
+  return change;
+ }
+@@ -1214,6 +1232,7 @@ static int snd_ctl_elem_add(struct snd_ctl_file *file,
+  ue = kzalloc(sizeof(struct user_element) + private_size, GFP_KERNEL);
+  if (ue == NULL)
+   return -ENOMEM;
++ ue->card = card;
+  ue->info = *info;
+  ue->info.access = 0;
+  ue->elem_data = (char *)ue + sizeof(*ue);
+diff --git a/sound/core/init.c b/sound/core/init.c
+index a6e1f7a..bbf3b8c 100644
+--- a/sound/core/init.c
++++ b/sound/core/init.c
+@@ -232,6 +232,7 @@ int snd_card_new(struct device *parent, int idx, const char *xid,
+  INIT_LIST_HEAD(&card->devices);
+  init_rwsem(&card->controls_rwsem);
+  rwlock_init(&card->ctl_files_rwlock);
++ mutex_init(&card->user_ctl_lock);
+  INIT_LIST_HEAD(&card->controls);
+  INIT_LIST_HEAD(&card->ctl_files);
+  spin_lock_init(&card->files_lock);
+-- 
+1.7.1

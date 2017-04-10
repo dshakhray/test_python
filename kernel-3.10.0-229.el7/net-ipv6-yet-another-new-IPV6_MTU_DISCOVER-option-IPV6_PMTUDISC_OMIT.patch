@@ -1,0 +1,116 @@
+From 45aeb074603b9fdb0bd343eb097b6b96877e1a6e Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@redhat.com>
+Date: Mon, 8 Dec 2014 17:33:09 -0500
+Subject: [net] ipv6: yet another new IPV6_MTU_DISCOVER option IPV6_PMTUDISC_OMIT
+
+Message-id: <198470abb5eb7309825d92ac980cbfa146950372.1418058212.git.hannes@redhat.com>
+Patchwork-id: 101187
+O-Subject: [RHEL7.1 net 13/13] ipv6: yet another new IPV6_MTU_DISCOVER option IPV6_PMTUDISC_OMIT
+Bugzilla: 1170116
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1170116
+Upstream Status: 0b95227a7ba7e69f795757cd7c839eff0615f2d1
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8344420
+
+Upstream Commit:
+commit 0b95227a7ba7e69f795757cd7c839eff0615f2d1
+Author: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date:   Wed Feb 26 01:20:43 2014 +0100
+
+    ipv6: yet another new IPV6_MTU_DISCOVER option IPV6_PMTUDISC_OMIT
+
+    This option has the same semantic as IP_PMTUDISC_OMIT for IPv4 which
+    got recently introduced. It doesn't honor the path mtu discovered by the
+    host but in contrary to IPV6_PMTUDISC_INTERFACE allows the generation of
+    fragments if the packet size exceeds the MTU of the outgoing interface
+    MTU.
+
+    Fixes: 93b36cf3425b9b ("ipv6: support IPV6_PMTU_INTERFACE on sockets")
+    Cc: Florian Weimer <fweimer@redhat.com>
+    Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Hannes Frederic Sowa <hannes@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/ip6_route.h b/include/net/ip6_route.h
+index 3594a08..02f3bb1 100644
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@ -196,7 +196,14 @@ static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+ 
+ static inline bool ip6_sk_accept_pmtu(const struct sock *sk)
+ {
+- return inet6_sk(sk)->pmtudisc != IPV6_PMTUDISC_INTERFACE;
++ return inet6_sk(sk)->pmtudisc != IPV6_PMTUDISC_INTERFACE &&
++        inet6_sk(sk)->pmtudisc != IPV6_PMTUDISC_OMIT;
++}
++
++static inline bool ip6_sk_local_df(const struct sock *sk)
++{
++ return inet6_sk(sk)->pmtudisc < IPV6_PMTUDISC_DO ||
++        inet6_sk(sk)->pmtudisc == IPV6_PMTUDISC_OMIT;
+ }
+ 
+ static inline struct in6_addr *rt6_nexthop(struct rt6_info *rt)
+diff --git a/include/uapi/linux/in6.h b/include/uapi/linux/in6.h
+index b37a14c..f9eadcd 100644
+--- a/include/uapi/linux/in6.h
++++ b/include/uapi/linux/in6.h
+@@ -170,6 +170,10 @@ struct in6_flowlabel_req {
+  * also see comments on IP_PMTUDISC_INTERFACE
+  */
+ #define IPV6_PMTUDISC_INTERFACE  4
++/* weaker version of IPV6_PMTUDISC_INTERFACE, which allows packets to
++ * get fragmented if they exceed the interface mtu
++ */
++#define IPV6_PMTUDISC_OMIT  5
+ 
+ /* Flowlabel */
+ #define IPV6_FLOWLABEL_MGR 32
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 73a2b13..71ecba7 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1219,8 +1219,10 @@ int ip6_append_data(struct sock *sk, int getfrag(void *from, char *to,
+          sizeof(struct frag_hdr) : 0) +
+         rt->rt6i_nfheader_len;
+ 
+-  maxnonfragsize = (np->pmtudisc >= IPV6_PMTUDISC_DO) ?
+-     mtu : sizeof(struct ipv6hdr) + IPV6_MAXPLEN;
++  if (ip6_sk_local_df(sk))
++   maxnonfragsize = sizeof(struct ipv6hdr) + IPV6_MAXPLEN;
++  else
++   maxnonfragsize = mtu;
+ 
+   /* dontfrag active */
+   if ((cork->length + length > mtu - headersize) && dontfrag &&
+@@ -1526,8 +1528,7 @@ int ip6_push_pending_frames(struct sock *sk)
+  }
+ 
+  /* Allow local fragmentation. */
+- if (np->pmtudisc < IPV6_PMTUDISC_DO)
+-  skb->local_df = 1;
++ skb->local_df = ip6_sk_local_df(sk);
+ 
+  *final_dst = fl6->daddr;
+  __skb_pull(skb, skb_network_header_len(skb));
+diff --git a/net/ipv6/ipv6_sockglue.c b/net/ipv6/ipv6_sockglue.c
+index 156955b..1c17ddb 100644
+--- a/net/ipv6/ipv6_sockglue.c
++++ b/net/ipv6/ipv6_sockglue.c
+@@ -722,7 +722,7 @@ done:
+  case IPV6_MTU_DISCOVER:
+   if (optlen < sizeof(int))
+    goto e_inval;
+-  if (val < IPV6_PMTUDISC_DONT || val > IPV6_PMTUDISC_INTERFACE)
++  if (val < IPV6_PMTUDISC_DONT || val > IPV6_PMTUDISC_OMIT)
+    goto e_inval;
+   np->pmtudisc = val;
+   retv = 0;
+-- 
+1.7.1

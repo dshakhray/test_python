@@ -1,0 +1,66 @@
+From e3a03412df60ba8cbaa403c718e4b6fc677029b0 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 23 Oct 2014 20:01:27 -0400
+Subject: [md] dm-thin: performance improvement to discard processing
+
+Message-id: <1414094494-22068-18-git-send-email-snitzer@redhat.com>
+Patchwork-id: 98347
+O-Subject: [RHEL7.2 PATCH 17/24] dm thin: performance improvement to discard processing
+Bugzilla: 1156164
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1156164
+
+Upstream linux-dm.git commit 9531c4ef328e46b5aa66c8ba7e1752892fa1684f
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Fri Sep 12 11:34:01 2014 +0100
+
+    dm thin: performance improvement to discard processing
+
+    When processing a discard bio, if the block is already quiesced do the
+    discard immediately rather than adding the mapping to a list for the
+    next iteration of the worker thread.
+
+    Discarding a fully provisioned 100G thin volume with 64k block size goes
+    from 860s to 95s with this change.
+
+    Clearly there's something wrong with the worker architecture, more
+    investigation needed.
+
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index eaf7d2a..b1078b4 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -1188,7 +1188,6 @@ static void retry_bios_on_resume(struct pool *pool, struct dm_bio_prison_cell *c
+ static void process_discard(struct thin_c *tc, struct bio *bio)
+ {
+  int r;
+- unsigned long flags;
+  struct pool *pool = tc->pool;
+  struct dm_bio_prison_cell *cell, *cell2;
+  struct dm_cell_key key, key2;
+@@ -1229,12 +1228,9 @@ static void process_discard(struct thin_c *tc, struct bio *bio)
+    m->cell2 = cell2;
+    m->bio = bio;
+ 
+-   if (!dm_deferred_set_add_work(pool->all_io_ds, &m->list)) {
+-    spin_lock_irqsave(&pool->lock, flags);
+-    list_add_tail(&m->list, &pool->prepared_discards);
+-    spin_unlock_irqrestore(&pool->lock, flags);
+-    wake_worker(pool);
+-   }
++   if (!dm_deferred_set_add_work(pool->all_io_ds, &m->list))
++    pool->process_prepared_discard(m);
++
+   } else {
+    inc_all_io_entry(pool, bio);
+    cell_defer_no_holder(tc, cell);
+-- 
+1.7.1

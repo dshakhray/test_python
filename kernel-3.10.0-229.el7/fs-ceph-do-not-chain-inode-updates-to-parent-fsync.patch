@@ -1,0 +1,132 @@
+From abefec06ea621df500b0c81f1b6e009d6d8b21df Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:24:36 -0400
+Subject: [fs] ceph: do not chain inode updates to parent fsync
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-170-git-send-email-sweil@redhat.com>
+Patchwork-id: 89828
+O-Subject: [PATCH 169/303] ceph: do not chain inode updates to parent fsync
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Sage Weil <sage@inktank.com>
+
+The fsync(dirfd) only covers namespace operations, not inode updates.
+We do not need to cover setattr variants or O_TRUNC.
+
+Reported-by: Al Viro <viro@xeniv.linux.org.uk>
+Signed-off-by: Sage Weil <sage@inktank.com>
+Reviewed-by: Yan, Zheng <zheng.z.yan@intel.com>
+(cherry picked from commit 752c8bdcfe88f27a17c5c9264df928fd145a4b30)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 96ab61f..7d77409 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -193,7 +193,7 @@ int ceph_open(struct inode *inode, struct file *file)
+  req->r_inode = inode;
+  ihold(inode);
+  req->r_num_caps = 1;
+- if (flags & (O_CREAT|O_TRUNC))
++ if (flags & O_CREAT)
+   parent_inode = ceph_get_dentry_parent_inode(file->f_dentry);
+  err = ceph_mdsc_do_request(mdsc, parent_inode, req);
+  iput(parent_inode);
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index 70745ba..e7117f4 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -1612,7 +1612,6 @@ int ceph_setattr(struct dentry *dentry, struct iattr *attr)
+ {
+  struct inode *inode = dentry->d_inode;
+  struct ceph_inode_info *ci = ceph_inode(inode);
+- struct inode *parent_inode;
+  const unsigned int ia_valid = attr->ia_valid;
+  struct ceph_mds_request *req;
+  struct ceph_mds_client *mdsc = ceph_sb_to_client(dentry->d_sb)->mdsc;
+@@ -1797,9 +1796,7 @@ int ceph_setattr(struct dentry *dentry, struct iattr *attr)
+   req->r_inode_drop = release;
+   req->r_args.setattr.mask = cpu_to_le32(mask);
+   req->r_num_caps = 1;
+-  parent_inode = ceph_get_dentry_parent_inode(dentry);
+-  err = ceph_mdsc_do_request(mdsc, parent_inode, req);
+-  iput(parent_inode);
++  err = ceph_mdsc_do_request(mdsc, NULL, req);
+  }
+  dout("setattr %p result=%d (%s locally, %d remote)\n", inode, err,
+       ceph_cap_string(dirtied), mask);
+diff --git a/fs/ceph/ioctl.c b/fs/ceph/ioctl.c
+index dc66c9e..efbe082 100644
+--- a/fs/ceph/ioctl.c
++++ b/fs/ceph/ioctl.c
+@@ -64,7 +64,6 @@ static long __validate_layout(struct ceph_mds_client *mdsc,
+ static long ceph_ioctl_set_layout(struct file *file, void __user *arg)
+ {
+  struct inode *inode = file_inode(file);
+- struct inode *parent_inode;
+  struct ceph_mds_client *mdsc = ceph_sb_to_client(inode->i_sb)->mdsc;
+  struct ceph_mds_request *req;
+  struct ceph_ioctl_layout l;
+@@ -121,9 +120,7 @@ static long ceph_ioctl_set_layout(struct file *file, void __user *arg)
+   cpu_to_le32(l.object_size);
+  req->r_args.setlayout.layout.fl_pg_pool = cpu_to_le32(l.data_pool);
+ 
+- parent_inode = ceph_get_dentry_parent_inode(file->f_dentry);
+- err = ceph_mdsc_do_request(mdsc, parent_inode, req);
+- iput(parent_inode);
++ err = ceph_mdsc_do_request(mdsc, NULL, req);
+  ceph_mdsc_put_request(req);
+  return err;
+ }
+diff --git a/fs/ceph/xattr.c b/fs/ceph/xattr.c
+index 091b359..c3de244 100644
+--- a/fs/ceph/xattr.c
++++ b/fs/ceph/xattr.c
+@@ -821,7 +821,6 @@ static int ceph_sync_setxattr(struct dentry *dentry, const char *name,
+  struct ceph_fs_client *fsc = ceph_sb_to_client(dentry->d_sb);
+  struct inode *inode = dentry->d_inode;
+  struct ceph_inode_info *ci = ceph_inode(inode);
+- struct inode *parent_inode;
+  struct ceph_mds_request *req;
+  struct ceph_mds_client *mdsc = fsc->mdsc;
+  int err;
+@@ -872,9 +871,7 @@ static int ceph_sync_setxattr(struct dentry *dentry, const char *name,
+  req->r_data_len = size;
+ 
+  dout("xattr.ver (before): %lld\n", ci->i_xattrs.version);
+- parent_inode = ceph_get_dentry_parent_inode(dentry);
+- err = ceph_mdsc_do_request(mdsc, parent_inode, req);
+- iput(parent_inode);
++ err = ceph_mdsc_do_request(mdsc, NULL, req);
+  ceph_mdsc_put_request(req);
+  dout("xattr.ver (after): %lld\n", ci->i_xattrs.version);
+ 
+@@ -989,7 +986,6 @@ static int ceph_send_removexattr(struct dentry *dentry, const char *name)
+  struct ceph_fs_client *fsc = ceph_sb_to_client(dentry->d_sb);
+  struct ceph_mds_client *mdsc = fsc->mdsc;
+  struct inode *inode = dentry->d_inode;
+- struct inode *parent_inode;
+  struct ceph_mds_request *req;
+  int err;
+ 
+@@ -1003,9 +999,7 @@ static int ceph_send_removexattr(struct dentry *dentry, const char *name)
+  req->r_num_caps = 1;
+  req->r_path2 = kstrdup(name, GFP_NOFS);
+ 
+- parent_inode = ceph_get_dentry_parent_inode(dentry);
+- err = ceph_mdsc_do_request(mdsc, parent_inode, req);
+- iput(parent_inode);
++ err = ceph_mdsc_do_request(mdsc, NULL, req);
+  ceph_mdsc_put_request(req);
+  return err;
+ }
+-- 
+1.7.1

@@ -1,0 +1,139 @@
+From d3a4e89550af76f1494bbf5ad60f16616db65582 Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:12:28 -0400
+Subject: [virt] kvm/ppc: book3s/hv - Add H_SET_MODE hcall handling
+
+Message-id: <1410765214-16377-13-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94705
+O-Subject: [PATCH 12/78] KVM: PPC: Book3S HV: Add H_SET_MODE hcall handling
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1123145
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit 9642382e826066c2d30d1b23d1b45410cdd8e07d
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Mon Jun 2 11:03:01 2014 +1000
+
+    KVM: PPC: Book3S HV: Add H_SET_MODE hcall handling
+
+    This adds support for the H_SET_MODE hcall.  This hcall is a
+    multiplexer that has several functions, some of which are called
+    rarely, and some which are potentially called very frequently.
+    Here we add support for the functions that set the debug registers
+    CIABR (Completed Instruction Address Breakpoint Register) and
+    DAWR/DAWRX (Data Address Watchpoint Register and eXtension),
+    since they could be updated by the guest as often as every context
+    switch.
+
+    This also adds a kvmppc_power8_compatible() function to test to see
+    if a guest is compatible with POWER8 or not.  The CIABR and DAWR/X
+    only exist on POWER8.
+
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/hvcall.h b/arch/powerpc/include/asm/hvcall.h
+index 5dbbb29..85bc8c0 100644
+--- a/arch/powerpc/include/asm/hvcall.h
++++ b/arch/powerpc/include/asm/hvcall.h
+@@ -279,6 +279,12 @@
+ #define H_GET_24X7_DATA  0xF07C
+ #define H_GET_PERF_COUNTER_INFO 0xF080
+ 
++/* Values for 2nd argument to H_SET_MODE */
++#define H_SET_MODE_RESOURCE_SET_CIABR  1
++#define H_SET_MODE_RESOURCE_SET_DAWR  2
++#define H_SET_MODE_RESOURCE_ADDR_TRANS_MODE 3
++#define H_SET_MODE_RESOURCE_LE   4
++
+ #ifndef __ASSEMBLY__
+ 
+ /**
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 60cb19c..6bbe0d4 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -553,6 +553,48 @@ static void kvmppc_create_dtl_entry(struct kvm_vcpu *vcpu,
+  vcpu->arch.dtl.dirty = true;
+ }
+ 
++static bool kvmppc_power8_compatible(struct kvm_vcpu *vcpu)
++{
++ if (vcpu->arch.vcore->arch_compat >= PVR_ARCH_207)
++  return true;
++ if ((!vcpu->arch.vcore->arch_compat) &&
++     cpu_has_feature(CPU_FTR_ARCH_207S))
++  return true;
++ return false;
++}
++
++static int kvmppc_h_set_mode(struct kvm_vcpu *vcpu, unsigned long mflags,
++        unsigned long resource, unsigned long value1,
++        unsigned long value2)
++{
++ switch (resource) {
++ case H_SET_MODE_RESOURCE_SET_CIABR:
++  if (!kvmppc_power8_compatible(vcpu))
++   return H_P2;
++  if (value2)
++   return H_P4;
++  if (mflags)
++   return H_UNSUPPORTED_FLAG_START;
++  /* Guests can't breakpoint the hypervisor */
++  if ((value1 & CIABR_PRIV) == CIABR_PRIV_HYPER)
++   return H_P3;
++  vcpu->arch.ciabr  = value1;
++  return H_SUCCESS;
++ case H_SET_MODE_RESOURCE_SET_DAWR:
++  if (!kvmppc_power8_compatible(vcpu))
++   return H_P2;
++  if (mflags)
++   return H_UNSUPPORTED_FLAG_START;
++  if (value2 & DABRX_HYP)
++   return H_P4;
++  vcpu->arch.dawr  = value1;
++  vcpu->arch.dawrx = value2;
++  return H_SUCCESS;
++ default:
++  return H_TOO_HARD;
++ }
++}
++
+ int kvmppc_pseries_do_hcall(struct kvm_vcpu *vcpu)
+ {
+  unsigned long req = kvmppc_get_gpr(vcpu, 3);
+@@ -622,7 +664,14 @@ int kvmppc_pseries_do_hcall(struct kvm_vcpu *vcpu)
+ 
+   /* Send the error out to userspace via KVM_RUN */
+   return rc;
+-
++ case H_SET_MODE:
++  ret = kvmppc_h_set_mode(vcpu, kvmppc_get_gpr(vcpu, 4),
++     kvmppc_get_gpr(vcpu, 5),
++     kvmppc_get_gpr(vcpu, 6),
++     kvmppc_get_gpr(vcpu, 7));
++  if (ret == H_TOO_HARD)
++   return RESUME_HOST;
++  break;
+  case H_XIRR:
+  case H_CPPR:
+  case H_EOI:
+@@ -648,6 +697,7 @@ static int kvmppc_hcall_impl_hv(unsigned long cmd)
+  case H_PROD:
+  case H_CONFER:
+  case H_REGISTER_VPA:
++ case H_SET_MODE:
+ #ifdef CONFIG_KVM_XICS
+  case H_XIRR:
+  case H_CPPR:
+-- 
+1.7.1

@@ -1,0 +1,89 @@
+From 7c8eeaffe3389b312156624950a0bd99f87b627c Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Wed, 24 Sep 2014 18:49:56 -0400
+Subject: [net] fix UDP tunnel GSO of frag_list GRO packets
+
+Message-id: <27e1310518b37177af85b991c321189232883664.1411584585.git.jbenc@redhat.com>
+Patchwork-id: 96710
+O-Subject: [RHEL7.1 net PATCH] net: fix UDP tunnel GSO of frag_list GRO packets
+Bugzilla: 1119392
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119392
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8003701
+Tested: by the customer
+
+commit 5882a07c72093dc3a18e2d2b129fb200686bb6ee
+Author: Wei-Chun Chao <weichunc@plumgrid.com>
+Date:   Sun Jun 8 23:48:54 2014 -0700
+
+    net: fix UDP tunnel GSO of frag_list GRO packets
+
+    This patch fixes a kernel BUG_ON in skb_segment. It is hit when
+    testing two VMs on openvswitch with one VM acting as VXLAN gateway.
+
+    During VXLAN packet GSO, skb_segment is called with skb->data
+    pointing to inner TCP payload. skb_segment calls skb_network_protocol
+    to retrieve the inner protocol. skb_network_protocol actually expects
+    skb->data to point to MAC and it calls pskb_may_pull with ETH_HLEN.
+    This ends up pulling in ETH_HLEN data from header tail. As a result,
+    pskb_trim logic is skipped and BUG_ON is hit later.
+
+    Move skb_push in front of skb_network_protocol so that skb->data
+    lines up properly.
+
+    kernel BUG at net/core/skbuff.c:2999!
+    Call Trace:
+    [<ffffffff816ac412>] tcp_gso_segment+0x122/0x410
+    [<ffffffff816bc74c>] inet_gso_segment+0x13c/0x390
+    [<ffffffff8164b39b>] skb_mac_gso_segment+0x9b/0x170
+    [<ffffffff816b3658>] skb_udp_tunnel_segment+0xd8/0x390
+    [<ffffffff816b3c00>] udp4_ufo_fragment+0x120/0x140
+    [<ffffffff816bc74c>] inet_gso_segment+0x13c/0x390
+    [<ffffffff8109d742>] ? default_wake_function+0x12/0x20
+    [<ffffffff8164b39b>] skb_mac_gso_segment+0x9b/0x170
+    [<ffffffff8164b4d0>] __skb_gso_segment+0x60/0xc0
+    [<ffffffff8164b6b3>] dev_hard_start_xmit+0x183/0x550
+    [<ffffffff8166c91e>] sch_direct_xmit+0xfe/0x1d0
+    [<ffffffff8164bc94>] __dev_queue_xmit+0x214/0x4f0
+    [<ffffffff8164bf90>] dev_queue_xmit+0x10/0x20
+    [<ffffffff81687edb>] ip_finish_output+0x66b/0x890
+    [<ffffffff81688a58>] ip_output+0x58/0x90
+    [<ffffffff816c628f>] ? fib_table_lookup+0x29f/0x350
+    [<ffffffff816881c9>] ip_local_out_sk+0x39/0x50
+    [<ffffffff816cbfad>] iptunnel_xmit+0x10d/0x130
+    [<ffffffffa0212200>] vxlan_xmit_skb+0x1d0/0x330 [vxlan]
+    [<ffffffffa02a3919>] vxlan_tnl_send+0x129/0x1a0 [openvswitch]
+    [<ffffffffa02a2cd6>] ovs_vport_send+0x26/0xa0 [openvswitch]
+    [<ffffffffa029931e>] do_output+0x2e/0x50 [openvswitch]
+
+    Signed-off-by: Wei-Chun Chao <weichunc@plumgrid.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index c4d22dd..c222690 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -2875,6 +2875,7 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
+  int i = 0;
+  int pos;
+ 
++ __skb_push(head_skb, doffset);
+  proto = skb_network_protocol(head_skb);
+  if (unlikely(!proto))
+   return ERR_PTR(-EINVAL);
+@@ -2882,7 +2883,6 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
+  csum = !head_skb->encap_hdr_csum &&
+      !!can_checksum_protocol(features, proto);
+ 
+- __skb_push(head_skb, doffset);
+  headroom = skb_headroom(head_skb);
+  pos = skb_headlen(head_skb);
+ 
+-- 
+1.7.1

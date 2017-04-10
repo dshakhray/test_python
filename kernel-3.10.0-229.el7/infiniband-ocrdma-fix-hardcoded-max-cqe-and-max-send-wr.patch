@@ -1,0 +1,114 @@
+From 2bacc2b0a4fcea7fedc69aebaa75f45599f2574f Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 14 Jan 2015 05:49:08 -0500
+Subject: [infiniband] ocrdma: fix hardcoded max cqe and max send wr
+
+Message-id: <907bbfff9a4d2dc121d9aa406c9f7b1418cba59d.1421213950.git.dledford@redhat.com>
+Patchwork-id: 102841
+O-Subject: [Patch RHEL7.1] IB/ocrdma: fix hardcoded max cqe and max send wr
+Bugzilla: 1158148
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Bugzilla Status
+--
+  Bug 1158148 - Fix for hard coded values of send_wr and cqe in ISER Layer
+  https://bugzilla.redhat.com/show_bug.cgi?id=1158148
+
+Upstream Status
+--
+  This is a rhel7 specific patch.  The issue was fixed upstream by similar
+  means, however, other aspects of the core iSER code had changed enough
+  between our rhel7 version and the version that the upstream fix was
+  applied to, that we needed a specific fix for rhel that is not really
+  a backport of the upstream fix, but a minimalist fix instead.  The actual
+  upstream commit can be viewed as f4641ef701d41 (IB/iser: Re-adjust CQ and
+  QP send ring sizes to HW limits).
+
+Testing Status
+--
+  This code is up and running in the Westford cluster.  I configured an
+  iSER target server using an upstream kernel due to issues with the rhel7
+  iSER target itself, and then was able to properly log in and access the
+  iSER devices from a previously afflicted machine.
+
+Brew Status
+--
+  Scratch build:
+  https://brewweb.devel.redhat.com/taskinfo?taskID=8511465
+
+Signed-off-by: Minh Tran <minh.tran@emulex.com>
+Signed-off-by: Jayamohan Kallickal <jayamohan.kallickal@emulex.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index 3bfec4b..fbf2a1e 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -73,7 +73,7 @@ static int iser_create_device_ib_res(struct iser_device *device)
+ {
+  struct iser_cq_desc *cq_desc;
+  struct ib_device_attr *dev_attr = &device->dev_attr;
+- int ret, i;
++ int ret, i, max_cqe;
+ 
+  ret = ib_query_device(device->ib_device, dev_attr);
+  if (ret) {
+@@ -120,20 +120,22 @@ static int iser_create_device_ib_res(struct iser_device *device)
+   cq_desc[i].device   = device;
+   cq_desc[i].cq_index = i;
+ 
++  max_cqe = min(ISER_MAX_RX_CQ_LEN, dev_attr->max_cqe);
+   device->rx_cq[i] = ib_create_cq(device->ib_device,
+        iser_cq_callback,
+        iser_cq_event_callback,
+        (void *)&cq_desc[i],
+-       ISER_MAX_RX_CQ_LEN, i);
++       max_cqe, i);
+   if (IS_ERR(device->rx_cq[i])) {
+    device->rx_cq[i] = NULL;
+    goto cq_err;
+   }
+ 
++  max_cqe = min(ISER_MAX_TX_CQ_LEN, dev_attr->max_cqe);
+   device->tx_cq[i] = ib_create_cq(device->ib_device,
+        NULL, iser_cq_event_callback,
+        (void *)&cq_desc[i],
+-       ISER_MAX_TX_CQ_LEN, i);
++       max_cqe, i);
+ 
+   if (IS_ERR(device->tx_cq[i])) {
+    device->tx_cq[i] = NULL;
+@@ -443,6 +445,7 @@ void iser_free_fastreg_pool(struct iser_conn *ib_conn)
+ static int iser_create_ib_conn_res(struct iser_conn *ib_conn)
+ {
+  struct iser_device *device;
++ struct ib_device_attr *dev_attr;
+  struct ib_qp_init_attr init_attr;
+  int   ret = -ENOMEM;
+  int index, min_index = 0;
+@@ -450,6 +453,7 @@ static int iser_create_ib_conn_res(struct iser_conn *ib_conn)
+  BUG_ON(ib_conn->device == NULL);
+ 
+  device = ib_conn->device;
++ dev_attr = &device->dev_attr;
+ 
+  memset(&init_attr, 0, sizeof init_attr);
+ 
+@@ -473,10 +477,12 @@ static int iser_create_ib_conn_res(struct iser_conn *ib_conn)
+  init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+  init_attr.qp_type = IB_QPT_RC;
+  if (ib_conn->pi_support) {
+-  init_attr.cap.max_send_wr = ISER_QP_SIG_MAX_REQ_DTOS;
++  init_attr.cap.max_send_wr = min(ISER_QP_SIG_MAX_REQ_DTOS,
++       dev_attr->max_qp_wr);
+   init_attr.create_flags |= IB_QP_CREATE_SIGNATURE_EN;
+  } else {
+-  init_attr.cap.max_send_wr  = ISER_QP_MAX_REQ_DTOS;
++  init_attr.cap.max_send_wr  = min(ISER_QP_MAX_REQ_DTOS,
++       dev_attr->max_qp_wr);
+  }
+ 
+  ret = rdma_create_qp(ib_conn->cma_id, device->pd, &init_attr);
+-- 
+1.7.1

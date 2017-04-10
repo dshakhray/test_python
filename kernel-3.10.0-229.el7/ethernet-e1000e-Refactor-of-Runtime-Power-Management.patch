@@ -1,0 +1,225 @@
+From 2986a8c42368d98d6f606ebf7c73eed45d173158 Mon Sep 17 00:00:00 2001
+From: John Greene <jogreene@redhat.com>
+Date: Thu, 14 Aug 2014 14:42:02 -0400
+Subject: [ethernet] e1000e: Refactor of Runtime Power Management
+
+Message-id: <1408027348-9610-9-git-send-email-jogreene@redhat.com>
+Patchwork-id: 87704
+O-Subject: [RHEL7.1 PATCH 08/34] e1000e Refactor of Runtime Power Management
+Bugzilla: 1091119
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Fix issues with:
+RuntimePM causing the device to repeatedly flip between suspend and resume
+with the interface administratively downed.
+Having RuntimePM enabled interfering with the functionality of Energy
+Efficient Ethernet.
+
+Added checks to disallow functions that should not be executed if the
+device is currently runtime suspended
+
+Make runtime_idle callback to use same deterministic behavior as the igb
+driver.
+
+Signed-off-by: Dave Ertman <davidx.m.ertman@intel.com>
+Acked-by: Bruce Allan <bruce.w.allan@intel.com>
+Tested-by: Jeff Pieper <jeffrey.e.pieper@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 63eb48f151b5f1d8dba35d6176d0d7c9643b33af)
+
+BZ: 1091119
+Testing: Acceptable, see BZ
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7834849
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/e1000e/e1000.h b/drivers/net/ethernet/intel/e1000e/e1000.h
+index 2a749a1..69c6796 100644
+--- a/drivers/net/ethernet/intel/e1000e/e1000.h
++++ b/drivers/net/ethernet/intel/e1000e/e1000.h
+@@ -326,7 +326,6 @@ struct e1000_adapter {
+  struct work_struct update_phy_task;
+  struct work_struct print_hang_task;
+ 
+- bool idle_check;
+  int phy_hang_count;
+ 
+  u16 tx_ring_count;
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index b6526a8..8d7c23c 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -3324,6 +3324,9 @@ static void e1000e_set_rx_mode(struct net_device *netdev)
+  struct e1000_hw *hw = &adapter->hw;
+  u32 rctl;
+ 
++ if (pm_runtime_suspended(netdev->dev.parent))
++  return;
++
+  /* Check for Promiscuous and All Multicast modes */
+  rctl = er32(RCTL);
+ 
+@@ -4337,7 +4340,6 @@ static int e1000_open(struct net_device *netdev)
+  adapter->tx_hang_recheck = false;
+  netif_start_queue(netdev);
+ 
+- adapter->idle_check = true;
+  hw->mac.get_link_status = true;
+  pm_runtime_put(&pdev->dev);
+ 
+@@ -4389,6 +4391,9 @@ static int e1000_close(struct net_device *netdev)
+  if (!test_bit(__E1000_DOWN, &adapter->state)) {
+   e1000e_down(adapter, true);
+   e1000_free_irq(adapter);
++
++  /* Link status message must follow this format */
++  pr_info("%s NIC Link is Down\n", adapter->netdev->name);
+  }
+ 
+  napi_disable(&adapter->napi);
+@@ -5695,6 +5700,9 @@ static int e1000_change_mtu(struct net_device *netdev, int new_mtu)
+  adapter->max_frame_size = max_frame;
+  e_info("changing MTU from %d to %d\n", netdev->mtu, new_mtu);
+  netdev->mtu = new_mtu;
++
++ pm_runtime_get_sync(netdev->dev.parent);
++
+  if (netif_running(netdev))
+   e1000e_down(adapter, true);
+ 
+@@ -5722,6 +5730,8 @@ static int e1000_change_mtu(struct net_device *netdev, int new_mtu)
+  else
+   e1000e_reset(adapter);
+ 
++ pm_runtime_put_sync(netdev->dev.parent);
++
+  clear_bit(__E1000_RESETTING, &adapter->state);
+ 
+  return 0;
+@@ -5990,6 +6000,9 @@ static int __e1000_shutdown(struct pci_dev *pdev, bool runtime)
+    ew32(CTRL_EXT, ctrl_ext);
+   }
+ 
++  if (!runtime)
++   e1000e_power_up_phy(adapter);
++
+   if (adapter->flags & FLAG_IS_ICH)
+    e1000_suspend_workarounds_ich8lan(&adapter->hw);
+ 
+@@ -6119,11 +6132,6 @@ static void e1000e_disable_aspm(struct pci_dev *pdev, u16 state)
+ }
+ 
+ #ifdef CONFIG_PM
+-static bool e1000e_pm_ready(struct e1000_adapter *adapter)
+-{
+- return !!adapter->tx_ring->buffer_info;
+-}
+-
+ static int __e1000_resume(struct pci_dev *pdev)
+ {
+  struct net_device *netdev = pci_get_drvdata(pdev);
+@@ -6178,11 +6186,6 @@ static int __e1000_resume(struct pci_dev *pdev)
+ 
+  e1000_init_manageability_pt(adapter);
+ 
+- if (netif_running(netdev))
+-  e1000e_up(adapter);
+-
+- netif_device_attach(netdev);
+-
+  /* If the controller has AMT, do not set DRV_LOAD until the interface
+   * is up.  For all other cases, let the f/w know that the h/w is now
+   * under the control of the driver.
+@@ -6237,47 +6240,59 @@ static int e1000e_pm_resume(struct device *dev)
+ #endif /* CONFIG_PM_SLEEP */
+ 
+ #ifdef CONFIG_PM_RUNTIME
+-static int e1000_runtime_suspend(struct device *dev)
++static int e1000e_pm_runtime_idle(struct device *dev)
+ {
+  struct pci_dev *pdev = to_pci_dev(dev);
+  struct net_device *netdev = pci_get_drvdata(pdev);
+  struct e1000_adapter *adapter = netdev_priv(netdev);
+ 
+- if (!e1000e_pm_ready(adapter))
+-  return 0;
++ if (!e1000e_has_link(adapter))
++  pm_schedule_suspend(dev, 5 * MSEC_PER_SEC);
+ 
+- return __e1000_shutdown(pdev, true);
++ return -EBUSY;
+ }
+ 
+-static int e1000_idle(struct device *dev)
++static int e1000e_pm_runtime_resume(struct device *dev)
+ {
+  struct pci_dev *pdev = to_pci_dev(dev);
+  struct net_device *netdev = pci_get_drvdata(pdev);
+  struct e1000_adapter *adapter = netdev_priv(netdev);
++ int rc;
+ 
+- if (!e1000e_pm_ready(adapter))
+-  return 0;
++ rc = __e1000_resume(pdev);
++ if (rc)
++  return rc;
+ 
+- if (adapter->idle_check) {
+-  adapter->idle_check = false;
+-  if (!e1000e_has_link(adapter))
+-   pm_schedule_suspend(dev, MSEC_PER_SEC);
+- }
++ if (netdev->flags & IFF_UP)
++  rc = e1000e_up(adapter);
+ 
+- return -EBUSY;
++ return rc;
+ }
+ 
+-static int e1000_runtime_resume(struct device *dev)
++static int e1000e_pm_runtime_suspend(struct device *dev)
+ {
+  struct pci_dev *pdev = to_pci_dev(dev);
+  struct net_device *netdev = pci_get_drvdata(pdev);
+  struct e1000_adapter *adapter = netdev_priv(netdev);
+ 
+- if (!e1000e_pm_ready(adapter))
+-  return 0;
++ if (netdev->flags & IFF_UP) {
++  int count = E1000_CHECK_RESET_COUNT;
++
++  while (test_bit(__E1000_RESETTING, &adapter->state) && count--)
++   usleep_range(10000, 20000);
+ 
+- adapter->idle_check = !dev->power.runtime_auto;
+- return __e1000_resume(pdev);
++  WARN_ON(test_bit(__E1000_RESETTING, &adapter->state));
++
++  /* Down the device without resetting the hardware */
++  e1000e_down(adapter, false);
++ }
++
++ if (__e1000_shutdown(pdev, true)) {
++  e1000e_pm_runtime_resume(dev);
++  return -EBUSY;
++ }
++
++ return 0;
+ }
+ #endif /* CONFIG_PM_RUNTIME */
+ #endif /* CONFIG_PM */
+@@ -7068,8 +7083,8 @@ static const struct dev_pm_ops e1000_pm_ops = {
+  .thaw  = e1000e_pm_thaw,
+  .poweroff = e1000e_pm_suspend,
+  .restore = e1000e_pm_resume,
+- SET_RUNTIME_PM_OPS(e1000_runtime_suspend, e1000_runtime_resume,
+-      e1000_idle)
++ SET_RUNTIME_PM_OPS(e1000e_pm_runtime_suspend, e1000e_pm_runtime_resume,
++      e1000e_pm_runtime_idle)
+ };
+ 
+ /* PCI Device API Driver */
+-- 
+1.7.1

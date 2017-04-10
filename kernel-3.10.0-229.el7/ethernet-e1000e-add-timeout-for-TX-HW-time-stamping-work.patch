@@ -1,0 +1,91 @@
+From 4668b8f20bc1882e0ca763fa53bcc8f177df8d40 Mon Sep 17 00:00:00 2001
+From: John Greene <jogreene@redhat.com>
+Date: Thu, 14 Aug 2014 14:42:09 -0400
+Subject: [ethernet] e1000e: add timeout for TX HW time stamping work
+
+Message-id: <1408027348-9610-16-git-send-email-jogreene@redhat.com>
+Patchwork-id: 87711
+O-Subject: [RHEL7.1 PATCH 15/34] e1000e: add timeout for TX HW time stamping work
+Bugzilla: 1091119
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Hardware may fail to report time stamp e.g.:
+ - when hardware time stamping is not enabled
+ - when time stamp is requested shortly after ifup
+
+Timeout time stamp reading work to prevent it from
+scheduling itself indefinitely. Report timeout events
+via system log and device stats.
+
+Signed-off-by: Jakub Kicinski <kubakici@wp.pl>
+Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 59c871c5f0540c974db85eaa77f518de26940c1f)
+
+BZ: 1091119
+Testing: Acceptable, see BZ
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7834849
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/e1000e/e1000.h b/drivers/net/ethernet/intel/e1000e/e1000.h
+index 69c6796..7e599c9 100644
+--- a/drivers/net/ethernet/intel/e1000e/e1000.h
++++ b/drivers/net/ethernet/intel/e1000e/e1000.h
+@@ -262,6 +262,7 @@ struct e1000_adapter {
+  u32 tx_head_addr;
+  u32 tx_fifo_size;
+  u32 tx_dma_failed;
++ u32 tx_hwtstamp_timeouts;
+ 
+  /* Rx */
+  bool (*clean_rx) (struct e1000_ring *ring, int *work_done,
+@@ -334,6 +335,7 @@ struct e1000_adapter {
+  struct hwtstamp_config hwtstamp_config;
+  struct delayed_work systim_overflow_work;
+  struct sk_buff *tx_hwtstamp_skb;
++ unsigned long tx_hwtstamp_start;
+  struct work_struct tx_hwtstamp_work;
+  spinlock_t systim_lock; /* protects SYSTIML/H regsters */
+  struct cyclecounter cc;
+diff --git a/drivers/net/ethernet/intel/e1000e/ethtool.c b/drivers/net/ethernet/intel/e1000e/ethtool.c
+index 3c2898d..cad250b 100644
+--- a/drivers/net/ethernet/intel/e1000e/ethtool.c
++++ b/drivers/net/ethernet/intel/e1000e/ethtool.c
+@@ -104,6 +104,7 @@ static const struct e1000_stats e1000_gstrings_stats[] = {
+  E1000_STAT("rx_hwtstamp_cleared", rx_hwtstamp_cleared),
+  E1000_STAT("uncorr_ecc_errors", uncorr_errors),
+  E1000_STAT("corr_ecc_errors", corr_errors),
++ E1000_STAT("tx_hwtstamp_timeouts", tx_hwtstamp_timeouts),
+ };
+ 
+ #define E1000_GLOBAL_STATS_LEN ARRAY_SIZE(e1000_gstrings_stats)
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index 10e7847..af61ca4 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -1163,6 +1163,12 @@ static void e1000e_tx_hwtstamp_work(struct work_struct *work)
+   skb_tstamp_tx(adapter->tx_hwtstamp_skb, &shhwtstamps);
+   dev_kfree_skb_any(adapter->tx_hwtstamp_skb);
+   adapter->tx_hwtstamp_skb = NULL;
++ } else if (time_after(jiffies, adapter->tx_hwtstamp_start
++         + adapter->tx_timeout_factor * HZ)) {
++  dev_kfree_skb_any(adapter->tx_hwtstamp_skb);
++  adapter->tx_hwtstamp_skb = NULL;
++  adapter->tx_hwtstamp_timeouts++;
++  e_warn("clearing Tx timestamp hang");
+  } else {
+   /* reschedule to check later */
+   schedule_work(&adapter->tx_hwtstamp_work);
+@@ -5584,6 +5590,7 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
+    skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+    tx_flags |= E1000_TX_FLAGS_HWTSTAMP;
+    adapter->tx_hwtstamp_skb = skb_get(skb);
++   adapter->tx_hwtstamp_start = jiffies;
+    schedule_work(&adapter->tx_hwtstamp_work);
+   } else {
+    skb_tx_timestamp(skb);
+-- 
+1.7.1

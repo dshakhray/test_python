@@ -1,0 +1,158 @@
+From 5845f295c10bdc87d6dff15edde70b77205b7b79 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:07:03 -0400
+Subject: [tools] perf: Share map_groups among threads of the same group
+
+Message-id: <1410181752-25631-179-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91968
+O-Subject: [PATCH RHEL7.1 BZ1134356 178/307] perf tools: Share map_groups among threads of the same group
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit cddcef607782966f1601808c17fe9c4c5f79f9f4
+Author: Jiri Olsa <jolsa@kernel.org>
+Date: Wed Apr 9 20:54:29 2014 +0200
+
+description
+===========
+Sharing map groups within all process threads. This way
+there's only one copy of mmap info and it's reachable
+from any thread within the process.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index 27c2a5e..7409ac8 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -316,6 +316,17 @@ static struct thread *__machine__findnew_thread(struct machine *machine,
+   rb_link_node(&th->rb_node, parent, p);
+   rb_insert_color(&th->rb_node, &machine->threads);
+   machine->last_match = th;
++
++  /*
++   * We have to initialize map_groups separately
++   * after rb tree is updated.
++   *
++   * The reason is that we call machine__findnew_thread
++   * within thread__init_map_groups to find the thread
++   * leader and that would screwed the rb tree.
++   */
++  if (thread__init_map_groups(th, machine))
++   return NULL;
+  }
+ 
+  return th;
+diff --git a/tools/perf/util/thread.c b/tools/perf/util/thread.c
+index b501848..2fde0d5 100644
+--- a/tools/perf/util/thread.c
++++ b/tools/perf/util/thread.c
+@@ -8,6 +8,22 @@
+ #include "debug.h"
+ #include "comm.h"
+ 
++int thread__init_map_groups(struct thread *thread, struct machine *machine)
++{
++ struct thread *leader;
++ pid_t pid = thread->pid_;
++
++ if (pid == thread->tid) {
++  thread->mg = map_groups__new();
++ } else {
++  leader = machine__findnew_thread(machine, pid, pid);
++  if (leader)
++   thread->mg = map_groups__get(leader->mg);
++ }
++
++ return thread->mg ? 0 : -1;
++}
++
+ struct thread *thread__new(pid_t pid, pid_t tid)
+ {
+  char *comm_str;
+@@ -15,10 +31,6 @@ struct thread *thread__new(pid_t pid, pid_t tid)
+  struct thread *thread = zalloc(sizeof(*thread));
+ 
+  if (thread != NULL) {
+-  thread->mg = map_groups__new();
+-  if (thread->mg == NULL)
+-   goto out_free;
+-
+   thread->pid_ = pid;
+   thread->tid = tid;
+   thread->ppid = -1;
+@@ -40,8 +52,6 @@ struct thread *thread__new(pid_t pid, pid_t tid)
+  return thread;
+ 
+ err_thread:
+- map_groups__delete(thread->mg);
+-out_free:
+  free(thread);
+  return NULL;
+ }
+@@ -126,9 +136,26 @@ void thread__insert_map(struct thread *thread, struct map *map)
+  map_groups__insert(thread->mg, map);
+ }
+ 
++static int thread__clone_map_groups(struct thread *thread,
++        struct thread *parent)
++{
++ int i;
++
++ /* This is new thread, we share map groups for process. */
++ if (thread->pid_ == parent->pid_)
++  return 0;
++
++ /* But this one is new process, copy maps. */
++ for (i = 0; i < MAP__NR_TYPES; ++i)
++  if (map_groups__clone(thread->mg, parent->mg, i) < 0)
++   return -ENOMEM;
++
++ return 0;
++}
++
+ int thread__fork(struct thread *thread, struct thread *parent, u64 timestamp)
+ {
+- int i, err;
++ int err;
+ 
+  if (parent->comm_set) {
+   const char *comm = thread__comm_str(parent);
+@@ -140,13 +167,8 @@ int thread__fork(struct thread *thread, struct thread *parent, u64 timestamp)
+   thread->comm_set = true;
+  }
+ 
+- for (i = 0; i < MAP__NR_TYPES; ++i)
+-  if (map_groups__clone(thread->mg, parent->mg, i) < 0)
+-   return -ENOMEM;
+-
+  thread->ppid = parent->tid;
+-
+- return 0;
++ return thread__clone_map_groups(thread, parent);
+ }
+ 
+ void thread__find_cpumode_addr_location(struct thread *thread,
+diff --git a/tools/perf/util/thread.h b/tools/perf/util/thread.h
+index bee1eb0..3c0c272 100644
+--- a/tools/perf/util/thread.h
++++ b/tools/perf/util/thread.h
+@@ -30,6 +30,7 @@ struct machine;
+ struct comm;
+ 
+ struct thread *thread__new(pid_t pid, pid_t tid);
++int thread__init_map_groups(struct thread *thread, struct machine *machine);
+ void thread__delete(struct thread *thread);
+ static inline void thread__exited(struct thread *thread)
+ {
+-- 
+1.7.1

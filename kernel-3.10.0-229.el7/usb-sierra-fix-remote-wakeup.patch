@@ -1,0 +1,84 @@
+From e8439511c1be97a67fdaa9e044830ff235d85018 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:08:17 -0400
+Subject: [usb] sierra: fix remote wakeup
+
+Message-id: <1410887463-20674-426-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95574
+O-Subject: [RHEL7 PATCH 425/591] USB: sierra: fix remote wakeup
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 80cc0fcbdaeaf10d04ba27779a2d7ceb73d2717a
+Author: Johan Hovold <jhovold@gmail.com>
+Date:   Mon May 26 19:22:54 2014 +0200
+
+    USB: sierra: fix remote wakeup
+
+    Make sure that needs_remote_wake up is always set when there are open
+    ports.
+
+    Currently close() would unconditionally set needs_remote_wakeup to 0
+    even though there might still be open ports. This could lead to blocked
+    input and possibly dropped data on devices that do not support remote
+    wakeup (and which must therefore not be runtime suspended while open).
+
+    Add an open_ports counter (protected by the susp_lock) and only clear
+    needs_remote_wakeup when the last port is closed.
+
+    Fixes: e6929a9020ac ("USB: support for autosuspend in sierra while
+    online")
+
+    Cc: <stable@vger.kernel.org> # v2.6.32
+    Signed-off-by: Johan Hovold <jhovold@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/serial/sierra.c b/drivers/usb/serial/sierra.c
+index 1a42649..3748034 100644
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -58,6 +58,7 @@ struct sierra_intf_private {
+  spinlock_t susp_lock;
+  unsigned int suspended:1;
+  int in_flight;
++ unsigned int open_ports;
+ };
+ 
+ static int sierra_set_power_state(struct usb_device *udev, __u16 swiState)
+@@ -768,7 +769,6 @@ static void sierra_close(struct usb_serial_port *port)
+ 
+  mutex_lock(&serial->disc_mutex);
+  if (!serial->disconnected) {
+-  serial->interface->needs_remote_wakeup = 0;
+   /* odd error handling due to pm counters */
+   if (!usb_autopm_get_interface(serial->interface))
+    sierra_send_setup(port);
+@@ -779,6 +779,8 @@ static void sierra_close(struct usb_serial_port *port)
+  mutex_unlock(&serial->disc_mutex);
+  spin_lock_irq(&intfdata->susp_lock);
+  portdata->opened = 0;
++ if (--intfdata->open_ports == 0)
++  serial->interface->needs_remote_wakeup = 0;
+  spin_unlock_irq(&intfdata->susp_lock);
+ 
+  for (;;) {
+@@ -834,9 +836,10 @@ static int sierra_open(struct tty_struct *tty, struct usb_serial_port *port)
+ 
+  sierra_send_setup(port);
+ 
+- serial->interface->needs_remote_wakeup = 1;
+  spin_lock_irq(&intfdata->susp_lock);
+  portdata->opened = 1;
++ if (++intfdata->open_ports == 1)
++  serial->interface->needs_remote_wakeup = 1;
+  spin_unlock_irq(&intfdata->susp_lock);
+  usb_autopm_put_interface(serial->interface);
+ 
+-- 
+1.7.1

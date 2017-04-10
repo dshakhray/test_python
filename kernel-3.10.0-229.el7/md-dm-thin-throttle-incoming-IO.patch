@@ -1,0 +1,163 @@
+From ab665a4741c5f014b7a830a34c3c6c5e7e9d80fa Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 23 Oct 2014 20:01:21 -0400
+Subject: [md] dm-thin: throttle incoming IO
+
+Message-id: <1414094494-22068-12-git-send-email-snitzer@redhat.com>
+Patchwork-id: 98346
+O-Subject: [RHEL7.2 PATCH 11/24] dm thin: throttle incoming IO
+Bugzilla: 1156161
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1156161
+
+Upstream linux-dm.git commit 7dcc926e47f4f4ab40ef15e2bf0e0fbb98089cd8
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Mon Oct 6 15:45:59 2014 +0100
+
+    dm thin: throttle incoming IO
+
+    Throttle IO based on the time it's taking the worker to do one loop.
+    There were reports of hung task timeouts occuring and it was observed
+    that the excessively long avgqu-sz (as reported by iostat) was
+    contributing to these hung tasks.
+
+    Throttling definitely helps dm-thinp perform better under heavy IO load
+    (without being detremental by being overzealous).  It reduces avgqu-sz
+    drastically, e.g.: from 60K to ~6K, and even as low as 150 once metadata
+    is cached by bufio, when dirty_ratio=5, dirty_background_ratio=2.  And
+    avgqu-sz stays at or below 30K even with dirty_ratio=20,
+    dirty_background_ratio=10.
+
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index 17f3c92..5dfda44 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -126,6 +126,53 @@ static void build_virtual_key(struct dm_thin_device *td, dm_block_t b,
+ 
+ /*----------------------------------------------------------------*/
+ 
++#define THROTTLE_THRESHOLD (1 * HZ)
++
++struct throttle {
++ struct rw_semaphore lock;
++ unsigned long threshold;
++ bool throttle_applied;
++};
++
++static void throttle_init(struct throttle *t)
++{
++ init_rwsem(&t->lock);
++ t->throttle_applied = false;
++}
++
++static void throttle_work_start(struct throttle *t)
++{
++ t->threshold = jiffies + THROTTLE_THRESHOLD;
++}
++
++static void throttle_work_update(struct throttle *t)
++{
++ if (!t->throttle_applied && jiffies > t->threshold) {
++  down_write(&t->lock);
++  t->throttle_applied = true;
++ }
++}
++
++static void throttle_work_complete(struct throttle *t)
++{
++ if (t->throttle_applied) {
++  t->throttle_applied = false;
++  up_write(&t->lock);
++ }
++}
++
++static void throttle_lock(struct throttle *t)
++{
++ down_read(&t->lock);
++}
++
++static void throttle_unlock(struct throttle *t)
++{
++ up_read(&t->lock);
++}
++
++/*----------------------------------------------------------------*/
++
+ /*
+  * A pool device ties together a metadata device and a data device.  It
+  * also provides the interface for creating and destroying internal
+@@ -175,6 +222,7 @@ struct pool {
+  struct dm_kcopyd_client *copier;
+ 
+  struct workqueue_struct *wq;
++ struct throttle throttle;
+  struct work_struct worker;
+  struct delayed_work waker;
+  struct delayed_work no_space_timeout;
+@@ -1564,6 +1612,7 @@ static void process_thin_deferred_bios(struct thin_c *tc)
+    pool->process_bio(tc, bio);
+ 
+   if ((count++ & 127) == 0) {
++   throttle_work_update(&pool->throttle);
+    dm_pool_issue_prefetches(pool->pmd);
+   }
+  }
+@@ -1651,10 +1700,15 @@ static void do_worker(struct work_struct *ws)
+ {
+  struct pool *pool = container_of(ws, struct pool, worker);
+ 
++ throttle_work_start(&pool->throttle);
+  dm_pool_issue_prefetches(pool->pmd);
++ throttle_work_update(&pool->throttle);
+  process_prepared(pool, &pool->prepared_mappings, &pool->process_prepared_mapping);
++ throttle_work_update(&pool->throttle);
+  process_prepared(pool, &pool->prepared_discards, &pool->process_prepared_discard);
++ throttle_work_update(&pool->throttle);
+  process_deferred_bios(pool);
++ throttle_work_complete(&pool->throttle);
+ }
+ 
+ /*
+@@ -1894,6 +1948,15 @@ static void thin_defer_bio(struct thin_c *tc, struct bio *bio)
+  wake_worker(pool);
+ }
+ 
++static void thin_defer_bio_with_throttle(struct thin_c *tc, struct bio *bio)
++{
++ struct pool *pool = tc->pool;
++
++ throttle_lock(&pool->throttle);
++ thin_defer_bio(tc, bio);
++ throttle_unlock(&pool->throttle);
++}
++
+ static void thin_hook_bio(struct thin_c *tc, struct bio *bio)
+ {
+  struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
+@@ -1931,7 +1994,7 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio)
+  }
+ 
+  if (bio->bi_rw & (REQ_DISCARD | REQ_FLUSH | REQ_FUA)) {
+-  thin_defer_bio(tc, bio);
++  thin_defer_bio_with_throttle(tc, bio);
+   return DM_MAPIO_SUBMITTED;
+  }
+ 
+@@ -2206,6 +2269,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
+   goto bad_wq;
+  }
+ 
++ throttle_init(&pool->throttle);
+  INIT_WORK(&pool->worker, do_worker);
+  INIT_DELAYED_WORK(&pool->waker, do_waker);
+  INIT_DELAYED_WORK(&pool->no_space_timeout, do_no_space_timeout);
+-- 
+1.7.1

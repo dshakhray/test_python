@@ -1,0 +1,309 @@
+From cfd81e8f17f1e2e0f5701b4fa542846e3b1aabbf Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:06:46 -0400
+Subject: [ethernet] qlcnic: Add mac learning support to SR-IOV VF
+
+Message-id: <1408626422-3941-123-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88632
+O-Subject: [PATCH RHEL 7.1 122/138] qlcnic: Add mac learning support to SR-IOV VF.
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Rajesh Borundia <rajesh.borundia@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id d747c3337484afac9953c44ea56a912869778559
+
+o SR-IOV VF can be uplinked to bridge/macvtap device.
+  Enable mac learning to support communication through
+  embedded switch.
+o Learn vlan filters based on QLCNIC_VLAN_FILTERING flag.
+
+Signed-off-by: Rajesh Borundia <rajesh.borundia@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+index 0cf6ed9..71f637f 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+@@ -1019,6 +1019,8 @@ struct qlcnic_ipaddr {
+ #define QLCNIC_DEL_VXLAN_PORT  0x200000
+ #endif
+ 
++#define QLCNIC_VLAN_FILTERING  0x800000
++
+ #define QLCNIC_IS_MSI_FAMILY(adapter) \
+  ((adapter)->flags & (QLCNIC_MSI_ENABLED | QLCNIC_MSIX_ENABLED))
+ #define QLCNIC_IS_TSO_CAPABLE(adapter)  \
+@@ -2339,6 +2341,16 @@ static inline bool qlcnic_83xx_vf_check(struct qlcnic_adapter *adapter)
+  return (device == PCI_DEVICE_ID_QLOGIC_VF_QLE834X) ? true : false;
+ }
+ 
++static inline bool qlcnic_sriov_check(struct qlcnic_adapter *adapter)
++{
++ bool status;
++
++ status = (qlcnic_sriov_pf_check(adapter) ||
++    qlcnic_sriov_vf_check(adapter)) ? true : false;
++
++ return status;
++}
++
+ static inline u32 qlcnic_get_vnic_func_count(struct qlcnic_adapter *adapter)
+ {
+  if (qlcnic_84xx_check(adapter))
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+index 520f15d..3f8e2b3 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+@@ -313,20 +313,16 @@ static void qlcnic_send_filter(struct qlcnic_adapter *adapter,
+  u16 vlan_id = 0;
+  u8 hindex, hval;
+ 
+- if (!qlcnic_sriov_pf_check(adapter)) {
+-  if (ether_addr_equal(phdr->h_source, adapter->mac_addr))
+-   return;
+- } else {
++ if (ether_addr_equal(phdr->h_source, adapter->mac_addr))
++  return;
++
++ if (adapter->flags & QLCNIC_VLAN_FILTERING) {
+   if (protocol == ETH_P_8021Q) {
+    vh = (struct vlan_ethhdr *)skb->data;
+    vlan_id = ntohs(vh->h_vlan_TCI);
+   } else if (vlan_tx_tag_present(skb)) {
+    vlan_id = vlan_tx_tag_get(skb);
+   }
+-
+-  if (ether_addr_equal(phdr->h_source, adapter->mac_addr) &&
+-      !vlan_id)
+-   return;
+  }
+ 
+  memcpy(&src_addr, phdr->h_source, ETH_ALEN);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index ae201c9..40fd447 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -379,7 +379,8 @@ static int qlcnic_fdb_del(struct ndmsg *ndm, struct nlattr *tb[],
+  if (!adapter->fdb_mac_learn)
+   return ndo_dflt_fdb_del(ndm, tb, netdev, addr);
+ 
+- if (adapter->flags & QLCNIC_ESWITCH_ENABLED) {
++ if ((adapter->flags & QLCNIC_ESWITCH_ENABLED) ||
++     qlcnic_sriov_check(adapter)) {
+   if (is_unicast_ether_addr(addr)) {
+    err = dev_uc_del(netdev, addr);
+    if (!err)
+@@ -403,7 +404,8 @@ static int qlcnic_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
+  if (!adapter->fdb_mac_learn)
+   return ndo_dflt_fdb_add(ndm, tb, netdev, addr, flags);
+ 
+- if (!(adapter->flags & QLCNIC_ESWITCH_ENABLED)) {
++ if (!(adapter->flags & QLCNIC_ESWITCH_ENABLED) &&
++     !qlcnic_sriov_check(adapter)) {
+   pr_info("%s: FDB e-switch is not enabled\n", __func__);
+   return -EOPNOTSUPP;
+  }
+@@ -433,7 +435,8 @@ static int qlcnic_fdb_dump(struct sk_buff *skb, struct netlink_callback *ncb,
+  if (!adapter->fdb_mac_learn)
+   return ndo_dflt_fdb_dump(skb, ncb, netdev, idx);
+ 
+- if (adapter->flags & QLCNIC_ESWITCH_ENABLED)
++ if ((adapter->flags & QLCNIC_ESWITCH_ENABLED) ||
++     qlcnic_sriov_check(adapter))
+   idx = ndo_dflt_fdb_dump(skb, ncb, netdev, idx);
+ 
+  return idx;
+@@ -2841,6 +2844,8 @@ static int qlcnic_close(struct net_device *netdev)
+  return 0;
+ }
+ 
++#define QLCNIC_VF_LB_BUCKET_SIZE 1
++
+ void qlcnic_alloc_lb_filters_mem(struct qlcnic_adapter *adapter)
+ {
+  void *head;
+@@ -2856,7 +2861,10 @@ void qlcnic_alloc_lb_filters_mem(struct qlcnic_adapter *adapter)
+  spin_lock_init(&adapter->mac_learn_lock);
+  spin_lock_init(&adapter->rx_mac_learn_lock);
+ 
+- if (qlcnic_82xx_check(adapter)) {
++ if (qlcnic_sriov_vf_check(adapter)) {
++  filter_size = QLCNIC_83XX_SRIOV_VF_MAX_MAC - 1;
++  adapter->fhash.fbucket_size = QLCNIC_VF_LB_BUCKET_SIZE;
++ } else if (qlcnic_82xx_check(adapter)) {
+   filter_size = QLCNIC_LB_MAX_FILTERS;
+   adapter->fhash.fbucket_size = QLCNIC_LB_BUCKET_SIZE;
+  } else {
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h
+index 54159bd..335b50f 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h
+@@ -52,6 +52,7 @@ enum qlcnic_bc_commands {
+  QLCNIC_BC_CMD_CFG_GUEST_VLAN = 0x3,
+ };
+ 
++#define QLCNIC_83XX_SRIOV_VF_MAX_MAC 2
+ #define QLC_BC_CMD 1
+ 
+ struct qlcnic_trans_list {
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+index 67719a9..498fa63 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+@@ -199,6 +199,7 @@ int qlcnic_sriov_init(struct qlcnic_adapter *adapter, int num_vfs)
+     goto qlcnic_destroy_async_wq;
+    }
+    sriov->vf_info[i].vp = vp;
++   vp->vlan_mode = QLC_GUEST_VLAN_MODE;
+    vp->max_tx_bw = MAX_BW;
+    vp->spoofchk = false;
+    random_ether_addr(vp->mac);
+@@ -517,6 +518,8 @@ static int qlcnic_sriov_setup_vf(struct qlcnic_adapter *adapter,
+ {
+  int err;
+ 
++ adapter->flags |= QLCNIC_VLAN_FILTERING;
++ adapter->ahw->total_nic_func = 1;
+  INIT_LIST_HEAD(&adapter->vf_mc_list);
+  if (!qlcnic_use_msi_x && !!qlcnic_use_msi)
+   dev_warn(&adapter->pdev->dev,
+@@ -772,6 +775,7 @@ static int qlcnic_sriov_prepare_bc_hdr(struct qlcnic_bc_trans *trans,
+   cmd->req.arg = (u32 *)trans->req_pay;
+   cmd->rsp.arg = (u32 *)trans->rsp_pay;
+   cmd_op = cmd->req.arg[0] & 0xff;
++  cmd->cmd_op = cmd_op;
+   remainder = (trans->rsp_pay_size) % (bc_pay_sz);
+   num_frags = (trans->rsp_pay_size) / (bc_pay_sz);
+   if (remainder)
+@@ -1410,12 +1414,17 @@ retry:
+      (mbx_err_code == QLCNIC_MBX_PORT_RSP_OK)) {
+   rsp = QLCNIC_RCODE_SUCCESS;
+  } else {
+-  rsp = mbx_err_code;
+-  if (!rsp)
+-   rsp = 1;
+-  dev_err(dev,
+-   "MBX command 0x%x failed with err:0x%x for VF %d\n",
+-   opcode, mbx_err_code, func);
++  if (cmd->type == QLC_83XX_MBX_CMD_NO_WAIT) {
++   rsp = QLCNIC_RCODE_SUCCESS;
++  } else {
++   rsp = mbx_err_code;
++   if (!rsp)
++    rsp = 1;
++
++   dev_err(dev,
++    "MBX command 0x%x failed with err:0x%x for VF %d\n",
++    opcode, mbx_err_code, func);
++  }
+  }
+ 
+ err_out:
+@@ -1544,6 +1553,28 @@ void qlcnic_sriov_vf_set_multi(struct net_device *netdev)
+   }
+  }
+ 
++ /* configure unicast MAC address, if there is not sufficient space
++  * to store all the unicast addresses then enable promiscuous mode
++  */
++ if (netdev_uc_count(netdev) > ahw->max_uc_count) {
++  mode = VPORT_MISS_MODE_ACCEPT_ALL;
++ } else if (!netdev_uc_empty(netdev)) {
++  netdev_for_each_uc_addr(ha, netdev)
++   qlcnic_vf_add_mc_list(netdev, ha->addr);
++ }
++
++ if (adapter->pdev->is_virtfn) {
++  if (mode == VPORT_MISS_MODE_ACCEPT_ALL &&
++      !adapter->fdb_mac_learn) {
++   qlcnic_alloc_lb_filters_mem(adapter);
++   adapter->drv_mac_learn = 1;
++   adapter->rx_mac_learn = true;
++  } else {
++   adapter->drv_mac_learn = 0;
++   adapter->rx_mac_learn = false;
++  }
++ }
++
+  qlcnic_nic_set_promisc(adapter, mode);
+ }
+ 
+@@ -1837,6 +1868,12 @@ static int qlcnic_sriov_vf_idc_unknown_state(struct qlcnic_adapter *adapter)
+  return 0;
+ }
+ 
++static void qlcnic_sriov_vf_periodic_tasks(struct qlcnic_adapter *adapter)
++{
++ if (adapter->fhash.fnum)
++  qlcnic_prune_lb_filters(adapter);
++}
++
+ static void qlcnic_sriov_vf_poll_dev_state(struct work_struct *work)
+ {
+  struct qlcnic_adapter *adapter;
+@@ -1868,6 +1905,8 @@ static void qlcnic_sriov_vf_poll_dev_state(struct work_struct *work)
+  }
+ 
+  idc->prev_state = idc->curr_state;
++ qlcnic_sriov_vf_periodic_tasks(adapter);
++
+  if (!ret && test_bit(QLC_83XX_MODULE_LOADED, &idc->status))
+   qlcnic_schedule_work(adapter, qlcnic_sriov_vf_poll_dev_state,
+          idc->delay);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+index 4b1f94f..5a5e172 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+@@ -83,7 +83,7 @@ static int qlcnic_sriov_pf_cal_res_limit(struct qlcnic_adapter *adapter,
+  info->bit_offsets = 0xffff;
+ 
+  if (qlcnic_83xx_pf_check(adapter))
+-  num_macs = 1;
++  num_macs = QLCNIC_83XX_SRIOV_VF_MAX_MAC;
+ 
+  if (adapter->ahw->pci_func == func) {
+   info->min_tx_bw = 0;
+@@ -331,9 +331,12 @@ static int qlcnic_sriov_pf_cfg_vlan_filtering(struct qlcnic_adapter *adapter,
+ 
+  cmd.req.arg[1] = 0x4;
+  if (enable) {
++  adapter->flags |= QLCNIC_VLAN_FILTERING;
+   cmd.req.arg[1] |= BIT_16;
+   if (qlcnic_84xx_check(adapter))
+    cmd.req.arg[1] |= QLC_SRIOV_ALLOW_VLAN0;
++ } else {
++  adapter->flags &= ~QLCNIC_VLAN_FILTERING;
+  }
+ 
+  err = qlcnic_issue_cmd(adapter, &cmd);
+@@ -1246,7 +1249,6 @@ static int qlcnic_sriov_validate_cfg_macvlan(struct qlcnic_adapter *adapter,
+           struct qlcnic_vf_info *vf,
+           struct qlcnic_cmd_args *cmd)
+ {
+- struct qlcnic_macvlan_mbx *macvlan;
+  struct qlcnic_vport *vp = vf->vp;
+  u8 op, new_op;
+ 
+@@ -1256,14 +1258,6 @@ static int qlcnic_sriov_validate_cfg_macvlan(struct qlcnic_adapter *adapter,
+  cmd->req.arg[1] |= (vf->vp->handle << 16);
+  cmd->req.arg[1] |= BIT_31;
+ 
+- macvlan = (struct qlcnic_macvlan_mbx *)&cmd->req.arg[2];
+- if (!(macvlan->mac_addr0 & BIT_0)) {
+-  dev_err(&adapter->pdev->dev,
+-   "MAC address change is not allowed from VF %d",
+-   vf->pci_func);
+-  return -EINVAL;
+- }
+-
+  if (vp->vlan_mode == QLC_PVID_MODE) {
+   op = cmd->req.arg[1] & 0x7;
+   cmd->req.arg[1] &= ~0x7;
+-- 
+1.7.1

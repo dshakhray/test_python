@@ -1,0 +1,136 @@
+From b0271d958c21513dca5819face042623e0ea7c19 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 18 Dec 2014 19:56:20 -0500
+Subject: [pci] Revert: Remove from bus_list and release resources in pci_release_dev()
+
+Message-id: <1418932580-13340-1-git-send-email-prarit@redhat.com>
+Patchwork-id: 102287
+O-Subject: [RHEL7.1 PATCH BZ 1172946 v2] Revert "[pci] Remove from bus_list and release resources in pci_release_dev()"
+Bugzilla: 1172946
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+This reverts RHEL7 commit c6a393f3528cab557bb35be62bd000ccda88f8da, which
+causes a hotplug failure in virt guests.  I've successfully tested this
+revert (test data in BZ).
+
+This patch was also reverted upstream in the following commit.
+
+commit 04480094de7242d08bb62088e713fd7fe00443b4
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Sat Feb 1 15:38:29 2014 +0100
+
+    Revert "PCI: Remove from bus_list and release resources in pci_release_dev()
+
+    Revert commit ef83b0781a73 "PCI: Remove from bus_list and release
+    resources in pci_release_dev()" that made some nasty race conditions
+    become possible.  For example, if a Thunderbolt link is unplugged
+    and then replugged immediately, the pci_release_dev() resulting from
+    the hot-remove code path may be racing with the hot-add code path
+    which after that commit causes various kinds of breakage to happen
+    (up to and including a hard crash of the whole system).
+
+    Moreover, the problem that commit ef83b0781a73 attempted to address
+    cannot happen any more after commit 8a4c5c329de7 "PCI: Check parent
+    kobject in pci_destroy_dev()", because pci_destroy_dev() will now
+    return immediately if it has already been executed for the given
+    device.
+
+    Note, however, that the invocation of msi_remove_pci_irq_vectors()
+    removed by commit ef83b0781a73 from pci_free_resources() along with
+    the other changes made by it is not added back because of subsequent
+    code changes depending on that modification.
+
+    Fixes: ef83b0781a73 (PCI: Remove from bus_list and release resources in pci_
+    Reported-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+[v2]: mstowe pointed out that we don't need the
+msi_remove_pci_irq_vectors() call anymore.  After looking through the code
+and confirming, I re-ran the test and verified that the interrupts were
+correctly free'd.
+
+Cc: Myron Stowe <mstowe@redhat.com>
+Cc: Andy Gospodarek <agospoda@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Cc: Stefan Assmann <sassmann@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index 9fa0033..8980775 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -1242,18 +1242,6 @@ static void pci_release_capabilities(struct pci_dev *dev)
+  pci_free_cap_save_buffers(dev);
+ }
+ 
+-static void pci_free_resources(struct pci_dev *dev)
+-{
+- int i;
+-
+- pci_cleanup_rom(dev);
+- for (i = 0; i < PCI_NUM_RESOURCES; i++) {
+-  struct resource *res = dev->resource + i;
+-  if (res->parent)
+-   release_resource(res);
+- }
+-}
+-
+ /**
+  * pci_release_dev - free a pci device structure when all users of it are finished.
+  * @dev: device that's been disconnected
+@@ -1263,14 +1251,9 @@ static void pci_free_resources(struct pci_dev *dev)
+  */
+ static void pci_release_dev(struct device *dev)
+ {
+- struct pci_dev *pci_dev = to_pci_dev(dev);
+-
+- down_write(&pci_bus_sem);
+- list_del(&pci_dev->bus_list);
+- up_write(&pci_bus_sem);
+-
+- pci_free_resources(pci_dev);
++ struct pci_dev *pci_dev;
+ 
++ pci_dev = to_pci_dev(dev);
+  pci_release_capabilities(pci_dev);
+  pci_release_of_node(pci_dev);
+  pcibios_release_device(pci_dev);
+diff --git a/drivers/pci/remove.c b/drivers/pci/remove.c
+index 4ff36bf..8bd76c9 100644
+--- a/drivers/pci/remove.c
++++ b/drivers/pci/remove.c
+@@ -3,6 +3,18 @@
+ #include <linux/pci-aspm.h>
+ #include "pci.h"
+ 
++static void pci_free_resources(struct pci_dev *dev)
++{
++ int i;
++
++ pci_cleanup_rom(dev);
++ for (i = 0; i < PCI_NUM_RESOURCES; i++) {
++  struct resource *res = dev->resource + i;
++  if (res->parent)
++   release_resource(res);
++ }
++}
++
+ static void pci_stop_dev(struct pci_dev *dev)
+ {
+  pci_pme_active(dev, false);
+@@ -25,6 +37,11 @@ static void pci_destroy_dev(struct pci_dev *dev)
+ 
+  device_del(&dev->dev);
+ 
++ down_write(&pci_bus_sem);
++ list_del(&dev->bus_list);
++ up_write(&pci_bus_sem);
++
++ pci_free_resources(dev);
+  put_device(&dev->dev);
+ }
+ 
+-- 
+1.7.1

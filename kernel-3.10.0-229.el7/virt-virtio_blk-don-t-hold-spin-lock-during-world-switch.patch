@@ -1,0 +1,88 @@
+From d2dbf3890d187ba3323985b0d8f70cfd6ead482c Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Thu, 28 Aug 2014 19:16:08 -0400
+Subject: [virt] virtio_blk: don't hold spin lock during world switch
+
+Message-id: <1409253371-23161-19-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 89861
+O-Subject: [RHEL7 PATCH 18/21] block: virtio_blk: don't hold spin lock during world switch
+Bugzilla: 1105698
+RH-Acked-by: Fam Zheng <famz@redhat.com>
+
+This is a backport of the following upstream commit.
+Related to bug 1105698.
+
+  commit e8edca6f7f92234202d6dd163c118ef495244d7c
+  Author: Ming Lei <ming.lei@canonical.com>
+  Date:   Fri May 30 10:49:29 2014 +0800
+
+    block: virtio_blk: don't hold spin lock during world switch
+
+    Firstly, it isn't necessary to hold lock of vblk->vq_lock
+    when notifying hypervisor about queued I/O.
+
+    Secondly, virtqueue_notify() will cause world switch and
+    it may take long time on some hypervisors(such as, qemu-arm),
+    so it isn't good to hold the lock and block other vCPUs.
+
+    On arm64 quad core VM(qemu-kvm), the patch can increase I/O
+    performance a lot with VIRTIO_RING_F_EVENT_IDX enabled:
+     - without the patch: 14K IOPS
+     - with the patch: 34K IOPS
+
+    fio script:
+     [global]
+     direct=1
+     bsrange=4k-4k
+     timeout=10
+     numjobs=4
+     ioengine=libaio
+     iodepth=64
+
+     filename=/dev/vdc
+     group_reporting=1
+
+     [f1]
+     rw=randread
+
+    Cc: Rusty Russell <rusty@rustcorp.com.au>
+    Cc: "Michael S. Tsirkin" <mst@redhat.com>
+    Cc: virtualization@lists.linux-foundation.org
+    Signed-off-by: Ming Lei <ming.lei@canonical.com>
+    Acked-by: Rusty Russell <rusty@rustcorp.com.au>
+    Cc: stable@kernel.org # 3.13+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index c8f286e..f63d358 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -162,6 +162,7 @@ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
+  unsigned int num;
+  const bool last = (req->cmd_flags & REQ_END) != 0;
+  int err;
++ bool notify = false;
+ 
+  BUG_ON(req->nr_phys_segments + 2 > vblk->sg_elems);
+ 
+@@ -214,10 +215,12 @@ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
+   return BLK_MQ_RQ_QUEUE_ERROR;
+  }
+ 
+- if (last)
+-  virtqueue_kick(vblk->vq);
+-
++ if (last && virtqueue_kick_prepare(vblk->vq))
++  notify = true;
+  spin_unlock_irqrestore(&vblk->vq_lock, flags);
++
++ if (notify)
++  virtqueue_notify(vblk->vq);
+  return BLK_MQ_RQ_QUEUE_OK;
+ }
+ 
+-- 
+1.7.1

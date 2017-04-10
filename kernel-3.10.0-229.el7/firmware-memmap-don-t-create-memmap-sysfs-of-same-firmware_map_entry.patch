@@ -1,0 +1,115 @@
+From cd091b9552a89795276dcd699013eceaacb366f6 Mon Sep 17 00:00:00 2001
+From: Takahiro MUNEDA <tmuneda@redhat.com>
+Date: Fri, 14 Nov 2014 16:26:43 -0500
+Subject: [firmware] memmap: don't create memmap sysfs of same firmware_map_entry
+
+Message-id: <1415982403-9710-1-git-send-email-tmuneda@redhat.com>
+Patchwork-id: 100053
+O-Subject: [RHEL7.1 PATCH] drivers/firmware/memmap.c: don't create memmap sysfs of same firmware_map_entry
+Bugzilla: 1160173
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Dave Anderson <anderson@redhat.com>
+
+RHBZ#: https://bugzilla.redhat.com/show_bug.cgi?id=1160173
+Brew#: https://brewweb.devel.redhat.com/taskinfo?taskID=8239539
+Upstream: https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=22880ebe76be421a572b6f004604467c63f281f5
+Test: Tested by Fujitsu Japan
+
+>From 22880ebe76be421a572b6f004604467c63f281f5 Mon Sep 17 00:00:00 2001
+From: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+Date: Thu, 9 Oct 2014 15:29:07 -0700
+
+ By the following commits, we prevented from allocating firmware_map_entry
+ of same memory range:
+   f0093ede: drivers/firmware/memmap.c: don't allocate firmware_map_entry
+             of same memory range
+   49c8b24d: drivers/firmware/memmap.c: pass the correct argument to
+             firmware_map_find_entry_bootmem()
+
+ But it's not enough. When PNP0C80 device is added by acpi_scan_init(),
+ memmap sysfses of same firmware_map_entry are created twice as follows:
+
+   # cat /sys/firmware/memmap/*/start
+   0x40000000000
+   0x60000000000
+   0x4a837000
+   0x4a83a000
+   0x4a8b5000
+   ...
+   0x40000000000
+   0x60000000000
+   ...
+
+ The flows of the issues are as follows:
+
+   1. e820_reserve_resources() allocates firmware_map_entrys of all
+      memory ranges defined in e820. And, these firmware_map_entrys
+      are linked with map_entries list.
+
+      map_entries -> entry 1 -> ... -> entry N
+
+   2. When PNP0C80 device is limited by mem= boot option, acpi_scan_init()
+      added the memory device. In this case, firmware_map_add_hotplug()
+      allocates firmware_map_entry and creates memmap sysfs.
+
+      map_entries -> entry 1 -> ... -> entry N -> entry N+1
+                                                  |
+                                                  memmap 1
+
+   3. firmware_memmap_init() creates memmap sysfses of firmware_map_entrys
+      linked with map_entries.
+
+      map_entries -> entry 1 -> ... -> entry N -> entry N+1
+                      |                 |             |
+                      memmap 2          memmap N+1    memmap 1
+                                                      memmap N+2
+
+ So while hot removing the PNP0C80 device, kernel panic occurs as follows:
+
+      BUG: unable to handle kernel paging request at 00000001003e000b
+       IP: sysfs_open_file+0x46/0x2b0
+       PGD 203a89fe067 PUD 0
+       Oops: 0000 [#1] SMP
+       ...
+       Call Trace:
+         do_dentry_open+0x1ef/0x2a0
+         finish_open+0x31/0x40
+         do_last+0x57c/0x1220
+         path_openat+0xc2/0x4c0
+         do_filp_open+0x4b/0xb0
+         do_sys_open+0xf3/0x1f0
+         SyS_open+0x1e/0x20
+         system_call_fastpath+0x16/0x1b
+
+ The patch adds a check of confirming whether memmap sysfs of
+ firmware_map_entry has been created, and does not create memmap
+ sysfs of same firmware_map_entry.
+
+ Signed-off-by: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+ Cc: Santosh Shilimkar <santosh.shilimkar@ti.com>
+ Cc: Toshi Kani <toshi.kani@hp.com>
+ Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+ Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: Takahiro MUNEDA <tmuneda@redhat.com>
+Cc: prarit@redhat.com
+Cc: lwoodman@redhat.com
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/firmware/memmap.c b/drivers/firmware/memmap.c
+index 40b7a4c..1a04bc1 100644
+--- a/drivers/firmware/memmap.c
++++ b/drivers/firmware/memmap.c
+@@ -184,6 +184,9 @@ static int add_sysfs_fw_map_entry(struct firmware_map_entry *entry)
+  static int map_entries_nr;
+  static struct kset *mmap_kset;
+ 
++ if (entry->kobj.state_in_sysfs)
++  return -EEXIST;
++
+  if (!mmap_kset) {
+   mmap_kset = kset_create_and_add("memmap", NULL, firmware_kobj);
+   if (!mmap_kset)
+-- 
+1.7.1

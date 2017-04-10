@@ -1,0 +1,113 @@
+From 7ddef0e2f33f06ab9d1ab559a262fb94501fbb93 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:09:37 -0400
+Subject: [usb] mutual exclusion for resetting a hub and power-managing a port
+
+Message-id: <1410887463-20674-506-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95388
+O-Subject: [RHEL7 PATCH 505/591] USB: mutual exclusion for resetting a hub and power-managing a port
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=821903
+
+commit 600856c231ccb0cbf8afcf09066a8ab2a93ab03d
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Tue May 20 18:08:07 2014 -0700
+
+    USB: mutual exclusion for resetting a hub and power-managing a port
+
+    The USB core doesn't properly handle mutual exclusion between
+    resetting a hub and changing the power states of the hub's ports.  We
+    need to avoid sending port-power requests to the hub while it is being
+    reset, because such requests cannot succeed.
+
+    This patch fixes the problem by keeping track of when a reset is in
+    progress.  At such times, attempts to suspend (power-off) a port will
+    fail immediately with -EBUSY, and calls to usb_port_runtime_resume()
+    will update the power_is_on flag and return immediately.  When the
+    reset is complete, hub_activate() will automatically restore each port
+    to the proper power state.
+
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 4adc5c0..f2923f2 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1272,12 +1272,22 @@ static void hub_quiesce(struct usb_hub *hub, enum hub_quiescing_type type)
+   flush_work(&hub->tt.clear_work);
+ }
+ 
++static void hub_pm_barrier_for_all_ports(struct usb_hub *hub)
++{
++ int i;
++
++ for (i = 0; i < hub->hdev->maxchild; ++i)
++  pm_runtime_barrier(&hub->ports[i]->dev);
++}
++
+ /* caller has locked the hub device */
+ static int hub_pre_reset(struct usb_interface *intf)
+ {
+  struct usb_hub *hub = usb_get_intfdata(intf);
+ 
+  hub_quiesce(hub, HUB_PRE_RESET);
++ hub->in_reset = 1;
++ hub_pm_barrier_for_all_ports(hub);
+  return 0;
+ }
+ 
+@@ -1286,6 +1296,8 @@ static int hub_post_reset(struct usb_interface *intf)
+ {
+  struct usb_hub *hub = usb_get_intfdata(intf);
+ 
++ hub->in_reset = 0;
++ hub_pm_barrier_for_all_ports(hub);
+  hub_activate(hub, HUB_POST_RESET);
+  return 0;
+ }
+diff --git a/drivers/usb/core/hub.h b/drivers/usb/core/hub.h
+index df629a3..dce596b 100644
+--- a/drivers/usb/core/hub.h
++++ b/drivers/usb/core/hub.h
+@@ -66,6 +66,7 @@ struct usb_hub {
+  unsigned  limited_power:1;
+  unsigned  quiescing:1;
+  unsigned  disconnected:1;
++ unsigned  in_reset:1;
+ 
+  unsigned  quirk_check_port_auto_suspend:1;
+ 
+diff --git a/drivers/usb/core/port.c b/drivers/usb/core/port.c
+index 51542f8..37647e0 100644
+--- a/drivers/usb/core/port.c
++++ b/drivers/usb/core/port.c
+@@ -81,6 +81,10 @@ static int usb_port_runtime_resume(struct device *dev)
+ 
+  if (!hub)
+   return -EINVAL;
++ if (hub->in_reset) {
++  port_dev->power_is_on = 1;
++  return 0;
++ }
+ 
+  usb_autopm_get_interface(intf);
+  set_bit(port1, hub->busy_bits);
+@@ -117,6 +121,8 @@ static int usb_port_runtime_suspend(struct device *dev)
+ 
+  if (!hub)
+   return -EINVAL;
++ if (hub->in_reset)
++  return -EBUSY;
+ 
+  if (dev_pm_qos_flags(&port_dev->dev, PM_QOS_FLAG_NO_POWER_OFF)
+    == PM_QOS_FLAGS_ALL)
+-- 
+1.7.1

@@ -1,0 +1,117 @@
+From 93656fa57f24bbb6577f838f869931e267004ad6 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:14:58 -0400
+Subject: [net] Fix save software checksum complete
+
+Message-id: <1409652920-431-36-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90184
+O-Subject: [PATCH 35/57] [RHEL7.1 net] net: Fix save software checksum complete
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+commit 46fb51eb96cafb2c148b7b5119adb5e31a2bf3c4
+Author: Tom Herbert <therbert@google.com>
+Date:   Sat Jun 14 23:24:03 2014 -0700
+
+    net: Fix save software checksum complete
+
+    Geert reported issues regarding checksum complete and UDP.
+    The logic introduced in commit 7e3cead5172927732f51fde
+    ("net: Save software checksum complete") is not correct.
+
+    This patch:
+    1) Restores code in __skb_checksum_complete_header except for setting
+       CHECKSUM_UNNECESSARY. This function may be calculating checksum on
+       something less than skb->len.
+    2) Adds saving checksum to __skb_checksum_complete. The full packet
+       checksum 0..skb->len is calculated without adding in pseudo header.
+       This value is saved in skb->csum and then the pseudo header is added
+       to that to derive the checksum for validation.
+    3) In both __skb_checksum_complete_header and __skb_checksum_complete,
+       set skb->csum_valid to whether checksum of zero was computed. This
+       allows skb_csum_unnecessary to return true without changing to
+       CHECKSUM_UNNECESSARY which was done previously.
+    4) Copy new csum related bits in __copy_skb_header.
+
+    Reported-by: Geert Uytterhoeven <geert@linux-m68k.org>
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/core/datagram.c b/net/core/datagram.c
+index 7ad0ea2..9e03e1f 100644
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -667,22 +667,38 @@ __sum16 __skb_checksum_complete_head(struct sk_buff *skb, int len)
+  __sum16 sum;
+ 
+  sum = csum_fold(skb_checksum(skb, 0, len, skb->csum));
+- if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) && !sum &&
+-     !skb->csum_complete_sw)
+-  netdev_rx_csum_fault(skb->dev);
+-
+- /* Save checksum complete for later use */
+- skb->csum = sum;
+- skb->ip_summed = CHECKSUM_COMPLETE;
+- skb->csum_complete_sw = 1;
+-
++ if (likely(!sum)) {
++  if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
++      !skb->csum_complete_sw)
++   netdev_rx_csum_fault(skb->dev);
++ }
++ skb->csum_valid = !sum;
+  return sum;
+ }
+ EXPORT_SYMBOL(__skb_checksum_complete_head);
+ 
+ __sum16 __skb_checksum_complete(struct sk_buff *skb)
+ {
+- return __skb_checksum_complete_head(skb, skb->len);
++ __wsum csum;
++ __sum16 sum;
++
++ csum = skb_checksum(skb, 0, skb->len, 0);
++
++ /* skb->csum holds pseudo checksum */
++ sum = csum_fold(csum_add(skb->csum, csum));
++ if (likely(!sum)) {
++  if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
++      !skb->csum_complete_sw)
++   netdev_rx_csum_fault(skb->dev);
++ }
++
++ /* Save full packet checksum */
++ skb->csum = csum;
++ skb->ip_summed = CHECKSUM_COMPLETE;
++ skb->csum_complete_sw = 1;
++ skb->csum_valid = !sum;
++
++ return sum;
+ }
+ EXPORT_SYMBOL(__skb_checksum_complete);
+ 
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 18f0121..b7bd946 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -706,6 +706,9 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+  new->l4_rxhash  = old->l4_rxhash;
+  new->no_fcs  = old->no_fcs;
+  new->encapsulation = old->encapsulation;
++ new->encap_hdr_csum = old->encap_hdr_csum;
++ new->csum_valid  = old->csum_valid;
++ new->csum_complete_sw = old->csum_complete_sw;
+ #ifdef CONFIG_XFRM
+  new->sp   = secpath_get(old->sp);
+ #endif
+-- 
+1.7.1

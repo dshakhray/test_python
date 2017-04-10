@@ -1,0 +1,122 @@
+From 7394f3f6e22e6c2cd39f9ae79e2d606cc579e01a Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:05:59 -0400
+Subject: [usb] core: Track if an endpoint has streams
+
+Message-id: <1410887463-20674-288-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95425
+O-Subject: [RHEL7 PATCH 287/591] usb-core: Track if an endpoint has streams
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 8d4f70b2fa52ca80f74faebc2471f74ee374cf61
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Wed Oct 9 17:19:25 2013 +0200
+
+    usb-core: Track if an endpoint has streams
+
+    This is a preparation patch for adding support for bulk streams to usbfs.
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index 7fb817c..3af0ab8 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -2049,7 +2049,7 @@ int usb_alloc_streams(struct usb_interface *interface,
+ {
+  struct usb_hcd *hcd;
+  struct usb_device *dev;
+- int i;
++ int i, ret;
+ 
+  dev = interface_to_usbdev(interface);
+  hcd = bus_to_hcd(dev->bus);
+@@ -2058,13 +2058,24 @@ int usb_alloc_streams(struct usb_interface *interface,
+  if (dev->speed != USB_SPEED_SUPER)
+   return -EINVAL;
+ 
+- /* Streams only apply to bulk endpoints. */
+- for (i = 0; i < num_eps; i++)
++ for (i = 0; i < num_eps; i++) {
++  /* Streams only apply to bulk endpoints. */
+   if (!usb_endpoint_xfer_bulk(&eps[i]->desc))
+    return -EINVAL;
++  /* Re-alloc is not allowed */
++  if (eps[i]->streams)
++   return -EINVAL;
++ }
+ 
+- return hcd->driver->alloc_streams(hcd, dev, eps, num_eps,
++ ret = hcd->driver->alloc_streams(hcd, dev, eps, num_eps,
+    num_streams, mem_flags);
++ if (ret < 0)
++  return ret;
++
++ for (i = 0; i < num_eps; i++)
++  eps[i]->streams = ret;
++
++ return ret;
+ }
+ EXPORT_SYMBOL_GPL(usb_alloc_streams);
+ 
+@@ -2086,19 +2097,26 @@ int usb_free_streams(struct usb_interface *interface,
+ {
+  struct usb_hcd *hcd;
+  struct usb_device *dev;
+- int i;
++ int i, ret;
+ 
+  dev = interface_to_usbdev(interface);
+  hcd = bus_to_hcd(dev->bus);
+  if (dev->speed != USB_SPEED_SUPER)
+   return -EINVAL;
+ 
+- /* Streams only apply to bulk endpoints. */
++ /* Double-free is not allowed */
+  for (i = 0; i < num_eps; i++)
+-  if (!eps[i] || !usb_endpoint_xfer_bulk(&eps[i]->desc))
++  if (!eps[i] || !eps[i]->streams)
+    return -EINVAL;
+ 
+- return hcd->driver->free_streams(hcd, dev, eps, num_eps, mem_flags);
++ ret = hcd->driver->free_streams(hcd, dev, eps, num_eps, mem_flags);
++ if (ret < 0)
++  return ret;
++
++ for (i = 0; i < num_eps; i++)
++  eps[i]->streams = 0;
++
++ return ret;
+ }
+ EXPORT_SYMBOL_GPL(usb_free_streams);
+ 
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 4c53d54..a4c8406 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -57,6 +57,7 @@ struct ep_device;
+  * @extra: descriptors following this endpoint in the configuration
+  * @extralen: how many bytes of "extra" are valid
+  * @enabled: URBs may be submitted to this endpoint
++ * @streams: number of USB-3 streams allocated on the endpoint
+  *
+  * USB requests are always queued to a given endpoint, identified by a
+  * descriptor within an active interface in a given USB configuration.
+@@ -71,6 +72,7 @@ struct usb_host_endpoint {
+  unsigned char *extra;   /* Extra descriptors */
+  int extralen;
+  int enabled;
++ int streams;
+ };
+ 
+ /* host-side wrapper for one interface setting's parsed descriptors */
+-- 
+1.7.1

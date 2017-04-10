@@ -1,0 +1,183 @@
+From a48019aa28063c8c17ce51aaa0aaf272e50b52a9 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:15:17 -0400
+Subject: [net] udp: Add support for doing checksum unnecessary conversion
+
+Message-id: <1409652920-431-55-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90165
+O-Subject: [PATCH 54/57] [RHEL7.1 net] udp: Add support for doing checksum unnecessary conversion
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+commit 2abb7cdc0dc84e99b76ef983a1ae1978922aa9b3
+Author: Tom Herbert <therbert@google.com>
+Date:   Sun Aug 31 15:12:43 2014 -0700
+
+    udp: Add support for doing checksum unnecessary conversion
+
+    Add support for doing CHECKSUM_UNNECESSARY to CHECKSUM_COMPLETE
+    conversion in UDP tunneling path.
+
+    In the normal UDP path, we call skb_checksum_try_convert after locating
+    the UDP socket. The check is that checksum conversion is enabled for
+    the socket (new flag in UDP socket) and that checksum field is
+    non-zero.
+
+    In the UDP GRO path, we call skb_gro_checksum_try_convert after
+    checksum is validated and checksum field is non-zero. Since this is
+    already in GRO we assume that checksum conversion is always wanted.
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/udp.h b/include/linux/udp.h
+index 247cfdc..ee32775 100644
+--- a/include/linux/udp.h
++++ b/include/linux/udp.h
+@@ -49,7 +49,11 @@ struct udp_sock {
+  unsigned int  corkflag; /* Cork is required */
+  __u8   encap_type; /* Is this an Encapsulation socket? */
+  unsigned char  no_check6_tx:1,/* Send zero UDP6 checksums on TX? */
+-    no_check6_rx:1;/* Allow zero UDP6 checksums on RX? */
++    no_check6_rx:1,/* Allow zero UDP6 checksums on RX? */
++    convert_csum:1;/* On receive, convert checksum
++      * unnecessary to checksum complete
++      * if possible.
++      */
+  /*
+   * Following member retains the information to create a UDP header
+   * when the socket is uncorked.
+@@ -98,6 +102,16 @@ static inline bool udp_get_no_check6_rx(struct sock *sk)
+  return udp_sk(sk)->no_check6_rx;
+ }
+ 
++static inline void udp_set_convert_csum(struct sock *sk, bool val)
++{
++ udp_sk(sk)->convert_csum = val;
++}
++
++static inline bool udp_get_convert_csum(struct sock *sk)
++{
++ return udp_sk(sk)->convert_csum;
++}
++
+ #define udp_portaddr_for_each_entry(__sk, node, list) \
+  hlist_nulls_for_each_entry(__sk, node, list, __sk_common.skc_portaddr_node)
+ 
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index ca6292e..ed8053a 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1742,6 +1742,10 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+  if (sk != NULL) {
+   int ret;
+ 
++  if (udp_sk(sk)->convert_csum && uh->check && !IS_UDPLITE(sk))
++   skb_checksum_try_convert(skb, IPPROTO_UDP, uh->check,
++       inet_compute_pseudo);
++
+   ret = udp_queue_rcv_skb(sk, skb);
+   sock_put(sk);
+ 
+diff --git a/net/ipv4/udp_offload.c b/net/ipv4/udp_offload.c
+index 689dc82..01bdd85 100644
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -214,16 +214,25 @@ static struct sk_buff **udp4_gro_receive(struct sk_buff **head,
+ {
+  struct udphdr *uh = udp_gro_udphdr(skb);
+ 
+- /* Don't bother verifying checksum if we're going to flush anyway. */
+- if (unlikely(!uh) ||
+-     (!NAPI_GRO_CB(skb)->flush &&
+-      skb_gro_checksum_validate_zero_check(skb, IPPROTO_UDP, uh->check,
+-        inet_gro_compute_pseudo))) {
+-  NAPI_GRO_CB(skb)->flush = 1;
+-  return NULL;
+- }
++ if (unlikely(!uh))
++  goto flush;
+ 
++ /* Don't bother verifying checksum if we're going to flush anyway. */
++ if (!NAPI_GRO_CB(skb)->flush)
++  goto skip;
++
++ if (skb_gro_checksum_validate_zero_check(skb, IPPROTO_UDP, uh->check,
++       inet_gro_compute_pseudo))
++  goto flush;
++ else if (uh->check)
++  skb_gro_checksum_try_convert(skb, IPPROTO_UDP, uh->check,
++          inet_gro_compute_pseudo);
++skip:
+  return udp_gro_receive(head, skb, uh);
++
++flush:
++ NAPI_GRO_CB(skb)->flush = 1;
++ return NULL;
+ }
+ 
+ int udp_gro_complete(struct sk_buff *skb, int nhoff)
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index e61689a..4e89e0f 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -863,6 +863,10 @@ int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+    goto csum_error;
+   }
+ 
++  if (udp_sk(sk)->convert_csum && uh->check && !IS_UDPLITE(sk))
++   skb_checksum_try_convert(skb, IPPROTO_UDP, uh->check,
++       ip6_compute_pseudo);
++
+   ret = udpv6_queue_rcv_skb(sk, skb);
+   sock_put(sk);
+ 
+diff --git a/net/ipv6/udp_offload.c b/net/ipv6/udp_offload.c
+index 0d60f40..ba6e0d4 100644
+--- a/net/ipv6/udp_offload.c
++++ b/net/ipv6/udp_offload.c
+@@ -134,16 +134,26 @@ static struct sk_buff **udp6_gro_receive(struct sk_buff **head,
+ {
+  struct udphdr *uh = udp_gro_udphdr(skb);
+ 
++ if (unlikely(!uh))
++  goto flush;
++
+  /* Don't bother verifying checksum if we're going to flush anyway. */
+- if (unlikely(!uh) ||
+-     (!NAPI_GRO_CB(skb)->flush &&
+-      skb_gro_checksum_validate_zero_check(skb, IPPROTO_UDP, uh->check,
+-        ip6_gro_compute_pseudo))) {
+-  NAPI_GRO_CB(skb)->flush = 1;
+-  return NULL;
+- }
++ if (!NAPI_GRO_CB(skb)->flush)
++  goto skip;
+ 
++ if (skb_gro_checksum_validate_zero_check(skb, IPPROTO_UDP, uh->check,
++       ip6_gro_compute_pseudo))
++  goto flush;
++ else if (uh->check)
++  skb_gro_checksum_try_convert(skb, IPPROTO_UDP, uh->check,
++          ip6_gro_compute_pseudo);
++
++skip:
+  return udp_gro_receive(head, skb, uh);
++
++flush:
++ NAPI_GRO_CB(skb)->flush = 1;
++ return NULL;
+ }
+ 
+ int udp6_gro_complete(struct sk_buff *skb, int nhoff)
+-- 
+1.7.1

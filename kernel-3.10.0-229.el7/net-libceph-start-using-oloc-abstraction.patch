@@ -1,0 +1,144 @@
+From f6c42c9400d199a97855c3beacf44b0d38fbd3a6 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:24:03 -0400
+Subject: [net] libceph: start using oloc abstraction
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-137-git-send-email-sweil@redhat.com>
+Patchwork-id: 89749
+O-Subject: [PATCH 136/303] libceph: start using oloc abstraction
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+Instead of relying on pool fields in ceph_file_layout (for mapping) and
+ceph_pg (for enconding), start using ceph_object_locator (oloc)
+abstraction.  Note that userspace oloc currently consists of pool, key,
+nspace and hash fields, while this one contains only a pool.  This is
+OK, because at this point we only send (i.e. encode) olocs and never
+have to receive (i.e. decode) them.
+
+This makes keeping a copy of ceph_file_layout in every osd request
+unnecessary, so ceph_osd_request::r_file_layout field is nuked.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit 22116525baec1d63f4878eaa92f0b57946a78819)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 894f597..eb86ef8 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -1792,12 +1792,12 @@ static struct ceph_osd_request *rbd_osd_req_create(
+  osd_req->r_callback = rbd_osd_req_callback;
+  osd_req->r_priv = obj_request;
+ 
++ osd_req->r_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
++
+  osd_req->r_oid_len = strlen(obj_request->object_name);
+  rbd_assert(osd_req->r_oid_len < sizeof (osd_req->r_oid));
+  memcpy(osd_req->r_oid, obj_request->object_name, osd_req->r_oid_len);
+ 
+- osd_req->r_file_layout = rbd_dev->layout; /* struct */
+-
+  return osd_req;
+ }
+ 
+@@ -1833,12 +1833,12 @@ rbd_osd_req_create_copyup(struct rbd_obj_request *obj_request)
+  osd_req->r_callback = rbd_osd_req_callback;
+  osd_req->r_priv = obj_request;
+ 
++ osd_req->r_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
++
+  osd_req->r_oid_len = strlen(obj_request->object_name);
+  rbd_assert(osd_req->r_oid_len < sizeof (osd_req->r_oid));
+  memcpy(osd_req->r_oid, obj_request->object_name, osd_req->r_oid_len);
+ 
+- osd_req->r_file_layout = rbd_dev->layout; /* struct */
+-
+  return osd_req;
+ }
+ 
+diff --git a/include/linux/ceph/osd_client.h b/include/linux/ceph/osd_client.h
+index 4fb6a89..5b85551 100644
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@ -159,12 +159,13 @@ struct ceph_osd_request {
+  struct inode *r_inode;                /* for use by callbacks */
+  void *r_priv;         /* ditto */
+ 
++ struct ceph_object_locator r_oloc;
++
+  char              r_oid[MAX_OBJ_NAME_SIZE];          /* object name */
+  int               r_oid_len;
+  u64               r_snapid;
+  unsigned long     r_stamp;            /* send OR check time */
+ 
+- struct ceph_file_layout r_file_layout;
+  struct ceph_snap_context *r_snapc;    /* snap context for writes */
+ };
+ 
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index d05cc44..256134a 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -40,8 +40,7 @@ struct ceph_pg_pool_info {
+ };
+ 
+ struct ceph_object_locator {
+- uint64_t pool;
+- char *key;
++ s64 pool;
+ };
+ 
+ struct ceph_pg_mapping {
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 959d332..7130c5c 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -368,6 +368,8 @@ struct ceph_osd_request *ceph_osdc_alloc_request(struct ceph_osd_client *osdc,
+  INIT_LIST_HEAD(&req->r_req_lru_item);
+  INIT_LIST_HEAD(&req->r_osd_item);
+ 
++ req->r_oloc.pool = -1;
++
+  /* create reply message */
+  if (use_mempool)
+   msg = ceph_msgpool_get(&osdc->msgpool_op_reply, 0);
+@@ -761,7 +763,7 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
+  if (num_ops > 1)
+   osd_req_op_init(req, 1, CEPH_OSD_OP_STARTSYNC);
+ 
+- req->r_file_layout = *layout;  /* keep a copy */
++ req->r_oloc.pool = ceph_file_layout_pg_pool(*layout);
+ 
+  snprintf(req->r_oid, sizeof(req->r_oid), "%llx.%08llx",
+   vino.ino, objnum);
+@@ -1268,7 +1270,7 @@ static int __map_request(struct ceph_osd_client *osdc,
+ 
+  dout("map_request %p tid %lld\n", req, req->r_tid);
+  err = ceph_calc_ceph_pg(&pgid, req->r_oid, osdc->osdmap,
+-    ceph_file_layout_pg_pool(req->r_file_layout));
++    req->r_oloc.pool);
+  if (err) {
+   list_move(&req->r_req_lru_item, &osdc->req_notarget);
+   return err;
+@@ -1354,7 +1356,7 @@ static void __send_request(struct ceph_osd_client *osdc,
+  /* fill in message content that changes each time we send it */
+  put_unaligned_le32(osdc->osdmap->epoch, req->r_request_osdmap_epoch);
+  put_unaligned_le32(req->r_flags, req->r_request_flags);
+- put_unaligned_le64(req->r_pgid.pool, req->r_request_pool);
++ put_unaligned_le64(req->r_oloc.pool, req->r_request_pool);
+  p = req->r_request_pgid;
+  ceph_encode_64(&p, req->r_pgid.pool);
+  ceph_encode_32(&p, req->r_pgid.seed);
+-- 
+1.7.1

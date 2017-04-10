@@ -1,0 +1,56 @@
+From a0c82f206f9d4220d53288d50a0c9885a7e625c4 Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@redhat.com>
+Date: Fri, 5 Sep 2014 14:17:02 -0400
+Subject: [kernel] sched/cputime: atomically increment stime & utime
+
+Message-id: <1409926623-25929-7-git-send-email-riel@redhat.com>
+Patchwork-id: 91459
+O-Subject: [RHEL7 PATCH 6/7] sched,time: atomically increment stime & utime
+Bugzilla: 1120307
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: Rik van Riel <riel@redhat.com>
+
+Upstream status: in peterz's tip queue
+
+Fixes bug 1120307
+
+The functions task_cputime_adjusted and thread_group_cputime_adjusted
+can be called locklessly, as well as concurrently on many different CPUs.
+
+This can occasionally lead to the utime and stime reported by times(), and
+other syscalls like it, going backward. The cause for this appears to be
+multiple threads racing in cputime_adjust, both with values for utime or
+stime that is larger than the original, but each with a different value.
+
+Sometimes the larger value gets saved first, only to be immediately
+overwritten with a smaller value by another thread.
+
+Using atomic exchange prevents that problem, and ensures time
+progresses monotonically.
+
+Signed-off-by: Rik van Riel <riel@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index f5dd3be..9c76729 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -602,9 +602,12 @@ static void cputime_adjust(struct task_cputime *curr,
+   * If the tick based count grows faster than the scheduler one,
+   * the result of the scaling may go backward.
+   * Let's enforce monotonicity.
++  * Atomic exchange protects against concurrent cputime_adjust.
+   */
+- prev->stime = max(prev->stime, stime);
+- prev->utime = max(prev->utime, utime);
++ while (stime > (rtime = ACCESS_ONCE(prev->stime)))
++  cmpxchg(&prev->stime, rtime, stime);
++ while (utime > (rtime = ACCESS_ONCE(prev->utime)))
++  cmpxchg(&prev->utime, rtime, utime);
+ 
+ out:
+  *ut = prev->utime;
+-- 
+1.7.1

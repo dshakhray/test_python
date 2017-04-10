@@ -1,0 +1,139 @@
+From 60a387afe8ac6de9261cd237135607bcfdfaddd7 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:05:31 -0400
+Subject: [tools] perf: Disable user-space callchain/stack dumps for function trace events
+
+Message-id: <1410181752-25631-87-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91911
+O-Subject: [PATCH RHEL7.1 BZ1134356 086/307] perf tools: Disable user-space callchain/stack dumps for function trace events
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 6bedfab68666afac1b03f8d62ee037c6ab82fbc5
+Author: Jiri Olsa <jolsa@redhat.com>
+Date: Sun Mar 2 16:56:40 2014 +0100
+
+description
+===========
+User space callchains and user space stack dump were disabled
+for function trace event. Mailing list discussions:
+
+  http://marc.info/?t=139302086500001&r=1&w=2
+  http://marc.info/?t=139301437300003&r=1&w=2
+
+Catching up with perf and disabling user space callchains and
+DWARF unwind (uses user stack dump) for function trace event.
+
+Adding following warnings when callchains are used
+for function trace event:
+
+  # perf record -g -e ftrace:function ...
+  Disabling user space callchains for function trace event.
+  ...
+
+  # ./perf record --call-graph=dwarf -e ftrace:function ...
+  Cannot use DWARF unwind for function trace event, falling back to framepointers.
+  Disabling user space callchains for function trace event.
+  ...
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index adc94dd..26b67b1 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -500,6 +500,34 @@ int perf_evsel__group_desc(struct perf_evsel *evsel, char *buf, size_t size)
+  return ret;
+ }
+ 
++static void
++perf_evsel__config_callgraph(struct perf_evsel *evsel,
++        struct record_opts *opts)
++{
++ bool function = perf_evsel__is_function_event(evsel);
++ struct perf_event_attr *attr = &evsel->attr;
++
++ perf_evsel__set_sample_bit(evsel, CALLCHAIN);
++
++ if (opts->call_graph == CALLCHAIN_DWARF) {
++  if (!function) {
++   perf_evsel__set_sample_bit(evsel, REGS_USER);
++   perf_evsel__set_sample_bit(evsel, STACK_USER);
++   attr->sample_regs_user = PERF_REGS_MASK;
++   attr->sample_stack_user = opts->stack_dump_size;
++   attr->exclude_callchain_user = 1;
++  } else {
++   pr_info("Cannot use DWARF unwind for function trace event,"
++    " falling back to framepointers.\n");
++  }
++ }
++
++ if (function) {
++  pr_info("Disabling user space callchains for function trace event.\n");
++  attr->exclude_callchain_user = 1;
++ }
++}
++
+ /*
+  * The enable_on_exec/disabled value strategy:
+  *
+@@ -595,17 +623,8 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
+   attr->mmap_data = track;
+  }
+ 
+- if (opts->call_graph_enabled) {
+-  perf_evsel__set_sample_bit(evsel, CALLCHAIN);
+-
+-  if (opts->call_graph == CALLCHAIN_DWARF) {
+-   perf_evsel__set_sample_bit(evsel, REGS_USER);
+-   perf_evsel__set_sample_bit(evsel, STACK_USER);
+-   attr->sample_regs_user = PERF_REGS_MASK;
+-   attr->sample_stack_user = opts->stack_dump_size;
+-   attr->exclude_callchain_user = 1;
+-  }
+- }
++ if (opts->call_graph_enabled)
++  perf_evsel__config_callgraph(evsel, opts);
+ 
+  if (target__has_cpu(&opts->target))
+   perf_evsel__set_sample_bit(evsel, CPU);
+diff --git a/tools/perf/util/evsel.h b/tools/perf/util/evsel.h
+index f1b3256..0c9926c 100644
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@ -315,6 +315,24 @@ static inline bool perf_evsel__is_group_event(struct perf_evsel *evsel)
+  return perf_evsel__is_group_leader(evsel) && evsel->nr_members > 1;
+ }
+ 
++/**
++ * perf_evsel__is_function_event - Return whether given evsel is a function
++ * trace event
++ *
++ * @evsel - evsel selector to be tested
++ *
++ * Return %true if event is function trace event
++ */
++static inline bool perf_evsel__is_function_event(struct perf_evsel *evsel)
++{
++#define FUNCTION_EVENT "ftrace:function"
++
++ return evsel->name &&
++        !strncmp(FUNCTION_EVENT, evsel->name, sizeof(FUNCTION_EVENT));
++
++#undef FUNCTION_EVENT
++}
++
+ struct perf_attr_details {
+  bool freq;
+  bool verbose;
+-- 
+1.7.1

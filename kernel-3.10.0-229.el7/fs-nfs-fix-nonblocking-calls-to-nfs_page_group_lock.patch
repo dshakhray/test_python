@@ -1,0 +1,73 @@
+From 827aa55a187f628dfab1ea6c880aab3cf37805cd Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:20:45 -0400
+Subject: [fs] nfs: fix nonblocking calls to nfs_page_group_lock
+
+Message-id: <1411050057-12417-83-git-send-email-steved@redhat.com>
+Patchwork-id: 96234
+O-Subject: [RHEL7.1 PATCH 82/94] nfs: fix nonblocking calls to nfs_page_group_lock
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+nfs_page_group_lock was calling wait_on_bit_lock even when told not to
+block. Fix by first trying test_and_set_bit, followed by wait_on_bit_lock
+if and only if blocking is allowed.  Return -EAGAIN if nonblocking and the
+test_and_set of the bit was already locked.
+
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Reviewed-by: Peng Tao <tao.peng@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: bc8a309e88a86205fc3e17f06e42a2e56fc6f807
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 080c88f..3b5b9d1 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -149,24 +149,29 @@ static int nfs_wait_bit_uninterruptible(void *word)
+  *
+  * this lock must be held if modifying the page group list
+  *
+- * returns result from wait_on_bit_lock: 0 on success, < 0 on error
++ * return 0 on success, < 0 on error: -EDELAY if nonblocking or the
++ * result from wait_on_bit_lock
++ *
++ * NOTE: calling with nonblock=false should always have set the
++ *       lock bit (see fs/buffer.c and other uses of wait_on_bit_lock
++ *       with TASK_UNINTERRUPTIBLE), so there is no need to check the result.
+  */
+ int
+ nfs_page_group_lock(struct nfs_page *req, bool nonblock)
+ {
+  struct nfs_page *head = req->wb_head;
+- int ret;
+ 
+  WARN_ON_ONCE(head != head->wb_head);
+ 
+- do {
+-  ret = wait_on_bit_lock(&head->wb_flags, PG_HEADLOCK,
+-   nfs_wait_bit_uninterruptible,
+-   TASK_UNINTERRUPTIBLE);
+- } while (!nonblock && ret != 0);
++ if (!test_and_set_bit(PG_HEADLOCK, &head->wb_flags))
++  return 0;
+ 
+- WARN_ON_ONCE(ret > 0);
+- return ret;
++ if (!nonblock)
++  return wait_on_bit_lock(&head->wb_flags, PG_HEADLOCK,
++    nfs_wait_bit_uninterruptible,
++    TASK_UNINTERRUPTIBLE);
++
++ return -EAGAIN;
+ }
+ 
+ /*
+-- 
+1.7.1

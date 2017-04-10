@@ -1,0 +1,97 @@
+From 7b33aa7e334f75ce27c9f219f380b72153110af4 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:26:24 -0400
+Subject: [block] rbd: add rbd_obj_watch_request_helper() helper
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-278-git-send-email-sweil@redhat.com>
+Patchwork-id: 89742
+O-Subject: [PATCH 277/303] rbd: add rbd_obj_watch_request_helper() helper
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+In the past, rbd_dev_header_watch_sync() used to handle both watch and
+unwatch requests and was entangled and leaky.  Commit b30a01f2a307
+("rbd: fix osd_request memory leak in __rbd_dev_header_watch_sync()")
+split it into two separate functions.  This commit cleanly abstracts
+the common bits, relying on the fixed rbd_obj_request_wait().
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+(cherry picked from commit bb040aa03ce870b0eff21ee75f7f324cd8cabe03)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index e9c81bd..b8c223d 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -3014,6 +3014,59 @@ static void rbd_watch_cb(u64 ver, u64 notify_id, u8 opcode, void *data)
+ }
+ 
+ /*
++ * Send a (un)watch request and wait for the ack.  Return a request
++ * with a ref held on success or error.
++ */
++static struct rbd_obj_request *rbd_obj_watch_request_helper(
++      struct rbd_device *rbd_dev,
++      bool watch)
++{
++ struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
++ struct rbd_obj_request *obj_request;
++ int ret;
++
++ obj_request = rbd_obj_request_create(rbd_dev->header_name, 0, 0,
++          OBJ_REQUEST_NODATA);
++ if (!obj_request)
++  return ERR_PTR(-ENOMEM);
++
++ obj_request->osd_req = rbd_osd_req_create(rbd_dev, true, 1,
++        obj_request);
++ if (!obj_request->osd_req) {
++  ret = -ENOMEM;
++  goto out;
++ }
++
++ osd_req_op_watch_init(obj_request->osd_req, 0, CEPH_OSD_OP_WATCH,
++         rbd_dev->watch_event->cookie, 0, watch);
++ rbd_osd_req_format_write(obj_request);
++
++ if (watch)
++  ceph_osdc_set_request_linger(osdc, obj_request->osd_req);
++
++ ret = rbd_obj_request_submit(osdc, obj_request);
++ if (ret)
++  goto out;
++
++ ret = rbd_obj_request_wait(obj_request);
++ if (ret)
++  goto out;
++
++ ret = obj_request->result;
++ if (ret) {
++  if (watch)
++   rbd_obj_request_end(obj_request);
++  goto out;
++ }
++
++ return obj_request;
++
++out:
++ rbd_obj_request_put(obj_request);
++ return ERR_PTR(ret);
++}
++
++/*
+  * Initiate a watch request, synchronously.
+  */
+ static int rbd_dev_header_watch_sync(struct rbd_device *rbd_dev)
+-- 
+1.7.1

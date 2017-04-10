@@ -1,0 +1,212 @@
+From 5e67f0a5cf213b706d05eb88029381333a5f5d66 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:19:10 -0400
+Subject: [fs] nfsd: fix race that grants unrecallable delegation
+
+Message-id: <1410898849-22126-67-git-send-email-bfields@redhat.com>
+Patchwork-id: 95833
+O-Subject: [Patch RHEL7 066/165] nfsd: fix race that grants unrecallable delegation
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jlayton@primarydata.com>
+
+If nfs4_setlease succesfully acquires a new delegation, then another
+task breaks the delegation before we reach hash_delegation_locked, then
+the breaking task will see an empty fi_delegations list and do nothing.
+The client will receive an open reply incorrectly granting a delegation
+and will never receive a recall.
+
+Move more of the delegation fields to be protected by the fi_lock. It's
+more granular than the state_lock and in later patches we'll want to
+be able to rely on it in addition to the state_lock.
+
+Attempt to acquire a delegation. If that succeeds, take the spinlocks
+and then check to see if the file has had a conflict show up since then.
+If it has, then we assume that the lease is no longer valid and that
+we shouldn't hand out a delegation.
+
+There's also one more potential (but very unlikely) problem. If the
+lease is broken before the delegation is hashed, then it could leak.
+In the event that the fi_delegations list is empty, reset the
+fl_break_time to jiffies so that it's cleaned up ASAP by
+the normal lease handling code.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 417c6629b2d81d5a18d29c4bbb6a9a4c64282a36
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 10cdb67..cc477dd 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -624,6 +624,8 @@ nfs4_put_delegation(struct nfs4_delegation *dp)
+ 
+ static void nfs4_put_deleg_lease(struct nfs4_file *fp)
+ {
++ lockdep_assert_held(&state_lock);
++
+  if (!fp->fi_lease)
+   return;
+  if (atomic_dec_and_test(&fp->fi_delegees)) {
+@@ -643,11 +645,10 @@ static void
+ hash_delegation_locked(struct nfs4_delegation *dp, struct nfs4_file *fp)
+ {
+  lockdep_assert_held(&state_lock);
++ lockdep_assert_held(&fp->fi_lock);
+ 
+  dp->dl_stid.sc_type = NFS4_DELEG_STID;
+- spin_lock(&fp->fi_lock);
+  list_add(&dp->dl_perfile, &fp->fi_delegations);
+- spin_unlock(&fp->fi_lock);
+  list_add(&dp->dl_perclnt, &dp->dl_stid.sc_client->cl_delegations);
+ }
+ 
+@@ -659,17 +660,18 @@ unhash_delegation(struct nfs4_delegation *dp)
+ 
+  spin_lock(&state_lock);
+  dp->dl_stid.sc_type = NFS4_CLOSED_DELEG_STID;
++ spin_lock(&fp->fi_lock);
+  list_del_init(&dp->dl_perclnt);
+  list_del_init(&dp->dl_recall_lru);
+- spin_lock(&fp->fi_lock);
+  list_del_init(&dp->dl_perfile);
+  spin_unlock(&fp->fi_lock);
+- spin_unlock(&state_lock);
+  if (fp) {
+   nfs4_put_deleg_lease(fp);
+-  put_nfs4_file(fp);
+   dp->dl_file = NULL;
+  }
++ spin_unlock(&state_lock);
++ if (fp)
++  put_nfs4_file(fp);
+ }
+ 
+ static void destroy_revoked_delegation(struct nfs4_delegation *dp)
+@@ -3141,10 +3143,19 @@ static void nfsd_break_deleg_cb(struct file_lock *fl)
+   */
+  fl->fl_break_time = 0;
+ 
+- fp->fi_had_conflict = true;
+  spin_lock(&fp->fi_lock);
+- list_for_each_entry(dp, &fp->fi_delegations, dl_perfile)
+-  nfsd_break_one_deleg(dp);
++ fp->fi_had_conflict = true;
++ /*
++  * If there are no delegations on the list, then we can't count on this
++  * lease ever being cleaned up. Set the fl_break_time to jiffies so that
++  * time_out_leases will do it ASAP. The fact that fi_had_conflict is now
++  * true should keep any new delegations from being hashed.
++  */
++ if (list_empty(&fp->fi_delegations))
++  fl->fl_break_time = jiffies;
++ else
++  list_for_each_entry(dp, &fp->fi_delegations, dl_perfile)
++   nfsd_break_one_deleg(dp);
+  spin_unlock(&fp->fi_lock);
+ }
+ 
+@@ -3491,46 +3502,77 @@ static int nfs4_setlease(struct nfs4_delegation *dp)
+ {
+  struct nfs4_file *fp = dp->dl_file;
+  struct file_lock *fl;
+- int status;
++ struct file *filp;
++ int status = 0;
+ 
+  fl = nfs4_alloc_init_lease(fp, NFS4_OPEN_DELEGATE_READ);
+  if (!fl)
+   return -ENOMEM;
+- fl->fl_file = find_readable_file(fp);
+- status = vfs_setlease(fl->fl_file, fl->fl_type, &fl);
+- if (status)
+-  goto out_free;
++ filp = find_readable_file(fp);
++ if (!filp) {
++  /* We should always have a readable file here */
++  WARN_ON_ONCE(1);
++  return -EBADF;
++ }
++ fl->fl_file = filp;
++ status = vfs_setlease(filp, fl->fl_type, &fl);
++ if (status) {
++  locks_free_lock(fl);
++  goto out_fput;
++ }
++ spin_lock(&state_lock);
++ spin_lock(&fp->fi_lock);
++ /* Did the lease get broken before we took the lock? */
++ status = -EAGAIN;
++ if (fp->fi_had_conflict)
++  goto out_unlock;
++ /* Race breaker */
++ if (fp->fi_lease) {
++  status = 0;
++  atomic_inc(&fp->fi_delegees);
++  hash_delegation_locked(dp, fp);
++  goto out_unlock;
++ }
+  fp->fi_lease = fl;
+- fp->fi_deleg_file = fl->fl_file;
++ fp->fi_deleg_file = filp;
+  atomic_set(&fp->fi_delegees, 1);
+- spin_lock(&state_lock);
+  hash_delegation_locked(dp, fp);
++ spin_unlock(&fp->fi_lock);
+  spin_unlock(&state_lock);
+  return 0;
+-out_free:
+- if (fl->fl_file)
+-  fput(fl->fl_file);
+- locks_free_lock(fl);
++out_unlock:
++ spin_unlock(&fp->fi_lock);
++ spin_unlock(&state_lock);
++out_fput:
++ fput(filp);
+  return status;
+ }
+ 
+ static int nfs4_set_delegation(struct nfs4_delegation *dp, struct nfs4_file *fp)
+ {
++ int status = 0;
++
+  if (fp->fi_had_conflict)
+   return -EAGAIN;
+  get_nfs4_file(fp);
++ spin_lock(&state_lock);
++ spin_lock(&fp->fi_lock);
+  dp->dl_file = fp;
+- if (!fp->fi_lease)
++ if (!fp->fi_lease) {
++  spin_unlock(&fp->fi_lock);
++  spin_unlock(&state_lock);
+   return nfs4_setlease(dp);
+- spin_lock(&state_lock);
++ }
+  atomic_inc(&fp->fi_delegees);
+  if (fp->fi_had_conflict) {
+-  spin_unlock(&state_lock);
+-  return -EAGAIN;
++  status = -EAGAIN;
++  goto out_unlock;
+  }
+  hash_delegation_locked(dp, fp);
++out_unlock:
++ spin_unlock(&fp->fi_lock);
+  spin_unlock(&state_lock);
+- return 0;
++ return status;
+ }
+ 
+ static void nfsd4_open_deleg_none_ext(struct nfsd4_open *open, int status)
+-- 
+1.7.1

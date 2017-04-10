@@ -1,0 +1,90 @@
+From 9920af31d5a4ea0d0c80217425ccde1cab8d7971 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:16 -0400
+Subject: [x86] perf/intel: Use rdmsrl_safe() when initializing RAPL PMU
+
+Message-id: <1410181752-25631-12-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91700
+O-Subject: [PATCH RHEL7.1 BZ1134356 011/307] perf/x86/intel: Use rdmsrl_safe() when initializing RAPL PMU
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 24223657806a0ebd0ae5c9caaf7b021091889cf2
+Author: Venkatesh Srinivas <venkateshs@google.com>
+Date: Thu Mar 13 12:36:26 2014 -0700
+
+description
+===========
+CPUs which should support the RAPL counters according to
+Family/Model/Stepping may still issue #GP when attempting to access
+the RAPL MSRs. This may happen when Linux is running under KVM and
+we are passing-through host F/M/S data, for example. Use rdmsrl_safe
+to first access the RAPL_POWER_UNIT MSR; if this fails, do not
+attempt to use this PMU.
+
+[ The patch also silently fixes another bug: rapl_pmu_init() didn't handle the memory alloc failure case previously. ]
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_rapl.c b/arch/x86/kernel/cpu/perf_event_intel_rapl.c
+index 4b9a9e9..7c87424 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_rapl.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_rapl.c
+@@ -535,6 +535,7 @@ static int rapl_cpu_prepare(int cpu)
+  struct rapl_pmu *pmu = per_cpu(rapl_pmu, cpu);
+  int phys_id = topology_physical_package_id(cpu);
+  u64 ms;
++ u64 msr_rapl_power_unit_bits;
+ 
+  if (pmu)
+   return 0;
+@@ -542,6 +543,9 @@ static int rapl_cpu_prepare(int cpu)
+  if (phys_id < 0)
+   return -1;
+ 
++ if (!rdmsrl_safe(MSR_RAPL_POWER_UNIT, &msr_rapl_power_unit_bits))
++  return -1;
++
+  pmu = kzalloc_node(sizeof(*pmu), GFP_KERNEL, cpu_to_node(cpu));
+  if (!pmu)
+   return -1;
+@@ -555,8 +559,7 @@ static int rapl_cpu_prepare(int cpu)
+   *
+   * we cache in local PMU instance
+   */
+- rdmsrl(MSR_RAPL_POWER_UNIT, pmu->hw_unit);
+- pmu->hw_unit = (pmu->hw_unit >> 8) & 0x1FULL;
++ pmu->hw_unit = (msr_rapl_power_unit_bits >> 8) & 0x1FULL;
+  pmu->pmu = &rapl_pmu_class;
+ 
+  /*
+@@ -677,7 +680,9 @@ static int __init rapl_pmu_init(void)
+  cpu_notifier_register_begin();
+ 
+  for_each_online_cpu(cpu) {
+-  rapl_cpu_prepare(cpu);
++  ret = rapl_cpu_prepare(cpu);
++  if (ret)
++   goto out;
+   rapl_cpu_init(cpu);
+  }
+ 
+@@ -700,6 +705,7 @@ static int __init rapl_pmu_init(void)
+   hweight32(rapl_cntr_mask),
+   ktime_to_ms(pmu->timer_interval));
+ 
++out:
+  cpu_notifier_register_done();
+ 
+  return 0;
+-- 
+1.7.1

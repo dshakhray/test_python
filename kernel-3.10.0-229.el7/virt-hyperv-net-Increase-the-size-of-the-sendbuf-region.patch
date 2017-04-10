@@ -1,0 +1,90 @@
+From 2db167a054fd33d0fd29ef133d2c35b74c44fd6d Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Mon, 29 Sep 2014 00:59:15 -0400
+Subject: [virt] hyperv/net: Increase the size of the sendbuf region
+
+Message-id: <1411952358-34104-32-git-send-email-jasowang@redhat.com>
+Patchwork-id: 96783
+O-Subject: [RHEL7.1 PATCH 31/34] Drivers: net-next: hyperv: Increase the size of the sendbuf region
+Bugzilla: 1146357
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+
+From: KY Srinivasan <kys@microsoft.com>
+
+Bugzilla: 1146357
+
+Intel did some benchmarking on our network throughput when Linux on Hyper-V
+is as used as a gateway. This fix gave us almost a 1 Gbps additional throughput
+on about 5Gbps base throughput we hadi, prior to increasing the sendbuf size.
+The sendbuf mechanism is a copy based transport that we have which is clearly
+more optimal than the copy-free page flipping mechanism (for small packets).
+In the forwarding scenario, we deal only with MTU sized packets,
+and increasing the size of the senbuf area gave us the additional performance.
+For what it is worth, Windows guests on Hyper-V, I am told use similar sendbuf
+size as well.
+
+The exact value of sendbuf I think is less important than the fact that it needs
+to be larger than what Linux can allocate as physically contiguous memory.
+Thus the change over to allocating via vmalloc().
+
+We currently allocate 16MB receive buffer and we use vmalloc there for allocation.
+Also the low level channel code has already been modified to deal with physically
+dis-contiguous memory in the ringbuffer setup.
+
+Based on experimentation Intel did, they say there was some improvement in throughput
+as the sendbuf size was increased up to 16MB and there was no effect on throughput
+beyond 16MB. Thus I have chosen 16MB here.
+
+Increasing the sendbuf value makes a material difference in small packet handling
+
+In this version of the patch, based on David's feedback, I have added
+additional details in the commit log.
+
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 06b47aac4924180d63aad50727a11230d876c348)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index 476b0f6..8f0013a 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -586,7 +586,7 @@ struct nvsp_message {
+ 
+ #define NETVSC_RECEIVE_BUFFER_SIZE  (1024*1024*16) /* 16MB */
+ #define NETVSC_RECEIVE_BUFFER_SIZE_LEGACY (1024*1024*15)  /* 15MB */
+-#define NETVSC_SEND_BUFFER_SIZE   (1024 * 1024)   /* 1MB */
++#define NETVSC_SEND_BUFFER_SIZE   (1024 * 1024 * 16)   /* 16MB */
+ #define NETVSC_INVALID_INDEX   -1
+ 
+ 
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 8ffc41f..6e2d703 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -194,8 +194,7 @@ static int netvsc_destroy_buf(struct netvsc_device *net_device)
+  }
+  if (net_device->send_buf) {
+   /* Free up the receive buffer */
+-  free_pages((unsigned long)net_device->send_buf,
+-      get_order(net_device->send_buf_size));
++  vfree(net_device->send_buf);
+   net_device->send_buf = NULL;
+  }
+  kfree(net_device->send_section_map);
+@@ -304,9 +303,7 @@ static int netvsc_init_buf(struct hv_device *device)
+ 
+  /* Now setup the send buffer.
+   */
+- net_device->send_buf =
+-  (void *)__get_free_pages(GFP_KERNEL|__GFP_ZERO,
+-      get_order(net_device->send_buf_size));
++ net_device->send_buf = vzalloc(net_device->send_buf_size);
+  if (!net_device->send_buf) {
+   netdev_err(ndev, "unable to allocate send "
+       "buffer of size %d\n", net_device->send_buf_size);
+-- 
+1.7.1

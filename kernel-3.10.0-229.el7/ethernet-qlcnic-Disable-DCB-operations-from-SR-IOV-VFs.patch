@@ -1,0 +1,159 @@
+From bbd612fb4dbd709e17dca0554040b419a4d73b9d Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:05:34 -0400
+Subject: [ethernet] qlcnic: Disable DCB operations from SR-IOV VFs
+
+Message-id: <1408626422-3941-51-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88594
+O-Subject: [PATCH RHEL 7.1 050/138] qlcnic: Disable DCB operations from SR-IOV VFs.
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Sucheta Chakraborty <sucheta.chakraborty@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id 3c44bba1d270cb1620b4fe76786d0968118cb86b
+
+o These operations will be supported only through PFs (SR-IOV and non-SR-IOV).
+
+Signed-off-by: Sucheta Chakraborty <sucheta.chakraborty@qlogic.com>
+Signed-off-by: Manish Chopra <manish.chopra@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+index 918e18d..fa1af17 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+@@ -2213,7 +2213,6 @@ static void qlcnic_83xx_init_rings(struct qlcnic_adapter *adapter)
+ int qlcnic_83xx_init(struct qlcnic_adapter *adapter, int pci_using_dac)
+ {
+  struct qlcnic_hardware_context *ahw = adapter->ahw;
+- struct qlcnic_dcb *dcb;
+  int err = 0;
+ 
+  ahw->msix_supported = !!qlcnic_use_msi_x;
+@@ -2279,11 +2278,6 @@ int qlcnic_83xx_init(struct qlcnic_adapter *adapter, int pci_using_dac)
+  if (err)
+   goto disable_mbx_intr;
+ 
+- dcb = adapter->dcb;
+-
+- if (dcb && qlcnic_dcb_attach(dcb))
+-  qlcnic_clear_dcb_ops(dcb);
+-
+  /* Periodically monitor device status */
+  qlcnic_83xx_idc_poll_dev_state(&adapter->fw_work.work);
+  return 0;
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_dcb.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_dcb.c
+index 86bca7c..c233084 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_dcb.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_dcb.c
+@@ -260,6 +260,9 @@ int qlcnic_register_dcb(struct qlcnic_adapter *adapter)
+ {
+  struct qlcnic_dcb *dcb;
+ 
++ if (qlcnic_sriov_vf_check(adapter))
++  return 0;
++
+  dcb = kzalloc(sizeof(struct qlcnic_dcb), GFP_ATOMIC);
+  if (!dcb)
+   return -ENOMEM;
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_dcb.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_dcb.h
+index c04ae0c..6b6144d 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_dcb.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_dcb.h
+@@ -121,4 +121,10 @@ static inline void qlcnic_dcb_init_dcbnl_ops(struct qlcnic_dcb *dcb)
+  if (dcb && dcb->ops->init_dcbnl_ops)
+   dcb->ops->init_dcbnl_ops(dcb);
+ }
++
++static inline void qlcnic_dcb_enable(struct qlcnic_dcb *dcb)
++{
++ if (dcb && qlcnic_dcb_attach(dcb))
++  qlcnic_clear_dcb_ops(dcb);
++}
+ #endif
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index 655d1bb..5e65a5a 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -2212,7 +2212,6 @@ qlcnic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+  struct qlcnic_hardware_context *ahw;
+  int err, pci_using_dac = -1;
+  char board_name[QLCNIC_MAX_BOARD_NAME_LEN + 19]; /* MAC + ": " + name */
+- struct qlcnic_dcb *dcb;
+ 
+  if (pdev->is_virtfn)
+   return -ENODEV;
+@@ -2334,10 +2333,6 @@ qlcnic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+   adapter->flags |= QLCNIC_NEED_FLR;
+ 
+-  dcb = adapter->dcb;
+-
+-  if (dcb && qlcnic_dcb_attach(dcb))
+-   qlcnic_clear_dcb_ops(dcb);
+  } else if (qlcnic_83xx_check(adapter)) {
+   qlcnic_83xx_check_vf(adapter, ent);
+   adapter->portnum = adapter->ahw->pci_func;
+@@ -2366,6 +2361,8 @@ qlcnic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+   goto err_out_free_hw;
+  }
+ 
++ qlcnic_dcb_enable(adapter->dcb);
++
+  if (qlcnic_read_mac_addr(adapter))
+   dev_warn(&pdev->dev, "failed to read mac addr\n");
+ 
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+index 21a4b27..af5a108 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+@@ -500,7 +500,6 @@ static int qlcnic_sriov_vf_init_driver(struct qlcnic_adapter *adapter)
+ static int qlcnic_sriov_setup_vf(struct qlcnic_adapter *adapter,
+      int pci_using_dac)
+ {
+- struct qlcnic_dcb *dcb;
+  int err;
+ 
+  INIT_LIST_HEAD(&adapter->vf_mc_list);
+@@ -538,11 +537,6 @@ static int qlcnic_sriov_setup_vf(struct qlcnic_adapter *adapter,
+  if (err)
+   goto err_out_send_channel_term;
+ 
+- dcb = adapter->dcb;
+-
+- if (dcb && qlcnic_dcb_attach(dcb))
+-  qlcnic_clear_dcb_ops(dcb);
+-
+  err = qlcnic_setup_netdev(adapter, adapter->netdev, pci_using_dac);
+  if (err)
+   goto err_out_send_channel_term;
+@@ -1584,8 +1578,6 @@ static int qlcnic_sriov_vf_reinit_driver(struct qlcnic_adapter *adapter)
+  if (err)
+   goto err_out_term_channel;
+ 
+- qlcnic_dcb_get_info(adapter->dcb);
+-
+  return 0;
+ 
+ err_out_term_channel:
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+index 686f460..b679309 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+@@ -1299,8 +1299,6 @@ static const int qlcnic_pf_passthru_supp_cmds[] = {
+  QLCNIC_CMD_GET_STATISTICS,
+  QLCNIC_CMD_GET_PORT_CONFIG,
+  QLCNIC_CMD_GET_LINK_STATUS,
+- QLCNIC_CMD_DCB_QUERY_CAP,
+- QLCNIC_CMD_DCB_QUERY_PARAM,
+  QLCNIC_CMD_INIT_NIC_FUNC,
+  QLCNIC_CMD_STOP_NIC_FUNC,
+ };
+-- 
+1.7.1

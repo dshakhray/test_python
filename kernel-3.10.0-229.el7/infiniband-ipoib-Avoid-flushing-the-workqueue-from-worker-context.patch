@@ -1,0 +1,113 @@
+From cd59ec061909b536acc1357468fba553343a4016 Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 24 Sep 2014 17:28:08 -0400
+Subject: [infiniband] ipoib: Avoid flushing the workqueue from worker context
+
+Message-id: <32775a5918c368843a2f03c3b45ea88c2d859ab6.1411578494.git.dledford@redhat.com>
+Patchwork-id: 96670
+O-Subject: [Patch RHEL7 15/26] IB/ipoib: Avoid flushing the workqueue from worker context
+Bugzilla: 1107621
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Erez Shitrit <erezsh@mellanox.com>
+
+The error flow of ipoib_ib_dev_open() invokes ipoib_ib_dev_stop() with
+workqueue flushing enabled, which deadlocks if the open procedure
+itself was called by a worker thread.
+
+Fix this by adding a flush enabled flag to ipoib_ib_dev_open() and set
+it accordingly from the locations where such a call is made.
+
+The call trace was the following:
+
+ [<ffffffff81095bc4>] ? flush_workqueue+0x54/0x80
+ [<ffffffffa056c657>] ? ipoib_ib_dev_stop+0x447/0x650 [ib_ipoib]
+ [<ffffffffa056cc34>] ? ipoib_ib_dev_open+0x284/0x430 [ib_ipoib]
+ [<ffffffffa05674a8>] ? ipoib_open+0x78/0x1d0 [ib_ipoib]
+ [<ffffffffa05697b8>] ? ipoib_pkey_open+0x38/0x40 [ib_ipoib]
+ [<ffffffffa056cf3c>] ? __ipoib_ib_dev_flush+0x15c/0x2c0 [ib_ipoib]
+ [<ffffffffa056ce56>] ? __ipoib_ib_dev_flush+0x76/0x2c0 [ib_ipoib]
+ [<ffffffffa056d0a0>] ? ipoib_ib_dev_flush_heavy+0x0/0x20 [ib_ipoib]
+ [<ffffffffa056d0ba>] ? ipoib_ib_dev_flush_heavy+0x1a/0x20 [ib_ipoib]
+ [<ffffffff81094d20>] ? worker_thread+0x170/0x2a0
+ [<ffffffff8109b2a0>] ? autoremove_wake_function+0x0/0x40
+
+Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Acked-by: Alex Estrin <alex.estrin@intel.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 4eae374845affc3ebf8ccfc38d554a86adc95003)
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 683d23a..3edce61 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -471,7 +471,7 @@ void ipoib_ib_dev_flush_heavy(struct work_struct *work);
+ void ipoib_pkey_event(struct work_struct *work);
+ void ipoib_ib_dev_cleanup(struct net_device *dev);
+ 
+-int ipoib_ib_dev_open(struct net_device *dev);
++int ipoib_ib_dev_open(struct net_device *dev, int flush);
+ int ipoib_ib_dev_up(struct net_device *dev);
+ int ipoib_ib_dev_down(struct net_device *dev, int flush);
+ int ipoib_ib_dev_stop(struct net_device *dev, int flush);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_ib.c b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+index be8f971..9dcb2c9 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@ -664,7 +664,7 @@ static void ipoib_ib_tx_timer_func(unsigned long ctx)
+  drain_tx_cq((struct net_device *)ctx);
+ }
+ 
+-int ipoib_ib_dev_open(struct net_device *dev)
++int ipoib_ib_dev_open(struct net_device *dev, int flush)
+ {
+  struct ipoib_dev_priv *priv = netdev_priv(dev);
+  int ret;
+@@ -705,7 +705,7 @@ int ipoib_ib_dev_open(struct net_device *dev)
+ dev_stop:
+  if (!test_and_set_bit(IPOIB_FLAG_INITIALIZED, &priv->flags))
+   napi_enable(&priv->napi);
+- ipoib_ib_dev_stop(dev, 1);
++ ipoib_ib_dev_stop(dev, flush);
+  return -1;
+ }
+ 
+@@ -916,7 +916,7 @@ int ipoib_ib_dev_init(struct net_device *dev, struct ib_device *ca, int port)
+       (unsigned long) dev);
+ 
+  if (dev->flags & IFF_UP) {
+-  if (ipoib_ib_dev_open(dev)) {
++  if (ipoib_ib_dev_open(dev, 1)) {
+    ipoib_transport_dev_cleanup(dev);
+    return -ENODEV;
+   }
+@@ -1033,7 +1033,7 @@ static void __ipoib_ib_dev_flush(struct ipoib_dev_priv *priv,
+ 
+  if (level == IPOIB_FLUSH_HEAVY) {
+   ipoib_ib_dev_stop(dev, 0);
+-  ipoib_ib_dev_open(dev);
++  ipoib_ib_dev_open(dev, 0);
+  }
+ 
+  /*
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 35acbd4..1bf994a 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -114,7 +114,7 @@ int ipoib_open(struct net_device *dev)
+  if (!test_bit(IPOIB_PKEY_ASSIGNED, &priv->flags))
+   return 0;
+ 
+- if (ipoib_ib_dev_open(dev))
++ if (ipoib_ib_dev_open(dev, 1))
+   goto err_disable;
+ 
+  if (ipoib_ib_dev_up(dev))
+-- 
+1.7.1

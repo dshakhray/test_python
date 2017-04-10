@@ -1,0 +1,130 @@
+From b20240ab84183c3d73e82dc3cb239f47beacfdfb Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:14:28 -0400
+Subject: [net] ipv4: Call skb_checksum_init in IPv4
+
+Message-id: <1409652920-431-6-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90187
+O-Subject: [PATCH 05/57] [RHEL7.1 net] net: Call skb_checksum_init in IPv4
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+commit ed70fcfcee953a76028bfc3f963d2167c2990020
+Author: Tom Herbert <therbert@google.com>
+Date:   Fri May 2 16:29:38 2014 -0700
+
+    net: Call skb_checksum_init in IPv4
+
+    Call skb_checksum_init instead of private functions.
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/ip.h b/include/net/ip.h
+index 9bd4e68..f148ad0 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -313,6 +313,12 @@ static inline void ip_select_ident_more(struct sk_buff *skb, struct dst_entry *d
+   __ip_select_ident(iph, dst, more);
+ }
+ 
++static inline __wsum inet_compute_pseudo(struct sk_buff *skb, int proto)
++{
++ return csum_tcpudp_nofold(ip_hdr(skb)->saddr, ip_hdr(skb)->daddr,
++      skb->len, proto, 0);
++}
++
+ /*
+  * Map a multicast IP onto multicast MAC for type ethernet.
+  */
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 9b27962..8c0e01c 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -1751,28 +1751,6 @@ static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
+  return sk;
+ }
+ 
+-static __sum16 tcp_v4_checksum_init(struct sk_buff *skb)
+-{
+- const struct iphdr *iph = ip_hdr(skb);
+-
+- if (skb->ip_summed == CHECKSUM_COMPLETE) {
+-  if (!tcp_v4_check(skb->len, iph->saddr,
+-      iph->daddr, skb->csum)) {
+-   skb->ip_summed = CHECKSUM_UNNECESSARY;
+-   return 0;
+-  }
+- }
+-
+- skb->csum = csum_tcpudp_nofold(iph->saddr, iph->daddr,
+-           skb->len, IPPROTO_TCP, 0);
+-
+- if (skb->len <= 76) {
+-  return __skb_checksum_complete(skb);
+- }
+- return 0;
+-}
+-
+-
+ /* The socket must have it's spinlock held when we get
+  * here.
+  *
+@@ -1970,7 +1948,8 @@ int tcp_v4_rcv(struct sk_buff *skb)
+   * Packet length and doff are validated by header prediction,
+   * provided case of th->doff==0 is eliminated.
+   * So, we defer the checks. */
+- if (!skb_csum_unnecessary(skb) && tcp_v4_checksum_init(skb))
++
++ if (skb_checksum_init(skb, IPPROTO_TCP, inet_compute_pseudo))
+   goto csum_error;
+ 
+  th = tcp_hdr(skb);
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index e029d8c..21404cb 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1636,7 +1636,6 @@ static int __udp4_lib_mcast_deliver(struct net *net, struct sk_buff *skb,
+ static inline int udp4_csum_init(struct sk_buff *skb, struct udphdr *uh,
+      int proto)
+ {
+- const struct iphdr *iph;
+  int err;
+ 
+  UDP_SKB_CB(skb)->partial_cov = 0;
+@@ -1648,22 +1647,8 @@ static inline int udp4_csum_init(struct sk_buff *skb, struct udphdr *uh,
+    return err;
+  }
+ 
+- iph = ip_hdr(skb);
+- if (uh->check == 0) {
+-  skb->ip_summed = CHECKSUM_UNNECESSARY;
+- } else if (skb->ip_summed == CHECKSUM_COMPLETE) {
+-  if (!csum_tcpudp_magic(iph->saddr, iph->daddr, skb->len,
+-          proto, skb->csum))
+-   skb->ip_summed = CHECKSUM_UNNECESSARY;
+- }
+- if (!skb_csum_unnecessary(skb))
+-  skb->csum = csum_tcpudp_nofold(iph->saddr, iph->daddr,
+-            skb->len, proto, 0);
+- /* Probably, we should checksum udp header (it should be in cache
+-  * in any case) and data in tiny packets (< rx copybreak).
+-  */
+-
+- return 0;
++ return skb_checksum_init_zero_check(skb, proto, uh->check,
++         inet_compute_pseudo);
+ }
+ 
+ /*
+-- 
+1.7.1

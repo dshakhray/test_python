@@ -1,0 +1,174 @@
+From af0f1cf8b409a4fda96bdaccbe3b49d59baefb2d Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 2 May 2014 14:37:05 -0400
+Subject: [misc] mei: use hbm idle state to prevent spurious resets
+
+Message-id: <1399041470-21330-33-git-send-email-prarit@redhat.com>
+Patchwork-id: 79322
+O-Subject: [RHEL7.1 PATCH BZ 1088953 32/77] mei: use hbm idle state to prevent spurious resets
+Bugzilla: 1088953
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1088953
+
+commit 66ae460b13c31a176b41550259683c841a62af3e
+Author: Tomas Winkler <tomas.winkler@intel.com>
+Date:   Wed Jan 8 20:19:22 2014 +0200
+
+    mei: use hbm idle state to prevent spurious resets
+
+    When reset is caused by hbm protocol mismatch or timeout
+    we might end up in an endless reset loop and hbm protocol
+    will never sync
+
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+    Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Cc: Dean Nelson <dnelson@redhat.com>
+Cc: Stefan Assmann <sassmann@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/misc/mei/hbm.c b/drivers/misc/mei/hbm.c
+index cbea221..6586bac 100644
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -126,6 +126,17 @@ static bool is_treat_specially_client(struct mei_cl *cl,
+  return false;
+ }
+ 
++/**
++ * mei_hbm_idle - set hbm to idle state
++ *
++ * @dev: the device structure
++ */
++void mei_hbm_idle(struct mei_device *dev)
++{
++ dev->init_clients_timer = 0;
++ dev->hbm_state = MEI_HBM_IDLE;
++}
++
+ int mei_hbm_start_wait(struct mei_device *dev)
+ {
+  int ret;
+@@ -583,6 +594,14 @@ int mei_hbm_dispatch(struct mei_device *dev, struct mei_msg_hdr *hdr)
+  mei_read_slots(dev, dev->rd_msg_buf, hdr->length);
+  mei_msg = (struct mei_bus_message *)dev->rd_msg_buf;
+ 
++ /* ignore spurious message and prevent reset nesting
++  * hbm is put to idle during system reset
++  */
++ if (dev->hbm_state == MEI_HBM_IDLE) {
++  dev_dbg(&dev->pdev->dev, "hbm: state is idle ignore spurious messages\n");
++  return 0;
++ }
++
+  switch (mei_msg->hbm_cmd) {
+  case HOST_START_RES_CMD:
+   dev_dbg(&dev->pdev->dev, "hbm: start: response message received.\n");
+diff --git a/drivers/misc/mei/hbm.h b/drivers/misc/mei/hbm.h
+index f2540ff..5f92188 100644
+--- a/drivers/misc/mei/hbm.h
++++ b/drivers/misc/mei/hbm.h
+@@ -49,6 +49,7 @@ static inline void mei_hbm_hdr(struct mei_msg_hdr *hdr, size_t length)
+  hdr->reserved = 0;
+ }
+ 
++void mei_hbm_idle(struct mei_device *dev);
+ int mei_hbm_start_req(struct mei_device *dev);
+ int mei_hbm_start_wait(struct mei_device *dev);
+ int mei_hbm_cl_flow_control_req(struct mei_device *dev, struct mei_cl *cl);
+diff --git a/drivers/misc/mei/init.c b/drivers/misc/mei/init.c
+index 1ba3052..d8885fe 100644
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -129,14 +129,19 @@ void mei_reset(struct mei_device *dev, int interrupts_enabled)
+   dev_warn(&dev->pdev->dev, "unexpected reset: dev_state = %s\n",
+     mei_dev_state_str(dev->dev_state));
+ 
++ /* we're already in reset, cancel the init timer
++  * if the reset was called due the hbm protocol error
++  * we need to call it before hw start
++  * so the hbm watchdog won't kick in
++  */
++ mei_hbm_idle(dev);
++
+  ret = mei_hw_reset(dev, interrupts_enabled);
+  if (ret) {
+   dev_err(&dev->pdev->dev, "hw reset failed disabling the device\n");
+   interrupts_enabled = false;
+-  dev->dev_state = MEI_DEV_DISABLED;
+  }
+ 
+- dev->hbm_state = MEI_HBM_IDLE;
+ 
+  if (dev->dev_state != MEI_DEV_INITIALIZING &&
+      dev->dev_state != MEI_DEV_POWER_UP) {
+@@ -160,8 +165,6 @@ void mei_reset(struct mei_device *dev, int interrupts_enabled)
+   memset(&dev->wr_ext_msg, 0, sizeof(dev->wr_ext_msg));
+  }
+ 
+- /* we're already in reset, cancel the init timer */
+- dev->init_clients_timer = 0;
+ 
+  dev->me_clients_num = 0;
+  dev->rd_msg_hdr = 0;
+@@ -169,6 +172,7 @@ void mei_reset(struct mei_device *dev, int interrupts_enabled)
+ 
+  if (!interrupts_enabled) {
+   dev_dbg(&dev->pdev->dev, "intr not enabled end of reset\n");
++  dev->dev_state = MEI_DEV_DISABLED;
+   return;
+  }
+ 
+diff --git a/drivers/misc/mei/interrupt.c b/drivers/misc/mei/interrupt.c
+index bbb61be..206dbe9 100644
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -537,7 +537,6 @@ EXPORT_SYMBOL_GPL(mei_irq_write_handler);
+  *
+  * @work: pointer to the work_struct structure
+  *
+- * NOTE: This function is called by timer interrupt work
+  */
+ void mei_timer(struct work_struct *work)
+ {
+@@ -552,18 +551,24 @@ void mei_timer(struct work_struct *work)
+ 
+ 
+  mutex_lock(&dev->device_lock);
+- if (dev->dev_state != MEI_DEV_ENABLED) {
+-  if (dev->dev_state == MEI_DEV_INIT_CLIENTS) {
+-   if (dev->init_clients_timer) {
+-    if (--dev->init_clients_timer == 0) {
+-     dev_err(&dev->pdev->dev, "reset: init clients timeout hbm_state = %d.\n",
+-      dev->hbm_state);
+-     mei_reset(dev, 1);
+-    }
++
++ /* Catch interrupt stalls during HBM init handshake */
++ if (dev->dev_state == MEI_DEV_INIT_CLIENTS &&
++     dev->hbm_state != MEI_HBM_IDLE) {
++
++  if (dev->init_clients_timer) {
++   if (--dev->init_clients_timer == 0) {
++    dev_err(&dev->pdev->dev, "timer: init clients timeout hbm_state = %d.\n",
++     dev->hbm_state);
++    mei_reset(dev, 1);
++    goto out;
+    }
+   }
+-  goto out;
+  }
++
++ if (dev->dev_state != MEI_DEV_ENABLED)
++  goto out;
++
+  /*** connect/disconnect timeouts ***/
+  list_for_each_entry_safe(cl_pos, cl_next, &dev->file_list, link) {
+   if (cl_pos->timer_count) {
+-- 
+1.7.1

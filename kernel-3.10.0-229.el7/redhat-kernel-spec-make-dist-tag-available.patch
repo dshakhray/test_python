@@ -1,0 +1,132 @@
+From 7c02a1bf30d128f2b33262f98ece43c118cca062 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Thu, 18 Sep 2014 19:45:16 -0400
+Subject: [redhat] kernel.spec: make %{dist} tag available
+
+Message-id: <1411069516-229927-1-git-send-email-dzickus@redhat.com>
+Patchwork-id: 96317
+O-Subject: [RHEL7 PATCH] redhat: add %{dist} tag to kernel.spec file
+Bugzilla: 1144150
+RH-Acked-by: Kyle McMartin <kmcmarti@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1144150
+(not sure if bugzilla is needed.  I touched the kernel.spec file so..)
+
+The kernel currently hardcodes .el7 into the spec file.  Normally this is not
+a problem as that is the only tag that builds the kernel.
+
+However, under certain conditions we need flexibility to build off on the side
+under another dist tag.
+
+Such is the case for pp64le.  Because formal ppc64le builds are not happening
+yet, brew builds the normal kernel, notifies the message bus, and a daemon on the
+side notices the message and kicks off a ppc64le kernel with a different
+dist-tag.
+
+Right now that doesn't work because el7 is hardcoded into the version string.
+So even though brew passes in 'bs4' the rpm tries to build el7 and that was
+already built (by the original build that triggered the side build).  And brew
+won't let you officially build duplicate package NVRs.
+
+We can explore philosophically how much of our tarballs, rpms, and tags should
+have el7 in them, but considering we are in the middle of 7.1, I would rather
+avoid a large amount of change.
+
+I kept the fix very small.  Only the release string in the spec file changes to
+include %{?dist} in its string.  The rest of the change is just creating and
+passing this info to the spec file.
+
+TESTED:
+- local srpm:
+
+[dzickus@intel-canoepass-08 rhel7]$ brew build --scratch rhel-7.1-ppc64le-candidate
+/ssd/dzickus/git/rhel7/redhat/rpm/SRPMS/kernel-3.10.0-161.el7.usb71.2.src.rpm
+
+Uploading srpm:
+/ssd/dzickus/git/rhel7/redhat/rpm/SRPMS/kernel-3.10.0-161.el7.usb71.2.src.rpm
+[====================================] 100% 00:00:10  75.51 MiB   7.23 MiB/sec
+Created task: 7988519
+Task info: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=7988519
+
+- dist-git and a giturl
+
+[dzickus@intel-canoepass-08 kernel]$ brew build --scratch rhel-7.1-ppc64le-candidate
+git://pkgs.devel.redhat.com/rpms/kernel?#c352db7597c5d8d3f7c98214f480f055e04c1bd6
+
+Created task: 7988753
+Task info: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=7988753
+
+Both of them create rpms with 'bs4' instead of 'el7'.
+
+----
+I kinda wonder if the RT folks stumbled upon this or if it would help them
+(even though they use kernel-rt to work around it).
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/redhat/Makefile b/redhat/Makefile
+index 4e4ee91..5d8add6 100644
+--- a/redhat/Makefile
++++ b/redhat/Makefile
+@@ -90,7 +90,7 @@ $(TARBALL):
+ 
+ setup-source: rh-clean-sources
+  @cp $(REDHAT)/$(SPECFILE).template $(SOURCES)/$(SPECFILE)
+- @$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(PKGRELEASE) $(RPMVERSION) $(RELEASED_KERNEL)
++ @$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(PKGRELEASE) $(RPMVERSION) $(RELEASED_KERNEL) $(SPECRELEASE)
+  @cp $(SOURCES)/$(SPECFILE) $(SOURCES)/../SPECS/
+ 
+ sources-rh: $(TARBALL)
+diff --git a/redhat/Makefile.common b/redhat/Makefile.common
+index e664533..34022b6 100644
+--- a/redhat/Makefile.common
++++ b/redhat/Makefile.common
+@@ -31,6 +31,7 @@ endif
+ $(info BUILDID is "$(BUILDID)". Update '$(shell dirname $(REDHAT))/localversion' to change.)
+ 
+ PKGRELEASE:=$(PREBUILD)$(BUILD)$(DIST)$(BUILDID)
++SPECRELEASE:=$(PREBUILD)$(BUILD)%{?dist}$(BUILDID)
+ 
+ TARFILE:=linux-$(KVERSION)-$(PKGRELEASE).tar.xz
+ TARBALL:=$(REDHAT)/$(TARFILE)
+diff --git a/redhat/genspec.sh b/redhat/genspec.sh
+index 2e6024a..db4136c 100755
+--- a/redhat/genspec.sh
++++ b/redhat/genspec.sh
+@@ -5,6 +5,7 @@ SPECFILE=$2
+ PKGRELEASE=$3
+ RPMVERSION=$4
+ RELEASED_KERNEL=$5
++SPECRELEASE=$6
+ clogf="$SOURCES/changelog"
+ # hide [redhat] entries from changelog
+ HIDE_REDHAT=1;
+@@ -162,6 +163,7 @@ test -n "$SPECFILE" &&
+  /%%CHANGELOG%%/d
+  s/%%RPMVERSION%%/$RPMVERSION/
+  s/%%PKGRELEASE%%/$PKGRELEASE/
++ s/%%SPECRELEASE%%/$SPECRELEASE/
+  s/%%RELEASED_KERNEL%%/$RELEASED_KERNEL/" $SPECFILE
+ 
+ rm -f $clogf{,.rev,.stripped};
+diff --git a/redhat/kernel.spec.template b/redhat/kernel.spec.template
+index 26006c2..ab6c6b9 100644
+--- a/redhat/kernel.spec.template
++++ b/redhat/kernel.spec.template
+@@ -12,7 +12,10 @@ Summary: The Linux kernel
+ %define rpmversion %%RPMVERSION%%
+ %define pkgrelease %%PKGRELEASE%%
+ 
+-%define pkg_release %{pkgrelease}%{?buildid}
++# allow pkg_release to have configurable %{?dist} tag
++%define specrelease %%SPECRELEASE%%
++
++%define pkg_release %{specrelease}%{?buildid}
+ 
+ # The kernel tarball/base version
+ %define rheltarball %{rpmversion}-%{pkgrelease}
+-- 
+1.7.1

@@ -1,0 +1,89 @@
+From b91881dc77fcbf46b0ef3f307566a0da64246dd2 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 25 Nov 2014 16:36:10 -0500
+Subject: [fs] overlayfs: fix lockdep misannotation
+
+Message-id: <20141125163610.18115.23797.stgit@warthog.procyon.org.uk>
+Patchwork-id: 100943
+O-Subject: [PATCH 43/47] overlayfs: fix lockdep misannotation
+Bugzilla: 985875
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+From: Miklos Szeredi <miklos@szeredi.hu>
+
+In an overlay directory that shadows an empty lower directory, say
+/mnt/a/empty102, do:
+
+  touch /mnt/a/empty102/x
+  unlink /mnt/a/empty102/x
+  rmdir /mnt/a/empty102
+
+It's actually harmless, but needs another level of nesting between
+I_MUTEX_CHILD and I_MUTEX_NORMAL.
+
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+Tested-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Original-commit: d1b72cc6d8cb766c802fdc70a5edc2f0ba8a2b57
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/namei.c b/fs/namei.c
+index d88666d..b3eaad7 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -2485,7 +2485,7 @@ struct dentry *lock_rename(struct dentry *p1, struct dentry *p2)
+  }
+ 
+  mutex_lock_nested(&p1->d_inode->i_mutex, I_MUTEX_PARENT);
+- mutex_lock_nested(&p2->d_inode->i_mutex, I_MUTEX_CHILD);
++ mutex_lock_nested(&p2->d_inode->i_mutex, I_MUTEX_PARENT2);
+  return NULL;
+ }
+ 
+diff --git a/fs/overlayfs/readdir.c b/fs/overlayfs/readdir.c
+index ec36f80..5207a1d 100644
+--- a/fs/overlayfs/readdir.c
++++ b/fs/overlayfs/readdir.c
+@@ -588,7 +588,7 @@ void ovl_cleanup_whiteouts(struct dentry *upper, struct list_head *list)
+ {
+  struct ovl_cache_entry *p;
+ 
+- mutex_lock_nested(&upper->d_inode->i_mutex, I_MUTEX_PARENT);
++ mutex_lock_nested(&upper->d_inode->i_mutex, I_MUTEX_CHILD);
+  list_for_each_entry(p, list, l_node) {
+   struct dentry *dentry;
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 3bab9de..324a66f 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -640,11 +640,13 @@ static inline int inode_unhashed(struct inode *inode)
+  * 2: child/target
+  * 3: xattr
+  * 4: second non-directory
+- * The last is for certain operations (such as rename) which lock two
++ * 5: second parent (when locking independent directories in rename)
++ *
++ * I_MUTEX_NONDIR2 is for certain operations (such as rename) which lock two
+  * non-directories at once.
+  *
+  * The locking order between these classes is
+- * parent -> child -> normal -> xattr -> second non-directory
++ * parent[2] -> child -> grandchild -> normal -> xattr -> second non-directory
+  */
+ enum inode_i_mutex_lock_class
+ {
+@@ -652,7 +654,8 @@ enum inode_i_mutex_lock_class
+  I_MUTEX_PARENT,
+  I_MUTEX_CHILD,
+  I_MUTEX_XATTR,
+- I_MUTEX_NONDIR2
++ I_MUTEX_NONDIR2,
++ I_MUTEX_PARENT2,
+ };
+ 
+ void lock_two_nondirectories(struct inode *, struct inode*);
+-- 
+1.7.1

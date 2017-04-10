@@ -1,0 +1,100 @@
+From 40c1c9e990a2b73b0e184fa8e07f9f27ac1a48c5 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Thu, 28 Aug 2014 19:16:03 -0400
+Subject: [virt] virtio_blk, blk-mq: add ->init_request and ->exit_request methods
+
+Message-id: <1409253371-23161-14-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 89857
+O-Subject: [RHEL7 PATCH 13/21] virtio-blk, blk-mq: add ->init_request and ->exit_request methods
+Bugzilla: 1105698
+RH-Acked-by: Fam Zheng <famz@redhat.com>
+
+This is a backport of the virtio-blk portion of the following commit.
+This is related to bug 1105698.
+
+  commit e9b267d91f6ddbc694cb40aa962b0b2cec03971d
+  Author: Christoph Hellwig <hch@lst.de>
+  Date:   Tue Apr 15 13:59:10 2014 -0600
+
+    blk-mq: add ->init_request and ->exit_request methods
+
+    The current blk_mq_init_commands/blk_mq_free_commands interface has a
+    two problems:
+
+     1) Because only the constructor is passed to blk_mq_init_commands there
+        is no easy way to clean up when a comman initialization failed.  The
+        current code simply leaks the allocations done in the constructor.
+
+     2) There is no good place to call blk_mq_free_commands: before
+        blk_cleanup_queue there is no guarantee that all outstanding
+        commands have completed, so we can't free them yet.  After
+        blk_cleanup_queue the queue has usually been freed.  This can be
+        worked around by grabbing an unconditional reference before calling
+        blk_cleanup_queue and dropping it after blk_mq_free_commands is
+        done, although that's not exatly pretty and driver writers are
+        guaranteed to get it wrong sooner or later.
+
+    Both issues are easily fixed by making the request constructor and
+    destructor normal blk_mq_ops methods.
+
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index c7d02bc..d06206a 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -480,11 +480,22 @@ static const struct device_attribute dev_attr_cache_type_rw =
+  __ATTR(cache_type, S_IRUGO|S_IWUSR,
+         virtblk_cache_type_show, virtblk_cache_type_store);
+ 
++static int virtblk_init_request(void *data, struct blk_mq_hw_ctx *hctx,
++  struct request *rq, unsigned int nr)
++{
++ struct virtio_blk *vblk = data;
++ struct virtblk_req *vbr = blk_mq_rq_to_pdu(rq);
++
++ sg_init_table(vbr->sg, vblk->sg_elems);
++ return 0;
++}
++
+ static struct blk_mq_ops virtio_mq_ops = {
+  .queue_rq = virtio_queue_rq,
+  .map_queue = blk_mq_map_queue,
+  .alloc_hctx = blk_mq_alloc_single_hw_queue,
+  .free_hctx = blk_mq_free_single_hw_queue,
++ .init_request = virtblk_init_request,
+  .complete = virtblk_request_done,
+ };
+ 
+@@ -497,16 +508,6 @@ static struct blk_mq_reg virtio_mq_reg = {
+ };
+ module_param_named(queue_depth, virtio_mq_reg.queue_depth, uint, 0444);
+ 
+-static int virtblk_init_vbr(void *data, struct blk_mq_hw_ctx *hctx,
+-        struct request *rq, unsigned int nr)
+-{
+- struct virtio_blk *vblk = data;
+- struct virtblk_req *vbr = blk_mq_rq_to_pdu(rq);
+-
+- sg_init_table(vbr->sg, vblk->sg_elems);
+- return 0;
+-}
+-
+ static int virtblk_probe(struct virtio_device *vdev)
+ {
+  struct virtio_blk *vblk;
+@@ -577,8 +578,6 @@ static int virtblk_probe(struct virtio_device *vdev)
+   goto out_put_disk;
+  }
+ 
+- blk_mq_init_commands(q, virtblk_init_vbr, vblk);
+-
+  q->queuedata = vblk;
+ 
+  virtblk_name_format("vd", index, vblk->disk->disk_name, DISK_NAME_LEN);
+-- 
+1.7.1

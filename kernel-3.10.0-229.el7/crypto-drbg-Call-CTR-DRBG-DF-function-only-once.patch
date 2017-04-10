@@ -1,0 +1,114 @@
+From c184b90efa903ac4338ac31d8dfb8712e40ab4f8 Mon Sep 17 00:00:00 2001
+From: Herbert Xu <herbert@gondor.apana.org.au>
+Date: Mon, 1 Sep 2014 13:10:37 -0400
+Subject: [crypto] drbg: Call CTR DRBG DF function only once
+
+Message-id: <E1XORNV-000887-7C@gondolin.me.apana.org.au>
+Patchwork-id: 90070
+O-Subject: [PATCH 13/19] crypto: drbg - Call CTR DRBG DF function only once
+Bugzilla: 1011562
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+RHEL7 Bugzilla #1011562
+
+Upstream commit: 72e7c25aa6d73df2951229d2ce0a35065de66d3a
+
+The CTR DRBG requires the update function to be called twice when
+generating a random number. In both cases, update function must process
+the additional information string by using the DF function. As the DF
+produces the same result in both cases, we can save one invocation of
+the DF function when the first DF function result is reused.
+
+The result of the DF function is stored in the scratchpad storage. The
+patch ensures that the scratchpad is not cleared when we want to reuse
+the DF result. For achieving this, the CTR DRBG update function must
+know by whom and in which scenario it is called. This information is
+provided with the reseed parameter to the update function.
+
+Signed-off-by: Stephan Mueller <smueller@chronox.de>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/crypto/drbg.c b/crypto/drbg.c
+index c9b4c49..dba5ed2 100644
+--- a/crypto/drbg.c
++++ b/crypto/drbg.c
+@@ -562,7 +562,21 @@ out:
+  return ret;
+ }
+ 
+-/* update function of CTR DRBG as defined in 10.2.1.2 */
++/*
++ * update function of CTR DRBG as defined in 10.2.1.2
++ *
++ * The reseed variable has an enhanced meaning compared to the update
++ * functions of the other DRBGs as follows:
++ * 0 => initial seed from initialization
++ * 1 => reseed via drbg_seed
++ * 2 => first invocation from drbg_ctr_update when addtl is present. In
++ *      this case, the df_data scratchpad is not deleted so that it is
++ *      available for another calls to prevent calling the DF function
++ *      again.
++ * 3 => second invocation from drbg_ctr_update. When the update function
++ *      was called with addtl, the df_data memory already contains the
++ *      DFed addtl information and we do not need to call DF again.
++ */
+ static int drbg_ctr_update(struct drbg_state *drbg, struct list_head *seed,
+       int reseed)
+ {
+@@ -577,7 +591,8 @@ static int drbg_ctr_update(struct drbg_state *drbg, struct list_head *seed,
+  unsigned char prefix = DRBG_PREFIX1;
+ 
+  memset(temp, 0, drbg_statelen(drbg) + drbg_blocklen(drbg));
+- memset(df_data, 0, drbg_statelen(drbg));
++ if (3 > reseed)
++  memset(df_data, 0, drbg_statelen(drbg));
+ 
+  /* 10.2.1.3.2 step 2 and 10.2.1.4.2 step 2 */
+  if (seed) {
+@@ -619,7 +634,8 @@ static int drbg_ctr_update(struct drbg_state *drbg, struct list_head *seed,
+ 
+ out:
+  memset(temp, 0, drbg_statelen(drbg) + drbg_blocklen(drbg));
+- memset(df_data, 0, drbg_statelen(drbg));
++ if (2 != reseed)
++  memset(df_data, 0, drbg_statelen(drbg));
+  return ret;
+ }
+ 
+@@ -644,7 +660,7 @@ static int drbg_ctr_generate(struct drbg_state *drbg,
+   LIST_HEAD(addtllist);
+ 
+   list_add_tail(&addtl->list, &addtllist);
+-  ret = drbg_ctr_update(drbg, &addtllist, 1);
++  ret = drbg_ctr_update(drbg, &addtllist, 2);
+   if (ret)
+    return 0;
+  }
+@@ -675,21 +691,8 @@ static int drbg_ctr_generate(struct drbg_state *drbg,
+    drbg_add_buf(drbg->V, drbg_blocklen(drbg), &prefix, 1);
+  }
+ 
+- /*
+-  * 10.2.1.5.2 step 6
+-  * The following call invokes the DF function again which could be
+-  * optimized. In step 2, the "additional_input" after step 2 is the
+-  * output of the DF function. If this result would be saved, the DF
+-  * function would not need to be invoked again at this point.
+-  */
+- if (addtl && 0 < addtl->len) {
+-  LIST_HEAD(addtllist);
+-
+-  list_add_tail(&addtl->list, &addtllist);
+-  ret = drbg_ctr_update(drbg, &addtllist, 1);
+- } else {
+-  ret = drbg_ctr_update(drbg, NULL, 1);
+- }
++ /* 10.2.1.5.2 step 6 */
++ ret = drbg_ctr_update(drbg, NULL, 3);
+  if (ret)
+   len = ret;
+ 
+-- 
+1.7.1

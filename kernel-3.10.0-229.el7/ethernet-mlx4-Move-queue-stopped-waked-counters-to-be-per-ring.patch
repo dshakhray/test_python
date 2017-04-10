@@ -1,0 +1,92 @@
+From 8c6b3fe7b0ad2a7133db261eed3b7a36b2f89caa Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 11:59:53 -0400
+Subject: [ethernet] mlx4: Move queue stopped/waked counters to be per ring
+
+Message-id: <890d55b6bf6718fd3788f93cf130b04ecf0e2743.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93626
+O-Subject: [Patch RHEL7.1 V1 057/197] net/mlx4_en: Move queue stopped/waked counters to be per ring
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Eugenia Emantayev <eugenia@mellanox.com>
+
+Give accurate counters and avoids cache misses when several rings
+update the counters of stop/wake queue.
+
+Signed-off-by: Eugenia Emantayev <eugenia@mellanox.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 15bffdffccb3204eb1e993f60eee65c439a03136)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_port.c b/drivers/net/ethernet/mellanox/mlx4/en_port.c
+index dae1a1f..c2cfb05 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_port.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_port.c
+@@ -148,10 +148,16 @@ int mlx4_en_DUMP_ETH_STATS(struct mlx4_en_dev *mdev, u8 port, u8 reset)
+  stats->tx_packets = 0;
+  stats->tx_bytes = 0;
+  priv->port_stats.tx_chksum_offload = 0;
++ priv->port_stats.queue_stopped = 0;
++ priv->port_stats.wake_queue = 0;
++
+  for (i = 0; i < priv->tx_ring_num; i++) {
+   stats->tx_packets += priv->tx_ring[i]->packets;
+   stats->tx_bytes += priv->tx_ring[i]->bytes;
+   priv->port_stats.tx_chksum_offload += priv->tx_ring[i]->tx_csum;
++  priv->port_stats.queue_stopped +=
++   priv->tx_ring[i]->queue_stopped;
++  priv->port_stats.wake_queue += priv->tx_ring[i]->wake_queue;
+  }
+ 
+  stats->rx_errors = be64_to_cpu(mlx4_en_stats->PCS) +
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index eae35a9..77e8999 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -445,7 +445,7 @@ static int mlx4_en_process_tx_cq(struct net_device *dev,
+   */
+  if (netif_tx_queue_stopped(ring->tx_queue) && txbbs_skipped > 0) {
+   netif_tx_wake_queue(ring->tx_queue);
+-  priv->port_stats.wake_queue++;
++  ring->wake_queue++;
+  }
+  return done;
+ }
+@@ -690,7 +690,7 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
+        ring->size - HEADROOM - MAX_DESC_TXBBS)) {
+   /* every full Tx ring stops queue */
+   netif_tx_stop_queue(ring->tx_queue);
+-  priv->port_stats.queue_stopped++;
++  ring->queue_stopped++;
+ 
+   /* If queue was emptied after the if, and before the
+    * stop_queue - need to wake the queue, or else it will remain
+@@ -703,7 +703,7 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev)
+   if (unlikely(((int)(ring->prod - ring->cons)) <=
+         ring->size - HEADROOM - MAX_DESC_TXBBS)) {
+    netif_tx_wake_queue(ring->tx_queue);
+-   priv->port_stats.wake_queue++;
++   ring->wake_queue++;
+   } else {
+    return NETDEV_TX_BUSY;
+   }
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 46aa030..14ca6bc 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -274,6 +274,8 @@ struct mlx4_en_tx_ring {
+  unsigned long bytes;
+  unsigned long packets;
+  unsigned long tx_csum;
++ unsigned long queue_stopped;
++ unsigned long wake_queue;
+  struct mlx4_bf bf;
+  bool bf_enabled;
+  struct netdev_queue *tx_queue;
+-- 
+1.7.1

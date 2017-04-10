@@ -1,0 +1,88 @@
+From c648102e30ee3f669f7c27eaccd9416bb68e6c6d Mon Sep 17 00:00:00 2001
+From: Sai Vemuri <svemuri@redhat.com>
+Date: Wed, 12 Nov 2014 19:08:20 -0500
+Subject: [scsi] cxgb4i: send abort_rpl correctly
+
+Message-id: <1415819300-32670-20-git-send-email-svemuri@redhat.com>
+Patchwork-id: 99873
+O-Subject: [RHEL7.1 PATCH BZ 1163467 19/19] cxgb4i: send abort_rpl correctly
+Bugzilla: 1163467
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Connection retries were not being cleaned up correctly if they failed as a
+result of link down. Applies on top of drivers-for-3.18.
+
+Signed-off-by: Anish Bhatt <anish@chelsio.com>
+Signed-off-by: Karen Xie <kxie@chelsio.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 7b07bf244ae33e4ce8d51c23f1359121942a6f3e)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
+index 3e0a0d3..81bb3bd 100644
+--- a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
++++ b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
+@@ -936,20 +936,23 @@ static void do_abort_req_rss(struct cxgbi_device *cdev, struct sk_buff *skb)
+  cxgbi_sock_get(csk);
+  spin_lock_bh(&csk->lock);
+ 
+- if (!cxgbi_sock_flag(csk, CTPF_ABORT_REQ_RCVD)) {
+-  cxgbi_sock_set_flag(csk, CTPF_ABORT_REQ_RCVD);
+-  cxgbi_sock_set_state(csk, CTP_ABORTING);
+-  goto done;
++ cxgbi_sock_clear_flag(csk, CTPF_ABORT_REQ_RCVD);
++
++ if (!cxgbi_sock_flag(csk, CTPF_TX_DATA_SENT)) {
++  send_tx_flowc_wr(csk);
++  cxgbi_sock_set_flag(csk, CTPF_TX_DATA_SENT);
+  }
+ 
+- cxgbi_sock_clear_flag(csk, CTPF_ABORT_REQ_RCVD);
++ cxgbi_sock_set_flag(csk, CTPF_ABORT_REQ_RCVD);
++ cxgbi_sock_set_state(csk, CTP_ABORTING);
++
+  send_abort_rpl(csk, rst_status);
+ 
+  if (!cxgbi_sock_flag(csk, CTPF_ABORT_RPL_PENDING)) {
+   csk->err = abort_status_to_errno(csk, req->status, &rst_status);
+   cxgbi_sock_closed(csk);
+  }
+-done:
++
+  spin_unlock_bh(&csk->lock);
+  cxgbi_sock_put(csk);
+ rel_skb:
+diff --git a/drivers/scsi/cxgbi/libcxgbi.c b/drivers/scsi/cxgbi/libcxgbi.c
+index d090b7f..504979e 100644
+--- a/drivers/scsi/cxgbi/libcxgbi.c
++++ b/drivers/scsi/cxgbi/libcxgbi.c
+@@ -905,18 +905,16 @@ void cxgbi_sock_rcv_abort_rpl(struct cxgbi_sock *csk)
+ {
+  cxgbi_sock_get(csk);
+  spin_lock_bh(&csk->lock);
++
++ cxgbi_sock_set_flag(csk, CTPF_ABORT_RPL_RCVD);
+  if (cxgbi_sock_flag(csk, CTPF_ABORT_RPL_PENDING)) {
+-  if (!cxgbi_sock_flag(csk, CTPF_ABORT_RPL_RCVD))
+-   cxgbi_sock_set_flag(csk, CTPF_ABORT_RPL_RCVD);
+-  else {
+-   cxgbi_sock_clear_flag(csk, CTPF_ABORT_RPL_RCVD);
+-   cxgbi_sock_clear_flag(csk, CTPF_ABORT_RPL_PENDING);
+-   if (cxgbi_sock_flag(csk, CTPF_ABORT_REQ_RCVD))
+-    pr_err("csk 0x%p,%u,0x%lx,%u,ABT_RPL_RSS.\n",
+-     csk, csk->state, csk->flags, csk->tid);
+-   cxgbi_sock_closed(csk);
+-  }
++  cxgbi_sock_clear_flag(csk, CTPF_ABORT_RPL_PENDING);
++  if (cxgbi_sock_flag(csk, CTPF_ABORT_REQ_RCVD))
++   pr_err("csk 0x%p,%u,0x%lx,%u,ABT_RPL_RSS.\n",
++          csk, csk->state, csk->flags, csk->tid);
++  cxgbi_sock_closed(csk);
+  }
++
+  spin_unlock_bh(&csk->lock);
+  cxgbi_sock_put(csk);
+ }
+-- 
+1.7.1

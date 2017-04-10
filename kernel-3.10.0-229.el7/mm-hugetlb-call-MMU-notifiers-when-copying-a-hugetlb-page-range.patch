@@ -1,0 +1,86 @@
+From 98d980063878bcfcb0f9d963c2dacc3677032c66 Mon Sep 17 00:00:00 2001
+From: Andrea Arcangeli <aarcange@redhat.com>
+Date: Tue, 9 Sep 2014 01:16:38 -0400
+Subject: [mm] hugetlb: call MMU notifiers when copying a hugetlb page range
+
+Message-id: <1410225399-8094-22-git-send-email-aarcange@redhat.com>
+Patchwork-id: 93376
+O-Subject: [RHEL7.1 PATCH 21/22] mm/hugetlb.c: call MMU notifiers when copying a hugetlb page range
+Bugzilla: 1135506
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+From: Andreas Sandberg <andreas@sandberg.pp.se>
+
+When copy_hugetlb_page_range() is called to copy a range of hugetlb
+mappings, the secondary MMUs are not notified if there is a protection
+downgrade, which breaks COW semantics in KVM.
+
+This patch adds the necessary MMU notifier calls.
+
+Signed-off-by: Andreas Sandberg <andreas@sandberg.pp.se>
+Acked-by: Steve Capper <steve.capper@linaro.org>
+Acked-by: Marc Zyngier <marc.zyngier@arm.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 5fd04d3..11e22c6 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -2463,17 +2463,27 @@ int copy_hugetlb_page_range(struct mm_struct *dst, struct mm_struct *src,
+  int cow;
+  struct hstate *h = hstate_vma(vma);
+  unsigned long sz = huge_page_size(h);
++ unsigned long mmun_start; /* For mmu_notifiers */
++ unsigned long mmun_end;  /* For mmu_notifiers */
++ int ret = 0;
+ 
+  cow = (vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
+ 
++ mmun_start = vma->vm_start;
++ mmun_end = vma->vm_end;
++ if (cow)
++  mmu_notifier_invalidate_range_start(src, mmun_start, mmun_end);
++
+  for (addr = vma->vm_start; addr < vma->vm_end; addr += sz) {
+   spinlock_t *src_ptl, *dst_ptl;
+   src_pte = huge_pte_offset(src, addr);
+   if (!src_pte)
+    continue;
+   dst_pte = huge_pte_alloc(dst, addr, sz);
+-  if (!dst_pte)
+-   goto nomem;
++  if (!dst_pte) {
++   ret = -ENOMEM;
++   break;
++  }
+ 
+   /* If the pagetables are shared don't copy or take references */
+   if (dst_pte == src_pte)
+@@ -2494,10 +2504,11 @@ int copy_hugetlb_page_range(struct mm_struct *dst, struct mm_struct *src,
+   spin_unlock(src_ptl);
+   spin_unlock(dst_ptl);
+  }
+- return 0;
+ 
+-nomem:
+- return -ENOMEM;
++ if (cow)
++  mmu_notifier_invalidate_range_end(src, mmun_start, mmun_end);
++
++ return ret;
+ }
+ 
+ static int is_hugetlb_entry_migration(pte_t pte)
+-- 
+1.7.1

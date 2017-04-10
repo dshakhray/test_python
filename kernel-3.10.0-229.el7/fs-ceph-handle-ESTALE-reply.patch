@@ -1,0 +1,88 @@
+From 5c725e1bd85ee82bc7fcb5945a5003d7e8422f82 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:23:54 -0400
+Subject: [fs] ceph: handle -ESTALE reply
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-128-git-send-email-sweil@redhat.com>
+Patchwork-id: 89630
+O-Subject: [PATCH 127/303] ceph: handle -ESTALE reply
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: "Yan, Zheng" <zheng.z.yan@intel.com>
+
+Send requests that operate on path to directory's auth MDS if
+mode == USE_AUTH_MDS. Always retry using the auth MDS if got
+-ESTALE reply from non-auth MDS. Also clean up the code that
+handles auth MDS change.
+
+Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+(cherry picked from commit ca18bede048e95a749d13410ce1da4ad0ffa7938)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 73c7943..1fd655a 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -713,14 +713,15 @@ static int __choose_mds(struct ceph_mds_client *mdsc,
+    struct dentry *dn = get_nonsnap_parent(parent);
+    inode = dn->d_inode;
+    dout("__choose_mds using nonsnap parent %p\n", inode);
+-  } else if (req->r_dentry->d_inode) {
++  } else {
+    /* dentry target */
+    inode = req->r_dentry->d_inode;
+-  } else {
+-   /* dir + name */
+-   inode = dir;
+-   hash = ceph_dentry_hash(dir, req->r_dentry);
+-   is_hash = true;
++   if (!inode || mode == USE_AUTH_MDS) {
++    /* dir + name */
++    inode = dir;
++    hash = ceph_dentry_hash(dir, req->r_dentry);
++    is_hash = true;
++   }
+   }
+  }
+ 
+@@ -2161,26 +2162,16 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+   */
+  if (result == -ESTALE) {
+   dout("got ESTALE on request %llu", req->r_tid);
+-  if (!req->r_inode) {
+-   /* do nothing; not an authority problem */
+-  } else if (req->r_direct_mode != USE_AUTH_MDS) {
++  if (req->r_direct_mode != USE_AUTH_MDS) {
+    dout("not using auth, setting for that now");
+    req->r_direct_mode = USE_AUTH_MDS;
+    __do_request(mdsc, req);
+    mutex_unlock(&mdsc->mutex);
+    goto out;
+   } else  {
+-   struct ceph_inode_info *ci = ceph_inode(req->r_inode);
+-   struct ceph_cap *cap = NULL;
+-
+-   if (req->r_session)
+-    cap = ceph_get_cap_for_mds(ci,
+-         req->r_session->s_mds);
+-
+-   dout("already using auth");
+-   if ((!cap || cap != ci->i_auth_cap) ||
+-       (cap->mseq != req->r_sent_on_mseq)) {
+-    dout("but cap changed, so resending");
++   int mds = __choose_mds(mdsc, req);
++   if (mds >= 0 && mds != req->r_session->s_mds) {
++    dout("but auth changed, so resending");
+     __do_request(mdsc, req);
+     mutex_unlock(&mdsc->mutex);
+     goto out;
+-- 
+1.7.1

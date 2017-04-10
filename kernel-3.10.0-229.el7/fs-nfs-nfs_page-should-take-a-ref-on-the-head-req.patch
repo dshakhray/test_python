@@ -1,0 +1,66 @@
+From 8731d7d7b8bb1fc9e005affda510b353838ec085 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 24 Jul 2014 18:16:08 -0400
+Subject: [fs] nfs: nfs_page should take a ref on the head req
+
+Message-id: <1406225773-16395-6-git-send-email-steved@redhat.com>
+Patchwork-id: 86639
+O-Subject: [RHEL7.1 PATCH 05/10] nfs: nfs_page should take a ref on the head req
+Bugzilla: 1120728
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+nfs_pages that aren't the the head of a group must take a reference on the
+head as long as ->wb_head is set to it. This stops the head from hitting
+a refcount of 0 while there is still an active nfs_page for the page group.
+
+This avoids kref warnings in the writeback code when the page group head
+is found and referenced.
+
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 85710a837c2026aae80b7c64187edf1f10027b0b
+Bugzilla: 1120728
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index a1df2bd..11972a8 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -269,15 +269,21 @@ nfs_page_group_init(struct nfs_page *req, struct nfs_page *prev)
+  WARN_ON_ONCE(prev == req);
+ 
+  if (!prev) {
++  /* a head request */
+   req->wb_head = req;
+   req->wb_this_page = req;
+  } else {
++  /* a subrequest */
+   WARN_ON_ONCE(prev->wb_this_page != prev->wb_head);
+   WARN_ON_ONCE(!test_bit(PG_HEADLOCK, &prev->wb_head->wb_flags));
+   req->wb_head = prev->wb_head;
+   req->wb_this_page = prev->wb_this_page;
+   prev->wb_this_page = req;
+ 
++  /* All subrequests take a ref on the head request until
++   * nfs_page_group_destroy is called */
++  kref_get(&req->wb_head->wb_kref);
++
+   /* grab extra ref if head request has extra ref from
+    * the write/commit path to handle handoff between write
+    * and commit lists */
+@@ -301,6 +307,10 @@ nfs_page_group_destroy(struct kref *kref)
+  struct nfs_page *req = container_of(kref, struct nfs_page, wb_kref);
+  struct nfs_page *tmp, *next;
+ 
++ /* subrequests must release the ref on the head request */
++ if (req->wb_head != req)
++  nfs_release_request(req->wb_head);
++
+  if (!nfs_page_group_sync_on_bit(req, PG_TEARDOWN))
+   return;
+ 
+-- 
+1.7.1

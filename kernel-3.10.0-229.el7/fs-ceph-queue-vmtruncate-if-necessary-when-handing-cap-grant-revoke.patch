@@ -1,0 +1,76 @@
+From 0abd2e1cda539725a52b92e51a50625f000cbda9 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:25:50 -0400
+Subject: [fs] ceph: queue vmtruncate if necessary when handing cap grant/revoke
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-244-git-send-email-sweil@redhat.com>
+Patchwork-id: 89768
+O-Subject: [PATCH 243/303] ceph: queue vmtruncate if necessary when handing cap grant/revoke
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: "Yan, Zheng" <zheng.z.yan@intel.com>
+
+cap grant/revoke message from non-auth MDS can update inode's size
+and truncate_seq/truncate_size. (the message arrives before auth
+MDS's cap trunc message)
+
+Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+(cherry picked from commit c6bcda6f525129b1df169f77d96a4b0972e1ecb1)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index 5db8817..a23f9c1 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -2416,10 +2416,11 @@ static void handle_cap_grant(struct inode *inode, struct ceph_mds_caps *grant,
+  u64 max_size = le64_to_cpu(grant->max_size);
+  struct timespec mtime, atime, ctime;
+  int check_caps = 0;
+- int wake = 0;
+- int writeback = 0;
+- int queue_invalidate = 0;
+- int deleted_inode = 0;
++ bool wake = 0;
++ bool writeback = 0;
++ bool queue_trunc = 0;
++ bool queue_invalidate = 0;
++ bool deleted_inode = 0;
+ 
+  dout("handle_cap_grant inode %p cap %p mds%d seq %d %s\n",
+       inode, cap, mds, seq, ceph_cap_string(newcaps));
+@@ -2501,9 +2502,10 @@ static void handle_cap_grant(struct inode *inode, struct ceph_mds_caps *grant,
+  }
+ 
+  /* size/ctime/mtime/atime? */
+- ceph_fill_file_size(inode, issued,
+-       le32_to_cpu(grant->truncate_seq),
+-       le64_to_cpu(grant->truncate_size), size);
++ queue_trunc = ceph_fill_file_size(inode, issued,
++       le32_to_cpu(grant->truncate_seq),
++       le64_to_cpu(grant->truncate_size),
++       size);
+  ceph_decode_timespec(&mtime, &grant->mtime);
+  ceph_decode_timespec(&atime, &grant->atime);
+  ceph_decode_timespec(&ctime, &grant->ctime);
+@@ -2583,6 +2585,11 @@ static void handle_cap_grant(struct inode *inode, struct ceph_mds_caps *grant,
+  BUG_ON(cap->issued & ~cap->implemented);
+ 
+  spin_unlock(&ci->i_ceph_lock);
++
++ if (queue_trunc) {
++  ceph_queue_vmtruncate(inode);
++ }
++
+  if (writeback)
+   /*
+    * queue inode for writeback: we can't actually call
+-- 
+1.7.1

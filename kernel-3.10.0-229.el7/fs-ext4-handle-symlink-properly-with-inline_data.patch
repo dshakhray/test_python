@@ -1,0 +1,83 @@
+From 636e8cfcc1f75ed0f01835e37584f10ba80ff18f Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Wed, 29 Oct 2014 16:34:03 -0400
+Subject: [fs] ext4: handle symlink properly with inline_data
+
+Message-id: <1414600485-1929-14-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98524
+O-Subject: [RHEL 7.1 PATCH v2 13/55] ext4: handle symlink properly with inline_data
+Bugzilla: 1156096
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Zheng Liu <wenqing.lz@taobao.com>
+
+BZ 1156096
+https://bugzilla.redhat.com/show_bug.cgi?id=1156096
+
+BREW 8169722
+https://brewweb.devel.redhat.com/taskinfo?taskID=8169722
+
+Upstream commit bd9db175dde14b606265e0d37e8319d96fe1a58f
+
+ This commit tries to fix a bug that we can't read symlink properly with
+ inline data feature when the length of symlink is greater than 60 bytes
+ but less than extra space.
+
+ The key issue is in ext4_inode_is_fast_symlink() that it doesn't check
+ whether or not an inode has inline data.  When the user creates a new
+ symlink, an inode will be allocated with MAY_INLINE_DATA flag.  Then
+ symlink will be stored in ->i_block and extended attribute space.  In
+ the mean time, this inode is with inline data flag.  After remounting
+ it, ext4_inode_is_fast_symlink() function thinks that this inode is a
+ fast symlink so that the data in ->i_block is copied to the user, and
+ the data in extra space is trimmed.  In fact this inode should be as a
+ normal symlink.
+
+ The following script can hit this bug.
+
+   #!/bin/bash
+
+   cd ${MNT}
+   filename=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
+   rm -rf test
+   mkdir test
+   cd test
+   echo "hello" >$filename
+   ln -s $filename symlinkfile
+   cd
+   sudo umount /mnt/sda1
+   sudo mount -t ext4 /dev/sda1 /mnt/sda1
+   readlink /mnt/sda1/test/symlinkfile
+
+ After applying this patch, it will break the assumption in e2fsck
+ because the original implementation doesn't want to support symlink
+ with inline data.
+
+ Reported-by: "Darrick J. Wong" <darrick.wong@oracle.com>
+ Reported-by: Ian Nartowicz <claws@nartowicz.co.uk>
+ Cc: Ian Nartowicz <claws@nartowicz.co.uk>
+ Cc: Tao Ma <tm@tao.ma>
+ Cc: "Darrick J. Wong" <darrick.wong@oracle.com>
+ Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+ Signed-off-by: Zheng Liu <wenqing.lz@taobao.com>
+ Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 259f75b..fb0fed4 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -147,6 +147,9 @@ static int ext4_inode_is_fast_symlink(struct inode *inode)
+         int ea_blocks = EXT4_I(inode)->i_file_acl ?
+   EXT4_CLUSTER_SIZE(inode->i_sb) >> 9 : 0;
+ 
++ if (ext4_has_inline_data(inode))
++  return 0;
++
+  return (S_ISLNK(inode->i_mode) && inode->i_blocks - ea_blocks == 0);
+ }
+ 
+-- 
+1.7.1

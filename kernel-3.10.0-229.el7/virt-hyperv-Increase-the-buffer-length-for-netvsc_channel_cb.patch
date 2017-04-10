@@ -1,0 +1,100 @@
+From 56962cbb3b5fe17da60001889a40208e233a42d2 Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Mon, 29 Sep 2014 00:59:17 -0400
+Subject: [virt] hyperv: Increase the buffer length for netvsc_channel_cb()
+
+Message-id: <1411952358-34104-34-git-send-email-jasowang@redhat.com>
+Patchwork-id: 96787
+O-Subject: [RHEL7.1 PATCH 33/34] hyperv: Increase the buffer length for netvsc_channel_cb()
+Bugzilla: 1146357
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+
+From: Haiyang Zhang <haiyangz@microsoft.com>
+
+Bugzilla: 1146357
+
+When the buffer is too small for a packet from VMBus, a bigger buffer will be
+allocated in netvsc_channel_cb() and retry reading the packet from VMBus.
+Increasing this buffer size will reduce the retry overhead.
+
+Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+Reviewed-by: Dexuan Cui <decui@microsoft.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f90251c8a6d06ed8b072a2a0f13c4b8a6d0cb222)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index 4170708..574e481 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -592,7 +592,7 @@ struct nvsp_message {
+ 
+ #define NETVSC_RECEIVE_BUFFER_ID  0xcafe
+ 
+-#define NETVSC_PACKET_SIZE                      2048
++#define NETVSC_PACKET_SIZE                      4096
+ 
+ #define VRSS_SEND_TAB_SIZE 16
+ 
+@@ -643,7 +643,7 @@ struct netvsc_device {
+  int ring_size;
+ 
+  /* The primary channel callback buffer */
+- unsigned char cb_buffer[NETVSC_PACKET_SIZE];
++ unsigned char *cb_buffer;
+  /* The sub channel callback buffer */
+  unsigned char *sub_cb_buf;
+ };
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 6e2d703..53a6ec3 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -43,6 +43,12 @@ static struct netvsc_device *alloc_net_device(struct hv_device *device)
+  if (!net_device)
+   return NULL;
+ 
++ net_device->cb_buffer = kzalloc(NETVSC_PACKET_SIZE, GFP_KERNEL);
++ if (!net_device->cb_buffer) {
++  kfree(net_device);
++  return NULL;
++ }
++
+  init_waitqueue_head(&net_device->wait_drain);
+  net_device->start_remove = false;
+  net_device->destroy = false;
+@@ -53,6 +59,12 @@ static struct netvsc_device *alloc_net_device(struct hv_device *device)
+  return net_device;
+ }
+ 
++static void free_netvsc_device(struct netvsc_device *nvdev)
++{
++ kfree(nvdev->cb_buffer);
++ kfree(nvdev);
++}
++
+ static struct netvsc_device *get_outbound_net_device(struct hv_device *device)
+ {
+  struct netvsc_device *net_device;
+@@ -552,7 +564,7 @@ int netvsc_device_remove(struct hv_device *device)
+  if (net_device->sub_cb_buf)
+   vfree(net_device->sub_cb_buf);
+ 
+- kfree(net_device);
++ free_netvsc_device(net_device);
+  return 0;
+ }
+ 
+@@ -1094,7 +1106,7 @@ close:
+  vmbus_close(device->channel);
+ 
+ cleanup:
+- kfree(net_device);
++ free_netvsc_device(net_device);
+ 
+  return ret;
+ }
+-- 
+1.7.1

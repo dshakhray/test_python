@@ -1,0 +1,143 @@
+From a42e0ab7d1ee8a38f03d4f0fc401de98e30a0d22 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 19 Sep 2014 13:29:51 -0400
+Subject: [acpi] Add container online uevent to acpi_bus_attach
+
+Message-id: <1411133391-24945-1-git-send-email-prarit@redhat.com>
+Patchwork-id: 96406
+O-Subject: [RHEL7.1 PATCH BZ 1140572] acpi : Add container online uevent to acpi_bus_attach
+Bugzilla: 1140572
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1140572
+Brew: Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=7956552 (along with patches for 1128634 and 1140567)
+
+This patch was submitted here:
+
+http://marc.info/?l=linux-acpi&m=140990031430462&w=2
+
+and Rafael has seemingly okayed it here:
+
+http://marc.info/?l=linux-acpi&m=141044010102787&w=2
+
+so it is safe putting this in without an actual upstream commit.
+
+Container online uevent was deleted by "46394fd01 : ACPI / hotplug:
+Move container-specific code out of the core" because container-
+specific uevent is raised to udev by attaching container device.
+But the container-specific uevent is not useful.
+
+In my box, conainer device has CPU and memory devices. In this case,
+when hot adding container device, the following uevets are raised to
+udev.
+
+  # udevadm monitor --kernel
+  monitor will print the received events for:
+  KERNEL - the kernel uevent
+
+  KERNEL[...] add      /devices/system/container/ACPI0004:01 (container)
+  <snip>
+  KERNEL[...] add      /devices/system/memory/memory2048 (memory)
+  KERNEL[...] add      /devices/system/memory/memory2049 (memory)
+  <snip>
+  KERNEL[...] add      /devices/system/memory/memory2063 (memory)
+  <snip>
+  KERNEL[...] add      /devices/system/cpu/cpu60 (cpu)
+  <snip>
+  KERNEL[...] add      /devices/system/cpu/cpu119 (cpu)
+
+When udev catches the container add uevent in my box, udev executes
+user land script for onlining all child's devices. But memory and CPU
+devices have not been attached at this time. So user land script fails.
+
+One of solutions is that user land script waits for all child's devices
+to attach. But user land script has no way to know all child's devices
+were attached.
+
+So the patch adds container online uevent to acpi_bus_sttach(). By
+applying
+the patch, container online uevent is raised to udev after all child's
+devices were attached as follows:
+
+  # udevadm monitor --kernel
+  monitor will print the received events for:
+  KERNEL - the kernel uevent
+
+  KERNEL[...] add      /devices/system/container/ACPI0004:01 (container)
+  <snip>
+  KERNEL[...] add      /devices/system/memory/memory2048 (memory)
+  KERNEL[...] add      /devices/system/memory/memory2049 (memory)
+  <snip>
+  KERNEL[...] add      /devices/system/memory/memory2063 (memory)
+  <snip>
+  KERNEL[...] add      /devices/system/cpu/cpu60 (cpu)
+  <snip>
+  KERNEL[...] add      /devices/system/cpu/cpu119 (cpu)
+  KERNEL[...] online   /devices/system/container/ACPI0004:01 (container)
+
+So if user land script is executed after raising the container online
+uevent, it guarantees that all child's devices were attached.
+
+ Signed-off-by: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+Cc: Stefan Assmann <sassmann@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/container.c b/drivers/acpi/container.c
+index 6c05ffd..be9a3b8 100644
+--- a/drivers/acpi/container.c
++++ b/drivers/acpi/container.c
+@@ -96,6 +96,13 @@ static void container_device_detach(struct acpi_device *adev)
+   device_unregister(dev);
+ }
+ 
++static void container_device_online(struct acpi_device *adev)
++{
++ struct device *dev = acpi_driver_data(adev);
++
++ kobject_uevent(&dev->kobj, KOBJ_ONLINE);
++}
++
+ static struct acpi_scan_handler container_handler = {
+  .ids = container_device_ids,
+  .attach = container_device_attach,
+@@ -103,6 +110,7 @@ static struct acpi_scan_handler container_handler = {
+  .hotplug = {
+   .enabled = true,
+   .demand_offline = true,
++  .notify_online = container_device_online,
+  },
+ };
+ 
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index 595feba..dbfee79 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -2053,6 +2053,9 @@ static void acpi_bus_attach(struct acpi_device *device)
+  ok:
+  list_for_each_entry(child, &device->children, node)
+   acpi_bus_attach(child);
++
++ if (device->handler && device->handler->hotplug.notify_online)
++  device->handler->hotplug.notify_online(device);
+ }
+ 
+ /**
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index 325c26e..0f64d1a 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -94,6 +94,7 @@ struct acpi_device;
+ struct acpi_hotplug_profile {
+  struct kobject kobj;
+  int (*scan_dependent)(struct acpi_device *adev);
++ void (*notify_online)(struct acpi_device *adev);
+  bool enabled:1;
+  bool demand_offline:1;
+ };
+-- 
+1.7.1

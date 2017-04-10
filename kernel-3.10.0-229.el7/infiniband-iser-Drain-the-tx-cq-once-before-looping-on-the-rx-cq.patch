@@ -1,0 +1,67 @@
+From ef293ec2c1f4483014088ed870e1f6552640f675 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Mon, 3 Nov 2014 07:52:15 -0500
+Subject: [infiniband] iser: Drain the tx cq once before looping on the rx cq
+
+Message-id: <5c487f2441c316d1ebbfdce0ff195204c5b3a1bb.1415000301.git.avadai@redhat.com>
+Patchwork-id: 98686
+O-Subject: [Patch RHEL7.1 17/37] IB/iser: Drain the tx cq once before looping on the rx cq
+Bugzilla: 1107622
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Doug Ledford <dledford@redhat.com>
+
+From: Roi Dayan <roid@mellanox.com>
+
+The iser disconnection flow isn't done before all the inflight
+recv/send buffers posted to the QP are either flushed or normally
+completed to the CQ that serves this connection.  The condition check
+is done in iser_handle_comp_error().
+
+Currently, it's possible for the send buffer completion that makes the
+posted send buffers counter reach zero to be polled in the drain tx
+call, which is after the rx cq is fully drained.  Since this
+completion might be not an error one (for example, it might be a
+completion of the logout request iSCSI PDU) we will skip
+iser_handle_comp_error().  So the connection will never terminate from
+the iscsi stack point of view, and we hang.
+
+To resolve this race, do the draining of the tx cq before the loop on
+the rx cq.
+
+Signed-off-by: Roi Dayan <roid@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 1d6c2b736fd251c1f827704b1234d81b28c112d6)
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index d2848e4..89fadd8 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -1112,8 +1112,12 @@ static void iser_cq_tasklet_fn(unsigned long data)
+   struct iser_rx_desc *desc;
+   unsigned long      xfer_len;
+  struct iser_conn *ib_conn;
+- int completed_tx, completed_rx;
+- completed_tx = completed_rx = 0;
++ int completed_tx, completed_rx = 0;
++
++ /* First do tx drain, so in a case where we have rx flushes and a successful
++  * tx completion we will still go through completion error handling.
++  */
++ completed_tx = iser_drain_tx_cq(device, cq_index);
+ 
+  while (ib_poll_cq(cq, 1, &wc) == 1) {
+   desc  = (struct iser_rx_desc *) (unsigned long) wc.wr_id;
+@@ -1141,7 +1145,6 @@ static void iser_cq_tasklet_fn(unsigned long data)
+   * " would not cause interrupts to be missed"                       */
+  ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
+ 
+- completed_tx += iser_drain_tx_cq(device, cq_index);
+  iser_dbg("got %d rx %d tx completions\n", completed_rx, completed_tx);
+ }
+ 
+-- 
+1.7.1

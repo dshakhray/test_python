@@ -1,0 +1,353 @@
+From 0e5f8d18b8d6620983ceb097f478bbc9dc7a5a23 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 19 Sep 2014 12:29:16 -0400
+Subject: [acpi] hotplug/pci: Hotplug notifications from acpi_bus_notify()
+
+Message-id: <1411129776-21656-42-git-send-email-prarit@redhat.com>
+Patchwork-id: 96358
+O-Subject: [RHEL7.1 PATCH BZ 1141846 41/61] ACPI / hotplug / PCI: Hotplug notifications from acpi_bus_notify()
+Bugzilla: 1141846
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1141846
+
+commit 1a699476e25814343766342672c655fb135224cc
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Thu Feb 6 13:58:13 2014 +0100
+
+    ACPI / hotplug / PCI: Hotplug notifications from acpi_bus_notify()
+
+    Since acpi_bus_notify() is executed on all notifications for all
+    devices anyway, make it execute acpi_device_hotplug() for all
+    hotplug events instead of installing notify handlers pointing to
+    the same function for all hotplug devices.
+
+    This change reduces both the size and complexity of ACPI-based device
+    hotplug code.  Moreover, since acpi_device_hotplug() only does
+    significant things for devices that have either an ACPI scan handler,
+    or a hotplug context with .eject() defined, and those devices
+    had notify handlers pointing to acpi_hotplug_notify_cb() installed
+    before anyway, this modification shouldn't change functionality.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+Cc: Stefan Assmann <sassmann@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Cc: Myron Stowe <mstowe@redhat.com>
+Cc: Andy Gospodarek <agospoda@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/bus.c b/drivers/acpi/bus.c
+index 5467368..cb7c930 100644
+--- a/drivers/acpi/bus.c
++++ b/drivers/acpi/bus.c
+@@ -439,62 +439,77 @@ int acpi_bus_receive_event(struct acpi_bus_event *event)
+  */
+ static void acpi_bus_notify(acpi_handle handle, u32 type, void *data)
+ {
+- struct acpi_device *device;
++ struct acpi_device *adev;
+  struct acpi_driver *driver;
+-
+- ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Notification %#02x to handle %p\n",
+-     type, handle));
++ acpi_status status;
++ u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+ 
+  switch (type) {
+-
+  case ACPI_NOTIFY_BUS_CHECK:
+-  /* TBD */
++  acpi_handle_debug(handle, "ACPI_NOTIFY_BUS_CHECK event\n");
+   break;
+ 
+  case ACPI_NOTIFY_DEVICE_CHECK:
+-  /* TBD */
++  acpi_handle_debug(handle, "ACPI_NOTIFY_DEVICE_CHECK event\n");
+   break;
+ 
+  case ACPI_NOTIFY_DEVICE_WAKE:
+-  /* TBD */
++  acpi_handle_debug(handle, "ACPI_NOTIFY_DEVICE_WAKE event\n");
+   break;
+ 
+  case ACPI_NOTIFY_EJECT_REQUEST:
+-  /* TBD */
++  acpi_handle_debug(handle, "ACPI_NOTIFY_EJECT_REQUEST event\n");
+   break;
+ 
+  case ACPI_NOTIFY_DEVICE_CHECK_LIGHT:
++  acpi_handle_debug(handle, "ACPI_NOTIFY_DEVICE_CHECK_LIGHT event\n");
+   /* TBD: Exactly what does 'light' mean? */
+   break;
+ 
+  case ACPI_NOTIFY_FREQUENCY_MISMATCH:
+-  /* TBD */
++  acpi_handle_err(handle, "Device cannot be configured due "
++    "to a frequency mismatch\n");
+   break;
+ 
+  case ACPI_NOTIFY_BUS_MODE_MISMATCH:
+-  /* TBD */
++  acpi_handle_err(handle, "Device cannot be configured due "
++    "to a bus mode mismatch\n");
+   break;
+ 
+  case ACPI_NOTIFY_POWER_FAULT:
+-  /* TBD */
++  acpi_handle_err(handle, "Device has suffered a power fault\n");
+   break;
+ 
+  default:
+-  ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+-      "Received unknown/unsupported notification [%08x]\n",
+-      type));
+-  break;
++  acpi_handle_warn(handle, "Unsupported event type 0x%x\n", type);
++  ost_code = ACPI_OST_SC_UNRECOGNIZED_NOTIFY;
++  goto err;
+  }
+ 
+- device = acpi_bus_get_acpi_device(handle);
+- if (device) {
+-  driver = device->driver;
+-  if (driver && driver->ops.notify &&
+-      (driver->flags & ACPI_DRIVER_ALL_NOTIFY_EVENTS))
+-   driver->ops.notify(device, type);
++ adev = acpi_bus_get_acpi_device(handle);
++ if (!adev)
++  goto err;
+ 
+-  acpi_bus_put_acpi_device(device);
++ driver = adev->driver;
++ if (driver && driver->ops.notify &&
++     (driver->flags & ACPI_DRIVER_ALL_NOTIFY_EVENTS))
++  driver->ops.notify(adev, type);
++
++ switch (type) {
++ case ACPI_NOTIFY_BUS_CHECK:
++ case ACPI_NOTIFY_DEVICE_CHECK:
++ case ACPI_NOTIFY_EJECT_REQUEST:
++  status = acpi_hotplug_execute(acpi_device_hotplug, adev, type);
++  if (ACPI_SUCCESS(status))
++   return;
++ default:
++  break;
+  }
++ acpi_bus_put_acpi_device(adev);
++ return;
++
++ err:
++ acpi_evaluate_hotplug_ost(handle, type, ost_code, NULL);
+ }
+ 
+ /* --------------------------------------------------------------------------
+diff --git a/drivers/acpi/internal.h b/drivers/acpi/internal.h
+index 2b1fc9a..04d3614 100644
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -73,6 +73,7 @@ static inline void acpi_lpss_init(void) {}
+ #endif
+ 
+ bool acpi_queue_hotplug_work(struct work_struct *work);
++void acpi_device_hotplug(void *data, u32 src);
+ bool acpi_scan_is_offline(struct acpi_device *adev, bool uevent);
+ 
+ /* --------------------------------------------------------------------------
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index 3b16d58..12445e0 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -411,7 +411,7 @@ static int acpi_generic_hotplug_event(struct acpi_device *adev, u32 type)
+  return -EINVAL;
+ }
+ 
+-static void acpi_device_hotplug(void *data, u32 src)
++void acpi_device_hotplug(void *data, u32 src)
+ {
+  u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+  struct acpi_device *adev = data;
+@@ -461,76 +461,6 @@ static void acpi_device_hotplug(void *data, u32 src)
+  unlock_device_hotplug();
+ }
+ 
+-static void acpi_hotplug_notify_cb(acpi_handle handle, u32 type, void *data)
+-{
+- struct acpi_device *adev;
+- u32 ost_code = ACPI_OST_SC_SUCCESS;
+- acpi_status status;
+-
+- adev = acpi_bus_get_acpi_device(handle);
+- if (!adev)
+-  goto out;
+-
+- switch (type) {
+- case ACPI_NOTIFY_BUS_CHECK:
+-  acpi_handle_debug(handle, "ACPI_NOTIFY_BUS_CHECK event\n");
+-  break;
+-
+- case ACPI_NOTIFY_DEVICE_CHECK:
+-  acpi_handle_debug(handle, "ACPI_NOTIFY_DEVICE_CHECK event\n");
+-  break;
+-
+- case ACPI_NOTIFY_EJECT_REQUEST:
+-  acpi_handle_debug(handle, "ACPI_NOTIFY_EJECT_REQUEST event\n");
+-  break;
+-
+- case ACPI_NOTIFY_DEVICE_WAKE:
+-  return;
+-
+- case ACPI_NOTIFY_FREQUENCY_MISMATCH:
+-  acpi_handle_err(handle, "Device cannot be configured due "
+-    "to a frequency mismatch\n");
+-  goto out;
+-
+- case ACPI_NOTIFY_BUS_MODE_MISMATCH:
+-  acpi_handle_err(handle, "Device cannot be configured due "
+-    "to a bus mode mismatch\n");
+-  goto out;
+-
+- case ACPI_NOTIFY_POWER_FAULT:
+-  acpi_handle_err(handle, "Device has suffered a power fault\n");
+-  goto out;
+-
+- default:
+-  acpi_handle_warn(handle, "Unsupported event type 0x%x\n", type);
+-  ost_code = ACPI_OST_SC_UNRECOGNIZED_NOTIFY;
+-  goto out;
+-  }
+-
+- ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+-
+- status = acpi_hotplug_execute(acpi_device_hotplug, adev, type);
+- if (ACPI_SUCCESS(status))
+-  return;
+-
+- acpi_bus_put_acpi_device(adev);
+-
+- out:
+- acpi_evaluate_hotplug_ost(handle, type, ost_code, NULL);
+-}
+-
+-void acpi_install_hotplug_notify_handler(acpi_handle handle)
+-{
+- acpi_install_notify_handler(handle, ACPI_SYSTEM_NOTIFY,
+-        acpi_hotplug_notify_cb, NULL);
+-}
+-
+-void acpi_remove_hotplug_notify_handler(acpi_handle handle)
+-{
+- acpi_remove_notify_handler(handle, ACPI_SYSTEM_NOTIFY,
+-       acpi_hotplug_notify_cb);
+-}
+-
+ static ssize_t real_power_state_show(struct device *dev,
+          struct device_attribute *attr, char *buf)
+ {
+@@ -1980,12 +1910,10 @@ static void acpi_scan_init_hotplug(struct acpi_device *adev)
+   struct acpi_scan_handler *handler;
+ 
+   handler = acpi_scan_match_handler(hwid->id, NULL);
+-  if (!handler)
+-   continue;
+-
+-  acpi_install_hotplug_notify_handler(adev->handle);
+-  adev->flags.hotplug_notify = true;
+-  break;
++  if (handler) {
++   adev->flags.hotplug_notify = true;
++   break;
++  }
+  }
+ }
+ 
+diff --git a/drivers/pci/hotplug/acpiphp.h b/drivers/pci/hotplug/acpiphp.h
+index d7c1fc9..2b85924 100644
+--- a/drivers/pci/hotplug/acpiphp.h
++++ b/drivers/pci/hotplug/acpiphp.h
+@@ -167,7 +167,6 @@ struct acpiphp_attention_info
+ 
+ #define FUNC_HAS_STA  (0x00000001)
+ #define FUNC_HAS_EJ0  (0x00000002)
+-#define FUNC_HAS_DCK            (0x00000004)
+ 
+ /* function prototypes */
+ 
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index 205af1a..5d45a40 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -297,7 +297,6 @@ static acpi_status register_slot(acpi_handle handle, u32 lvl, void *data,
+  newfunc = &context->func;
+  newfunc->function = function;
+  newfunc->parent = bridge;
+- acpi_unlock_hp_context();
+ 
+  if (acpi_has_method(handle, "_EJ0"))
+   newfunc->flags = FUNC_HAS_EJ0;
+@@ -305,8 +304,14 @@ static acpi_status register_slot(acpi_handle handle, u32 lvl, void *data,
+  if (acpi_has_method(handle, "_STA"))
+   newfunc->flags |= FUNC_HAS_STA;
+ 
++ /*
++  * Dock stations' notify handler should be used for dock devices instead
++  * of the common one, so clear hp.event in their contexts.
++  */
+  if (acpi_has_method(handle, "_DCK"))
+-  newfunc->flags |= FUNC_HAS_DCK;
++  context->hp.event = NULL;
++
++ acpi_unlock_hp_context();
+ 
+  /* search for objects that share the same slot */
+  list_for_each_entry(slot, &bridge->slots, node)
+@@ -374,10 +379,6 @@ static acpi_status register_slot(acpi_handle handle, u32 lvl, void *data,
+    pr_debug("failed to register dock device\n");
+  }
+ 
+- /* install notify handler */
+- if (!(newfunc->flags & FUNC_HAS_DCK))
+-  acpi_install_hotplug_notify_handler(handle);
+-
+  return AE_OK;
+ }
+ 
+@@ -406,13 +407,14 @@ static void cleanup_bridge(struct acpiphp_bridge *bridge)
+ 
+  list_for_each_entry(slot, &bridge->slots, node) {
+   list_for_each_entry(func, &slot->funcs, sibling) {
+-   acpi_handle handle = func_to_handle(func);
++   struct acpi_device *adev = func_to_acpi_device(func);
+ 
+-   if (is_dock_device(handle))
+-    unregister_hotplug_dock_device(handle);
++   if (is_dock_device(adev->handle))
++    unregister_hotplug_dock_device(adev->handle);
+ 
+-   if (!(func->flags & FUNC_HAS_DCK))
+-    acpi_remove_hotplug_notify_handler(handle);
++   acpi_lock_hp_context();
++   adev->hp->event = NULL;
++   acpi_unlock_hp_context();
+   }
+   slot->flags |= SLOT_IS_GOING_AWAY;
+   if (slot->slot)
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index 3170914..1c8df6b 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -429,8 +429,6 @@ static inline bool acpi_device_enumerated(struct acpi_device *adev)
+ typedef void (*acpi_hp_callback)(void *data, u32 src);
+ 
+ acpi_status acpi_hotplug_execute(acpi_hp_callback func, void *data, u32 src);
+-void acpi_install_hotplug_notify_handler(acpi_handle handle);
+-void acpi_remove_hotplug_notify_handler(acpi_handle handle);
+ 
+ /**
+  * module_acpi_driver(acpi_driver) - Helper macro for registering an ACPI driver
+-- 
+1.7.1

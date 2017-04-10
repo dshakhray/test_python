@@ -1,0 +1,97 @@
+From acab81b751a2de8f342845dd85e632b315139c84 Mon Sep 17 00:00:00 2001
+From: Michal Schmidt <mschmidt@redhat.com>
+Date: Fri, 5 Sep 2014 19:50:12 -0400
+Subject: [ethernet] bnx2x: Fix stop-on-error
+
+Message-id: <1409946615-5862-68-git-send-email-mschmidt@redhat.com>
+Patchwork-id: 91609
+O-Subject: [RHEL7.1 PATCH 67/70] bnx2x: Fix stop-on-error
+Bugzilla: 1089402
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+BZ: https://bugzilla.redhat.com/show_bug.cgi?id=1089402
+
+Upstream commit:
+commit ea36475a22ded71633331a0b9b3cddd7f1d6983a
+Author: Yuval Mintz <Yuval.Mintz@qlogic.com>
+Date:   Mon Aug 25 17:48:30 2014 +0300
+
+    bnx2x: Fix stop-on-error
+
+    When STOP_ON_ERROR is set driver will not compile. Even if it did,
+    traffic will not pass without this patch as several fields which are
+    verified by FW/HW on the Tx path are not properly set.
+
+    Signed-off-by: Yuval Mintz <Yuval.Mintz@qlogic.com>
+    Signed-off-by: Ariel Elior <Ariel.Elior@qlogic.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+index ef811d1..c5c700e 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+@@ -3873,12 +3873,16 @@ netdev_tx_t bnx2x_start_xmit(struct sk_buff *skb, struct net_device *dev)
+   /* when transmitting in a vf, start bd must hold the ethertype
+    * for fw to enforce it
+    */
++#ifndef BNX2X_STOP_ON_ERROR
+   if (IS_VF(bp))
++#endif
+    tx_start_bd->vlan_or_ethertype =
+     cpu_to_le16(ntohs(eth->h_proto));
++#ifndef BNX2X_STOP_ON_ERROR
+   else
+    /* used by FW for packet accounting */
+    tx_start_bd->vlan_or_ethertype = cpu_to_le16(pkt_prod);
++#endif
+  }
+ 
+  nbd = 2; /* start_bd + pbd + frags (updated when pages are mapped) */
+@@ -3951,11 +3955,22 @@ netdev_tx_t bnx2x_start_xmit(struct sk_buff *skb, struct net_device *dev)
+            &pbd_e2->data.mac_addr.dst_mid,
+            &pbd_e2->data.mac_addr.dst_lo,
+            eth->h_dest);
+-  } else if (bp->flags & TX_SWITCHING) {
+-   bnx2x_set_fw_mac_addr(&pbd_e2->data.mac_addr.dst_hi,
+-           &pbd_e2->data.mac_addr.dst_mid,
+-           &pbd_e2->data.mac_addr.dst_lo,
+-           eth->h_dest);
++  } else {
++   if (bp->flags & TX_SWITCHING)
++    bnx2x_set_fw_mac_addr(
++      &pbd_e2->data.mac_addr.dst_hi,
++      &pbd_e2->data.mac_addr.dst_mid,
++      &pbd_e2->data.mac_addr.dst_lo,
++      eth->h_dest);
++#ifdef BNX2X_STOP_ON_ERROR
++   /* Enforce security is always set in Stop on Error -
++    * source mac should be present in the parsing BD
++    */
++   bnx2x_set_fw_mac_addr(&pbd_e2->data.mac_addr.src_hi,
++           &pbd_e2->data.mac_addr.src_mid,
++           &pbd_e2->data.mac_addr.src_lo,
++           eth->h_source);
++#endif
+   }
+ 
+   SET_FLAG(pbd_e2_parsing_data,
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+index 4f310fa..96c4b15 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -1143,7 +1143,7 @@ void bnx2x_panic_dump(struct bnx2x *bp, bool disable_int)
+    if (!fp->txdata_ptr[cos])
+     break;
+ 
+-   if (!txdata.tx_cons_sb)
++   if (!txdata->tx_cons_sb)
+     continue;
+ 
+    start = TX_BD(le16_to_cpu(*txdata->tx_cons_sb) - 10);
+-- 
+1.7.1

@@ -1,0 +1,99 @@
+From 5b0819cd75a38965a647b52e0f183a44a5b873e8 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Mon, 10 Nov 2014 14:17:31 -0500
+Subject: [virt] kvm: Add request bit to reload APIC access page address
+
+Message-id: <1415629055-7922-6-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 99804
+O-Subject: [RHEL7 PATCH v2 5/9] kvm: x86: Add request bit to reload APIC access page address
+Bugzilla: 1140974
+RH-Acked-by: Marcelo Tosatti <mtosatti@redhat.com>
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Andrew Jones <drjones@redhat.com>
+
+From: Tang Chen <tangchen@cn.fujitsu.com>
+
+Currently, the APIC access page is pinned by KVM for the entire life
+of the guest.  We want to make it migratable in order to make memory
+hot-unplug available for machines that run KVM.
+
+This patch prepares to handle this in generic code, through a new
+request bit (that will be set by the MMU notifier) and a new hook
+that is called whenever the request bit is processed.
+
+Signed-off-by: Tang Chen <tangchen@cn.fujitsu.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from upstream commit 4256f43f9fab91e1c17b5846a240cf4b66a768a8)
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ arch/x86/kvm/x86.c [trivial]
+ include/linux/kvm_host.h [trivial]
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b197a6c..1f2866b 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -737,6 +737,7 @@ struct kvm_x86_ops {
+  void (*hwapic_isr_update)(struct kvm *kvm, int isr);
+  void (*load_eoi_exitmap)(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap);
+  void (*set_virtual_x2apic_mode)(struct kvm_vcpu *vcpu, bool set);
++ void (*set_apic_access_page_addr)(struct kvm_vcpu *vcpu, hpa_t hpa);
+  void (*deliver_posted_interrupt)(struct kvm_vcpu *vcpu, int vector);
+  void (*sync_pir_to_irr)(struct kvm_vcpu *vcpu);
+  int (*set_tss_addr)(struct kvm *kvm, unsigned int addr);
+@@ -1043,6 +1044,7 @@ int kvm_cpu_has_interrupt(struct kvm_vcpu *vcpu);
+ int kvm_arch_interrupt_allowed(struct kvm_vcpu *vcpu);
+ int kvm_cpu_get_interrupt(struct kvm_vcpu *v);
+ void kvm_vcpu_reset(struct kvm_vcpu *vcpu);
++void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu);
+ void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
+         unsigned long address);
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 2a46c38..5911409 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5937,6 +5937,18 @@ static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
+  kvm_apic_update_tmr(vcpu, tmr);
+ }
+ 
++void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu)
++{
++ if (!kvm_x86_ops->set_apic_access_page_addr)
++  return;
++
++ vcpu->kvm->arch.apic_access_page = gfn_to_page(vcpu->kvm,
++   APIC_DEFAULT_PHYS_BASE >> PAGE_SHIFT);
++ kvm_x86_ops->set_apic_access_page_addr(vcpu,
++   page_to_phys(vcpu->kvm->arch.apic_access_page));
++}
++EXPORT_SYMBOL_GPL(kvm_vcpu_reload_apic_access_page);
++
+ void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
+         unsigned long address)
+ {
+@@ -6002,6 +6014,8 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+    kvm_deliver_pmi(vcpu);
+   if (kvm_check_request(KVM_REQ_SCAN_IOAPIC, vcpu))
+    vcpu_scan_ioapic(vcpu);
++  if (kvm_check_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu))
++   kvm_vcpu_reload_apic_access_page(vcpu);
+  }
+ 
+  if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win) {
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index c9c17fb..d5ad8e3 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -134,6 +134,7 @@ static inline bool is_error_page(struct page *page)
+ #define KVM_REQ_EPR_EXIT          20
+ #define KVM_REQ_SCAN_IOAPIC       21
+ #define KVM_REQ_GLOBAL_CLOCK_UPDATE 22
++#define KVM_REQ_APIC_PAGE_RELOAD  25
+ 
+ #define KVM_USERSPACE_IRQ_SOURCE_ID  0
+ #define KVM_IRQFD_RESAMPLE_IRQ_SOURCE_ID 1
+-- 
+1.7.1

@@ -1,0 +1,150 @@
+From 179729f14bdc4df615b43197add29d3f182c9257 Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 24 Sep 2014 14:58:11 -0400
+Subject: [infiniband] usnic: Add UDP support to usnic_fwd.[hc]
+
+Message-id: <76351ac543bc91cfacd0bfa008b18180c301a7d3.1411569661.git.dledford@redhat.com>
+Patchwork-id: 96580
+O-Subject: [Patch RHEL7 09/29] IB/usnic: Add UDP support to usnic_fwd.[hc]
+Bugzilla: 916382
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Upinder Malhi <umalhi@cisco.com>
+
+Add *ip field* to *struct usnic_fwd_dev* as well as new *functions* to
+manipulate the *ip field.*  Furthermore, add new functions for
+programming UDP flows in the forwarding device.
+
+Signed-off-by: Upinder Malhi <umalhi@cisco.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 3f92bed3d6c073f41efc0777ecd3442aa1f03d20)
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/usnic/usnic_fwd.c b/drivers/infiniband/hw/usnic/usnic_fwd.c
+index 33fdd77..e3c9bd9 100644
+--- a/drivers/infiniband/hw/usnic/usnic_fwd.c
++++ b/drivers/infiniband/hw/usnic/usnic_fwd.c
+@@ -95,6 +95,29 @@ void usnic_fwd_set_mac(struct usnic_fwd_dev *ufdev, char mac[ETH_ALEN])
+  spin_unlock(&ufdev->lock);
+ }
+ 
++int usnic_fwd_add_ipaddr(struct usnic_fwd_dev *ufdev, __be32 inaddr)
++{
++ int status;
++
++ spin_lock(&ufdev->lock);
++ if (ufdev->inaddr == 0) {
++  ufdev->inaddr = inaddr;
++  status = 0;
++ } else {
++  status = -EFAULT;
++ }
++ spin_unlock(&ufdev->lock);
++
++ return status;
++}
++
++void usnic_fwd_del_ipaddr(struct usnic_fwd_dev *ufdev)
++{
++ spin_lock(&ufdev->lock);
++ ufdev->inaddr = 0;
++ spin_unlock(&ufdev->lock);
++}
++
+ void usnic_fwd_carrier_up(struct usnic_fwd_dev *ufdev)
+ {
+  spin_lock(&ufdev->lock);
+@@ -126,6 +149,30 @@ static int usnic_fwd_dev_ready_locked(struct usnic_fwd_dev *ufdev)
+  return 0;
+ }
+ 
++static int validate_filter_locked(struct usnic_fwd_dev *ufdev,
++     struct filter *filter)
++{
++
++ lockdep_assert_held(&ufdev->lock);
++
++ if (filter->type == FILTER_IPV4_5TUPLE) {
++  if (!(filter->u.ipv4.flags & FILTER_FIELD_5TUP_DST_AD))
++   return -EACCES;
++  if (!(filter->u.ipv4.flags & FILTER_FIELD_5TUP_DST_PT))
++   return -EBUSY;
++  else if (ufdev->inaddr == 0)
++   return -EINVAL;
++  else if (filter->u.ipv4.dst_port == 0)
++   return -ERANGE;
++  else if (ntohl(ufdev->inaddr) != filter->u.ipv4.dst_addr)
++   return -EFAULT;
++  else
++   return 0;
++ }
++
++ return 0;
++}
++
+ static void fill_tlv(struct filter_tlv *tlv, struct filter *filter,
+   struct filter_action *action)
+ {
+@@ -177,6 +224,13 @@ usnic_fwd_alloc_flow(struct usnic_fwd_dev *ufdev, struct filter *filter,
+   goto out_free_tlv;
+  }
+ 
++ status = validate_filter_locked(ufdev, filter);
++ if (status) {
++  usnic_err("Failed to validate filter with status %d\n",
++    status);
++  goto out_free_tlv;
++ }
++
+  /* Issue Devcmd */
+  a0 = tlv_pa;
+  a1 = tlv_size;
+diff --git a/drivers/infiniband/hw/usnic/usnic_fwd.h b/drivers/infiniband/hw/usnic/usnic_fwd.h
+index b146eb9..93713a2 100644
+--- a/drivers/infiniband/hw/usnic/usnic_fwd.h
++++ b/drivers/infiniband/hw/usnic/usnic_fwd.h
+@@ -40,6 +40,7 @@ struct usnic_fwd_dev {
+  bool    link_up;
+  char    mac[ETH_ALEN];
+  unsigned int   mtu;
++ __be32    inaddr;
+  char    name[IFNAMSIZ+1];
+ };
+ 
+@@ -58,6 +59,8 @@ struct usnic_fwd_dev *usnic_fwd_dev_alloc(struct pci_dev *pdev);
+ void usnic_fwd_dev_free(struct usnic_fwd_dev *ufdev);
+ 
+ void usnic_fwd_set_mac(struct usnic_fwd_dev *ufdev, char mac[ETH_ALEN]);
++int usnic_fwd_add_ipaddr(struct usnic_fwd_dev *ufdev, __be32 inaddr);
++void usnic_fwd_del_ipaddr(struct usnic_fwd_dev *ufdev);
+ void usnic_fwd_carrier_up(struct usnic_fwd_dev *ufdev);
+ void usnic_fwd_carrier_down(struct usnic_fwd_dev *ufdev);
+ void usnic_fwd_set_mtu(struct usnic_fwd_dev *ufdev, unsigned int mtu);
+@@ -89,4 +92,22 @@ static inline void usnic_fwd_init_usnic_filter(struct filter *filter,
+  filter->u.usnic.usnic_id = usnic_id;
+ }
+ 
++static inline void usnic_fwd_init_udp_filter(struct filter *filter,
++      uint32_t daddr, uint16_t dport)
++{
++ filter->type = FILTER_IPV4_5TUPLE;
++ filter->u.ipv4.flags = FILTER_FIELD_5TUP_PROTO;
++ filter->u.ipv4.protocol = PROTO_UDP;
++
++ if (daddr) {
++  filter->u.ipv4.flags |= FILTER_FIELD_5TUP_DST_AD;
++  filter->u.ipv4.dst_addr = daddr;
++ }
++
++ if (dport) {
++  filter->u.ipv4.flags |= FILTER_FIELD_5TUP_DST_PT;
++  filter->u.ipv4.dst_port = dport;
++ }
++}
++
+ #endif /* !USNIC_FWD_H_ */
+-- 
+1.7.1

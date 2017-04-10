@@ -1,0 +1,195 @@
+From d31e246f97872567207163c5052787c5a27d6873 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 10 Oct 2014 21:03:26 -0400
+Subject: [block] blk-mq: remove REQ_END
+
+Message-id: <1412975015-5370-26-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 97477
+O-Subject: [RHEL7 PATCH 25/34] blk-mq: remove REQ_END
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a backport of the following commit.  Because REQ_END is not
+the only condition upon which a driver should start I/O, it should
+be fine to remove this.  Additionally, to preserve kABI, I had to
+keep the old definition of queue_rq_fn, even though the blk mq ops
+were never covered under kabi.  (They are indirectly included via
+the struct request_queue.)
+
+This resolves bug 1146660.
+
+  commit bf57229745f849e500ba69ff91e35bc8160a7373
+  Author: Christoph Hellwig <hch@lst.de>
+  Date:   Sat Sep 13 16:40:08 2014 -0700
+
+    blk-mq: remove REQ_END
+
+    Pass an explicit parameter for the last request in a batch to ->queue_rq
+    instead of using a request flag.  Besides being a cleaner and non-stateful
+    interface this is also required for the next patch, which fixes the blk-mq
+    I/O submission code to not start a time too early.
+
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 2afa800..99d1d79 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -383,7 +383,7 @@ void blk_mq_complete_request(struct request *rq)
+ }
+ EXPORT_SYMBOL(blk_mq_complete_request);
+ 
+-static void blk_mq_start_request(struct request *rq, bool last)
++static void blk_mq_start_request(struct request *rq)
+ {
+  struct request_queue *q = rq->q;
+ 
+@@ -420,16 +420,6 @@ static void blk_mq_start_request(struct request *rq, bool last)
+    */
+   rq->nr_phys_segments++;
+  }
+-
+- /*
+-  * Flag the last request in the series so that drivers know when IO
+-  * should be kicked off, if they don't do it on a per-request basis.
+-  *
+-  * Note: the flag isn't the only condition drivers should do kick off.
+-  * If drive is busy, the last request might not have the bit set.
+-  */
+- if (last)
+-  rq->cmd_flags |= REQ_END;
+ }
+ 
+ static void __blk_mq_requeue_request(struct request *rq)
+@@ -439,8 +429,6 @@ static void __blk_mq_requeue_request(struct request *rq)
+  trace_block_rq_requeue(q, rq);
+  clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+ 
+- rq->cmd_flags &= ~REQ_END;
+-
+  if (q->dma_drain_size && blk_rq_bytes(rq))
+   rq->nr_phys_segments--;
+ }
+@@ -754,9 +742,9 @@ static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx)
+   rq = list_first_entry(&rq_list, struct request, queuelist);
+   list_del_init(&rq->queuelist);
+ 
+-  blk_mq_start_request(rq, list_empty(&rq_list));
++  blk_mq_start_request(rq);
+ 
+-  ret = q->mq_ops->queue_rq(hctx, rq);
++  ret = q->mq_ops->queue_rq(hctx, rq, list_empty(&rq_list));
+   switch (ret) {
+   case BLK_MQ_RQ_QUEUE_OK:
+    queued++;
+@@ -1197,14 +1185,14 @@ static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+   int ret;
+ 
+   blk_mq_bio_to_request(rq, bio);
+-  blk_mq_start_request(rq, true);
++  blk_mq_start_request(rq);
+ 
+   /*
+    * For OK queue, we are done. For error, kill it. Any other
+    * error (busy), just add it to our list as we previously
+    * would have done
+    */
+-  ret = q->mq_ops->queue_rq(data.hctx, rq);
++  ret = q->mq_ops->queue_rq(data.hctx, rq, true);
+   if (ret == BLK_MQ_RQ_QUEUE_OK)
+    goto done;
+   else {
+diff --git a/drivers/block/mtip32xx/mtip32xx.c b/drivers/block/mtip32xx/mtip32xx.c
+index 90564c8..a3fff44 100644
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@ -3775,7 +3775,8 @@ static bool mtip_check_unal_depth(struct blk_mq_hw_ctx *hctx,
+  return false;
+ }
+ 
+-static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
++static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq,
++  bool last)
+ {
+  int ret;
+ 
+diff --git a/drivers/block/null_blk.c b/drivers/block/null_blk.c
+index 925e543..f4bb977 100644
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@ -313,7 +313,8 @@ static void null_request_fn(struct request_queue *q)
+  }
+ }
+ 
+-static int null_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
++static int null_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq,
++  bool last)
+ {
+  struct nullb_cmd *cmd = blk_mq_rq_to_pdu(rq);
+ 
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 0a58140..13756e0 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -164,14 +164,14 @@ static void virtblk_done(struct virtqueue *vq)
+  spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+ }
+ 
+-static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
++static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req,
++  bool last)
+ {
+  struct virtio_blk *vblk = hctx->queue->queuedata;
+  struct virtblk_req *vbr = blk_mq_rq_to_pdu(req);
+  unsigned long flags;
+  unsigned int num;
+  int qid = hctx->queue_num;
+- const bool last = (req->cmd_flags & REQ_END) != 0;
+  int err;
+  bool notify = false;
+ 
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 9bf6e64..719b1b6 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -115,7 +115,12 @@ struct blk_mq_tag_set {
+ };
+ #endif
+ 
++#ifdef __GENKSYMS__
++/* This thing was never covered by kabi */
+ typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
++#else
++typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *, bool);
++#endif
+ typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+ #ifdef __GENKSYMS__
+ typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_reg *,unsigned int);
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 853b1d7..997a6f5 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -185,7 +185,7 @@ enum rq_flag_bits {
+  __REQ_MIXED_MERGE, /* merge of different types, fail separately */
+  __REQ_KERNEL,   /* direct IO to kernel pages */
+  __REQ_PM,  /* runtime pm request */
+- __REQ_END,  /* last of chain of requests */
++ __REQ_END,  /* OBSOLETE */
+  __REQ_HASHED,  /* on IO scheduler merge hash */
+  __REQ_MQ_INFLIGHT, /* track inflight for MQ */
+  __REQ_NR_BITS,  /* stops here */
+@@ -239,7 +239,6 @@ enum rq_flag_bits {
+ #define REQ_SECURE  (1ULL << __REQ_SECURE)
+ #define REQ_KERNEL  (1ULL << __REQ_KERNEL)
+ #define REQ_PM   (1ULL << __REQ_PM)
+-#define REQ_END   (1ULL << __REQ_END)
+ #define REQ_HASHED  (1ULL << __REQ_HASHED)
+ #define REQ_MQ_INFLIGHT  (1ULL << __REQ_MQ_INFLIGHT)
+ 
+-- 
+1.7.1

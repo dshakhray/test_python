@@ -1,0 +1,2066 @@
+From 7f055d431816216b1910a57750ff437a3780cb8e Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 11:59:25 -0400
+Subject: [infiniband] rdma/core: Add support for iWARP Port Mapper user space service
+
+Message-id: <9e59139bcb38f2dd39304c888953da5422b16949.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93604
+O-Subject: [Patch RHEL7.1 V1 029/197] RDMA/core: Add support for iWARP Port Mapper user space service
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Tatyana Nikolova <Tatyana.E.Nikolova@intel.com>
+
+This patch adds iWARP Port Mapper (IWPM) Version 2 support.  The iWARP
+Port Mapper implementation is based on the port mapper specification
+section in the Sockets Direct Protocol paper -
+http://www.rdmaconsortium.org/home/draft-pinkerton-iwarp-sdp-v1.0.pdf
+
+Existing iWARP RDMA providers use the same IP address as the native
+TCP/IP stack when creating RDMA connections.  They need a mechanism to
+claim the TCP ports used for RDMA connections to prevent TCP port
+collisions when other host applications use TCP ports.  The iWARP Port
+Mapper provides a standard mechanism to accomplish this.  Without this
+service it is possible for RDMA application to bind/listen on the same
+port which is already being used by native TCP host application.  If
+that happens the incoming TCP connection data can be passed to the
+RDMA stack with error.
+
+The iWARP Port Mapper solution doesn't contain any changes to the
+existing network stack in the kernel space.  All the changes are
+contained with the infiniband tree and also in user space.
+
+The iWARP Port Mapper service is implemented as a user space daemon
+process.  Source for the IWPM service is located at
+http://git.openfabrics.org/git?p=~tnikolova/libiwpm-1.0.0/.git;a=summary
+
+The iWARP driver (port mapper client) sends to the IWPM service the
+local IP address and TCP port it has received from the RDMA
+application, when starting a connection.  The IWPM service performs a
+socket bind from user space to get an available TCP port, called a
+mapped port, and communicates it back to the client.  In that sense,
+the IWPM service is used to map the TCP port, which the RDMA
+application uses to any port available from the host TCP port
+space. The mapped ports are used in iWARP RDMA connections to avoid
+collisions with native TCP stack which is aware that these ports are
+taken. When an RDMA connection using a mapped port is terminated, the
+client notifies the IWPM service, which then releases the TCP port.
+
+The message exchange between the IWPM service and the iWARP drivers
+(between user space and kernel space) is implemented using netlink
+sockets.
+
+1) Netlink interface functions are added: ibnl_unicast() and
+   ibnl_mulitcast() for sending netlink messages to user space
+
+2) The signature of the existing ibnl_put_msg() is changed to be more
+   generic
+
+3) Two netlink clients are added: RDMA_NL_NES, RDMA_NL_C4IW
+   corresponding to the two iWarp drivers - nes and cxgb4 which use
+   the IWPM service
+
+4) Enums are added to enumerate the attributes in the netlink
+   messages, which are exchanged between the user space IWPM service
+   and the iWARP drivers
+
+Signed-off-by: Tatyana Nikolova <tatyana.e.nikolova@intel.com>
+Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+Reviewed-by: PJ Waskiewicz <pj.waskiewicz@solidfire.com>
+
+[ Fold in range checking fixes and nlh_next removal as suggested by Dan
+  Carpenter and Steve Wise.  Fix sparse endianness in hash.  - Roland ]
+
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 30dc5e63d6a5ad24894b5512d10b228d73645a44)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+ create mode 100644 drivers/infiniband/core/iwpm_msg.c
+ create mode 100644 drivers/infiniband/core/iwpm_util.c
+ create mode 100644 drivers/infiniband/core/iwpm_util.h
+ create mode 100644 include/rdma/iw_portmap.h
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/core/Makefile b/drivers/infiniband/core/Makefile
+index 3ab3865..ffd0af6 100644
+--- a/drivers/infiniband/core/Makefile
++++ b/drivers/infiniband/core/Makefile
+@@ -18,7 +18,7 @@ ib_sa-y :=   sa_query.o multicast.o
+ 
+ ib_cm-y :=   cm.o
+ 
+-iw_cm-y :=   iwcm.o
++iw_cm-y :=   iwcm.o iwpm_util.o iwpm_msg.o
+ 
+ rdma_cm-y :=   cma.o
+ 
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index 9977f0a..9260905 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -3607,7 +3607,8 @@ static int cma_get_id_stats(struct sk_buff *skb, struct netlink_callback *cb)
+ 
+    id_stats = ibnl_put_msg(skb, &nlh, cb->nlh->nlmsg_seq,
+       sizeof *id_stats, RDMA_NL_RDMA_CM,
+-      RDMA_NL_RDMA_CM_ID_STATS);
++      RDMA_NL_RDMA_CM_ID_STATS,
++      NLM_F_MULTI);
+    if (!id_stats)
+     goto out;
+ 
+diff --git a/drivers/infiniband/core/iwpm_msg.c b/drivers/infiniband/core/iwpm_msg.c
+new file mode 100644
+index 0000000..b85ddbc
+--- /dev/null
++++ b/drivers/infiniband/core/iwpm_msg.c
+@@ -0,0 +1,685 @@
++/*
++ * Copyright (c) 2014 Intel Corporation. All rights reserved.
++ * Copyright (c) 2014 Chelsio, Inc. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "iwpm_util.h"
++
++static const char iwpm_ulib_name[] = "iWarpPortMapperUser";
++static int iwpm_ulib_version = 3;
++static int iwpm_user_pid = IWPM_PID_UNDEFINED;
++static atomic_t echo_nlmsg_seq;
++
++int iwpm_valid_pid(void)
++{
++ return iwpm_user_pid > 0;
++}
++EXPORT_SYMBOL(iwpm_valid_pid);
++
++/*
++ * iwpm_register_pid - Send a netlink query to user space
++ *                     for the iwarp port mapper pid
++ *
++ * nlmsg attributes:
++ * [IWPM_NLA_REG_PID_SEQ]
++ * [IWPM_NLA_REG_IF_NAME]
++ * [IWPM_NLA_REG_IBDEV_NAME]
++ * [IWPM_NLA_REG_ULIB_NAME]
++ */
++int iwpm_register_pid(struct iwpm_dev_data *pm_msg, u8 nl_client)
++{
++ struct sk_buff *skb = NULL;
++ struct iwpm_nlmsg_request *nlmsg_request = NULL;
++ struct nlmsghdr *nlh;
++ u32 msg_seq;
++ const char *err_str = "";
++ int ret = -EINVAL;
++
++ if (!iwpm_valid_client(nl_client)) {
++  err_str = "Invalid port mapper client";
++  goto pid_query_error;
++ }
++ if (iwpm_registered_client(nl_client))
++  return 0;
++ skb = iwpm_create_nlmsg(RDMA_NL_IWPM_REG_PID, &nlh, nl_client);
++ if (!skb) {
++  err_str = "Unable to create a nlmsg";
++  goto pid_query_error;
++ }
++ nlh->nlmsg_seq = iwpm_get_nlmsg_seq();
++ nlmsg_request = iwpm_get_nlmsg_request(nlh->nlmsg_seq, nl_client, GFP_KERNEL);
++ if (!nlmsg_request) {
++  err_str = "Unable to allocate netlink request";
++  goto pid_query_error;
++ }
++ msg_seq = atomic_read(&echo_nlmsg_seq);
++
++ /* fill in the pid request message */
++ err_str = "Unable to put attribute of the nlmsg";
++ ret = ibnl_put_attr(skb, nlh, sizeof(u32), &msg_seq, IWPM_NLA_REG_PID_SEQ);
++ if (ret)
++  goto pid_query_error;
++ ret = ibnl_put_attr(skb, nlh, IWPM_IFNAME_SIZE,
++    pm_msg->if_name, IWPM_NLA_REG_IF_NAME);
++ if (ret)
++  goto pid_query_error;
++ ret = ibnl_put_attr(skb, nlh, IWPM_DEVNAME_SIZE,
++    pm_msg->dev_name, IWPM_NLA_REG_IBDEV_NAME);
++ if (ret)
++  goto pid_query_error;
++ ret = ibnl_put_attr(skb, nlh, IWPM_ULIBNAME_SIZE,
++    (char *)iwpm_ulib_name, IWPM_NLA_REG_ULIB_NAME);
++ if (ret)
++  goto pid_query_error;
++
++ pr_debug("%s: Multicasting a nlmsg (dev = %s ifname = %s iwpm = %s)\n",
++  __func__, pm_msg->dev_name, pm_msg->if_name, iwpm_ulib_name);
++
++ ret = ibnl_multicast(skb, nlh, RDMA_NL_GROUP_IWPM, GFP_KERNEL);
++ if (ret) {
++  skb = NULL; /* skb is freed in the netlink send-op handling */
++  iwpm_set_registered(nl_client, 1);
++  iwpm_user_pid = IWPM_PID_UNAVAILABLE;
++  err_str = "Unable to send a nlmsg";
++  goto pid_query_error;
++ }
++ nlmsg_request->req_buffer = pm_msg;
++ ret = iwpm_wait_complete_req(nlmsg_request);
++ return ret;
++pid_query_error:
++ pr_info("%s: %s (client = %d)\n", __func__, err_str, nl_client);
++ if (skb)
++  dev_kfree_skb(skb);
++ if (nlmsg_request)
++  iwpm_free_nlmsg_request(&nlmsg_request->kref);
++ return ret;
++}
++EXPORT_SYMBOL(iwpm_register_pid);
++
++/*
++ * iwpm_add_mapping - Send a netlink add mapping message
++ *                    to the port mapper
++ * nlmsg attributes:
++ * [IWPM_NLA_MANAGE_MAPPING_SEQ]
++ * [IWPM_NLA_MANAGE_ADDR]
++ */
++int iwpm_add_mapping(struct iwpm_sa_data *pm_msg, u8 nl_client)
++{
++ struct sk_buff *skb = NULL;
++ struct iwpm_nlmsg_request *nlmsg_request = NULL;
++ struct nlmsghdr *nlh;
++ u32 msg_seq;
++ const char *err_str = "";
++ int ret = -EINVAL;
++
++ if (!iwpm_valid_client(nl_client)) {
++  err_str = "Invalid port mapper client";
++  goto add_mapping_error;
++ }
++ if (!iwpm_registered_client(nl_client)) {
++  err_str = "Unregistered port mapper client";
++  goto add_mapping_error;
++ }
++ if (!iwpm_valid_pid())
++  return 0;
++ skb = iwpm_create_nlmsg(RDMA_NL_IWPM_ADD_MAPPING, &nlh, nl_client);
++ if (!skb) {
++  err_str = "Unable to create a nlmsg";
++  goto add_mapping_error;
++ }
++ nlh->nlmsg_seq = iwpm_get_nlmsg_seq();
++ nlmsg_request = iwpm_get_nlmsg_request(nlh->nlmsg_seq, nl_client, GFP_KERNEL);
++ if (!nlmsg_request) {
++  err_str = "Unable to allocate netlink request";
++  goto add_mapping_error;
++ }
++ msg_seq = atomic_read(&echo_nlmsg_seq);
++ /* fill in the add mapping message */
++ err_str = "Unable to put attribute of the nlmsg";
++ ret = ibnl_put_attr(skb, nlh, sizeof(u32), &msg_seq,
++    IWPM_NLA_MANAGE_MAPPING_SEQ);
++ if (ret)
++  goto add_mapping_error;
++ ret = ibnl_put_attr(skb, nlh, sizeof(struct sockaddr_storage),
++    &pm_msg->loc_addr, IWPM_NLA_MANAGE_ADDR);
++ if (ret)
++  goto add_mapping_error;
++ nlmsg_request->req_buffer = pm_msg;
++
++ ret = ibnl_unicast(skb, nlh, iwpm_user_pid);
++ if (ret) {
++  skb = NULL; /* skb is freed in the netlink send-op handling */
++  iwpm_user_pid = IWPM_PID_UNDEFINED;
++  err_str = "Unable to send a nlmsg";
++  goto add_mapping_error;
++ }
++ ret = iwpm_wait_complete_req(nlmsg_request);
++ return ret;
++add_mapping_error:
++ pr_info("%s: %s (client = %d)\n", __func__, err_str, nl_client);
++ if (skb)
++  dev_kfree_skb(skb);
++ if (nlmsg_request)
++  iwpm_free_nlmsg_request(&nlmsg_request->kref);
++ return ret;
++}
++EXPORT_SYMBOL(iwpm_add_mapping);
++
++/*
++ * iwpm_add_and_query_mapping - Send a netlink add and query
++ *                              mapping message to the port mapper
++ * nlmsg attributes:
++ * [IWPM_NLA_QUERY_MAPPING_SEQ]
++ * [IWPM_NLA_QUERY_LOCAL_ADDR]
++ * [IWPM_NLA_QUERY_REMOTE_ADDR]
++ */
++int iwpm_add_and_query_mapping(struct iwpm_sa_data *pm_msg, u8 nl_client)
++{
++ struct sk_buff *skb = NULL;
++ struct iwpm_nlmsg_request *nlmsg_request = NULL;
++ struct nlmsghdr *nlh;
++ u32 msg_seq;
++ const char *err_str = "";
++ int ret = -EINVAL;
++
++ if (!iwpm_valid_client(nl_client)) {
++  err_str = "Invalid port mapper client";
++  goto query_mapping_error;
++ }
++ if (!iwpm_registered_client(nl_client)) {
++  err_str = "Unregistered port mapper client";
++  goto query_mapping_error;
++ }
++ if (!iwpm_valid_pid())
++  return 0;
++ ret = -ENOMEM;
++ skb = iwpm_create_nlmsg(RDMA_NL_IWPM_QUERY_MAPPING, &nlh, nl_client);
++ if (!skb) {
++  err_str = "Unable to create a nlmsg";
++  goto query_mapping_error;
++ }
++ nlh->nlmsg_seq = iwpm_get_nlmsg_seq();
++ nlmsg_request = iwpm_get_nlmsg_request(nlh->nlmsg_seq,
++    nl_client, GFP_KERNEL);
++ if (!nlmsg_request) {
++  err_str = "Unable to allocate netlink request";
++  goto query_mapping_error;
++ }
++ msg_seq = atomic_read(&echo_nlmsg_seq);
++
++ /* fill in the query message */
++ err_str = "Unable to put attribute of the nlmsg";
++ ret = ibnl_put_attr(skb, nlh, sizeof(u32), &msg_seq,
++    IWPM_NLA_QUERY_MAPPING_SEQ);
++ if (ret)
++  goto query_mapping_error;
++ ret = ibnl_put_attr(skb, nlh, sizeof(struct sockaddr_storage),
++    &pm_msg->loc_addr, IWPM_NLA_QUERY_LOCAL_ADDR);
++ if (ret)
++  goto query_mapping_error;
++ ret = ibnl_put_attr(skb, nlh, sizeof(struct sockaddr_storage),
++    &pm_msg->rem_addr, IWPM_NLA_QUERY_REMOTE_ADDR);
++ if (ret)
++  goto query_mapping_error;
++ nlmsg_request->req_buffer = pm_msg;
++
++ ret = ibnl_unicast(skb, nlh, iwpm_user_pid);
++ if (ret) {
++  skb = NULL; /* skb is freed in the netlink send-op handling */
++  err_str = "Unable to send a nlmsg";
++  goto query_mapping_error;
++ }
++ ret = iwpm_wait_complete_req(nlmsg_request);
++ return ret;
++query_mapping_error:
++ pr_info("%s: %s (client = %d)\n", __func__, err_str, nl_client);
++ if (skb)
++  dev_kfree_skb(skb);
++ if (nlmsg_request)
++  iwpm_free_nlmsg_request(&nlmsg_request->kref);
++ return ret;
++}
++EXPORT_SYMBOL(iwpm_add_and_query_mapping);
++
++/*
++ * iwpm_remove_mapping - Send a netlink remove mapping message
++ *                       to the port mapper
++ * nlmsg attributes:
++ * [IWPM_NLA_MANAGE_MAPPING_SEQ]
++ * [IWPM_NLA_MANAGE_ADDR]
++ */
++int iwpm_remove_mapping(struct sockaddr_storage *local_addr, u8 nl_client)
++{
++ struct sk_buff *skb = NULL;
++ struct nlmsghdr *nlh;
++ u32 msg_seq;
++ const char *err_str = "";
++ int ret = -EINVAL;
++
++ if (!iwpm_valid_client(nl_client)) {
++  err_str = "Invalid port mapper client";
++  goto remove_mapping_error;
++ }
++ if (!iwpm_registered_client(nl_client)) {
++  err_str = "Unregistered port mapper client";
++  goto remove_mapping_error;
++ }
++ if (!iwpm_valid_pid())
++  return 0;
++ skb = iwpm_create_nlmsg(RDMA_NL_IWPM_REMOVE_MAPPING, &nlh, nl_client);
++ if (!skb) {
++  ret = -ENOMEM;
++  err_str = "Unable to create a nlmsg";
++  goto remove_mapping_error;
++ }
++ msg_seq = atomic_read(&echo_nlmsg_seq);
++ nlh->nlmsg_seq = iwpm_get_nlmsg_seq();
++ err_str = "Unable to put attribute of the nlmsg";
++ ret = ibnl_put_attr(skb, nlh, sizeof(u32), &msg_seq,
++    IWPM_NLA_MANAGE_MAPPING_SEQ);
++ if (ret)
++  goto remove_mapping_error;
++ ret = ibnl_put_attr(skb, nlh, sizeof(struct sockaddr_storage),
++    local_addr, IWPM_NLA_MANAGE_ADDR);
++ if (ret)
++  goto remove_mapping_error;
++
++ ret = ibnl_unicast(skb, nlh, iwpm_user_pid);
++ if (ret) {
++  skb = NULL; /* skb is freed in the netlink send-op handling */
++  iwpm_user_pid = IWPM_PID_UNDEFINED;
++  err_str = "Unable to send a nlmsg";
++  goto remove_mapping_error;
++ }
++ iwpm_print_sockaddr(local_addr,
++   "remove_mapping: Local sockaddr:");
++ return 0;
++remove_mapping_error:
++ pr_info("%s: %s (client = %d)\n", __func__, err_str, nl_client);
++ if (skb)
++  dev_kfree_skb_any(skb);
++ return ret;
++}
++EXPORT_SYMBOL(iwpm_remove_mapping);
++
++/* netlink attribute policy for the received response to register pid request */
++static const struct nla_policy resp_reg_policy[IWPM_NLA_RREG_PID_MAX] = {
++ [IWPM_NLA_RREG_PID_SEQ]     = { .type = NLA_U32 },
++ [IWPM_NLA_RREG_IBDEV_NAME]  = { .type = NLA_STRING,
++     .len = IWPM_DEVNAME_SIZE - 1 },
++ [IWPM_NLA_RREG_ULIB_NAME]   = { .type = NLA_STRING,
++     .len = IWPM_ULIBNAME_SIZE - 1 },
++ [IWPM_NLA_RREG_ULIB_VER]    = { .type = NLA_U16 },
++ [IWPM_NLA_RREG_PID_ERR]     = { .type = NLA_U16 }
++};
++
++/*
++ * iwpm_register_pid_cb - Process a port mapper response to
++ *                        iwpm_register_pid()
++ */
++int iwpm_register_pid_cb(struct sk_buff *skb, struct netlink_callback *cb)
++{
++ struct iwpm_nlmsg_request *nlmsg_request = NULL;
++ struct nlattr *nltb[IWPM_NLA_RREG_PID_MAX];
++ struct iwpm_dev_data *pm_msg;
++ char *dev_name, *iwpm_name;
++ u32 msg_seq;
++ u8 nl_client;
++ u16 iwpm_version;
++ const char *msg_type = "Register Pid response";
++
++ if (iwpm_parse_nlmsg(cb, IWPM_NLA_RREG_PID_MAX,
++    resp_reg_policy, nltb, msg_type))
++  return -EINVAL;
++
++ msg_seq = nla_get_u32(nltb[IWPM_NLA_RREG_PID_SEQ]);
++ nlmsg_request = iwpm_find_nlmsg_request(msg_seq);
++ if (!nlmsg_request) {
++  pr_info("%s: Could not find a matching request (seq = %u)\n",
++     __func__, msg_seq);
++  return -EINVAL;
++ }
++ pm_msg = nlmsg_request->req_buffer;
++ nl_client = nlmsg_request->nl_client;
++ dev_name = (char *)nla_data(nltb[IWPM_NLA_RREG_IBDEV_NAME]);
++ iwpm_name = (char *)nla_data(nltb[IWPM_NLA_RREG_ULIB_NAME]);
++ iwpm_version = nla_get_u16(nltb[IWPM_NLA_RREG_ULIB_VER]);
++
++ /* check device name, ulib name and version */
++ if (strcmp(pm_msg->dev_name, dev_name) ||
++   strcmp(iwpm_ulib_name, iwpm_name) ||
++   iwpm_version != iwpm_ulib_version) {
++
++  pr_info("%s: Incorrect info (dev = %s name = %s version = %d)\n",
++    __func__, dev_name, iwpm_name, iwpm_version);
++  nlmsg_request->err_code = IWPM_USER_LIB_INFO_ERR;
++  goto register_pid_response_exit;
++ }
++ iwpm_user_pid = cb->nlh->nlmsg_pid;
++ atomic_set(&echo_nlmsg_seq, cb->nlh->nlmsg_seq);
++ pr_debug("%s: iWarp Port Mapper (pid = %d) is available!\n",
++   __func__, iwpm_user_pid);
++ if (iwpm_valid_client(nl_client))
++  iwpm_set_registered(nl_client, 1);
++register_pid_response_exit:
++ nlmsg_request->request_done = 1;
++ /* always for found nlmsg_request */
++ kref_put(&nlmsg_request->kref, iwpm_free_nlmsg_request);
++ barrier();
++ wake_up(&nlmsg_request->waitq);
++ return 0;
++}
++EXPORT_SYMBOL(iwpm_register_pid_cb);
++
++/* netlink attribute policy for the received response to add mapping request */
++static const struct nla_policy resp_add_policy[IWPM_NLA_RMANAGE_MAPPING_MAX] = {
++ [IWPM_NLA_MANAGE_MAPPING_SEQ]     = { .type = NLA_U32 },
++ [IWPM_NLA_MANAGE_ADDR]            = { .len = sizeof(struct sockaddr_storage) },
++ [IWPM_NLA_MANAGE_MAPPED_LOC_ADDR] = { .len = sizeof(struct sockaddr_storage) },
++ [IWPM_NLA_RMANAGE_MAPPING_ERR]   = { .type = NLA_U16 }
++};
++
++/*
++ * iwpm_add_mapping_cb - Process a port mapper response to
++ *                       iwpm_add_mapping()
++ */
++int iwpm_add_mapping_cb(struct sk_buff *skb, struct netlink_callback *cb)
++{
++ struct iwpm_sa_data *pm_msg;
++ struct iwpm_nlmsg_request *nlmsg_request = NULL;
++ struct nlattr *nltb[IWPM_NLA_RMANAGE_MAPPING_MAX];
++ struct sockaddr_storage *local_sockaddr;
++ struct sockaddr_storage *mapped_sockaddr;
++ const char *msg_type;
++ u32 msg_seq;
++
++ msg_type = "Add Mapping response";
++ if (iwpm_parse_nlmsg(cb, IWPM_NLA_RMANAGE_MAPPING_MAX,
++    resp_add_policy, nltb, msg_type))
++  return -EINVAL;
++
++ atomic_set(&echo_nlmsg_seq, cb->nlh->nlmsg_seq);
++
++ msg_seq = nla_get_u32(nltb[IWPM_NLA_MANAGE_MAPPING_SEQ]);
++ nlmsg_request = iwpm_find_nlmsg_request(msg_seq);
++ if (!nlmsg_request) {
++  pr_info("%s: Could not find a matching request (seq = %u)\n",
++     __func__, msg_seq);
++  return -EINVAL;
++ }
++ pm_msg = nlmsg_request->req_buffer;
++ local_sockaddr = (struct sockaddr_storage *)
++   nla_data(nltb[IWPM_NLA_MANAGE_ADDR]);
++ mapped_sockaddr = (struct sockaddr_storage *)
++   nla_data(nltb[IWPM_NLA_MANAGE_MAPPED_LOC_ADDR]);
++
++ if (iwpm_compare_sockaddr(local_sockaddr, &pm_msg->loc_addr)) {
++  nlmsg_request->err_code = IWPM_USER_LIB_INFO_ERR;
++  goto add_mapping_response_exit;
++ }
++ if (mapped_sockaddr->ss_family != local_sockaddr->ss_family) {
++  pr_info("%s: Sockaddr family doesn't match the requested one\n",
++    __func__);
++  nlmsg_request->err_code = IWPM_USER_LIB_INFO_ERR;
++  goto add_mapping_response_exit;
++ }
++ memcpy(&pm_msg->mapped_loc_addr, mapped_sockaddr,
++   sizeof(*mapped_sockaddr));
++ iwpm_print_sockaddr(&pm_msg->loc_addr,
++   "add_mapping: Local sockaddr:");
++ iwpm_print_sockaddr(&pm_msg->mapped_loc_addr,
++   "add_mapping: Mapped local sockaddr:");
++
++add_mapping_response_exit:
++ nlmsg_request->request_done = 1;
++ /* always for found request */
++ kref_put(&nlmsg_request->kref, iwpm_free_nlmsg_request);
++ barrier();
++ wake_up(&nlmsg_request->waitq);
++ return 0;
++}
++EXPORT_SYMBOL(iwpm_add_mapping_cb);
++
++/* netlink attribute policy for the response to add and query mapping request */
++static const struct nla_policy resp_query_policy[IWPM_NLA_RQUERY_MAPPING_MAX] = {
++ [IWPM_NLA_QUERY_MAPPING_SEQ]      = { .type = NLA_U32 },
++ [IWPM_NLA_QUERY_LOCAL_ADDR]       = { .len = sizeof(struct sockaddr_storage) },
++ [IWPM_NLA_QUERY_REMOTE_ADDR]      = { .len = sizeof(struct sockaddr_storage) },
++ [IWPM_NLA_RQUERY_MAPPED_LOC_ADDR] = { .len = sizeof(struct sockaddr_storage) },
++ [IWPM_NLA_RQUERY_MAPPED_REM_ADDR] = { .len = sizeof(struct sockaddr_storage) },
++ [IWPM_NLA_RQUERY_MAPPING_ERR]   = { .type = NLA_U16 }
++};
++
++/*
++ * iwpm_add_and_query_mapping_cb - Process a port mapper response to
++ *                                 iwpm_add_and_query_mapping()
++ */
++int iwpm_add_and_query_mapping_cb(struct sk_buff *skb,
++    struct netlink_callback *cb)
++{
++ struct iwpm_sa_data *pm_msg;
++ struct iwpm_nlmsg_request *nlmsg_request = NULL;
++ struct nlattr *nltb[IWPM_NLA_RQUERY_MAPPING_MAX];
++ struct sockaddr_storage *local_sockaddr, *remote_sockaddr;
++ struct sockaddr_storage *mapped_loc_sockaddr, *mapped_rem_sockaddr;
++ const char *msg_type;
++ u32 msg_seq;
++ u16 err_code;
++
++ msg_type = "Query Mapping response";
++ if (iwpm_parse_nlmsg(cb, IWPM_NLA_RQUERY_MAPPING_MAX,
++    resp_query_policy, nltb, msg_type))
++  return -EINVAL;
++ atomic_set(&echo_nlmsg_seq, cb->nlh->nlmsg_seq);
++
++ msg_seq = nla_get_u32(nltb[IWPM_NLA_QUERY_MAPPING_SEQ]);
++ nlmsg_request = iwpm_find_nlmsg_request(msg_seq);
++ if (!nlmsg_request) {
++  pr_info("%s: Could not find a matching request (seq = %u)\n",
++     __func__, msg_seq);
++   return -EINVAL;
++ }
++ pm_msg = nlmsg_request->req_buffer;
++ local_sockaddr = (struct sockaddr_storage *)
++   nla_data(nltb[IWPM_NLA_QUERY_LOCAL_ADDR]);
++ remote_sockaddr = (struct sockaddr_storage *)
++   nla_data(nltb[IWPM_NLA_QUERY_REMOTE_ADDR]);
++ mapped_loc_sockaddr = (struct sockaddr_storage *)
++   nla_data(nltb[IWPM_NLA_RQUERY_MAPPED_LOC_ADDR]);
++ mapped_rem_sockaddr = (struct sockaddr_storage *)
++   nla_data(nltb[IWPM_NLA_RQUERY_MAPPED_REM_ADDR]);
++
++ err_code = nla_get_u16(nltb[IWPM_NLA_RQUERY_MAPPING_ERR]);
++ if (err_code == IWPM_REMOTE_QUERY_REJECT) {
++  pr_info("%s: Received a Reject (pid = %u, echo seq = %u)\n",
++   __func__, cb->nlh->nlmsg_pid, msg_seq);
++  nlmsg_request->err_code = IWPM_REMOTE_QUERY_REJECT;
++ }
++ if (iwpm_compare_sockaddr(local_sockaddr, &pm_msg->loc_addr) ||
++  iwpm_compare_sockaddr(remote_sockaddr, &pm_msg->rem_addr)) {
++  pr_info("%s: Incorrect local sockaddr\n", __func__);
++  nlmsg_request->err_code = IWPM_USER_LIB_INFO_ERR;
++  goto query_mapping_response_exit;
++ }
++ if (mapped_loc_sockaddr->ss_family != local_sockaddr->ss_family ||
++  mapped_rem_sockaddr->ss_family != remote_sockaddr->ss_family) {
++  pr_info("%s: Sockaddr family doesn't match the requested one\n",
++    __func__);
++  nlmsg_request->err_code = IWPM_USER_LIB_INFO_ERR;
++  goto query_mapping_response_exit;
++ }
++ memcpy(&pm_msg->mapped_loc_addr, mapped_loc_sockaddr,
++   sizeof(*mapped_loc_sockaddr));
++ memcpy(&pm_msg->mapped_rem_addr, mapped_rem_sockaddr,
++   sizeof(*mapped_rem_sockaddr));
++
++ iwpm_print_sockaddr(&pm_msg->loc_addr,
++   "query_mapping: Local sockaddr:");
++ iwpm_print_sockaddr(&pm_msg->mapped_loc_addr,
++   "query_mapping: Mapped local sockaddr:");
++ iwpm_print_sockaddr(&pm_msg->rem_addr,
++   "query_mapping: Remote sockaddr:");
++ iwpm_print_sockaddr(&pm_msg->mapped_rem_addr,
++   "query_mapping: Mapped remote sockaddr:");
++query_mapping_response_exit:
++ nlmsg_request->request_done = 1;
++ /* always for found request */
++ kref_put(&nlmsg_request->kref, iwpm_free_nlmsg_request);
++ barrier();
++ wake_up(&nlmsg_request->waitq);
++ return 0;
++}
++EXPORT_SYMBOL(iwpm_add_and_query_mapping_cb);
++
++/* netlink attribute policy for the received request for mapping info */
++static const struct nla_policy resp_mapinfo_policy[IWPM_NLA_MAPINFO_REQ_MAX] = {
++ [IWPM_NLA_MAPINFO_ULIB_NAME] = { .type = NLA_STRING,
++     .len = IWPM_ULIBNAME_SIZE - 1 },
++ [IWPM_NLA_MAPINFO_ULIB_VER]  = { .type = NLA_U16 }
++};
++
++/*
++ * iwpm_mapping_info_cb - Process a port mapper request for mapping info
++ */
++int iwpm_mapping_info_cb(struct sk_buff *skb, struct netlink_callback *cb)
++{
++ struct nlattr *nltb[IWPM_NLA_MAPINFO_REQ_MAX];
++ const char *msg_type = "Mapping Info response";
++ int iwpm_pid;
++ u8 nl_client;
++ char *iwpm_name;
++ u16 iwpm_version;
++ int ret = -EINVAL;
++
++ if (iwpm_parse_nlmsg(cb, IWPM_NLA_MAPINFO_REQ_MAX,
++    resp_mapinfo_policy, nltb, msg_type)) {
++  pr_info("%s: Unable to parse nlmsg\n", __func__);
++  return ret;
++ }
++ iwpm_name = (char *)nla_data(nltb[IWPM_NLA_MAPINFO_ULIB_NAME]);
++ iwpm_version = nla_get_u16(nltb[IWPM_NLA_MAPINFO_ULIB_VER]);
++ if (strcmp(iwpm_ulib_name, iwpm_name) ||
++   iwpm_version != iwpm_ulib_version) {
++  pr_info("%s: Invalid port mapper name = %s version = %d\n",
++    __func__, iwpm_name, iwpm_version);
++  return ret;
++ }
++ nl_client = RDMA_NL_GET_CLIENT(cb->nlh->nlmsg_type);
++ if (!iwpm_valid_client(nl_client)) {
++  pr_info("%s: Invalid port mapper client = %d\n",
++    __func__, nl_client);
++  return ret;
++ }
++ iwpm_set_registered(nl_client, 0);
++ atomic_set(&echo_nlmsg_seq, cb->nlh->nlmsg_seq);
++ if (!iwpm_mapinfo_available())
++  return 0;
++ iwpm_pid = cb->nlh->nlmsg_pid;
++ pr_debug("%s: iWarp Port Mapper (pid = %d) is available!\n",
++   __func__, iwpm_pid);
++ ret = iwpm_send_mapinfo(nl_client, iwpm_pid);
++ return ret;
++}
++EXPORT_SYMBOL(iwpm_mapping_info_cb);
++
++/* netlink attribute policy for the received mapping info ack */
++static const struct nla_policy ack_mapinfo_policy[IWPM_NLA_MAPINFO_NUM_MAX] = {
++ [IWPM_NLA_MAPINFO_SEQ]    =   { .type = NLA_U32 },
++ [IWPM_NLA_MAPINFO_SEND_NUM] = { .type = NLA_U32 },
++ [IWPM_NLA_MAPINFO_ACK_NUM] =  { .type = NLA_U32 }
++};
++
++/*
++ * iwpm_ack_mapping_info_cb - Process a port mapper ack for
++ *                            the provided mapping info records
++ */
++int iwpm_ack_mapping_info_cb(struct sk_buff *skb, struct netlink_callback *cb)
++{
++ struct nlattr *nltb[IWPM_NLA_MAPINFO_NUM_MAX];
++ u32 mapinfo_send, mapinfo_ack;
++ const char *msg_type = "Mapping Info Ack";
++
++ if (iwpm_parse_nlmsg(cb, IWPM_NLA_MAPINFO_NUM_MAX,
++    ack_mapinfo_policy, nltb, msg_type))
++  return -EINVAL;
++ mapinfo_send = nla_get_u32(nltb[IWPM_NLA_MAPINFO_SEND_NUM]);
++ mapinfo_ack = nla_get_u32(nltb[IWPM_NLA_MAPINFO_ACK_NUM]);
++ if (mapinfo_ack != mapinfo_send)
++  pr_info("%s: Invalid mapinfo number (sent = %u ack-ed = %u)\n",
++   __func__, mapinfo_send, mapinfo_ack);
++ atomic_set(&echo_nlmsg_seq, cb->nlh->nlmsg_seq);
++ return 0;
++}
++EXPORT_SYMBOL(iwpm_ack_mapping_info_cb);
++
++/* netlink attribute policy for the received port mapper error message */
++static const struct nla_policy map_error_policy[IWPM_NLA_ERR_MAX] = {
++ [IWPM_NLA_ERR_SEQ]        = { .type = NLA_U32 },
++ [IWPM_NLA_ERR_CODE]       = { .type = NLA_U16 },
++};
++
++/*
++ * iwpm_mapping_error_cb - Process a port mapper error message
++ */
++int iwpm_mapping_error_cb(struct sk_buff *skb, struct netlink_callback *cb)
++{
++ struct iwpm_nlmsg_request *nlmsg_request = NULL;
++ int nl_client = RDMA_NL_GET_CLIENT(cb->nlh->nlmsg_type);
++ struct nlattr *nltb[IWPM_NLA_ERR_MAX];
++ u32 msg_seq;
++ u16 err_code;
++ const char *msg_type = "Mapping Error Msg";
++
++ if (iwpm_parse_nlmsg(cb, IWPM_NLA_ERR_MAX,
++    map_error_policy, nltb, msg_type))
++  return -EINVAL;
++
++ msg_seq = nla_get_u32(nltb[IWPM_NLA_ERR_SEQ]);
++ err_code = nla_get_u16(nltb[IWPM_NLA_ERR_CODE]);
++ pr_info("%s: Received msg seq = %u err code = %u client = %d\n",
++    __func__, msg_seq, err_code, nl_client);
++ /* look for nlmsg_request */
++ nlmsg_request = iwpm_find_nlmsg_request(msg_seq);
++ if (!nlmsg_request) {
++  /* not all errors have associated requests */
++  pr_debug("Could not find matching req (seq = %u)\n", msg_seq);
++  return 0;
++ }
++ atomic_set(&echo_nlmsg_seq, cb->nlh->nlmsg_seq);
++ nlmsg_request->err_code = err_code;
++ nlmsg_request->request_done = 1;
++ /* always for found request */
++ kref_put(&nlmsg_request->kref, iwpm_free_nlmsg_request);
++ barrier();
++ wake_up(&nlmsg_request->waitq);
++ return 0;
++}
++EXPORT_SYMBOL(iwpm_mapping_error_cb);
+diff --git a/drivers/infiniband/core/iwpm_util.c b/drivers/infiniband/core/iwpm_util.c
+new file mode 100644
+index 0000000..69e9f84
+--- /dev/null
++++ b/drivers/infiniband/core/iwpm_util.c
+@@ -0,0 +1,607 @@
++/*
++ * Copyright (c) 2014 Chelsio, Inc. All rights reserved.
++ * Copyright (c) 2014 Intel Corporation. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *   copyright notice, this list of conditions and the following
++ *   disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *   copyright notice, this list of conditions and the following
++ *   disclaimer in the documentation and/or other materials
++ *   provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "iwpm_util.h"
++
++#define IWPM_HASH_BUCKET_SIZE 512
++#define IWPM_HASH_BUCKET_MASK (IWPM_HASH_BUCKET_SIZE - 1)
++
++static LIST_HEAD(iwpm_nlmsg_req_list);
++static DEFINE_SPINLOCK(iwpm_nlmsg_req_lock);
++
++static struct hlist_head *iwpm_hash_bucket;
++static DEFINE_SPINLOCK(iwpm_mapinfo_lock);
++
++static DEFINE_MUTEX(iwpm_admin_lock);
++static struct iwpm_admin_data iwpm_admin;
++
++int iwpm_init(u8 nl_client)
++{
++ if (iwpm_valid_client(nl_client))
++  return -EINVAL;
++ mutex_lock(&iwpm_admin_lock);
++ if (atomic_read(&iwpm_admin.refcount) == 0) {
++  iwpm_hash_bucket = kzalloc(IWPM_HASH_BUCKET_SIZE *
++     sizeof(struct hlist_head), GFP_KERNEL);
++  if (!iwpm_hash_bucket) {
++   mutex_unlock(&iwpm_admin_lock);
++   pr_err("%s Unable to create mapinfo hash table\n", __func__);
++   return -ENOMEM;
++  }
++ }
++ atomic_inc(&iwpm_admin.refcount);
++ mutex_unlock(&iwpm_admin_lock);
++ iwpm_set_valid(nl_client, 1);
++ return 0;
++}
++EXPORT_SYMBOL(iwpm_init);
++
++static void free_hash_bucket(void);
++
++int iwpm_exit(u8 nl_client)
++{
++
++ if (!iwpm_valid_client(nl_client))
++  return -EINVAL;
++ mutex_lock(&iwpm_admin_lock);
++ if (atomic_read(&iwpm_admin.refcount) == 0) {
++  mutex_unlock(&iwpm_admin_lock);
++  pr_err("%s Incorrect usage - negative refcount\n", __func__);
++  return -EINVAL;
++ }
++ if (atomic_dec_and_test(&iwpm_admin.refcount)) {
++  free_hash_bucket();
++  pr_debug("%s: Mapinfo hash table is destroyed\n", __func__);
++ }
++ mutex_unlock(&iwpm_admin_lock);
++ iwpm_set_valid(nl_client, 0);
++ return 0;
++}
++EXPORT_SYMBOL(iwpm_exit);
++
++static struct hlist_head *get_hash_bucket_head(struct sockaddr_storage *,
++            struct sockaddr_storage *);
++
++int iwpm_create_mapinfo(struct sockaddr_storage *local_sockaddr,
++   struct sockaddr_storage *mapped_sockaddr,
++   u8 nl_client)
++{
++ struct hlist_head *hash_bucket_head;
++ struct iwpm_mapping_info *map_info;
++ unsigned long flags;
++
++ if (!iwpm_valid_client(nl_client))
++  return -EINVAL;
++ map_info = kzalloc(sizeof(struct iwpm_mapping_info), GFP_KERNEL);
++ if (!map_info) {
++  pr_err("%s: Unable to allocate a mapping info\n", __func__);
++  return -ENOMEM;
++ }
++ memcpy(&map_info->local_sockaddr, local_sockaddr,
++        sizeof(struct sockaddr_storage));
++ memcpy(&map_info->mapped_sockaddr, mapped_sockaddr,
++        sizeof(struct sockaddr_storage));
++ map_info->nl_client = nl_client;
++
++ spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
++ if (iwpm_hash_bucket) {
++  hash_bucket_head = get_hash_bucket_head(
++     &map_info->local_sockaddr,
++     &map_info->mapped_sockaddr);
++  hlist_add_head(&map_info->hlist_node, hash_bucket_head);
++ }
++ spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
++ return 0;
++}
++EXPORT_SYMBOL(iwpm_create_mapinfo);
++
++int iwpm_remove_mapinfo(struct sockaddr_storage *local_sockaddr,
++   struct sockaddr_storage *mapped_local_addr)
++{
++ struct hlist_node *tmp_hlist_node;
++ struct hlist_head *hash_bucket_head;
++ struct iwpm_mapping_info *map_info = NULL;
++ unsigned long flags;
++ int ret = -EINVAL;
++
++ spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
++ if (iwpm_hash_bucket) {
++  hash_bucket_head = get_hash_bucket_head(
++     local_sockaddr,
++     mapped_local_addr);
++  hlist_for_each_entry_safe(map_info, tmp_hlist_node,
++     hash_bucket_head, hlist_node) {
++
++   if (!iwpm_compare_sockaddr(&map_info->mapped_sockaddr,
++      mapped_local_addr)) {
++
++    hlist_del_init(&map_info->hlist_node);
++    kfree(map_info);
++    ret = 0;
++    break;
++   }
++  }
++ }
++ spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
++ return ret;
++}
++EXPORT_SYMBOL(iwpm_remove_mapinfo);
++
++static void free_hash_bucket(void)
++{
++ struct hlist_node *tmp_hlist_node;
++ struct iwpm_mapping_info *map_info;
++ unsigned long flags;
++ int i;
++
++ /* remove all the mapinfo data from the list */
++ spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
++ for (i = 0; i < IWPM_HASH_BUCKET_SIZE; i++) {
++  hlist_for_each_entry_safe(map_info, tmp_hlist_node,
++   &iwpm_hash_bucket[i], hlist_node) {
++
++    hlist_del_init(&map_info->hlist_node);
++    kfree(map_info);
++   }
++ }
++ /* free the hash list */
++ kfree(iwpm_hash_bucket);
++ iwpm_hash_bucket = NULL;
++ spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
++}
++
++struct iwpm_nlmsg_request *iwpm_get_nlmsg_request(__u32 nlmsg_seq,
++     u8 nl_client, gfp_t gfp)
++{
++ struct iwpm_nlmsg_request *nlmsg_request = NULL;
++ unsigned long flags;
++
++ nlmsg_request = kzalloc(sizeof(struct iwpm_nlmsg_request), gfp);
++ if (!nlmsg_request) {
++  pr_err("%s Unable to allocate a nlmsg_request\n", __func__);
++  return NULL;
++ }
++ spin_lock_irqsave(&iwpm_nlmsg_req_lock, flags);
++ list_add_tail(&nlmsg_request->inprocess_list, &iwpm_nlmsg_req_list);
++ spin_unlock_irqrestore(&iwpm_nlmsg_req_lock, flags);
++
++ kref_init(&nlmsg_request->kref);
++ kref_get(&nlmsg_request->kref);
++ nlmsg_request->nlmsg_seq = nlmsg_seq;
++ nlmsg_request->nl_client = nl_client;
++ nlmsg_request->request_done = 0;
++ nlmsg_request->err_code = 0;
++ return nlmsg_request;
++}
++
++void iwpm_free_nlmsg_request(struct kref *kref)
++{
++ struct iwpm_nlmsg_request *nlmsg_request;
++ unsigned long flags;
++
++ nlmsg_request = container_of(kref, struct iwpm_nlmsg_request, kref);
++
++ spin_lock_irqsave(&iwpm_nlmsg_req_lock, flags);
++ list_del_init(&nlmsg_request->inprocess_list);
++ spin_unlock_irqrestore(&iwpm_nlmsg_req_lock, flags);
++
++ if (!nlmsg_request->request_done)
++  pr_debug("%s Freeing incomplete nlmsg request (seq = %u).\n",
++   __func__, nlmsg_request->nlmsg_seq);
++ kfree(nlmsg_request);
++}
++
++struct iwpm_nlmsg_request *iwpm_find_nlmsg_request(__u32 echo_seq)
++{
++ struct iwpm_nlmsg_request *nlmsg_request;
++ struct iwpm_nlmsg_request *found_request = NULL;
++ unsigned long flags;
++
++ spin_lock_irqsave(&iwpm_nlmsg_req_lock, flags);
++ list_for_each_entry(nlmsg_request, &iwpm_nlmsg_req_list,
++       inprocess_list) {
++  if (nlmsg_request->nlmsg_seq == echo_seq) {
++   found_request = nlmsg_request;
++   kref_get(&nlmsg_request->kref);
++   break;
++  }
++ }
++ spin_unlock_irqrestore(&iwpm_nlmsg_req_lock, flags);
++ return found_request;
++}
++
++int iwpm_wait_complete_req(struct iwpm_nlmsg_request *nlmsg_request)
++{
++ int ret;
++ init_waitqueue_head(&nlmsg_request->waitq);
++
++ ret = wait_event_timeout(nlmsg_request->waitq,
++   (nlmsg_request->request_done != 0), IWPM_NL_TIMEOUT);
++ if (!ret) {
++  ret = -EINVAL;
++  pr_info("%s: Timeout %d sec for netlink request (seq = %u)\n",
++   __func__, (IWPM_NL_TIMEOUT/HZ), nlmsg_request->nlmsg_seq);
++ } else {
++  ret = nlmsg_request->err_code;
++ }
++ kref_put(&nlmsg_request->kref, iwpm_free_nlmsg_request);
++ return ret;
++}
++
++int iwpm_get_nlmsg_seq(void)
++{
++ return atomic_inc_return(&iwpm_admin.nlmsg_seq);
++}
++
++int iwpm_valid_client(u8 nl_client)
++{
++ if (nl_client >= RDMA_NL_NUM_CLIENTS)
++  return 0;
++ return iwpm_admin.client_list[nl_client];
++}
++
++void iwpm_set_valid(u8 nl_client, int valid)
++{
++ if (nl_client >= RDMA_NL_NUM_CLIENTS)
++  return;
++ iwpm_admin.client_list[nl_client] = valid;
++}
++
++/* valid client */
++int iwpm_registered_client(u8 nl_client)
++{
++ return iwpm_admin.reg_list[nl_client];
++}
++
++/* valid client */
++void iwpm_set_registered(u8 nl_client, int reg)
++{
++ iwpm_admin.reg_list[nl_client] = reg;
++}
++
++int iwpm_compare_sockaddr(struct sockaddr_storage *a_sockaddr,
++    struct sockaddr_storage *b_sockaddr)
++{
++ if (a_sockaddr->ss_family != b_sockaddr->ss_family)
++  return 1;
++ if (a_sockaddr->ss_family == AF_INET) {
++  struct sockaddr_in *a4_sockaddr =
++   (struct sockaddr_in *)a_sockaddr;
++  struct sockaddr_in *b4_sockaddr =
++   (struct sockaddr_in *)b_sockaddr;
++  if (!memcmp(&a4_sockaddr->sin_addr,
++   &b4_sockaddr->sin_addr, sizeof(struct in_addr))
++   && a4_sockaddr->sin_port == b4_sockaddr->sin_port)
++    return 0;
++
++ } else if (a_sockaddr->ss_family == AF_INET6) {
++  struct sockaddr_in6 *a6_sockaddr =
++   (struct sockaddr_in6 *)a_sockaddr;
++  struct sockaddr_in6 *b6_sockaddr =
++   (struct sockaddr_in6 *)b_sockaddr;
++  if (!memcmp(&a6_sockaddr->sin6_addr,
++   &b6_sockaddr->sin6_addr, sizeof(struct in6_addr))
++   && a6_sockaddr->sin6_port == b6_sockaddr->sin6_port)
++    return 0;
++
++ } else {
++  pr_err("%s: Invalid sockaddr family\n", __func__);
++ }
++ return 1;
++}
++
++struct sk_buff *iwpm_create_nlmsg(u32 nl_op, struct nlmsghdr **nlh,
++      int nl_client)
++{
++ struct sk_buff *skb = NULL;
++
++ skb = dev_alloc_skb(NLMSG_GOODSIZE);
++ if (!skb) {
++  pr_err("%s Unable to allocate skb\n", __func__);
++  goto create_nlmsg_exit;
++ }
++ if (!(ibnl_put_msg(skb, nlh, 0, 0, nl_client, nl_op,
++      NLM_F_REQUEST))) {
++  pr_warn("%s: Unable to put the nlmsg header\n", __func__);
++  dev_kfree_skb(skb);
++  skb = NULL;
++ }
++create_nlmsg_exit:
++ return skb;
++}
++
++int iwpm_parse_nlmsg(struct netlink_callback *cb, int policy_max,
++       const struct nla_policy *nlmsg_policy,
++       struct nlattr *nltb[], const char *msg_type)
++{
++ int nlh_len = 0;
++ int ret;
++ const char *err_str = "";
++
++ ret = nlmsg_validate(cb->nlh, nlh_len, policy_max-1, nlmsg_policy);
++ if (ret) {
++  err_str = "Invalid attribute";
++  goto parse_nlmsg_error;
++ }
++ ret = nlmsg_parse(cb->nlh, nlh_len, nltb, policy_max-1, nlmsg_policy);
++ if (ret) {
++  err_str = "Unable to parse the nlmsg";
++  goto parse_nlmsg_error;
++ }
++ ret = iwpm_validate_nlmsg_attr(nltb, policy_max);
++ if (ret) {
++  err_str = "Invalid NULL attribute";
++  goto parse_nlmsg_error;
++ }
++ return 0;
++parse_nlmsg_error:
++ pr_warn("%s: %s (msg type %s ret = %d)\n",
++   __func__, err_str, msg_type, ret);
++ return ret;
++}
++
++void iwpm_print_sockaddr(struct sockaddr_storage *sockaddr, char *msg)
++{
++ struct sockaddr_in6 *sockaddr_v6;
++ struct sockaddr_in *sockaddr_v4;
++
++ switch (sockaddr->ss_family) {
++ case AF_INET:
++  sockaddr_v4 = (struct sockaddr_in *)sockaddr;
++  pr_debug("%s IPV4 %pI4: %u(0x%04X)\n",
++   msg, &sockaddr_v4->sin_addr,
++   ntohs(sockaddr_v4->sin_port),
++   ntohs(sockaddr_v4->sin_port));
++  break;
++ case AF_INET6:
++  sockaddr_v6 = (struct sockaddr_in6 *)sockaddr;
++  pr_debug("%s IPV6 %pI6: %u(0x%04X)\n",
++   msg, &sockaddr_v6->sin6_addr,
++   ntohs(sockaddr_v6->sin6_port),
++   ntohs(sockaddr_v6->sin6_port));
++  break;
++ default:
++  break;
++ }
++}
++
++static u32 iwpm_ipv6_jhash(struct sockaddr_in6 *ipv6_sockaddr)
++{
++ u32 ipv6_hash = jhash(&ipv6_sockaddr->sin6_addr, sizeof(struct in6_addr), 0);
++ u32 hash = jhash_2words(ipv6_hash, (__force u32) ipv6_sockaddr->sin6_port, 0);
++ return hash;
++}
++
++static u32 iwpm_ipv4_jhash(struct sockaddr_in *ipv4_sockaddr)
++{
++ u32 ipv4_hash = jhash(&ipv4_sockaddr->sin_addr, sizeof(struct in_addr), 0);
++ u32 hash = jhash_2words(ipv4_hash, (__force u32) ipv4_sockaddr->sin_port, 0);
++ return hash;
++}
++
++static struct hlist_head *get_hash_bucket_head(struct sockaddr_storage
++            *local_sockaddr,
++            struct sockaddr_storage
++            *mapped_sockaddr)
++{
++ u32 local_hash, mapped_hash, hash;
++
++ if (local_sockaddr->ss_family == AF_INET) {
++  local_hash = iwpm_ipv4_jhash((struct sockaddr_in *) local_sockaddr);
++  mapped_hash = iwpm_ipv4_jhash((struct sockaddr_in *) mapped_sockaddr);
++
++ } else if (local_sockaddr->ss_family == AF_INET6) {
++  local_hash = iwpm_ipv6_jhash((struct sockaddr_in6 *) local_sockaddr);
++  mapped_hash = iwpm_ipv6_jhash((struct sockaddr_in6 *) mapped_sockaddr);
++ } else {
++  pr_err("%s: Invalid sockaddr family\n", __func__);
++  return NULL;
++ }
++
++ if (local_hash == mapped_hash) /* if port mapper isn't available */
++  hash = local_hash;
++ else
++  hash = jhash_2words(local_hash, mapped_hash, 0);
++
++ return &iwpm_hash_bucket[hash & IWPM_HASH_BUCKET_MASK];
++}
++
++static int send_mapinfo_num(u32 mapping_num, u8 nl_client, int iwpm_pid)
++{
++ struct sk_buff *skb = NULL;
++ struct nlmsghdr *nlh;
++ u32 msg_seq;
++ const char *err_str = "";
++ int ret = -EINVAL;
++
++ skb = iwpm_create_nlmsg(RDMA_NL_IWPM_MAPINFO_NUM, &nlh, nl_client);
++ if (!skb) {
++  err_str = "Unable to create a nlmsg";
++  goto mapinfo_num_error;
++ }
++ nlh->nlmsg_seq = iwpm_get_nlmsg_seq();
++ msg_seq = 0;
++ err_str = "Unable to put attribute of mapinfo number nlmsg";
++ ret = ibnl_put_attr(skb, nlh, sizeof(u32), &msg_seq, IWPM_NLA_MAPINFO_SEQ);
++ if (ret)
++  goto mapinfo_num_error;
++ ret = ibnl_put_attr(skb, nlh, sizeof(u32),
++    &mapping_num, IWPM_NLA_MAPINFO_SEND_NUM);
++ if (ret)
++  goto mapinfo_num_error;
++ ret = ibnl_unicast(skb, nlh, iwpm_pid);
++ if (ret) {
++  skb = NULL;
++  err_str = "Unable to send a nlmsg";
++  goto mapinfo_num_error;
++ }
++ pr_debug("%s: Sent mapping number = %d\n", __func__, mapping_num);
++ return 0;
++mapinfo_num_error:
++ pr_info("%s: %s\n", __func__, err_str);
++ if (skb)
++  dev_kfree_skb(skb);
++ return ret;
++}
++
++static int send_nlmsg_done(struct sk_buff *skb, u8 nl_client, int iwpm_pid)
++{
++ struct nlmsghdr *nlh = NULL;
++ int ret = 0;
++
++ if (!skb)
++  return ret;
++ if (!(ibnl_put_msg(skb, &nlh, 0, 0, nl_client,
++      RDMA_NL_IWPM_MAPINFO, NLM_F_MULTI))) {
++  pr_warn("%s Unable to put NLMSG_DONE\n", __func__);
++  return -ENOMEM;
++ }
++ nlh->nlmsg_type = NLMSG_DONE;
++ ret = ibnl_unicast(skb, (struct nlmsghdr *)skb->data, iwpm_pid);
++ if (ret)
++  pr_warn("%s Unable to send a nlmsg\n", __func__);
++ return ret;
++}
++
++int iwpm_send_mapinfo(u8 nl_client, int iwpm_pid)
++{
++ struct iwpm_mapping_info *map_info;
++ struct sk_buff *skb = NULL;
++ struct nlmsghdr *nlh;
++ int skb_num = 0, mapping_num = 0;
++ int i = 0, nlmsg_bytes = 0;
++ unsigned long flags;
++ const char *err_str = "";
++ int ret;
++
++ skb = dev_alloc_skb(NLMSG_GOODSIZE);
++ if (!skb) {
++  ret = -ENOMEM;
++  err_str = "Unable to allocate skb";
++  goto send_mapping_info_exit;
++ }
++ skb_num++;
++ spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
++ for (i = 0; i < IWPM_HASH_BUCKET_SIZE; i++) {
++  hlist_for_each_entry(map_info, &iwpm_hash_bucket[i],
++         hlist_node) {
++   if (map_info->nl_client != nl_client)
++    continue;
++   nlh = NULL;
++   if (!(ibnl_put_msg(skb, &nlh, 0, 0, nl_client,
++     RDMA_NL_IWPM_MAPINFO, NLM_F_MULTI))) {
++    ret = -ENOMEM;
++    err_str = "Unable to put the nlmsg header";
++    goto send_mapping_info_unlock;
++   }
++   err_str = "Unable to put attribute of the nlmsg";
++   ret = ibnl_put_attr(skb, nlh,
++     sizeof(struct sockaddr_storage),
++     &map_info->local_sockaddr,
++     IWPM_NLA_MAPINFO_LOCAL_ADDR);
++   if (ret)
++    goto send_mapping_info_unlock;
++
++   ret = ibnl_put_attr(skb, nlh,
++     sizeof(struct sockaddr_storage),
++     &map_info->mapped_sockaddr,
++     IWPM_NLA_MAPINFO_MAPPED_ADDR);
++   if (ret)
++    goto send_mapping_info_unlock;
++
++   iwpm_print_sockaddr(&map_info->local_sockaddr,
++    "send_mapping_info: Local sockaddr:");
++   iwpm_print_sockaddr(&map_info->mapped_sockaddr,
++    "send_mapping_info: Mapped local sockaddr:");
++   mapping_num++;
++   nlmsg_bytes += nlh->nlmsg_len;
++
++   /* check if all mappings can fit in one skb */
++   if (NLMSG_GOODSIZE - nlmsg_bytes < nlh->nlmsg_len * 2) {
++    /* and leave room for NLMSG_DONE */
++    nlmsg_bytes = 0;
++    skb_num++;
++    spin_unlock_irqrestore(&iwpm_mapinfo_lock,
++             flags);
++    /* send the skb */
++    ret = send_nlmsg_done(skb, nl_client, iwpm_pid);
++    skb = NULL;
++    if (ret) {
++     err_str = "Unable to send map info";
++     goto send_mapping_info_exit;
++    }
++    if (skb_num == IWPM_MAPINFO_SKB_COUNT) {
++     ret = -ENOMEM;
++     err_str = "Insufficient skbs for map info";
++     goto send_mapping_info_exit;
++    }
++    skb = dev_alloc_skb(NLMSG_GOODSIZE);
++    if (!skb) {
++     ret = -ENOMEM;
++     err_str = "Unable to allocate skb";
++     goto send_mapping_info_exit;
++    }
++    spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
++   }
++  }
++ }
++send_mapping_info_unlock:
++ spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
++send_mapping_info_exit:
++ if (ret) {
++  pr_warn("%s: %s (ret = %d)\n", __func__, err_str, ret);
++  if (skb)
++   dev_kfree_skb(skb);
++  return ret;
++ }
++ send_nlmsg_done(skb, nl_client, iwpm_pid);
++ return send_mapinfo_num(mapping_num, nl_client, iwpm_pid);
++}
++
++int iwpm_mapinfo_available(void)
++{
++ unsigned long flags;
++ int full_bucket = 0, i = 0;
++
++ spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
++ if (iwpm_hash_bucket) {
++  for (i = 0; i < IWPM_HASH_BUCKET_SIZE; i++) {
++   if (!hlist_empty(&iwpm_hash_bucket[i])) {
++    full_bucket = 1;
++    break;
++   }
++  }
++ }
++ spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
++ return full_bucket;
++}
+diff --git a/drivers/infiniband/core/iwpm_util.h b/drivers/infiniband/core/iwpm_util.h
+new file mode 100644
+index 0000000..9777c86
+--- /dev/null
++++ b/drivers/infiniband/core/iwpm_util.h
+@@ -0,0 +1,238 @@
++/*
++ * Copyright (c) 2014 Intel Corporation. All rights reserved.
++ * Copyright (c) 2014 Chelsio, Inc. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *   copyright notice, this list of conditions and the following
++ *   disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *   copyright notice, this list of conditions and the following
++ *   disclaimer in the documentation and/or other materials
++ *   provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#ifndef _IWPM_UTIL_H
++#define _IWPM_UTIL_H
++
++#include <linux/module.h>
++#include <linux/io.h>
++#include <linux/in.h>
++#include <linux/in6.h>
++#include <linux/spinlock.h>
++#include <linux/kernel.h>
++#include <linux/netdevice.h>
++#include <linux/delay.h>
++#include <linux/workqueue.h>
++#include <linux/mutex.h>
++#include <linux/jhash.h>
++#include <linux/kref.h>
++#include <net/netlink.h>
++#include <linux/errno.h>
++#include <rdma/iw_portmap.h>
++#include <rdma/rdma_netlink.h>
++
++
++#define IWPM_NL_RETRANS  3
++#define IWPM_NL_TIMEOUT  (10*HZ)
++#define IWPM_MAPINFO_SKB_COUNT 20
++
++#define IWPM_PID_UNDEFINED     -1
++#define IWPM_PID_UNAVAILABLE   -2
++
++struct iwpm_nlmsg_request {
++ struct list_head    inprocess_list;
++ __u32               nlmsg_seq;
++ void                *req_buffer;
++ u8             nl_client;
++ u8                  request_done;
++ u16                 err_code;
++ wait_queue_head_t   waitq;
++ struct kref         kref;
++};
++
++struct iwpm_mapping_info {
++ struct hlist_node hlist_node;
++ struct sockaddr_storage local_sockaddr;
++ struct sockaddr_storage mapped_sockaddr;
++ u8     nl_client;
++};
++
++struct iwpm_admin_data {
++ atomic_t refcount;
++ atomic_t nlmsg_seq;
++ int      client_list[RDMA_NL_NUM_CLIENTS];
++ int      reg_list[RDMA_NL_NUM_CLIENTS];
++};
++
++/**
++ * iwpm_get_nlmsg_request - Allocate and initialize netlink message request
++ * @nlmsg_seq: Sequence number of the netlink message
++ * @nl_client: The index of the netlink client
++ * @gfp: Indicates how the memory for the request should be allocated
++ *
++ * Returns the newly allocated netlink request object if successful,
++ * otherwise returns NULL
++ */
++struct iwpm_nlmsg_request *iwpm_get_nlmsg_request(__u32 nlmsg_seq,
++      u8 nl_client, gfp_t gfp);
++
++/**
++ * iwpm_free_nlmsg_request - Deallocate netlink message request
++ * @kref: Holds reference of netlink message request
++ */
++void iwpm_free_nlmsg_request(struct kref *kref);
++
++/**
++ * iwpm_find_nlmsg_request - Find netlink message request in the request list
++ * @echo_seq: Sequence number of the netlink request to find
++ *
++ * Returns the found netlink message request,
++ * if not found, returns NULL
++ */
++struct iwpm_nlmsg_request *iwpm_find_nlmsg_request(__u32 echo_seq);
++
++/**
++ * iwpm_wait_complete_req - Block while servicing the netlink request
++ * @nlmsg_request: Netlink message request to service
++ *
++ * Wakes up, after the request is completed or expired
++ * Returns 0 if the request is complete without error
++ */
++int iwpm_wait_complete_req(struct iwpm_nlmsg_request *nlmsg_request);
++
++/**
++ * iwpm_get_nlmsg_seq - Get the sequence number for a netlink
++ *   message to send to the port mapper
++ *
++ * Returns the sequence number for the netlink message.
++ */
++int iwpm_get_nlmsg_seq(void);
++
++/**
++ * iwpm_valid_client - Check if the port mapper client is valid
++ * @nl_client: The index of the netlink client
++ *
++ * Valid clients need to call iwpm_init() before using
++ * the port mapper
++ */
++int iwpm_valid_client(u8 nl_client);
++
++/**
++ * iwpm_set_valid - Set the port mapper client to valid or not
++ * @nl_client: The index of the netlink client
++ * @valid: 1 if valid or 0 if invalid
++ */
++void iwpm_set_valid(u8 nl_client, int valid);
++
++/**
++ * iwpm_registered_client - Check if the port mapper client is registered
++ * @nl_client: The index of the netlink client
++ *
++ * Call iwpm_register_pid() to register a client
++ */
++int iwpm_registered_client(u8 nl_client);
++
++/**
++ * iwpm_set_registered - Set the port mapper client to registered or not
++ * @nl_client: The index of the netlink client
++ * @reg: 1 if registered or 0 if not
++ */
++void iwpm_set_registered(u8 nl_client, int reg);
++
++/**
++ * iwpm_send_mapinfo - Send local and mapped IPv4/IPv6 address info of
++ *                     a client to the user space port mapper
++ * @nl_client: The index of the netlink client
++ * @iwpm_pid: The pid of the user space port mapper
++ *
++ * If successful, returns the number of sent mapping info records
++ */
++int iwpm_send_mapinfo(u8 nl_client, int iwpm_pid);
++
++/**
++ * iwpm_mapinfo_available - Check if any mapping info records is available
++ *              in the hash table
++ *
++ * Returns 1 if mapping information is available, otherwise returns 0
++ */
++int iwpm_mapinfo_available(void);
++
++/**
++ * iwpm_compare_sockaddr - Compare two sockaddr storage structs
++ *
++ * Returns 0 if they are holding the same ip/tcp address info,
++ * otherwise returns 1
++ */
++int iwpm_compare_sockaddr(struct sockaddr_storage *a_sockaddr,
++   struct sockaddr_storage *b_sockaddr);
++
++/**
++ * iwpm_validate_nlmsg_attr - Check for NULL netlink attributes
++ * @nltb: Holds address of each netlink message attributes
++ * @nla_count: Number of netlink message attributes
++ *
++ * Returns error if any of the nla_count attributes is NULL
++ */
++static inline int iwpm_validate_nlmsg_attr(struct nlattr *nltb[],
++        int nla_count)
++{
++ int i;
++ for (i = 1; i < nla_count; i++) {
++  if (!nltb[i])
++   return -EINVAL;
++ }
++ return 0;
++}
++
++/**
++ * iwpm_create_nlmsg - Allocate skb and form a netlink message
++ * @nl_op: Netlink message opcode
++ * @nlh: Holds address of the netlink message header in skb
++ * @nl_client: The index of the netlink client
++ *
++ * Returns the newly allcated skb, or NULL if the tailroom of the skb
++ * is insufficient to store the message header and payload
++ */
++struct sk_buff *iwpm_create_nlmsg(u32 nl_op, struct nlmsghdr **nlh,
++     int nl_client);
++
++/**
++ * iwpm_parse_nlmsg - Validate and parse the received netlink message
++ * @cb: Netlink callback structure
++ * @policy_max: Maximum attribute type to be expected
++ * @nlmsg_policy: Validation policy
++ * @nltb: Array to store policy_max parsed elements
++ * @msg_type: Type of netlink message
++ *
++ * Returns 0 on success or a negative error code
++ */
++int iwpm_parse_nlmsg(struct netlink_callback *cb, int policy_max,
++    const struct nla_policy *nlmsg_policy,
++    struct nlattr *nltb[], const char *msg_type);
++
++/**
++ * iwpm_print_sockaddr - Print IPv4/IPv6 address and TCP port
++ * @sockaddr: Socket address to print
++ * @msg: Message to print
++ */
++void iwpm_print_sockaddr(struct sockaddr_storage *sockaddr, char *msg);
++#endif
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index a1e9cba..23dd5a5 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -103,13 +103,13 @@ int ibnl_remove_client(int index)
+ EXPORT_SYMBOL(ibnl_remove_client);
+ 
+ void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
+-     int len, int client, int op)
++     int len, int client, int op, int flags)
+ {
+  unsigned char *prev_tail;
+ 
+  prev_tail = skb_tail_pointer(skb);
+  *nlh = nlmsg_put(skb, 0, seq, RDMA_NL_GET_TYPE(client, op),
+-    len, NLM_F_MULTI);
++    len, flags);
+  if (!*nlh)
+   goto out_nlmsg_trim;
+  (*nlh)->nlmsg_len = skb_tail_pointer(skb) - prev_tail;
+@@ -172,6 +172,20 @@ static void ibnl_rcv(struct sk_buff *skb)
+  mutex_unlock(&ibnl_mutex);
+ }
+ 
++int ibnl_unicast(struct sk_buff *skb, struct nlmsghdr *nlh,
++   __u32 pid)
++{
++ return nlmsg_unicast(nls, skb, pid);
++}
++EXPORT_SYMBOL(ibnl_unicast);
++
++int ibnl_multicast(struct sk_buff *skb, struct nlmsghdr *nlh,
++   unsigned int group, gfp_t flags)
++{
++ return nlmsg_multicast(nls, skb, 0, group, flags);
++}
++EXPORT_SYMBOL(ibnl_multicast);
++
+ int __init ibnl_init(void)
+ {
+  struct netlink_kernel_cfg cfg = {
+diff --git a/include/rdma/iw_portmap.h b/include/rdma/iw_portmap.h
+new file mode 100644
+index 0000000..928b277
+--- /dev/null
++++ b/include/rdma/iw_portmap.h
+@@ -0,0 +1,199 @@
++/*
++ * Copyright (c) 2014 Intel Corporation. All rights reserved.
++ * Copyright (c) 2014 Chelsio, Inc. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *   copyright notice, this list of conditions and the following
++ *   disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *   copyright notice, this list of conditions and the following
++ *   disclaimer in the documentation and/or other materials
++ *   provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#ifndef _IW_PORTMAP_H
++#define _IW_PORTMAP_H
++
++#define IWPM_ULIBNAME_SIZE 32
++#define IWPM_DEVNAME_SIZE 32
++#define IWPM_IFNAME_SIZE 16
++#define IWPM_IPADDR_SIZE 16
++
++enum {
++ IWPM_INVALID_NLMSG_ERR = 10,
++ IWPM_CREATE_MAPPING_ERR,
++ IWPM_DUPLICATE_MAPPING_ERR,
++ IWPM_UNKNOWN_MAPPING_ERR,
++ IWPM_CLIENT_DEV_INFO_ERR,
++ IWPM_USER_LIB_INFO_ERR,
++ IWPM_REMOTE_QUERY_REJECT
++};
++
++struct iwpm_dev_data {
++ char dev_name[IWPM_DEVNAME_SIZE];
++ char if_name[IWPM_IFNAME_SIZE];
++};
++
++struct iwpm_sa_data {
++ struct sockaddr_storage loc_addr;
++ struct sockaddr_storage mapped_loc_addr;
++ struct sockaddr_storage rem_addr;
++ struct sockaddr_storage mapped_rem_addr;
++};
++
++/**
++ * iwpm_init - Allocate resources for the iwarp port mapper
++ *
++ * Should be called when network interface goes up.
++ */
++int iwpm_init(u8);
++
++/**
++ * iwpm_exit - Deallocate resources for the iwarp port mapper
++ *
++ * Should be called when network interface goes down.
++ */
++int iwpm_exit(u8);
++
++/**
++ * iwpm_valid_pid - Check if the userspace iwarp port mapper pid is valid
++ *
++ * Returns true if the pid is greater than zero, otherwise returns false
++ */
++int iwpm_valid_pid(void);
++
++/**
++ * iwpm_register_pid - Send a netlink query to userspace
++ *                     to get the iwarp port mapper pid
++ * @pm_msg: Contains driver info to send to the userspace port mapper
++ * @nl_client: The index of the netlink client
++ */
++int iwpm_register_pid(struct iwpm_dev_data *pm_msg, u8 nl_client);
++
++/**
++ * iwpm_add_mapping - Send a netlink add mapping request to
++ *                    the userspace port mapper
++ * @pm_msg: Contains the local ip/tcp address info to send
++ * @nl_client: The index of the netlink client
++ *
++ * If the request is successful, the pm_msg stores
++ * the port mapper response (mapped address info)
++ */
++int iwpm_add_mapping(struct iwpm_sa_data *pm_msg, u8 nl_client);
++
++/**
++ * iwpm_add_and_query_mapping - Send a netlink add and query mapping request
++ *     to the userspace port mapper
++ * @pm_msg: Contains the local and remote ip/tcp address info to send
++ * @nl_client: The index of the netlink client
++ *
++ * If the request is successful, the pm_msg stores the
++ * port mapper response (mapped local and remote address info)
++ */
++int iwpm_add_and_query_mapping(struct iwpm_sa_data *pm_msg, u8 nl_client);
++
++/**
++ * iwpm_remove_mapping - Send a netlink remove mapping request
++ *                       to the userspace port mapper
++ *
++ * @local_addr: Local ip/tcp address to remove
++ * @nl_client: The index of the netlink client
++ */
++int iwpm_remove_mapping(struct sockaddr_storage *local_addr, u8 nl_client);
++
++/**
++ * iwpm_register_pid_cb - Process the port mapper response to
++ *                        iwpm_register_pid query
++ * @skb:
++ * @cb: Contains the received message (payload and netlink header)
++ *
++ * If successful, the function receives the userspace port mapper pid
++ * which is used in future communication with the port mapper
++ */
++int iwpm_register_pid_cb(struct sk_buff *, struct netlink_callback *);
++
++/**
++ * iwpm_add_mapping_cb - Process the port mapper response to
++ *                       iwpm_add_mapping request
++ * @skb:
++ * @cb: Contains the received message (payload and netlink header)
++ */
++int iwpm_add_mapping_cb(struct sk_buff *, struct netlink_callback *);
++
++/**
++ * iwpm_add_and_query_mapping_cb - Process the port mapper response to
++ *                                 iwpm_add_and_query_mapping request
++ * @skb:
++ * @cb: Contains the received message (payload and netlink header)
++ */
++int iwpm_add_and_query_mapping_cb(struct sk_buff *, struct netlink_callback *);
++
++/**
++ * iwpm_mapping_error_cb - Process port mapper notification for error
++ *
++ * @skb:
++ * @cb: Contains the received message (payload and netlink header)
++ */
++int iwpm_mapping_error_cb(struct sk_buff *, struct netlink_callback *);
++
++/**
++ * iwpm_mapping_info_cb - Process a notification that the userspace
++ *                        port mapper daemon is started
++ * @skb:
++ * @cb: Contains the received message (payload and netlink header)
++ *
++ * Using the received port mapper pid, send all the local mapping
++ * info records to the userspace port mapper
++ */
++int iwpm_mapping_info_cb(struct sk_buff *, struct netlink_callback *);
++
++/**
++ * iwpm_ack_mapping_info_cb - Process the port mapper ack for
++ *                            the provided local mapping info records
++ * @skb:
++ * @cb: Contains the received message (payload and netlink header)
++ */
++int iwpm_ack_mapping_info_cb(struct sk_buff *, struct netlink_callback *);
++
++/**
++ * iwpm_create_mapinfo - Store local and mapped IPv4/IPv6 address
++ *                       info in a hash table
++ * @local_addr: Local ip/tcp address
++ * @mapped_addr: Mapped local ip/tcp address
++ * @nl_client: The index of the netlink client
++ */
++int iwpm_create_mapinfo(struct sockaddr_storage *local_addr,
++   struct sockaddr_storage *mapped_addr, u8 nl_client);
++
++/**
++ * iwpm_remove_mapinfo - Remove local and mapped IPv4/IPv6 address
++ *                       info from the hash table
++ * @local_addr: Local ip/tcp address
++ * @mapped_addr: Mapped local ip/tcp address
++ *
++ * Returns err code if mapping info is not found in the hash table,
++ * otherwise returns 0
++ */
++int iwpm_remove_mapinfo(struct sockaddr_storage *local_addr,
++   struct sockaddr_storage *mapped_addr);
++
++#endif /* _IW_PORTMAP_H */
+diff --git a/include/rdma/rdma_netlink.h b/include/rdma/rdma_netlink.h
+index e38de79..0790882 100644
+--- a/include/rdma/rdma_netlink.h
++++ b/include/rdma/rdma_netlink.h
+@@ -43,7 +43,7 @@ int ibnl_remove_client(int index);
+  * Returns the allocated buffer on success and NULL on failure.
+  */
+ void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
+-     int len, int client, int op);
++     int len, int client, int op, int flags);
+ /**
+  * Put a new attribute in a supplied skb.
+  * @skb: The netlink skb.
+@@ -56,4 +56,25 @@ void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
+ int ibnl_put_attr(struct sk_buff *skb, struct nlmsghdr *nlh,
+     int len, void *data, int type);
+ 
++/**
++ * Send the supplied skb to a specific userspace PID.
++ * @skb: The netlink skb
++ * @nlh: Header of the netlink message to send
++ * @pid: Userspace netlink process ID
++ * Returns 0 on success or a negative error code.
++ */
++int ibnl_unicast(struct sk_buff *skb, struct nlmsghdr *nlh,
++   __u32 pid);
++
++/**
++ * Send the supplied skb to a netlink group.
++ * @skb: The netlink skb
++ * @nlh: Header of the netlink message to send
++ * @group: Netlink group ID
++ * @flags: allocation flags
++ * Returns 0 on success or a negative error code.
++ */
++int ibnl_multicast(struct sk_buff *skb, struct nlmsghdr *nlh,
++   unsigned int group, gfp_t flags);
++
+ #endif /* _RDMA_NETLINK_H */
+diff --git a/include/uapi/rdma/rdma_netlink.h b/include/uapi/rdma/rdma_netlink.h
+index 8297285..de69170 100644
+--- a/include/uapi/rdma/rdma_netlink.h
++++ b/include/uapi/rdma/rdma_netlink.h
+@@ -4,7 +4,16 @@
+ #include <linux/types.h>
+ 
+ enum {
+- RDMA_NL_RDMA_CM = 1
++ RDMA_NL_RDMA_CM = 1,
++ RDMA_NL_NES,
++ RDMA_NL_C4IW,
++ RDMA_NL_NUM_CLIENTS
++};
++
++enum {
++ RDMA_NL_GROUP_CM = 1,
++ RDMA_NL_GROUP_IWPM,
++ RDMA_NL_NUM_GROUPS
+ };
+ 
+ #define RDMA_NL_GET_CLIENT(type) ((type & (((1 << 6) - 1) << 10)) >> 10)
+@@ -22,6 +31,18 @@ enum {
+  RDMA_NL_RDMA_CM_NUM_ATTR,
+ };
+ 
++/* iwarp port mapper op-codes */
++enum {
++ RDMA_NL_IWPM_REG_PID = 0,
++ RDMA_NL_IWPM_ADD_MAPPING,
++ RDMA_NL_IWPM_QUERY_MAPPING,
++ RDMA_NL_IWPM_REMOVE_MAPPING,
++ RDMA_NL_IWPM_HANDLE_ERR,
++ RDMA_NL_IWPM_MAPINFO,
++ RDMA_NL_IWPM_MAPINFO_NUM,
++ RDMA_NL_IWPM_NUM_OPS
++};
++
+ struct rdma_cm_id_stats {
+  __u32 qp_num;
+  __u32 bound_dev_if;
+@@ -33,5 +54,78 @@ struct rdma_cm_id_stats {
+  __u8 qp_type;
+ };
+ 
++enum {
++ IWPM_NLA_REG_PID_UNSPEC = 0,
++ IWPM_NLA_REG_PID_SEQ,
++ IWPM_NLA_REG_IF_NAME,
++ IWPM_NLA_REG_IBDEV_NAME,
++ IWPM_NLA_REG_ULIB_NAME,
++ IWPM_NLA_REG_PID_MAX
++};
++
++enum {
++ IWPM_NLA_RREG_PID_UNSPEC = 0,
++ IWPM_NLA_RREG_PID_SEQ,
++ IWPM_NLA_RREG_IBDEV_NAME,
++ IWPM_NLA_RREG_ULIB_NAME,
++ IWPM_NLA_RREG_ULIB_VER,
++ IWPM_NLA_RREG_PID_ERR,
++ IWPM_NLA_RREG_PID_MAX
++
++};
++
++enum {
++ IWPM_NLA_MANAGE_MAPPING_UNSPEC = 0,
++ IWPM_NLA_MANAGE_MAPPING_SEQ,
++ IWPM_NLA_MANAGE_ADDR,
++ IWPM_NLA_MANAGE_MAPPED_LOC_ADDR,
++ IWPM_NLA_RMANAGE_MAPPING_ERR,
++ IWPM_NLA_RMANAGE_MAPPING_MAX
++};
++
++#define IWPM_NLA_MANAGE_MAPPING_MAX 3
++#define IWPM_NLA_QUERY_MAPPING_MAX  4
++#define IWPM_NLA_MAPINFO_SEND_MAX   3
++
++enum {
++ IWPM_NLA_QUERY_MAPPING_UNSPEC = 0,
++ IWPM_NLA_QUERY_MAPPING_SEQ,
++ IWPM_NLA_QUERY_LOCAL_ADDR,
++ IWPM_NLA_QUERY_REMOTE_ADDR,
++ IWPM_NLA_RQUERY_MAPPED_LOC_ADDR,
++ IWPM_NLA_RQUERY_MAPPED_REM_ADDR,
++ IWPM_NLA_RQUERY_MAPPING_ERR,
++ IWPM_NLA_RQUERY_MAPPING_MAX
++};
++
++enum {
++ IWPM_NLA_MAPINFO_REQ_UNSPEC = 0,
++ IWPM_NLA_MAPINFO_ULIB_NAME,
++ IWPM_NLA_MAPINFO_ULIB_VER,
++ IWPM_NLA_MAPINFO_REQ_MAX
++};
++
++enum {
++ IWPM_NLA_MAPINFO_UNSPEC = 0,
++ IWPM_NLA_MAPINFO_LOCAL_ADDR,
++ IWPM_NLA_MAPINFO_MAPPED_ADDR,
++ IWPM_NLA_MAPINFO_MAX
++};
++
++enum {
++ IWPM_NLA_MAPINFO_NUM_UNSPEC = 0,
++ IWPM_NLA_MAPINFO_SEQ,
++ IWPM_NLA_MAPINFO_SEND_NUM,
++ IWPM_NLA_MAPINFO_ACK_NUM,
++ IWPM_NLA_MAPINFO_NUM_MAX
++};
++
++enum {
++ IWPM_NLA_ERR_UNSPEC = 0,
++ IWPM_NLA_ERR_SEQ,
++ IWPM_NLA_ERR_CODE,
++ IWPM_NLA_ERR_MAX
++};
++
+ 
+ #endif /* _UAPI_RDMA_NETLINK_H */
+-- 
+1.7.1

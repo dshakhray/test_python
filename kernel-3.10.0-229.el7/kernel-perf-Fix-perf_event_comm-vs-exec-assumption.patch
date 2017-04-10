@@ -1,0 +1,127 @@
+From 02120e1cbae0a7f1406d50e3e3dce13629805179 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:37 -0400
+Subject: [kernel] perf: Fix perf_event_comm() vs. exec() assumption
+
+Message-id: <1410181752-25631-33-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91709
+O-Subject: [PATCH RHEL7.1 BZ1134356 032/307] perf: Fix perf_event_comm() vs. exec() assumption
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit e041e328c4b41e1db79bfe5ba9992c2ed771ad19
+Author: Peter Zijlstra <peterz@infradead.org>
+Date: Wed May 21 17:32:19 2014 +0200
+
+description
+===========
+perf_event_comm() assumes that set_task_comm() is only called on
+exec(), and in particular that its only called on current.
+
+Neither are true, as Dave reported a WARN triggered by set_task_comm()
+being called on !current.
+
+Separate the exec() hook from the comm hook.
+
+[ Build fix. ]
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/exec.c b/fs/exec.c
+index 4ba6694..dd300d8 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1116,6 +1116,7 @@ void setup_new_exec(struct linux_binprm * bprm)
+  else
+   set_dumpable(current->mm, suid_dumpable);
+ 
++ perf_event_exec();
+  set_task_comm(current, bprm->tcomm);
+ 
+  /* Set the new mm task size. We have to do that late because it may
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index a614937..b4cacdc 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -729,6 +729,7 @@ extern struct perf_guest_info_callbacks *perf_guest_cbs;
+ extern int perf_register_guest_info_callbacks(struct perf_guest_info_callbacks *callbacks);
+ extern int perf_unregister_guest_info_callbacks(struct perf_guest_info_callbacks *callbacks);
+ 
++extern void perf_event_exec(void);
+ extern void perf_event_comm(struct task_struct *tsk);
+ extern void perf_event_fork(struct task_struct *tsk);
+ 
+@@ -806,7 +807,7 @@ extern void perf_event_enable(struct perf_event *event);
+ extern void perf_event_disable(struct perf_event *event);
+ extern int __perf_event_disable(void *info);
+ extern void perf_event_task_tick(void);
+-#else
++#else /* !CONFIG_PERF_EVENTS: */
+ static inline void
+ perf_event_task_sched_in(struct task_struct *prev,
+     struct task_struct *task)   { }
+@@ -836,6 +837,7 @@ static inline int perf_unregister_guest_info_callbacks
+ (struct perf_guest_info_callbacks *callbacks)    { return 0; }
+ 
+ static inline void perf_event_mmap(struct vm_area_struct *vma)  { }
++static inline void perf_event_exec(void)    { }
+ static inline void perf_event_comm(struct task_struct *tsk)  { }
+ static inline void perf_event_fork(struct task_struct *tsk)  { }
+ static inline void perf_event_init(void)    { }
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index de92bb2..99c01f7 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -2985,6 +2985,22 @@ out:
+  local_irq_restore(flags);
+ }
+ 
++void perf_event_exec(void)
++{
++ struct perf_event_context *ctx;
++ int ctxn;
++
++ rcu_read_lock();
++ for_each_task_context_nr(ctxn) {
++  ctx = current->perf_event_ctxp[ctxn];
++  if (!ctx)
++   continue;
++
++  perf_event_enable_on_exec(ctx);
++ }
++ rcu_read_unlock();
++}
++
+ /*
+  * Cross CPU call to read the hardware event
+  */
+@@ -5082,18 +5098,6 @@ static void perf_event_comm_event(struct perf_comm_event *comm_event)
+ void perf_event_comm(struct task_struct *task)
+ {
+  struct perf_comm_event comm_event;
+- struct perf_event_context *ctx;
+- int ctxn;
+-
+- rcu_read_lock();
+- for_each_task_context_nr(ctxn) {
+-  ctx = task->perf_event_ctxp[ctxn];
+-  if (!ctx)
+-   continue;
+-
+-  perf_event_enable_on_exec(ctx);
+- }
+- rcu_read_unlock();
+ 
+  if (!atomic_read(&nr_comm_events))
+   return;
+-- 
+1.7.1

@@ -1,0 +1,112 @@
+From 3e91bb2a87c9668ed1c6eb6079bc0e63259f05d6 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:10:14 -0400
+Subject: [usb] storage/scsi: Add broken_fua blacklist flag
+
+Message-id: <1410887463-20674-543-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95627
+O-Subject: [RHEL7 PATCH 542/591] usb-storage/SCSI: Add broken_fua blacklist flag
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit b14bf2d0c0358140041d1c1805a674376964d0e0
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Mon Jun 30 11:04:21 2014 -0400
+
+    usb-storage/SCSI: Add broken_fua blacklist flag
+
+    Some buggy JMicron USB-ATA bridges don't know how to translate the FUA
+    bit in READs or WRITEs.  This patch adds an entry in unusual_devs.h
+    and a blacklist flag to tell the sd driver not to use FUA.
+
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    Reported-by: Michael Buesch <m@bues.ch>
+    Tested-by: Michael Buesch <m@bues.ch>
+    Acked-by: James Bottomley <James.Bottomley@HansenPartnership.com>
+    CC: Matthew Dharm <mdharm-usb@one-eyed-alien.net>
+    CC: <stable@vger.kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 93b879d..3bc6b66 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -2438,7 +2438,10 @@ sd_read_cache_type(struct scsi_disk *sdkp, unsigned char *buffer)
+   }
+ 
+   sdkp->DPOFUA = (data.device_specific & 0x10) != 0;
+-  if (sdkp->DPOFUA && !sdkp->device->use_10_for_rw) {
++  if (sdp->broken_fua) {
++   sd_first_printk(KERN_NOTICE, sdkp, "Disabling FUA\n");
++   sdkp->DPOFUA = 0;
++  } else if (sdkp->DPOFUA && !sdkp->device->use_10_for_rw) {
+    sd_first_printk(KERN_NOTICE, sdkp,
+       "Uses READ/WRITE(6), disabling FUA\n");
+    sdkp->DPOFUA = 0;
+diff --git a/drivers/usb/storage/scsiglue.c b/drivers/usb/storage/scsiglue.c
+index 18509e6..28009f0 100644
+--- a/drivers/usb/storage/scsiglue.c
++++ b/drivers/usb/storage/scsiglue.c
+@@ -250,6 +250,10 @@ static int slave_configure(struct scsi_device *sdev)
+   if (us->fflags & US_FL_WRITE_CACHE)
+    sdev->wce_default_on = 1;
+ 
++  /* A few buggy USB-ATA bridges don't understand FUA */
++  if (us->fflags & US_FL_BROKEN_FUA)
++   sdev->broken_fua = 1;
++
+  } else {
+ 
+   /* Non-disk-type devices don't need to blacklist any pages
+diff --git a/drivers/usb/storage/unusual_devs.h b/drivers/usb/storage/unusual_devs.h
+index 375fa7c..ba84866 100644
+--- a/drivers/usb/storage/unusual_devs.h
++++ b/drivers/usb/storage/unusual_devs.h
+@@ -1929,6 +1929,13 @@ UNUSUAL_DEV(  0x14cd, 0x6600, 0x0201, 0x0201,
+   USB_SC_DEVICE, USB_PR_DEVICE, NULL,
+   US_FL_IGNORE_RESIDUE ),
+ 
++/* Reported by Michael BÃÂ¼sch <m@bues.ch> */
++UNUSUAL_DEV(  0x152d, 0x0567, 0x0114, 0x0114,
++  "JMicron",
++  "USB to ATA/ATAPI Bridge",
++  USB_SC_DEVICE, USB_PR_DEVICE, NULL,
++  US_FL_BROKEN_FUA ),
++
+ /* Reported by Alexandre Oliva <oliva@lsd.ic.unicamp.br>
+  * JMicron responds to USN and several other SCSI ioctls with a
+  * residue that causes subsequent I/O requests to fail.  */
+diff --git a/include/linux/usb_usual.h b/include/linux/usb_usual.h
+index 1a64b26..9b7de1b 100644
+--- a/include/linux/usb_usual.h
++++ b/include/linux/usb_usual.h
+@@ -70,7 +70,9 @@
+  US_FLAG(NEEDS_CAP16, 0x00400000)   \
+   /* cannot handle READ_CAPACITY_10 */  \
+  US_FLAG(IGNORE_UAS, 0x00800000)   \
+-  /* Device advertises UAS but it is broken */
++  /* Device advertises UAS but it is broken */ \
++ US_FLAG(BROKEN_FUA, 0x01000000)   \
++  /* Cannot handle FUA in WRITE or READ CDBs */ \
+ 
+ #define US_FLAG(name, value) US_FL_##name = value ,
+ enum { US_DO_ALL_FLAGS };
+diff --git a/include/scsi/scsi_device.h b/include/scsi/scsi_device.h
+index 6692d45..5ea7ef5 100644
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@ -167,6 +167,7 @@ struct scsi_device {
+  unsigned is_visible:1; /* is the device visible in sysfs */
+  unsigned wce_default_on:1; /* Cache is ON by default */
+  unsigned no_dif:1; /* T10 PI (DIF) should be disabled */
++ unsigned broken_fua:1;  /* Don't set FUA bit */
+ 
+  /* FOR RH USE ONLY
+   *
+-- 
+1.7.1

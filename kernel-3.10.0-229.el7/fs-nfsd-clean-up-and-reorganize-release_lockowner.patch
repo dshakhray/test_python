@@ -1,0 +1,105 @@
+From e4734d9abbec9467c97f1d062a822c3c82e133b5 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:20:02 -0400
+Subject: [fs] nfsd: clean up and reorganize release_lockowner
+
+Message-id: <1410898849-22126-119-git-send-email-bfields@redhat.com>
+Patchwork-id: 95745
+O-Subject: [Patch RHEL7 118/165] nfsd: clean up and reorganize release_lockowner
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jlayton@primarydata.com>
+
+Do more within the main loop, and simplify the function a bit. Also,
+there's no need to take a stateowner reference unless we're going to call
+release_lockowner.
+
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 882e9d25e11d644b24e578866c688d3f8f0d3712
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 4af4e5e..cd7d7df 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -5424,8 +5424,8 @@ nfsd4_release_lockowner(struct svc_rqst *rqstp,
+    struct nfsd4_release_lockowner *rlockowner)
+ {
+  clientid_t *clid = &rlockowner->rl_clientid;
+- struct nfs4_stateowner *sop = NULL, *tmp;
+- struct nfs4_lockowner *lo;
++ struct nfs4_stateowner *sop;
++ struct nfs4_lockowner *lo = NULL;
+  struct nfs4_ol_stateid *stp;
+  struct xdr_netobj *owner = &rlockowner->rl_owner;
+  unsigned int hashval = ownerstr_hashval(owner);
+@@ -5442,45 +5442,32 @@ nfsd4_release_lockowner(struct svc_rqst *rqstp,
+  if (status)
+   goto out;
+ 
+- status = nfserr_locks_held;
+-
+  clp = cstate->clp;
+  /* Find the matching lock stateowner */
+  spin_lock(&clp->cl_lock);
+- list_for_each_entry(tmp, &clp->cl_ownerstr_hashtbl[hashval],
++ list_for_each_entry(sop, &clp->cl_ownerstr_hashtbl[hashval],
+        so_strhash) {
+-  if (tmp->so_is_open_owner)
+-   continue;
+-  if (same_owner_str(tmp, owner)) {
+-   sop = tmp;
+-   atomic_inc(&sop->so_count);
+-   break;
+-  }
+- }
+ 
+- /* No matching owner found, maybe a replay? Just declare victory... */
+- if (!sop) {
+-  spin_unlock(&clp->cl_lock);
+-  status = nfs_ok;
+-  goto out;
+- }
++  if (sop->so_is_open_owner || !same_owner_str(sop, owner))
++   continue;
+ 
+- lo = lockowner(sop);
+- /* see if there are still any locks associated with it */
+- list_for_each_entry(stp, &sop->so_stateids, st_perstateowner) {
+-  if (check_for_locks(stp->st_stid.sc_file, lo)) {
+-   spin_unlock(&clp->cl_lock);
+-   goto out;
++  /* see if there are still any locks associated with it */
++  lo = lockowner(sop);
++  list_for_each_entry(stp, &sop->so_stateids, st_perstateowner) {
++   if (check_for_locks(stp->st_stid.sc_file, lo)) {
++    status = nfserr_locks_held;
++    spin_unlock(&clp->cl_lock);
++    goto out;
++   }
+   }
++
++  atomic_inc(&sop->so_count);
++  break;
+  }
+  spin_unlock(&clp->cl_lock);
+-
+- status = nfs_ok;
+- sop = NULL;
+- release_lockowner(lo);
++ if (lo)
++  release_lockowner(lo);
+ out:
+- if (sop)
+-  nfs4_put_stateowner(sop);
+  nfs4_unlock_state();
+  return status;
+ }
+-- 
+1.7.1

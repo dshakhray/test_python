@@ -1,0 +1,290 @@
+From 3b06b1ec1325980f2a43c4c2ea938c77fa9dc5e0 Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Fri, 5 Sep 2014 18:56:08 -0400
+Subject: [kernel] kexec: create a new config option CONFIG_KEXEC_FILE for new syscall
+
+Message-id: <1409943373-12669-34-git-send-email-vgoyal@redhat.com>
+Patchwork-id: 91518
+O-Subject: [RHEL7.1 PATCH 33/38] kexec: create a new config option CONFIG_KEXEC_FILE for new syscall
+Bugzilla: 852066
+RH-Acked-by: Dave Anderson <anderson@redhat.com>
+RH-Acked-by: Baoquan He <bhe@redhat.com>
+RH-Acked-by: Dave Young <dyoung@redhat.com>
+RH-Acked-by: Chao WANG <chaowang@redhat.com>
+
+BZ:852066
+
+commit 74ca317c26a3f8543203b61d262c0ab2e30c384e
+Author: Vivek Goyal <vgoyal@redhat.com>
+Date: Fri, 29 Aug 2014 15:18:46 -0700
+
+Currently new system call kexec_file_load() and all the associated code
+compiles if CONFIG_KEXEC=y.  But new syscall also compiles purgatory
+code which currently uses gcc option -mcmodel=large.  This option seems
+to be available only gcc 4.4 onwards.
+
+Hiding new functionality behind a new config option will not break
+existing users of old gcc.  Those who wish to enable new functionality
+will require new gcc.  Having said that, I am trying to figure out how
+can I move away from using -mcmodel=large but that can take a while.
+
+I think there are other advantages of introducing this new config
+option.  As this option will be enabled only on x86_64, other arches
+don't have to compile generic kexec code which will never be used.  This
+new code selects CRYPTO=y and CRYPTO_SHA256=y.  And all other arches had
+to do this for CONFIG_KEXEC.  Now with introduction of new config
+option, we can remove crypto dependency from other arches.
+
+Now CONFIG_KEXEC_FILE is available only on x86_64.  So whereever I had
+CONFIG_X86_64 defined, I got rid of that.
+
+For CONFIG_KEXEC_FILE, instead of doing select CRYPTO=y, I changed it to
+"depends on CRYPTO=y".  This should be safer as "select" is not
+recursive.
+
+Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+Cc: Eric Biederman <ebiederm@xmission.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Tested-by: Shaun Ruffell <sruffell@digium.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/Kbuild b/arch/x86/Kbuild
+index 61b6d51..3942f74 100644
+--- a/arch/x86/Kbuild
++++ b/arch/x86/Kbuild
+@@ -17,6 +17,4 @@ obj-$(CONFIG_IA32_EMULATION) += ia32/
+ obj-y += platform/
+ obj-y += net/
+ 
+-ifeq ($(CONFIG_X86_64),y)
+-obj-$(CONFIG_KEXEC) += purgatory/
+-endif
++obj-$(CONFIG_KEXEC_FILE) += purgatory/
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 90c7e60..97fd25a 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1621,9 +1621,6 @@ source kernel/Kconfig.hz
+ 
+ config KEXEC
+  bool "kexec system call"
+- select BUILD_BIN2C
+- select CRYPTO
+- select CRYPTO_SHA256
+  ---help---
+    kexec is a system call that implements the ability to shutdown your
+    current kernel, and to start another kernel.  It is like a reboot
+@@ -1651,9 +1648,22 @@ config KEXEC_AUTO_RESERVE
+   On x86_32, 128M is reserved, on x86_64 1/32 of your memory is
+   reserved, but it will not exceed 4G.
+ 
++config KEXEC_FILE
++ bool "kexec file based system call"
++ select BUILD_BIN2C
++ depends on KEXEC
++ depends on X86_64
++ depends on CRYPTO=y
++ depends on CRYPTO_SHA256=y
++ ---help---
++   This is new version of kexec system call. This system call is
++   file based and takes file descriptors as system call argument
++   for kernel and initramfs as opposed to list of segments as
++   accepted by previous system call.
++
+ config KEXEC_VERIFY_SIG
+  bool "Verify kernel signature during kexec_file_load() syscall"
+- depends on KEXEC
++ depends on KEXEC_FILE
+  ---help---
+    This option makes kernel signature verification mandatory for
+    kexec_file_load() syscall. If kernel is signature can not be
+diff --git a/arch/x86/Makefile b/arch/x86/Makefile
+index e8ab029..5496d66 100644
+--- a/arch/x86/Makefile
++++ b/arch/x86/Makefile
+@@ -164,11 +164,8 @@ archheaders:
+  $(Q)$(MAKE) $(build)=arch/x86/syscalls all
+ 
+ archprepare:
+-ifeq ($(CONFIG_KEXEC),y)
+-# Build only for 64bit. No loaders for 32bit yet.
+- ifeq ($(CONFIG_X86_64),y)
++ifeq ($(CONFIG_KEXEC_FILE),y)
+  $(Q)$(MAKE) $(build)=arch/x86/purgatory arch/x86/purgatory/kexec-purgatory.c
+- endif
+ endif
+ 
+ ###
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index 93910d7..ead9d71 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -68,6 +68,7 @@ obj-$(CONFIG_FTRACE_SYSCALLS) += ftrace.o
+ obj-$(CONFIG_X86_TSC)  += trace_clock.o
+ obj-$(CONFIG_KEXEC)  += machine_kexec_$(BITS).o
+ obj-$(CONFIG_KEXEC)  += relocate_kernel_$(BITS).o crash.o
++obj-$(CONFIG_KEXEC_FILE) += kexec-bzimage64.o
+ obj-$(CONFIG_CRASH_DUMP) += crash_dump_$(BITS).o
+ obj-y    += kprobes/
+ obj-$(CONFIG_MODULES)  += module.o
+@@ -119,5 +120,4 @@ ifeq ($(CONFIG_X86_64),y)
+ 
+  obj-$(CONFIG_PCI_MMCONFIG) += mmconf-fam10h_64.o
+  obj-y    += vsmp_64.o
+- obj-$(CONFIG_KEXEC)  += kexec-bzimage64.o
+ endif
+diff --git a/arch/x86/kernel/crash.c b/arch/x86/kernel/crash.c
+index 352be68..0f47388 100644
+--- a/arch/x86/kernel/crash.c
++++ b/arch/x86/kernel/crash.c
+@@ -182,8 +182,7 @@ void native_machine_crash_shutdown(struct pt_regs *regs)
+  crash_save_cpu(regs, safe_smp_processor_id());
+ }
+ 
+-#ifdef CONFIG_X86_64
+-
++#ifdef CONFIG_KEXEC_FILE
+ static int get_nr_ram_ranges_callback(unsigned long start_pfn,
+     unsigned long nr_pfn, void *arg)
+ {
+@@ -696,5 +695,4 @@ int crash_load_segments(struct kimage *image)
+ 
+  return ret;
+ }
+-
+-#endif /* CONFIG_X86_64 */
++#endif /* CONFIG_KEXEC_FILE */
+diff --git a/arch/x86/kernel/machine_kexec_64.c b/arch/x86/kernel/machine_kexec_64.c
+index a52b634..ede1a1c 100644
+--- a/arch/x86/kernel/machine_kexec_64.c
++++ b/arch/x86/kernel/machine_kexec_64.c
+@@ -25,9 +25,11 @@
+ #include <asm/debugreg.h>
+ #include <asm/kexec-bzimage64.h>
+ 
++#ifdef CONFIG_KEXEC_FILE
+ static struct kexec_file_ops *kexec_file_loaders[] = {
+   &kexec_bzImage64_ops,
+ };
++#endif
+ 
+ static void free_transition_pgtable(struct kimage *image)
+ {
+@@ -178,6 +180,7 @@ static void load_segments(void)
+   );
+ }
+ 
++#ifdef CONFIG_KEXEC_FILE
+ /* Update purgatory as needed after various image segments have been prepared */
+ static int arch_update_purgatory(struct kimage *image)
+ {
+@@ -209,6 +212,12 @@ static int arch_update_purgatory(struct kimage *image)
+ 
+  return ret;
+ }
++#else /* !CONFIG_KEXEC_FILE */
++static inline int arch_update_purgatory(struct kimage *image)
++{
++ return 0;
++}
++#endif /* CONFIG_KEXEC_FILE */
+ 
+ int machine_kexec_prepare(struct kimage *image)
+ {
+@@ -327,6 +336,7 @@ void arch_crash_save_vmcoreinfo(void)
+ 
+ /* arch-dependent functionality related to kexec file-based syscall */
+ 
++#ifdef CONFIG_KEXEC_FILE
+ int arch_kexec_kernel_image_probe(struct kimage *image, void *buf,
+       unsigned long buf_len)
+ {
+@@ -520,3 +530,4 @@ overflow:
+         (int)ELF64_R_TYPE(rel[i].r_info), value);
+  return -ENOEXEC;
+ }
++#endif /* CONFIG_KEXEC_FILE */
+diff --git a/arch/x86/purgatory/Makefile b/arch/x86/purgatory/Makefile
+index 7fde9ee..c4ae06e 100644
+--- a/arch/x86/purgatory/Makefile
++++ b/arch/x86/purgatory/Makefile
+@@ -24,7 +24,4 @@ $(obj)/kexec-purgatory.c: $(obj)/purgatory.ro FORCE
+  $(call if_changed,bin2c)
+ 
+ 
+-# No loaders for 32bits yet.
+-ifeq ($(CONFIG_X86_64),y)
+- obj-$(CONFIG_KEXEC)  += kexec-purgatory.o
+-endif
++obj-$(CONFIG_KEXEC_FILE) += kexec-purgatory.o
+diff --git a/kernel/kexec.c b/kernel/kexec.c
+index 09b003a..895d6a9 100644
+--- a/kernel/kexec.c
++++ b/kernel/kexec.c
+@@ -65,7 +65,9 @@ bool kexec_in_progress = false;
+ char __weak kexec_purgatory[0];
+ size_t __weak kexec_purgatory_size = 0;
+ 
++#ifdef CONFIG_KEXEC_FILE
+ static int kexec_calculate_store_digests(struct kimage *image);
++#endif
+ 
+ /* Location of the reserved area for the crash kernel */
+ struct resource crashk_res = {
+@@ -342,6 +344,7 @@ out_free_image:
+  return ret;
+ }
+ 
++#ifdef CONFIG_KEXEC_FILE
+ static int copy_file_from_fd(int fd, void **buf, unsigned long *buf_len)
+ {
+  struct fd f = fdget(fd);
+@@ -613,6 +616,9 @@ out_free_image:
+  kfree(image);
+  return ret;
+ }
++#else /* CONFIG_KEXEC_FILE */
++static inline void kimage_file_post_load_cleanup(struct kimage *image) { }
++#endif /* CONFIG_KEXEC_FILE */
+ 
+ static int kimage_is_destination_range(struct kimage *image,
+      unsigned long start,
+@@ -1379,6 +1385,7 @@ COMPAT_SYSCALL_DEFINE4(kexec_load, compat_ulong_t, entry,
+ }
+ #endif
+ 
++#ifdef CONFIG_KEXEC_FILE
+ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
+   unsigned long, cmdline_len, const char __user *, cmdline_ptr,
+   unsigned long, flags)
+@@ -1455,6 +1462,8 @@ out:
+  return ret;
+ }
+ 
++#endif /* CONFIG_KEXEC_FILE */
++
+ void crash_kexec(struct pt_regs *regs)
+ {
+  /* Take the kexec_mutex here to prevent sys_kexec_load
+@@ -1974,6 +1983,7 @@ void vmcoreinfo_append_str(const char *fmt, ...)
+  vmcoreinfo_size += r;
+ }
+ 
++#ifdef CONFIG_KEXEC_FILE
+ static int __kexec_add_segment(struct kimage *image, char *buf,
+           unsigned long bufsz, unsigned long mem,
+           unsigned long memsz)
+@@ -2650,6 +2660,7 @@ int kexec_purgatory_get_set_symbol(struct kimage *image, const char *name,
+ 
+  return 0;
+ }
++#endif /* CONFIG_KEXEC_FILE */
+ 
+ /*
+  * provide an empty default implementation here -- architecture
+-- 
+1.7.1

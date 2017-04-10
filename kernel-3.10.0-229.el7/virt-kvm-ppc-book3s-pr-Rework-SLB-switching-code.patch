@@ -1,0 +1,197 @@
+From 3b0bc43e4ce7b21006020b51f7da29c2a84d0fdf Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:13:31 -0400
+Subject: [virt] kvm/ppc: book3s/pr - Rework SLB switching code
+
+Message-id: <1410765214-16377-76-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94772
+O-Subject: [PATCH 75/78] KVM: PPC: Book3S PR: Rework SLB switching code
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit d8d164a9850d486cc48081c18831680254688d0f
+Author: Alexander Graf <agraf@suse.de>
+Date:   Thu May 15 14:38:03 2014 +0200
+
+    KVM: PPC: Book3S PR: Rework SLB switching code
+
+    On LPAR guest systems Linux enables the shadow SLB to indicate to the
+    hypervisor a number of SLB entries that always have to be available.
+
+    Today we go through this shadow SLB and disable all ESID's valid bits.
+    However, pHyp doesn't like this approach very much and honors us with
+    fancy machine checks.
+
+    Fortunately the shadow SLB descriptor also has an entry that indicates
+    the number of valid entries following. During the lifetime of a guest
+    we can just swap that value to 0 and don't have to worry about the
+    SLB restoration magic.
+
+    While we're touching the code, let's also make it more readable (get
+    rid of rldicl), allow it to deal with a dynamic number of bolted
+    SLB entries and only do shadow SLB swizzling on LPAR systems.
+
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/paca.c b/arch/powerpc/kernel/paca.c
+index eaf6ed6..1bb5209 100644
+--- a/arch/powerpc/kernel/paca.c
++++ b/arch/powerpc/kernel/paca.c
+@@ -98,6 +98,9 @@ static inline void free_lppacas(void) { }
+ /*
+  * 3 persistent SLBs are registered here.  The buffer will be zero
+  * initially, hence will all be invaild until we actually write them.
++ *
++ * If you make the number of persistent SLB entries dynamic, please also
++ * update PR KVM to flush and restore them accordingly.
+  */
+ static struct slb_shadow *slb_shadow;
+ 
+diff --git a/arch/powerpc/kvm/book3s_64_slb.S b/arch/powerpc/kvm/book3s_64_slb.S
+index 84c52c6..3589c4e 100644
+--- a/arch/powerpc/kvm/book3s_64_slb.S
++++ b/arch/powerpc/kvm/book3s_64_slb.S
+@@ -17,29 +17,9 @@
+  * Authors: Alexander Graf <agraf@suse.de>
+  */
+ 
+-#define SHADOW_SLB_ESID(num) (SLBSHADOW_SAVEAREA + (num * 0x10))
+-#define SHADOW_SLB_VSID(num) (SLBSHADOW_SAVEAREA + (num * 0x10) + 0x8)
+-#define UNBOLT_SLB_ENTRY(num) \
+- li r11, SHADOW_SLB_ESID(num); \
+- LDX_BE r9, r12, r11;   \
+- /* Invalid? Skip. */;   \
+- rldicl. r0, r9, 37, 63;   \
+- beq slb_entry_skip_ ## num;  \
+- xoris r9, r9, SLB_ESID_V@h;  \
+- STDX_BE r9, r12, r11;   \
+-  slb_entry_skip_ ## num:
+-
+-#define REBOLT_SLB_ENTRY(num) \
+- li r8, SHADOW_SLB_ESID(num); \
+- li r7, SHADOW_SLB_VSID(num); \
+- LDX_BE r10, r11, r8;   \
+- cmpdi r10, 0;    \
+- beq slb_exit_skip_ ## num;  \
+- oris r10, r10, SLB_ESID_V@h;  \
+- LDX_BE r9, r11, r7;   \
+- slbmte r9, r10;   \
+- STDX_BE r10, r11, r8;   \
+-slb_exit_skip_ ## num:
++#define SHADOW_SLB_ENTRY_LEN 0x10
++#define OFFSET_ESID(x)  (SHADOW_SLB_ENTRY_LEN * x)
++#define OFFSET_VSID(x)  ((SHADOW_SLB_ENTRY_LEN * x) + 8)
+ 
+ /******************************************************************************
+  *                                                                            *
+@@ -63,20 +43,15 @@ slb_exit_skip_ ## num:
+   * SVCPU[LR]  = guest LR
+   */
+ 
+- /* Remove LPAR shadow entries */
++BEGIN_FW_FTR_SECTION
+ 
+-#if SLB_NUM_BOLTED == 3
++ /* Declare SLB shadow as 0 entries big */
+ 
+- ld r12, PACA_SLBSHADOWPTR(r13)
++ ld r11, PACA_SLBSHADOWPTR(r13)
++ li r8, 0
++ stb r8, 3(r11)
+ 
+- /* Remove bolted entries */
+- UNBOLT_SLB_ENTRY(0)
+- UNBOLT_SLB_ENTRY(1)
+- UNBOLT_SLB_ENTRY(2)
+- 
+-#else
+-#error unknown number of bolted entries
+-#endif
++END_FW_FTR_SECTION_IFSET(FW_FEATURE_LPAR)
+ 
+  /* Flush SLB */
+ 
+@@ -99,7 +74,7 @@ slb_loop_enter:
+ 
+  ld r10, 0(r11)
+ 
+- rldicl. r0, r10, 37, 63
++ andis. r9, r10, SLB_ESID_V@h
+  beq slb_loop_enter_skip
+ 
+  ld r9, 8(r11)
+@@ -136,24 +111,42 @@ slb_do_enter:
+   *
+   */
+ 
+- /* Restore bolted entries from the shadow and fix it along the way */
++ /* Remove all SLB entries that are in use. */
+ 
+  li r0, r0
+  slbmte r0, r0
+  slbia
+- isync
+ 
+-#if SLB_NUM_BOLTED == 3
++ /* Restore bolted entries from the shadow */
+ 
+  ld r11, PACA_SLBSHADOWPTR(r13)
+ 
+- REBOLT_SLB_ENTRY(0)
+- REBOLT_SLB_ENTRY(1)
+- REBOLT_SLB_ENTRY(2)
+- 
+-#else
+-#error unknown number of bolted entries
+-#endif
++BEGIN_FW_FTR_SECTION
++
++ /* Declare SLB shadow as SLB_NUM_BOLTED entries big */
++
++ li r8, SLB_NUM_BOLTED
++ stb r8, 3(r11)
++
++END_FW_FTR_SECTION_IFSET(FW_FEATURE_LPAR)
++
++ /* Manually load all entries from shadow SLB */
++
++ li r8, SLBSHADOW_SAVEAREA
++ li r7, SLBSHADOW_SAVEAREA + 8
++
++ .rept SLB_NUM_BOLTED
++ LDX_BE r10, r11, r8
++ cmpdi r10, 0
++ beq 1f
++ LDX_BE r9, r11, r7
++ slbmte r9, r10
++1: addi r7, r7, SHADOW_SLB_ENTRY_LEN
++ addi r8, r8, SHADOW_SLB_ENTRY_LEN
++ .endr
++
++ isync
++ sync
+ 
+ slb_do_exit:
+ 
+diff --git a/arch/powerpc/mm/slb.c b/arch/powerpc/mm/slb.c
+index 4623366..0399a67 100644
+--- a/arch/powerpc/mm/slb.c
++++ b/arch/powerpc/mm/slb.c
+@@ -97,7 +97,7 @@ static inline void create_shadowed_slbe(unsigned long ea, int ssize,
+ static void __slb_flush_and_rebolt(void)
+ {
+  /* If you change this make sure you change SLB_NUM_BOLTED
+-  * appropriately too. */
++  * and PR KVM appropriately too. */
+  unsigned long linear_llp, vmalloc_llp, lflags, vflags;
+  unsigned long ksp_esid_data, ksp_vsid_data;
+ 
+-- 
+1.7.1

@@ -1,0 +1,142 @@
+From 3fb0468e80af255648357d1e2c583faeadbe7a77 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 10 Oct 2014 21:03:27 -0400
+Subject: [block] blk-mq: call blk_mq_start_request from ->queue_rq
+
+Message-id: <1412975015-5370-27-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 97465
+O-Subject: [RHEL7 PATCH 26/34] blk-mq: call blk_mq_start_request from ->queue_rq
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a backport of the following commit.  The scsi_lib.c hunk is
+elided since we do not yet have commit d285203 (scsi: add support for
+a blk-mq based I/O path).
+
+This resolves bug 1146660.
+
+  commit e2490073cd7c3d6f6ef6e029a208edd4d38efac4
+  Author: Christoph Hellwig <hch@lst.de>
+  Date:   Sat Sep 13 16:40:09 2014 -0700
+
+    blk-mq: call blk_mq_start_request from ->queue_rq
+
+    When we call blk_mq_start_request from the core blk-mq code before calling into
+    ->queue_rq there is a racy window where the timeout handler can hit before we've
+    fully set up the driver specific part of the command.
+
+    Move the call to blk_mq_start_request into the driver so the driver can start
+    the request only once it is fully set up.
+
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 99d1d79..5776b1d 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -383,7 +383,7 @@ void blk_mq_complete_request(struct request *rq)
+ }
+ EXPORT_SYMBOL(blk_mq_complete_request);
+ 
+-static void blk_mq_start_request(struct request *rq)
++void blk_mq_start_request(struct request *rq)
+ {
+  struct request_queue *q = rq->q;
+ 
+@@ -421,16 +421,18 @@ static void blk_mq_start_request(struct request *rq)
+   rq->nr_phys_segments++;
+  }
+ }
++EXPORT_SYMBOL(blk_mq_start_request);
+ 
+ static void __blk_mq_requeue_request(struct request *rq)
+ {
+  struct request_queue *q = rq->q;
+ 
+  trace_block_rq_requeue(q, rq);
+- clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+ 
+- if (q->dma_drain_size && blk_rq_bytes(rq))
+-  rq->nr_phys_segments--;
++ if (test_and_clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags)) {
++  if (q->dma_drain_size && blk_rq_bytes(rq))
++   rq->nr_phys_segments--;
++ }
+ }
+ 
+ void blk_mq_requeue_request(struct request *rq)
+@@ -742,8 +744,6 @@ static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx)
+   rq = list_first_entry(&rq_list, struct request, queuelist);
+   list_del_init(&rq->queuelist);
+ 
+-  blk_mq_start_request(rq);
+-
+   ret = q->mq_ops->queue_rq(hctx, rq, list_empty(&rq_list));
+   switch (ret) {
+   case BLK_MQ_RQ_QUEUE_OK:
+@@ -1185,7 +1185,6 @@ static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+   int ret;
+ 
+   blk_mq_bio_to_request(rq, bio);
+-  blk_mq_start_request(rq);
+ 
+   /*
+    * For OK queue, we are done. For error, kill it. Any other
+diff --git a/drivers/block/mtip32xx/mtip32xx.c b/drivers/block/mtip32xx/mtip32xx.c
+index a3fff44..7cefdbd 100644
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@ -3783,6 +3783,8 @@ static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq,
+  if (unlikely(mtip_check_unal_depth(hctx, rq)))
+   return BLK_MQ_RQ_QUEUE_BUSY;
+ 
++ blk_mq_start_request(rq);
++
+  ret = mtip_submit_request(hctx, rq);
+  if (likely(!ret))
+   return BLK_MQ_RQ_QUEUE_OK;
+diff --git a/drivers/block/null_blk.c b/drivers/block/null_blk.c
+index f4bb977..a7c7e58 100644
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@ -321,6 +321,8 @@ static int null_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq,
+  cmd->rq = rq;
+  cmd->nq = hctx->driver_data;
+ 
++ blk_mq_start_request(rq);
++
+  null_handle_cmd(cmd);
+  return BLK_MQ_RQ_QUEUE_OK;
+ }
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 13756e0..83816bf 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -205,6 +205,8 @@ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req,
+   }
+  }
+ 
++ blk_mq_start_request(req);
++
+  num = blk_rq_map_sg(hctx->queue, vbr->req, vbr->sg);
+  if (num) {
+   if (rq_data_dir(vbr->req) == WRITE)
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 719b1b6..b5a64cc 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -216,6 +216,7 @@ struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+ struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+ struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+ 
++void blk_mq_start_request(struct request *rq);
+ void blk_mq_end_io(struct request *rq, int error);
+ void __blk_mq_end_io(struct request *rq, int error);
+ 
+-- 
+1.7.1

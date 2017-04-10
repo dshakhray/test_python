@@ -1,0 +1,116 @@
+From 3c48c23ee98ef1fe3ba7e59329478925889a26af Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:33:36 -0400
+Subject: [alsa] hda: Add a new quirk match based on default pin configuration
+
+Message-id: <140972823573-313-patchset-jkysela@redhat.com>
+Patchwork-id: 91009
+O-Subject: [RHEL 7.1 PATCH 312/442] ALSA: hda - Add a new quirk match based on default pin configuration
+Bugzilla: 1112200
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+Normally, we match on pci ssid only. This works but needs new code
+for every machine. To catch more machines in the same quirk, let's add
+a new type of quirk, where we match on
+1) PCI Subvendor ID (i e, not device, just vendor)
+2) Codec ID
+3) Pin configuration default
+
+If all these three match, we could be reasonably certain that the
+quirk should apply to the machine even though it might not be the
+exact same device.
+
+Signed-off-by: David Henningsson <david.henningsson@canonical.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+(picked from kernel: 20531415adf30877296ea89fb0e534ac87f6cc71)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/sound/pci/hda/hda_auto_parser.c b/sound/pci/hda/hda_auto_parser.c
+index 36961ab..a142753 100644
+--- a/sound/pci/hda/hda_auto_parser.c
++++ b/sound/pci/hda/hda_auto_parser.c
+@@ -839,6 +839,43 @@ void snd_hda_apply_fixup(struct hda_codec *codec, int action)
+ }
+ EXPORT_SYMBOL_GPL(snd_hda_apply_fixup);
+ 
++static bool pin_config_match(struct hda_codec *codec,
++        const struct hda_pintbl *pins)
++{
++ for (; pins->nid; pins++) {
++  u32 def_conf = snd_hda_codec_get_pincfg(codec, pins->nid);
++  if (pins->val != def_conf)
++   return false;
++ }
++ return true;
++}
++
++void snd_hda_pick_pin_fixup(struct hda_codec *codec,
++       const struct snd_hda_pin_quirk *pin_quirk,
++       const struct hda_fixup *fixlist)
++{
++ const struct snd_hda_pin_quirk *pq;
++
++ if (codec->fixup_forced)
++  return;
++
++ for (pq = pin_quirk; pq->subvendor; pq++) {
++  if (codec->bus->pci->subsystem_vendor != pq->subvendor)
++   continue;
++  if (codec->vendor_id != pq->codec)
++   continue;
++  if (pin_config_match(codec, pq->pins)) {
++   codec->fixup_id = pq->value;
++#ifdef CONFIG_SND_DEBUG_VERBOSE
++   codec->fixup_name = pq->name;
++#endif
++   codec->fixup_list = fixlist;
++   return;
++  }
++ }
++}
++EXPORT_SYMBOL_GPL(snd_hda_pick_pin_fixup);
++
+ void snd_hda_pick_fixup(struct hda_codec *codec,
+    const struct hda_model_fixup *models,
+    const struct snd_pci_quirk *quirk,
+diff --git a/sound/pci/hda/hda_local.h b/sound/pci/hda/hda_local.h
+index e51d155..ebd1fa6 100644
+--- a/sound/pci/hda/hda_local.h
++++ b/sound/pci/hda/hda_local.h
+@@ -407,6 +407,16 @@ struct hda_fixup {
+  } v;
+ };
+ 
++struct snd_hda_pin_quirk {
++ unsigned int codec;             /* Codec vendor/device ID */
++ unsigned short subvendor; /* PCI subvendor ID */
++ const struct hda_pintbl *pins;  /* list of matching pins */
++#ifdef CONFIG_SND_DEBUG_VERBOSE
++ const char *name;
++#endif
++ int value;   /* quirk value */
++};
++
+ /* fixup types */
+ enum {
+  HDA_FIXUP_INVALID,
+@@ -434,6 +444,10 @@ void snd_hda_pick_fixup(struct hda_codec *codec,
+    const struct hda_model_fixup *models,
+    const struct snd_pci_quirk *quirk,
+    const struct hda_fixup *fixlist);
++void snd_hda_pick_pin_fixup(struct hda_codec *codec,
++       const struct snd_hda_pin_quirk *pin_quirk,
++       const struct hda_fixup *fixlist);
++
+ 
+ /*
+  * unsolicited event handler
+-- 
+1.7.1

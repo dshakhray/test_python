@@ -1,0 +1,124 @@
+From 1536bf973ea54df6f1d29b36d25fdd323431ecfe Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:05:14 -0400
+Subject: [ethernet] qlcnic: Remove redundant eSwitch enable commands
+
+Message-id: <1408626422-3941-31-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88558
+O-Subject: [PATCH RHEL 7.1 030/138] qlcnic: Remove redundant eSwitch enable commands
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Sony Chacko <sony.chacko@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id 4c776aad7453b6795d6d26200706e07ef261b8c9
+
+When more than one NIC physical functions are enabled on a port,
+eSwitch on that port gets enabled automatically. Driver
+need not explicitly enable the eSwitch.
+
+Signed-off-by: Sony Chacko <sony.chacko@qlogic.com>
+Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+index 2883b57..9f4e4c4 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.h
+@@ -629,7 +629,7 @@ int qlcnic_83xx_config_vnic_opmode(struct qlcnic_adapter *);
+ int qlcnic_83xx_get_vnic_vport_info(struct qlcnic_adapter *,
+         struct qlcnic_info *, u8);
+ int qlcnic_83xx_get_vnic_pf_info(struct qlcnic_adapter *, struct qlcnic_info *);
+-int qlcnic_83xx_enable_port_eswitch(struct qlcnic_adapter *, int);
++int qlcnic_83xx_set_port_eswitch_status(struct qlcnic_adapter *, int, int *);
+ 
+ void qlcnic_83xx_get_minidump_template(struct qlcnic_adapter *);
+ void qlcnic_83xx_get_stats(struct qlcnic_adapter *adapter, u64 *data);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_vnic.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_vnic.c
+index 60a477f..734d286 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_vnic.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_vnic.c
+@@ -256,8 +256,8 @@ int qlcnic_83xx_check_vnic_state(struct qlcnic_adapter *adapter)
+  return 0;
+ }
+ 
+-static int qlcnic_83xx_get_eswitch_port_info(struct qlcnic_adapter *adapter,
+-          int func, int *port_id)
++int qlcnic_83xx_set_port_eswitch_status(struct qlcnic_adapter *adapter,
++     int func, int *port_id)
+ {
+  struct qlcnic_info nic_info;
+  int err = 0;
+@@ -273,23 +273,8 @@ static int qlcnic_83xx_get_eswitch_port_info(struct qlcnic_adapter *adapter,
+  else
+   err = -EIO;
+ 
+- return err;
+-}
+-
+-int qlcnic_83xx_enable_port_eswitch(struct qlcnic_adapter *adapter, int func)
+-{
+- int id, err = 0;
+-
+- err = qlcnic_83xx_get_eswitch_port_info(adapter, func, &id);
+- if (err)
+-  return err;
+-
+- if (!(adapter->eswitch[id].flags & QLCNIC_SWITCH_ENABLE)) {
+-  if (!qlcnic_enable_eswitch(adapter, id, 1))
+-   adapter->eswitch[id].flags |= QLCNIC_SWITCH_ENABLE;
+-  else
+-   err = -EIO;
+- }
++ if (!err)
++  adapter->eswitch[*port_id].flags |= QLCNIC_SWITCH_ENABLE;
+ 
+  return err;
+ }
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index c0cc6f7..3a2ada3 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -819,7 +819,7 @@ static bool qlcnic_port_eswitch_cfg_capability(struct qlcnic_adapter *adapter)
+ int qlcnic_init_pci_info(struct qlcnic_adapter *adapter)
+ {
+  struct qlcnic_pci_info *pci_info;
+- int i, ret = 0, j = 0;
++ int i, id = 0, ret = 0, j = 0;
+  u16 act_pci_func;
+  u8 pfn;
+ 
+@@ -860,7 +860,8 @@ int qlcnic_init_pci_info(struct qlcnic_adapter *adapter)
+    continue;
+ 
+   if (qlcnic_port_eswitch_cfg_capability(adapter)) {
+-   if (!qlcnic_83xx_enable_port_eswitch(adapter, pfn))
++   if (!qlcnic_83xx_set_port_eswitch_status(adapter, pfn,
++         &id))
+     adapter->npars[j].eswitch_status = true;
+    else
+     continue;
+@@ -879,12 +880,12 @@ int qlcnic_init_pci_info(struct qlcnic_adapter *adapter)
+   j++;
+  }
+ 
+- if (qlcnic_82xx_check(adapter)) {
++ /* Update eSwitch status for adapters without per port eSwitch
++  * configuration capability
++  */
++ if (!qlcnic_port_eswitch_cfg_capability(adapter)) {
+   for (i = 0; i < QLCNIC_NIU_MAX_XG_PORTS; i++)
+    adapter->eswitch[i].flags |= QLCNIC_SWITCH_ENABLE;
+- } else if (!qlcnic_port_eswitch_cfg_capability(adapter)) {
+-  for (i = 0; i < QLCNIC_NIU_MAX_XG_PORTS; i++)
+-   qlcnic_enable_eswitch(adapter, i, 1);
+  }
+ 
+  kfree(pci_info);
+-- 
+1.7.1

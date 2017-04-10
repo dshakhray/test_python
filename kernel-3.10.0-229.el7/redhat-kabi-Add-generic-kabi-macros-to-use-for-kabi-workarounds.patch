@@ -1,0 +1,161 @@
+From 22f7116921c710cb3935171cb57983eb724c9a4b Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 2 Dec 2014 21:03:26 -0500
+Subject: [redhat] kabi: Add generic kabi macros to use for kabi workarounds
+
+Message-id: <1417554215-238434-2-git-send-email-dzickus@redhat.com>
+Patchwork-id: 101088
+O-Subject: [RHEL7 PATCH 01/10] kabi: Add generic kabi macros to used for kabi workarounds
+Bugzilla: 1164383
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1164383
+Upstream: RHEL only
+Tested: passed through brew
+
+Very few folks enjoy working with KABI.  However, it has been explained to us
+repeatedly that KABI is here to stay.  Let's try to make life a little easier
+by creating macros that hide the ugly parts of the KABI workarounds we
+implement.
+
+This set of macros starts with the low hanging fruit, the simple replace
+reserved struct elements with something else and the extend the end of a struct
+with new elements.
+
+The idea is to get a feel for what macros work and make life easier and what
+problems are not covered so we can expand the macros later.
+
+The following macros have been added:
+
+RH_KABI_REPLACE - replace _orig element with an anonymous union of _orig and _new element
+RH_KABI_CHANGE_TYPE - same as above but for _orig and _new with same name but
+        different type
+RH_KABI_REPLACE_P - replacing pointers which are forbidden in anonymous unions
+
+RH_KABI_EXTEND - extend the end of a struct
+RH_KABI_FILL_HOLE - use a hole in the struct to preserve kabi
+
+RH_KABI_RESERVE(N) - replace 'unsigned long rh_reservedN' with a macro
+RH_KABI_RESERVE_P(N) - replace 'void (*rh_reserved)(void)' with a macro
+
+RH_KABI_USE(N) - indicate a RH reserved element is being used
+RH_KABI_USE_P(N) - indicates a RH reserved pointer element is being used
+
+RH_KABI_USE2(N) - indicates a RH reserved element is being used by 2 new elements
+
+Signed-off-by: Don Zickus <dzickus@redhat.com>
+---
+ create mode 100644 include/linux/rh_kabi.h
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/rh_kabi.h b/include/linux/rh_kabi.h
+new file mode 100644
+index 0000000..8e964a6
+--- /dev/null
++++ b/include/linux/rh_kabi.h
+@@ -0,0 +1,101 @@
++/*
++ * rh_kabi.h - Red Hat kabi abstraction header
++ *
++ * Copyright (c) 2014 Don Zickus
++ *
++ * This file is released under the GPLv2.
++ * See the file COPYING for more details.
++ */
++
++#ifndef _LINUX_RH_KABI_H
++#define _LINUX_RH_KABI_H
++
++/*
++ * The RH_KABI_REPLACE* macros attempt to add the ability to use the '_new'
++ * element while preserving size alignment and kabi agreement with the '_orig'
++ * element.
++ *
++ * The #ifdef __GENKSYMS__ preserves the kabi agreement, while the anonymous
++ * union structure preserves the size alignment (assuming the '_new' element is
++ * not bigger than the '_orig' element).
++ *
++ * RH_KABI_REPLACE - simple replacement of _orig with a union of _orig and _new
++ * RH_KABI_CHANGE_TYPE - replacement of _orig with _new of the same name but
++ *                       different type.  This causes problems with a union
++ *                       so append a '1' to the _orig name to avoid name
++ *                       collision.  Assumption here is _orig will not be used
++ *                       anymore.
++ * RH_KABI_REPLACE_P - replacement of _orig pointer with _new pointer.  Pointers
++ *                     don't work with anonymous unions and their sizes don't
++ *                     change, so just do a straightforward replacement.
++ *
++ * RH_KABI_EXTEND - simple macro for adding a new element to a struct while
++ *                  preserving the kabi agreement (by wrapping with GENKSYMS).
++ * RH_KABI_FILL_HOLE - simple macro for filling a hole in a struct while
++ *                     preserving the kabi agreement (by wrapping with GENKSYMS).
++ *
++ * NOTE NOTE NOTE
++ * Don't use ';' after these macros as it messes up the kabi checker by
++ * changing what the resulting token string looks like.
++ * Instead let this macro add the ';' so it can be properly hidden from
++ * the kabi checker (mainly for RH_KABI_EXTEND, but applied to all macros for
++ * uniformity).
++ * NOTE NOTE NOTE
++ */
++#ifdef __GENKSYMS__
++
++# define _RH_KABI_REPLACE(_orig, _new)  _orig
++# define _RH_KABI_CHANGE_TYPE(_orig, _new) _orig
++# define _RH_KABI_REPLACE_P(_orig, _new) _orig
++
++# define RH_KABI_EXTEND(_new)
++# define RH_KABI_FILL_HOLE(_new)
++
++#else
++
++# define _RH_KABI_REPLACE(_orig, _new)  \
++ union {     \
++  _new;    \
++  _orig;    \
++ }
++# define _RH_KABI_CHANGE_TYPE(_orig, _new) \
++ union {     \
++  _new;    \
++  _orig##1;   \
++ }
++# define _RH_KABI_REPLACE_P(_orig, _new) _new
++
++# define RH_KABI_EXTEND(_new)           _new;
++
++/* Warning, only use if a hole exists for _all_ arches. Use pahole to verify */
++# define RH_KABI_FILL_HOLE(_new)        _new;
++
++#endif /* __GENKSYMS__ */
++
++/* colon added wrappers for the RH_KABI_REPLACE macros */
++#define RH_KABI_REPLACE(_orig, _new)  _RH_KABI_REPLACE(_orig, _new);
++#define RH_KABI_CHANGE_TYPE(_orig, _new) _RH_KABI_CHANGE_TYPE(_orig, _new);
++#define RH_KABI_REPLACE_P(_orig, _new)  _RH_KABI_REPLACE_P(_orig, _new);
++
++/*
++ * We tried to standardize on Red Hat reserved names.  These wrappers leverage
++ * those common names making it easier to read and find in the code.
++ */
++#define _RH_KABI_RESERVE(n)  unsigned long rh_reserved##n
++#define _RH_KABI_RESERVE_P(n)  void (*rh_reserved##n)(void)
++#define RH_KABI_RESERVE(n)  _RH_KABI_RESERVE(n);
++#define RH_KABI_RESERVE_P(n)  _RH_KABI_RESERVE_P(n);
++
++/*
++ * Simple wrappers to replace standard Red Hat reserved elements.
++ */
++#define RH_KABI_USE(n, _new)  RH_KABI_REPLACE(_RH_KABI_RESERVE(n), _new)
++#define RH_KABI_USE_P(n, _new)  RH_KABI_REPLACE_P(_RH_KABI_RESERVE_P(n), _new)
++
++/*
++ * Macro for breaking up a reserved element into two smaller chunks using an
++ * anonymous struct inside an anonymous union.
++ */
++#define RH_KABI_USE2(n, _new1, _new2) RH_KABI_REPLACE(_RH_KABI_RESERVE(n), struct{ _new1; _new2; })
++
++#endif /* _LINUX_RH_KABI_H */
+-- 
+1.7.1

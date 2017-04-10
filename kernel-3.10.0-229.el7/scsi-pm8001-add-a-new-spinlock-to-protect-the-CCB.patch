@@ -1,0 +1,75 @@
+From 002f2870d38abafb262a9042a619cf98333aadef Mon Sep 17 00:00:00 2001
+From: Rich Bono <rbono@redhat.com>
+Date: Thu, 20 Nov 2014 21:23:33 -0500
+Subject: [scsi] pm8001: add a new spinlock to protect the CCB
+
+Message-id: <1416518623-7080-13-git-send-email-rbono@redhat.com>
+Patchwork-id: 100404
+O-Subject: [RHEL7.1 e-stor PATCH V3 12/22] pm8001: add a new spinlock to protect the CCB
+Bugzilla: 1110943
+RH-Acked-by: Rob Evers <revers@redhat.com>
+RH-Acked-by: Tomas Henzl <thenzl@redhat.com>
+
+From: Tomas Henzl <thenzl@redhat.com>
+
+Patch adds a new spinlock to protect the ccb management.
+It may happen that concurrent threads become the same tag value
+from the 'alloc' function', the spinlock prevents this situation.
+
+Signed-off-by: Tomas Henzl <thenzl@redhat.com>
+Acked-by: Suresh Thiagarajan <Suresh.Thiagarajan@pmcs.com>
+Acked-by: Jack Wang <xjtuwjp@gmail.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 646cdf0083e3d4a9b995f37b72c3c8a22d9307de)
+
+Signed-off-by: Rich Bono <rbono@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/pm8001/pm8001_init.c b/drivers/scsi/pm8001/pm8001_init.c
+index 1da608f..83f731a 100644
+--- a/drivers/scsi/pm8001/pm8001_init.c
++++ b/drivers/scsi/pm8001/pm8001_init.c
+@@ -246,6 +246,7 @@ static int pm8001_alloc(struct pm8001_hba_info *pm8001_ha,
+ {
+  int i;
+  spin_lock_init(&pm8001_ha->lock);
++ spin_lock_init(&pm8001_ha->bitmap_lock);
+  PM8001_INIT_DBG(pm8001_ha,
+   pm8001_printk("pm8001_alloc: PHY:%x\n",
+     pm8001_ha->chip->n_phy));
+diff --git a/drivers/scsi/pm8001/pm8001_sas.c b/drivers/scsi/pm8001/pm8001_sas.c
+index be55859..34cea82 100644
+--- a/drivers/scsi/pm8001/pm8001_sas.c
++++ b/drivers/scsi/pm8001/pm8001_sas.c
+@@ -77,11 +77,16 @@ inline int pm8001_tag_alloc(struct pm8001_hba_info *pm8001_ha, u32 *tag_out)
+ {
+  unsigned int tag;
+  void *bitmap = pm8001_ha->tags;
++ unsigned long flags;
+ 
++ spin_lock_irqsave(&pm8001_ha->bitmap_lock, flags);
+  tag = find_first_zero_bit(bitmap, pm8001_ha->tags_num);
+- if (tag >= pm8001_ha->tags_num)
++ if (tag >= pm8001_ha->tags_num) {
++  spin_unlock_irqrestore(&pm8001_ha->bitmap_lock, flags);
+   return -SAS_QUEUE_FULL;
++ }
+  set_bit(tag, bitmap);
++ spin_unlock_irqrestore(&pm8001_ha->bitmap_lock, flags);
+  *tag_out = tag;
+  return 0;
+ }
+diff --git a/drivers/scsi/pm8001/pm8001_sas.h b/drivers/scsi/pm8001/pm8001_sas.h
+index 14106ad..f6b2ac5 100644
+--- a/drivers/scsi/pm8001/pm8001_sas.h
++++ b/drivers/scsi/pm8001/pm8001_sas.h
+@@ -475,6 +475,7 @@ struct pm8001_hba_info {
+  struct list_head list;
+  unsigned long  flags;
+  spinlock_t  lock;/* host-wide lock */
++ spinlock_t  bitmap_lock;
+  struct pci_dev  *pdev;/* our device */
+  struct device  *dev;
+  struct pm8001_hba_memspace io_mem[6];
+-- 
+1.7.1

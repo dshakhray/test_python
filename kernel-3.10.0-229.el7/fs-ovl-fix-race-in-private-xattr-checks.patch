@@ -1,0 +1,101 @@
+From 62e9bb015a5b1170eaadcac5eece46464014a365 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Thu, 27 Nov 2014 11:46:49 -0500
+Subject: [fs] ovl: fix race in private xattr checks
+
+Message-id: <20141127114649.9170.92959.stgit@warthog.procyon.org.uk>
+Patchwork-id: 100986
+O-Subject: [RHEL7 PATCH 3/7] ovl: fix race in private xattr checks
+Bugzilla: 985875
+RH-Acked-by: Alexander Viro <aviro@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+From: Miklos Szeredi <mszeredi@suse.cz>
+
+Xattr operations can race with copy up.  This does not matter as long as
+we consistently fiter out "trunsted.overlay.opaque" attribute on upper
+directories.
+
+Previously we checked parent against OVL_PATH_MERGE.  This is too general,
+and prone to race with copy-up.  I.e. we found the parent to be on the
+lower layer but ovl_dentry_real() would return the copied-up dentry,
+possibly with the "opaque" attribute.
+
+So instead use ovl_path_real() and decide to filter the attributes based on
+the actual type of the dentry we'll use.
+
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+Original-commit: 521484639ec19a6f1ed56de6993feb255f5f676c
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/overlayfs/inode.c b/fs/overlayfs/inode.c
+index a3ddc0e..9ad8de5 100644
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@ -235,26 +235,36 @@ out:
+  return err;
+ }
+ 
++static bool ovl_need_xattr_filter(struct dentry *dentry,
++      enum ovl_path_type type)
++{
++ return type == OVL_PATH_UPPER && S_ISDIR(dentry->d_inode->i_mode);
++}
++
+ ssize_t ovl_getxattr(struct dentry *dentry, const char *name,
+        void *value, size_t size)
+ {
+- if (ovl_path_type(dentry->d_parent) == OVL_PATH_MERGE &&
+-     ovl_is_private_xattr(name))
++ struct path realpath;
++ enum ovl_path_type type = ovl_path_real(dentry, &realpath);
++
++ if (ovl_need_xattr_filter(dentry, type) && ovl_is_private_xattr(name))
+   return -ENODATA;
+ 
+- return vfs_getxattr(ovl_dentry_real(dentry), name, value, size);
++ return vfs_getxattr(realpath.dentry, name, value, size);
+ }
+ 
+ ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size)
+ {
++ struct path realpath;
++ enum ovl_path_type type = ovl_path_real(dentry, &realpath);
+  ssize_t res;
+  int off;
+ 
+- res = vfs_listxattr(ovl_dentry_real(dentry), list, size);
++ res = vfs_listxattr(realpath.dentry, list, size);
+  if (res <= 0 || size == 0)
+   return res;
+ 
+- if (ovl_path_type(dentry->d_parent) != OVL_PATH_MERGE)
++ if (!ovl_need_xattr_filter(dentry, type))
+   return res;
+ 
+  /* filter out private xattrs */
+@@ -279,17 +289,16 @@ int ovl_removexattr(struct dentry *dentry, const char *name)
+ {
+  int err;
+  struct path realpath;
+- enum ovl_path_type type;
++ enum ovl_path_type type = ovl_path_real(dentry, &realpath);
+ 
+  err = ovl_want_write(dentry);
+  if (err)
+   goto out;
+ 
+- if (ovl_path_type(dentry->d_parent) == OVL_PATH_MERGE &&
+-     ovl_is_private_xattr(name))
++ err = -ENODATA;
++ if (ovl_need_xattr_filter(dentry, type) && ovl_is_private_xattr(name))
+   goto out_drop_write;
+ 
+- type = ovl_path_real(dentry, &realpath);
+  if (type == OVL_PATH_LOWER) {
+   err = vfs_getxattr(realpath.dentry, name, NULL, 0);
+   if (err < 0)
+-- 
+1.7.1

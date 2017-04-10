@@ -1,0 +1,103 @@
+From 70553d519a49411c4683990e76d55b29d60b3a58 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Sun, 14 Sep 2014 19:49:57 -0400
+Subject: [net] gre: gro: Fix a bug that breaks the forwarding path
+
+Message-id: <1410724197-31885-8-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 94695
+O-Subject: [PATCH 61/57 RHEL7.1 net] net-gre-gro: Fix a bug that breaks the forwarding path
+Bugzilla: 1131999
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+
+BZ: 1131999
+
+commit c3caf1192f904de2f1381211f564537235d50de3
+Author: Jerry Chu <hkchu@google.com>
+Date:   Mon Jul 14 15:54:46 2014 -0700
+
+    net-gre-gro: Fix a bug that breaks the forwarding path
+
+    Fixed a bug that was introduced by my GRE-GRO patch
+    (bf5a755f5e9186406bbf50f4087100af5bd68e40 net-gre-gro: Add GRE
+    support to the GRO stack) that breaks the forwarding path
+    because various GSO related fields were not set. The bug will
+    cause on the egress path either the GSO code to fail, or a
+    GRE-TSO capable (NETIF_F_GSO_GRE) NICs to choke. The following
+    fix has been tested for both cases.
+
+    Signed-off-by: H.K. Jerry Chu <hkchu@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 1e90543..32412b0 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3946,6 +3946,8 @@ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
+  skb->vlan_tci = 0;
+  skb->dev = napi->dev;
+  skb->skb_iif = 0;
++ skb->encapsulation = 0;
++ skb_shinfo(skb)->gso_type = 0;
+  skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));
+ 
+  napi->skb = skb;
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 538b80b..2e72565 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1456,6 +1456,9 @@ static int inet_gro_complete(struct sk_buff *skb, int nhoff)
+  int proto = iph->protocol;
+  int err = -ENOSYS;
+ 
++ if (skb->encapsulation)
++  skb_set_inner_network_header(skb, nhoff);
++
+  csum_replace2(&iph->check, iph->tot_len, newlen);
+  iph->tot_len = newlen;
+ 
+diff --git a/net/ipv4/gre_offload.c b/net/ipv4/gre_offload.c
+index 0b94889..a131b01 100644
+--- a/net/ipv4/gre_offload.c
++++ b/net/ipv4/gre_offload.c
+@@ -235,6 +235,9 @@ static int gre_gro_complete(struct sk_buff *skb, int nhoff)
+  int err = -ENOENT;
+  __be16 type;
+ 
++ skb->encapsulation = 1;
++ skb_shinfo(skb)->gso_type = SKB_GSO_GRE;
++
+  type = greh->protocol;
+  if (greh->flags & GRE_KEY)
+   grehlen += GRE_HEADER_SECTION;
+diff --git a/net/ipv4/tcp_offload.c b/net/ipv4/tcp_offload.c
+index 2be7fcf..7cdeac5 100644
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -288,7 +288,7 @@ static int tcp4_gro_complete(struct sk_buff *skb, int thoff)
+ 
+  th->check = ~tcp_v4_check(skb->len - thoff, iph->saddr,
+       iph->daddr, 0);
+- skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4;
++ skb_shinfo(skb)->gso_type |= SKB_GSO_TCPV4;
+ 
+  return tcp_gro_complete(skb);
+ }
+diff --git a/net/ipv6/tcpv6_offload.c b/net/ipv6/tcpv6_offload.c
+index fea6e74..dbb3d92 100644
+--- a/net/ipv6/tcpv6_offload.c
++++ b/net/ipv6/tcpv6_offload.c
+@@ -53,7 +53,7 @@ static int tcp6_gro_complete(struct sk_buff *skb, int thoff)
+ 
+  th->check = ~tcp_v6_check(skb->len - thoff, &iph->saddr,
+       &iph->daddr, 0);
+- skb_shinfo(skb)->gso_type = SKB_GSO_TCPV6;
++ skb_shinfo(skb)->gso_type |= SKB_GSO_TCPV6;
+ 
+  return tcp_gro_complete(skb);
+ }
+-- 
+1.7.1

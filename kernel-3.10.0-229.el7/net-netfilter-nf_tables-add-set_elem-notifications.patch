@@ -1,0 +1,140 @@
+From 8964f91b557a76a730e861fdf4099928f4ae4d5f Mon Sep 17 00:00:00 2001
+From: Marcelo Leitner <mleitner@redhat.com>
+Date: Tue, 21 Oct 2014 16:17:09 -0400
+Subject: [net] netfilter: nf_tables: add set_elem notifications
+
+Message-id: <20141021161708.22888.27312.stgit@localhost.localdomain>
+Patchwork-id: 97930
+O-Subject: [RHEL7 net PATCH 033/124] netfilter: nf_tables: add set_elem notifications
+Bugzilla: 1148041 1155088
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Backport of upstream commit: d60ce62fb5949ea6bf09323462c15d05c9e76200
+
+ commit d60ce62fb5949ea6bf09323462c15d05c9e76200
+ Author: Arturo Borrero <arturo.borrero.glez@gmail.com>
+ Date:   Tue Apr 1 14:06:07 2014 +0200
+
+    netfilter: nf_tables: add set_elem notifications
+
+    This patch adds set_elems notifications. When a set_elem is
+    added/deleted, all listening peers in userspace will receive the
+    corresponding notification.
+
+    Signed-off-by: Arturo Borrero Gonzalez <arturo.borrero.glez@gmail.com>
+    Acked-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: Pablo Neira Ayuso <pablo@gnumonks.org>
+
+Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index bd3381e..60feca9 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -2807,6 +2807,85 @@ static int nf_tables_getsetelem(struct sock *nlsk, struct sk_buff *skb,
+  return -EOPNOTSUPP;
+ }
+ 
++static int nf_tables_fill_setelem_info(struct sk_buff *skb,
++           const struct nft_ctx *ctx, u32 seq,
++           u32 portid, int event, u16 flags,
++           const struct nft_set *set,
++           const struct nft_set_elem *elem)
++{
++ struct nfgenmsg *nfmsg;
++ struct nlmsghdr *nlh;
++ struct nlattr *nest;
++ int err;
++
++ event |= NFNL_SUBSYS_NFTABLES << 8;
++ nlh = nlmsg_put(skb, portid, seq, event, sizeof(struct nfgenmsg),
++   flags);
++ if (nlh == NULL)
++  goto nla_put_failure;
++
++ nfmsg = nlmsg_data(nlh);
++ nfmsg->nfgen_family = ctx->afi->family;
++ nfmsg->version  = NFNETLINK_V0;
++ nfmsg->res_id  = 0;
++
++ if (nla_put_string(skb, NFTA_SET_TABLE, ctx->table->name))
++  goto nla_put_failure;
++ if (nla_put_string(skb, NFTA_SET_NAME, set->name))
++  goto nla_put_failure;
++
++ nest = nla_nest_start(skb, NFTA_SET_ELEM_LIST_ELEMENTS);
++ if (nest == NULL)
++  goto nla_put_failure;
++
++ err = nf_tables_fill_setelem(skb, set, elem);
++ if (err < 0)
++  goto nla_put_failure;
++
++ nla_nest_end(skb, nest);
++
++ return nlmsg_end(skb, nlh);
++
++nla_put_failure:
++ nlmsg_trim(skb, nlh);
++ return -1;
++}
++
++static int nf_tables_setelem_notify(const struct nft_ctx *ctx,
++        const struct nft_set *set,
++        const struct nft_set_elem *elem,
++        int event, u16 flags)
++{
++ const struct sk_buff *oskb = ctx->skb;
++ struct net *net = sock_net(oskb->sk);
++ u32 portid = NETLINK_CB(oskb).portid;
++ bool report = nlmsg_report(ctx->nlh);
++ struct sk_buff *skb;
++ int err;
++
++ if (!report && !nfnetlink_has_listeners(net, NFNLGRP_NFTABLES))
++  return 0;
++
++ err = -ENOBUFS;
++ skb = nlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
++ if (skb == NULL)
++  goto err;
++
++ err = nf_tables_fill_setelem_info(skb, ctx, 0, portid, event, flags,
++       set, elem);
++ if (err < 0) {
++  kfree_skb(skb);
++  goto err;
++ }
++
++ err = nfnetlink_send(skb, net, portid, NFNLGRP_NFTABLES, report,
++        GFP_KERNEL);
++err:
++ if (err < 0)
++  nfnetlink_set_err(net, portid, NFNLGRP_NFTABLES, err);
++ return err;
++}
++
+ static int nft_add_set_elem(const struct nft_ctx *ctx, struct nft_set *set,
+        const struct nlattr *attr)
+ {
+@@ -2887,6 +2966,7 @@ static int nft_add_set_elem(const struct nft_ctx *ctx, struct nft_set *set,
+   goto err3;
+  set->nelems++;
+ 
++ nf_tables_setelem_notify(ctx, set, &elem, NFT_MSG_NEWSETELEM, 0);
+  return 0;
+ 
+ err3:
+@@ -2957,6 +3037,8 @@ static int nft_del_setelem(const struct nft_ctx *ctx, struct nft_set *set,
+  set->ops->remove(set, &elem);
+  set->nelems--;
+ 
++ nf_tables_setelem_notify(ctx, set, &elem, NFT_MSG_DELSETELEM, 0);
++
+  nft_data_uninit(&elem.key, NFT_DATA_VALUE);
+  if (set->flags & NFT_SET_MAP)
+   nft_data_uninit(&elem.data, set->dtype);
+-- 
+1.7.1

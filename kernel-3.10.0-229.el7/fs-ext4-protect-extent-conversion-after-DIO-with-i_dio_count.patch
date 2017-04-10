@@ -1,0 +1,72 @@
+From d7cbec4ffe60d9795771e47625688071b0f091b5 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:52:56 -0400
+Subject: [fs] ext4: protect extent conversion after DIO with i_dio_count
+
+Message-id: <1414058125-4183-23-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98112
+O-Subject: [RHEL 7.1 PATCH v2 022/171] ext4: protect extent conversion after DIO with i_dio_count
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Jan Kara <jack@suse.cz>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit e83403959fddb6d90e8c5e54bbce3110d0c82165
+
+ Make sure extent conversion after DIO happens while i_dio_count is
+ still elevated so that inode_dio_wait() waits until extent conversion
+ is done.  This removes the need for explicit waiting for extent
+ conversion in some cases.
+
+ Reviewed-by: Zheng Liu <wenqing.lz@taobao.com>
+ Signed-off-by: Jan Kara <jack@suse.cz>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index b5083ac..72e2cca 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -3040,11 +3040,18 @@ static ssize_t ext4_ext_direct_IO(int rw, struct kiocb *iocb,
+ 
+  BUG_ON(iocb->private == NULL);
+ 
++ /*
++  * Make all waiters for direct IO properly wait also for extent
++  * conversion. This also disallows race between truncate() and
++  * overwrite DIO as i_dio_count needs to be incremented under i_mutex.
++  */
++ if (rw == WRITE)
++  atomic_inc(&inode->i_dio_count);
++
+  /* If we do a overwrite dio, i_mutex locking can be released */
+  overwrite = *((int *)iocb->private);
+ 
+  if (overwrite) {
+-  atomic_inc(&inode->i_dio_count);
+   down_read(&EXT4_I(inode)->i_data_sem);
+   mutex_unlock(&inode->i_mutex);
+  }
+@@ -3147,9 +3154,10 @@ static ssize_t ext4_ext_direct_IO(int rw, struct kiocb *iocb,
+  }
+ 
+ retake_lock:
++ if (rw == WRITE)
++  inode_dio_done(inode);
+  /* take i_mutex locking again if we do a ovewrite dio */
+  if (overwrite) {
+-  inode_dio_done(inode);
+   up_read(&EXT4_I(inode)->i_data_sem);
+   mutex_lock(&inode->i_mutex);
+  }
+-- 
+1.7.1

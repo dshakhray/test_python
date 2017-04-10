@@ -1,0 +1,102 @@
+From 66030b2c80d410a3aa821a2ea34cdbf60b524f9d Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:54:03 -0400
+Subject: [fs] ext4: fix deadlock when writing in ENOSPC conditions
+
+Message-id: <1414058125-4183-90-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98188
+O-Subject: [RHEL 7.1 PATCH v2 089/171] ext4: fix deadlock when writing in ENOSPC conditions
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Jan Kara <jack@suse.cz>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit 34cf865d54813aab3497838132fb1bbd293f4054
+
+ Akira-san has been reporting rare deadlocks of his machine when running
+ xfstests test 269 on ext4 filesystem. The problem turned out to be in
+ ext4_da_reserve_metadata() and ext4_da_reserve_space() which called
+ ext4_should_retry_alloc() while holding i_data_sem. Since
+ ext4_should_retry_alloc() can force a transaction commit, this is a
+ lock ordering violation and leads to deadlocks.
+
+ Fix the problem by just removing the retry loops. These functions should
+ just report ENOSPC to the caller (e.g. ext4_da_write_begin()) and that
+ function must take care of retrying after dropping all necessary locks.
+
+ Reported-and-tested-by: Akira Fujita <a-fujita@rs.jp.nec.com>
+ Reviewed-by: Zheng Liu <wenqing.lz@taobao.com>
+ Signed-off-by: Jan Kara <jack@suse.cz>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Cc: stable@vger.kernel.org
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index fdce9b3..e75e536 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1202,7 +1202,6 @@ static int ext4_journalled_write_end(struct file *file,
+  */
+ static int ext4_da_reserve_metadata(struct inode *inode, ext4_lblk_t lblock)
+ {
+- int retries = 0;
+  struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+  struct ext4_inode_info *ei = EXT4_I(inode);
+  unsigned int md_needed;
+@@ -1214,7 +1213,6 @@ static int ext4_da_reserve_metadata(struct inode *inode, ext4_lblk_t lblock)
+   * in order to allocate nrblocks
+   * worse case is one extent per block
+   */
+-repeat:
+  spin_lock(&ei->i_block_reservation_lock);
+  /*
+   * ext4_calc_metadata_amount() has side effects, which we have
+@@ -1234,10 +1232,6 @@ repeat:
+   ei->i_da_metadata_calc_len = save_len;
+   ei->i_da_metadata_calc_last_lblock = save_last_lblock;
+   spin_unlock(&ei->i_block_reservation_lock);
+-  if (ext4_should_retry_alloc(inode->i_sb, &retries)) {
+-   cond_resched();
+-   goto repeat;
+-  }
+   return -ENOSPC;
+  }
+  ei->i_reserved_meta_blocks += md_needed;
+@@ -1251,7 +1245,6 @@ repeat:
+  */
+ static int ext4_da_reserve_space(struct inode *inode, ext4_lblk_t lblock)
+ {
+- int retries = 0;
+  struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+  struct ext4_inode_info *ei = EXT4_I(inode);
+  unsigned int md_needed;
+@@ -1273,7 +1266,6 @@ static int ext4_da_reserve_space(struct inode *inode, ext4_lblk_t lblock)
+   * in order to allocate nrblocks
+   * worse case is one extent per block
+   */
+-repeat:
+  spin_lock(&ei->i_block_reservation_lock);
+  /*
+   * ext4_calc_metadata_amount() has side effects, which we have
+@@ -1293,10 +1285,6 @@ repeat:
+   ei->i_da_metadata_calc_len = save_len;
+   ei->i_da_metadata_calc_last_lblock = save_last_lblock;
+   spin_unlock(&ei->i_block_reservation_lock);
+-  if (ext4_should_retry_alloc(inode->i_sb, &retries)) {
+-   cond_resched();
+-   goto repeat;
+-  }
+   dquot_release_reservation_block(inode, EXT4_C2B(sbi, 1));
+   return -ENOSPC;
+  }
+-- 
+1.7.1

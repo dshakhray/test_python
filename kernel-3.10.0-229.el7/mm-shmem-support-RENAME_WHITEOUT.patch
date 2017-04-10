@@ -1,0 +1,89 @@
+From de890872560a1bb572d714f8f769446b5c1d44aa Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 25 Nov 2014 16:35:07 -0500
+Subject: [mm] shmem: support RENAME_WHITEOUT
+
+Message-id: <20141125163507.18115.10447.stgit@warthog.procyon.org.uk>
+Patchwork-id: 100930
+O-Subject: [PATCH 30/47] shmem: support RENAME_WHITEOUT
+Bugzilla: 985875
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+From: Miklos Szeredi <mszeredi@suse.cz>
+
+Allocate a dentry, initialize it with a whiteout and hash it in the place
+of the old dentry.  Later the old dentry will be moved away and the
+whiteout will remain.
+
+i_mutex protects agains concurrent readdir.
+
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+Cc: Hugh Dickins <hughd@google.com>
+Original-commit: 46fdb794e3f52ef18b859ebc92f0a9d7db21c5df
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/shmem.c b/mm/shmem.c
+index a8f6d7c..e65d4f7 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2074,6 +2074,32 @@ static int shmem_exchange(struct inode *old_dir, struct dentry *old_dentry, stru
+  return 0;
+ }
+ 
++static int shmem_whiteout(struct inode *old_dir, struct dentry *old_dentry)
++{
++ struct dentry *whiteout;
++ int error;
++
++ whiteout = d_alloc(old_dentry->d_parent, &old_dentry->d_name);
++ if (!whiteout)
++  return -ENOMEM;
++
++ error = shmem_mknod(old_dir, whiteout,
++       S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
++ dput(whiteout);
++ if (error)
++  return error;
++
++ /*
++  * Cheat and hash the whiteout while the old dentry is still in
++  * place, instead of playing games with FS_RENAME_DOES_D_MOVE.
++  *
++  * d_lookup() will consistently find one of them at this point,
++  * not sure which one, but that isn't even important.
++  */
++ d_rehash(whiteout);
++ return 0;
++}
++
+ /*
+  * The VFS layer already does all the dentry stuff for rename,
+  * we just have to decrement the usage count for the target if
+@@ -2085,7 +2111,7 @@ static int shmem_rename2(struct inode *old_dir, struct dentry *old_dentry, struc
+  struct inode *inode = old_dentry->d_inode;
+  int they_are_dirs = S_ISDIR(inode->i_mode);
+ 
+- if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
++ if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
+   return -EINVAL;
+ 
+  if (flags & RENAME_EXCHANGE)
+@@ -2094,6 +2120,14 @@ static int shmem_rename2(struct inode *old_dir, struct dentry *old_dentry, struc
+  if (!simple_empty(new_dentry))
+   return -ENOTEMPTY;
+ 
++ if (flags & RENAME_WHITEOUT) {
++  int error;
++
++  error = shmem_whiteout(old_dir, old_dentry);
++  if (error)
++   return error;
++ }
++
+  if (new_dentry->d_inode) {
+   (void) shmem_unlink(new_dir, new_dentry);
+   if (they_are_dirs)
+-- 
+1.7.1

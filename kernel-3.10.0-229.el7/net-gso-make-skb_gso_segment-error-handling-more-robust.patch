@@ -1,0 +1,103 @@
+From c7c2bc92811416bbd56e9a76ce0592f7b9ccb08f Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 24 Oct 2014 20:55:33 -0400
+Subject: [net] gso: make skb_gso_segment error handling more robust
+
+Message-id: <151f5d024601f50b863924b8be01cd0f7765e7e8.1414183890.git.jbenc@redhat.com>
+Patchwork-id: 98459
+O-Subject: [RHEL7.1 net PATCH 4/5] net: make skb_gso_segment error handling more robust
+Bugzilla: 1144571
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Jesper Brouer <jbrouer@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1144571
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8159555
+
+commit 330966e501ffe282d7184fde4518d5e0c24bc7f8
+Author: Florian Westphal <fw@strlen.de>
+Date:   Mon Oct 20 13:49:17 2014 +0200
+
+    net: make skb_gso_segment error handling more robust
+
+    skb_gso_segment has three possible return values:
+    1. a pointer to the first segmented skb
+    2. an errno value (IS_ERR())
+    3. NULL.  This can happen when GSO is used for header verification.
+
+    However, several callers currently test IS_ERR instead of IS_ERR_OR_NULL
+    and would oops when NULL is returned.
+
+    Note that these call sites should never actually see such a NULL return
+    value; all callers mask out the GSO bits in the feature argument.
+
+    However, there have been issues with some protocol handlers erronously not
+    respecting the specified feature mask in some cases.
+
+    It is preferable to get 'have to turn off hw offloading, else slow' reports
+    rather than 'kernel crashes'.
+
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 729a6fe..a108d98 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -237,7 +237,7 @@ static int ip_finish_output_gso(struct sk_buff *skb)
+   */
+  features = netif_skb_features(skb);
+  segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+- if (IS_ERR(segs)) {
++ if (IS_ERR_OR_NULL(segs)) {
+   kfree_skb(skb);
+   return -ENOMEM;
+  }
+diff --git a/net/netfilter/nfnetlink_queue_core.c b/net/netfilter/nfnetlink_queue_core.c
+index 8f24e23..660119a 100644
+--- a/net/netfilter/nfnetlink_queue_core.c
++++ b/net/netfilter/nfnetlink_queue_core.c
+@@ -621,7 +621,7 @@ nfqnl_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
+   * returned by nf_queue.  For instance, callers rely on -ECANCELED to
+   * mean 'ignore this hook'.
+   */
+- if (IS_ERR(segs))
++ if (IS_ERR_OR_NULL(segs))
+   goto out_err;
+  queued = 0;
+  err = 0;
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index c3e9232..1eeedef 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -314,6 +314,8 @@ static int queue_gso_packets(struct datapath *dp, struct sk_buff *skb,
+  segs = __skb_gso_segment(skb, NETIF_F_SG, false);
+  if (IS_ERR(segs))
+   return PTR_ERR(segs);
++ if (segs == NULL)
++  return -EINVAL;
+ 
+  /* Queue all of the segments. */
+  skb = segs;
+diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
+index 0cf003d..ffa9a0b 100644
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -158,6 +158,8 @@ static int xfrm_output_gso(struct sk_buff *skb)
+  kfree_skb(skb);
+  if (IS_ERR(segs))
+   return PTR_ERR(segs);
++ if (segs == NULL)
++  return -EINVAL;
+ 
+  do {
+   struct sk_buff *nskb = segs->next;
+-- 
+1.7.1

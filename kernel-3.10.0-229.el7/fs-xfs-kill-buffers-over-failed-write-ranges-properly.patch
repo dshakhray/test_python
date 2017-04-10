@@ -1,0 +1,76 @@
+From 72a3116152d142acdeaef55826fa15c479ba2ad8 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Thu, 9 Oct 2014 20:59:57 -0400
+Subject: [fs] xfs: kill buffers over failed write ranges properly
+
+Message-id: <1412888441-4181-4-git-send-email-sandeen@redhat.com>
+Patchwork-id: 97347
+O-Subject: [RHEL7.1 PATCH 03/47] [fs] xfs: kill buffers over failed write ranges properly
+Bugzilla: 1145837
+RH-Acked-by: Brian Foster <bfoster@redhat.com>
+RH-Acked-by: Dave Chinner <dchinner@redhat.com>
+
+Bugzilla: 1145837
+Upstream Status: Committed upstream
+Build Info: https://brewweb.devel.redhat.com/taskinfo?taskID=8082426
+Tested: locally using xfstests
+
+Thanks,
+-Eric
+
+    commit 4ab9ed578e82851645f3dd69d36d91ae77564d6c
+    Author: Dave Chinner <dchinner@redhat.com>
+    Date:   Mon Apr 14 18:11:58 2014 +1000
+
+    xfs: kill buffers over failed write ranges properly
+
+    When a write fails, if we don't clear the delalloc flags from the
+    buffers over the failed range, they can persist beyond EOF and cause
+    problems. writeback will see the pages in the page cache, see they
+    are dirty and continually retry the write, assuming that the page
+    beyond EOF is just racing with a truncate. The page will eventually
+    be released due to some other operation (e.g. direct IO), and it
+    will not pass through invalidation because it is dirty. Hence it
+    will be released with buffer_delay set on it, and trigger warnings
+    in xfs_vm_releasepage() and assert fail in xfs_file_aio_write_direct
+    because invalidation failed and we didn't write the corect amount.
+
+    This causes failures on block size < page size filesystems in fsx
+    and fsstress workloads run by xfstests.
+
+    Fix it by completely trashing any state on the buffer that could be
+    used to imply that it contains valid data when the delalloc range
+    over the buffer is punched out during the failed write handling.
+
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Tested-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index a30c697..8e23af0 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -1581,6 +1581,16 @@ xfs_vm_write_failed(
+ 
+   xfs_vm_kill_delalloc_range(inode, block_offset,
+         block_offset + bh->b_size);
++
++  /*
++   * This buffer does not contain data anymore. make sure anyone
++   * who finds it knows that for certain.
++   */
++  clear_buffer_delay(bh);
++  clear_buffer_uptodate(bh);
++  clear_buffer_mapped(bh);
++  clear_buffer_new(bh);
++  clear_buffer_dirty(bh);
+  }
+ 
+ }
+-- 
+1.7.1

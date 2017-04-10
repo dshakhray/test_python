@@ -1,0 +1,110 @@
+From c0be8e5a51ea226c08007a7ae11264c4286bc961 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:42 -0400
+Subject: [usb] uas: Reset device on reboot
+
+Message-id: <1410887463-20674-331-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95319
+O-Subject: [RHEL7 PATCH 330/591] uas: Reset device on reboot
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit da65c2bb99542d05f2d8f67efe6627915f4c5ea4
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Mon Nov 11 11:51:42 2013 +0100
+
+    uas: Reset device on reboot
+
+    Some BIOS-es will hang on reboot when an uas device is attached and left in
+    uas mode on reboot.
+
+    This commit adds a shutdown handler which on reboot puts the device back into
+    usb-storage mode, fixing the hang on reboot on these systems.
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index 7a16ed8..019f203 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -54,6 +54,7 @@ struct uas_dev_info {
+  unsigned use_streams:1;
+  unsigned uas_sense_old:1;
+  unsigned running_task:1;
++ unsigned shutdown:1;
+  struct scsi_cmnd *cmnd;
+  spinlock_t lock;
+  struct work_struct work;
+@@ -1011,6 +1012,7 @@ static int uas_probe(struct usb_interface *intf, const struct usb_device_id *id)
+  devinfo->udev = udev;
+  devinfo->resetting = 0;
+  devinfo->running_task = 0;
++ devinfo->shutdown = 0;
+  init_usb_anchor(&devinfo->cmd_urbs);
+  init_usb_anchor(&devinfo->sense_urbs);
+  init_usb_anchor(&devinfo->data_urbs);
+@@ -1053,6 +1055,9 @@ static int uas_pre_reset(struct usb_interface *intf)
+  struct uas_dev_info *devinfo = (void *)shost->hostdata[0];
+  unsigned long flags;
+ 
++ if (devinfo->shutdown)
++  return 0;
++
+  /* Block new requests */
+  spin_lock_irqsave(shost->host_lock, flags);
+  scsi_block_requests(shost);
+@@ -1076,6 +1081,9 @@ static int uas_post_reset(struct usb_interface *intf)
+  struct uas_dev_info *devinfo = (void *)shost->hostdata[0];
+  unsigned long flags;
+ 
++ if (devinfo->shutdown)
++  return 0;
++
+  if (uas_configure_endpoints(devinfo) != 0) {
+   shost_printk(KERN_ERR, shost,
+         "%s: alloc streams error after reset", __func__);
+@@ -1147,6 +1155,27 @@ static void uas_disconnect(struct usb_interface *intf)
+  kfree(devinfo);
+ }
+ 
++/*
++ * Put the device back in usb-storage mode on shutdown, as some BIOS-es
++ * hang on reboot when the device is still in uas mode. Note the reset is
++ * necessary as some devices won't revert to usb-storage mode without it.
++ */
++static void uas_shutdown(struct device *dev)
++{
++ struct usb_interface *intf = to_usb_interface(dev);
++ struct usb_device *udev = interface_to_usbdev(intf);
++ struct Scsi_Host *shost = usb_get_intfdata(intf);
++ struct uas_dev_info *devinfo = (void *)shost->hostdata[0];
++
++ if (system_state != SYSTEM_RESTART)
++  return;
++
++ devinfo->shutdown = 1;
++ uas_free_streams(devinfo);
++ usb_set_interface(udev, intf->altsetting[0].desc.bInterfaceNumber, 0);
++ usb_reset_device(udev);
++}
++
+ static struct usb_driver uas_driver = {
+  .name = "uas",
+  .probe = uas_probe,
+@@ -1156,6 +1185,7 @@ static struct usb_driver uas_driver = {
+  .suspend = uas_suspend,
+  .resume = uas_resume,
+  .reset_resume = uas_reset_resume,
++ .drvwrap.driver.shutdown = uas_shutdown,
+  .id_table = uas_usb_ids,
+ };
+ 
+-- 
+1.7.1

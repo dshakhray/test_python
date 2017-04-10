@@ -1,0 +1,193 @@
+From 8d7a94be2a90fd0dc933c2a984e365f61c7b48f3 Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@redhat.com>
+Date: Fri, 5 Sep 2014 14:17:01 -0400
+Subject: [kernel] time, signal: protect resource use statistics with seqlock
+
+Message-id: <1409926623-25929-6-git-send-email-riel@redhat.com>
+Patchwork-id: 91457
+O-Subject: [RHEL7 PATCH 5/7] time, signal: protect resource use statistics with seqlock
+Bugzilla: 1120307
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stanislaw Gruszka <sgruszka@redhat.com>
+
+From: Rik van Riel <riel@redhat.com>
+
+Upstream status: in peterz's tip queue
+
+Fixes bug 1120307
+
+Both times() and clock_gettime(CLOCK_PROCESS_CPUTIME_ID) have scalability
+issues on large systems, due to both functions being serialized with a
+lock.
+
+The lock protects against reporting a wrong value, due to a thread in the
+task group exiting, its statistics reporting up to the signal struct, and
+that exited task's statistics being counted twice (or not at all).
+
+Protecting that with a lock results in times and clock_gettime being
+completely serialized on large systems.
+
+This can be fixed by using a seqlock around the events that gather and
+propagate statistics. As an additional benefit, the protection code can
+be moved into thread_group_cputime, slightly simplifying the calling
+functions.
+
+In the case of posix_cpu_clock_get_task things can be simplified a
+lot, because the calling function already ensures tsk sticks around,
+and the rest is now taken care of in thread_group_cputime.
+
+This way the statistics reporting code can run lockless.
+
+Signed-off-by: Rik van Riel <riel@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 3e391fa..cfe2011 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -567,6 +567,7 @@ struct signal_struct {
+   * Live threads maintain their own counters and add to these
+   * in __exit_signal, except for the group leader.
+   */
++ seqlock_t stats_lock;
+  cputime_t utime, stime, cutime, cstime;
+  cputime_t gtime;
+  cputime_t cgtime;
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 77a3dd8..08a9f4d 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -127,6 +127,7 @@ static void __exit_signal(struct task_struct *tsk)
+   * the signal_struct.
+   */
+  task_cputime(tsk, &utime, &stime);
++ write_seqlock(&sig->stats_lock);
+  sig->utime += utime;
+  sig->stime += stime;
+  sig->gtime += task_gtime(tsk);
+@@ -140,6 +141,7 @@ static void __exit_signal(struct task_struct *tsk)
+  sig->sum_sched_runtime += tsk->se.sum_exec_runtime;
+  sig->nr_threads--;
+  __unhash_process(tsk, group_dead);
++ write_sequnlock(&sig->stats_lock);
+ 
+  /*
+   * Do this under ->siglock, we can race with another thread
+@@ -1092,6 +1094,7 @@ static int wait_task_zombie(struct wait_opts *wo, struct task_struct *p)
+   spin_lock_irq(&p->real_parent->sighand->siglock);
+   psig = p->real_parent->signal;
+   sig = p->signal;
++  write_seqlock(&psig->stats_lock);
+   psig->cutime += tgutime + sig->cutime;
+   psig->cstime += tgstime + sig->cstime;
+   psig->cgtime += task_gtime(p) + sig->gtime + sig->cgtime;
+@@ -1114,6 +1117,7 @@ static int wait_task_zombie(struct wait_opts *wo, struct task_struct *p)
+    psig->cmaxrss = maxrss;
+   task_io_accounting_add(&psig->ioac, &p->ioac);
+   task_io_accounting_add(&psig->ioac, &sig->ioac);
++  write_sequnlock(&psig->stats_lock);
+   spin_unlock_irq(&p->real_parent->sighand->siglock);
+  }
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 1613441..6035582 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1051,6 +1051,7 @@ static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
+  sig->curr_target = tsk;
+  init_sigpending(&sig->shared_pending);
+  INIT_LIST_HEAD(&sig->posix_timers);
++ seqlock_init(&sig->stats_lock);
+ 
+  hrtimer_init(&sig->real_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+  sig->real_timer.function = it_real_fn;
+diff --git a/kernel/posix-cpu-timers.c b/kernel/posix-cpu-timers.c
+index b1faa9b..190a887 100644
+--- a/kernel/posix-cpu-timers.c
++++ b/kernel/posix-cpu-timers.c
+@@ -346,13 +346,11 @@ static int posix_cpu_clock_get(const clockid_t which_clock, struct timespec *tp)
+          p, &rtn);
+     }
+    } else {
+-    read_lock(&tasklist_lock);
+     if (thread_group_leader(p) && p->sighand) {
+      error =
+          cpu_clock_sample_group(which_clock,
+                   p, &rtn);
+     }
+-    read_unlock(&tasklist_lock);
+    }
+   }
+   rcu_read_unlock();
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index 1f4b7f2..f5dd3be 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -288,18 +288,28 @@ void thread_group_cputime(struct task_struct *tsk, struct task_cputime *times)
+  struct signal_struct *sig = tsk->signal;
+  cputime_t utime, stime;
+  struct task_struct *t;
+-
+- times->utime = sig->utime;
+- times->stime = sig->stime;
+- times->sum_exec_runtime = sig->sum_sched_runtime;
++ unsigned int seq, nextseq;
+ 
+  rcu_read_lock();
+- for_each_thread(tsk, t) {
+-  task_cputime(t, &utime, &stime);
+-  times->utime += utime;
+-  times->stime += stime;
+-  times->sum_exec_runtime += task_sched_runtime(t);
+- }
++ /* Attempt a lockless read on the first round. */
++ nextseq = 0;
++ do {
++  seq = nextseq;
++  read_seqbegin_or_lock(&sig->stats_lock, &seq);
++  times->utime = sig->utime;
++  times->stime = sig->stime;
++  times->sum_exec_runtime = sig->sum_sched_runtime;
++
++  for_each_thread(tsk, t) {
++   task_cputime(t, &utime, &stime);
++   times->utime += utime;
++   times->stime += stime;
++   times->sum_exec_runtime += task_sched_runtime(t);
++  }
++  /* If lockless access failed, take the lock. */
++  nextseq = 1;
++ } while (need_seqretry(&sig->stats_lock, seq));
++ done_seqretry(&sig->stats_lock, seq);
+  rcu_read_unlock();
+ }
+ 
+@@ -611,9 +621,6 @@ void task_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
+  cputime_adjust(&cputime, &p->prev_cputime, ut, st);
+ }
+ 
+-/*
+- * Must be called with siglock held.
+- */
+ void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st)
+ {
+  struct task_cputime cputime;
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 2bbd9a7..2e7076b 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -1137,11 +1137,9 @@ void do_sys_times(struct tms *tms)
+ {
+  cputime_t tgutime, tgstime, cutime, cstime;
+ 
+- spin_lock_irq(&current->sighand->siglock);
+  thread_group_cputime_adjusted(current, &tgutime, &tgstime);
+  cutime = current->signal->cutime;
+  cstime = current->signal->cstime;
+- spin_unlock_irq(&current->sighand->siglock);
+  tms->tms_utime = cputime_to_clock_t(tgutime);
+  tms->tms_stime = cputime_to_clock_t(tgstime);
+  tms->tms_cutime = cputime_to_clock_t(cutime);
+-- 
+1.7.1

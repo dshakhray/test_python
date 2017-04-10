@@ -1,0 +1,87 @@
+From 5dc2ccc3cb399de492bd55a8cb4d2809cd449aaf Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:25:57 -0400
+Subject: [md] avoid oops on unload if some process is in poll or select
+
+Message-id: <1409563584-9000-56-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 90009
+O-Subject: [RHEL7.1 PATCH 55/82] md: avoid oops on unload if some process is in poll or select.
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: NeilBrown <neilb@suse.de>
+
+If md-mod is unloaded while some process is in poll() or select(),
+then that process maintains a pointer to md_event_waiters, and when
+the try to unlink from that list, they will oops.
+
+The procfs infrastructure ensures that ->poll won't be called after
+remove_proc_entry, but doesn't provide a wait_queue_head for us to
+use, and the waitqueue code doesn't provide a way to remove all
+listeners from a waitqueue.
+
+So we need to:
+ 1/ make sure no further references to md_event_waiters are taken (by
+    setting md_unloading)
+ 2/ wake up all processes currently waiting, and
+ 3/ wait until all those processes have disconnected from our
+    wait_queue_head.
+
+Reported-by: "majianpeng" <majianpeng@gmail.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit e2f23b606b94f28a8febd5aa715df697d80b018e)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 609f1de..f91c232 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -7165,11 +7165,14 @@ static int md_seq_open(struct inode *inode, struct file *file)
+  return error;
+ }
+ 
++static int md_unloading;
+ static unsigned int mdstat_poll(struct file *filp, poll_table *wait)
+ {
+  struct seq_file *seq = filp->private_data;
+  int mask;
+ 
++ if (md_unloading)
++  return POLLIN|POLLRDNORM|POLLERR|POLLPRI;;
+  poll_wait(filp, &md_event_waiters, wait);
+ 
+  /* always allow read */
+@@ -8655,6 +8658,7 @@ static __exit void md_exit(void)
+ {
+  struct mddev *mddev;
+  struct list_head *tmp;
++ int delay = 1;
+ 
+  blk_unregister_region(MKDEV(MD_MAJOR,0), 1U << MINORBITS);
+  blk_unregister_region(MKDEV(mdp_major,0), 1U << MINORBITS);
+@@ -8663,7 +8667,19 @@ static __exit void md_exit(void)
+  unregister_blkdev(mdp_major, "mdp");
+  unregister_reboot_notifier(&md_notifier);
+  unregister_sysctl_table(raid_table_header);
++
++ /* We cannot unload the modules while some process is
++  * waiting for us in select() or poll() - wake them up
++  */
++ md_unloading = 1;
++ while (waitqueue_active(&md_event_waiters)) {
++  /* not safe to leave yet */
++  wake_up(&md_event_waiters);
++  msleep(delay);
++  delay += delay;
++ }
+  remove_proc_entry("mdstat", NULL);
++
+  for_each_mddev(mddev, tmp) {
+   export_array(mddev);
+   mddev->hold_active = 0;
+-- 
+1.7.1

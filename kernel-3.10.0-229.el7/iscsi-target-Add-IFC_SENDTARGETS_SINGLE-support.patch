@@ -1,0 +1,102 @@
+From 7f095beeecef752eb1aa64aebf824886955432f3 Mon Sep 17 00:00:00 2001
+From: Andy Grover <agrover@redhat.com>
+Date: Fri, 9 Jan 2015 00:27:27 -0500
+Subject: [iscsi-target] Add IFC_SENDTARGETS_SINGLE support
+
+Message-id: <1420763250-27236-7-git-send-email-agrover@redhat.com>
+Patchwork-id: 102563
+O-Subject: [RHEL7.1 PATCH e-stor 6/9] iscsi-target: Add IFC_SENDTARGETS_SINGLE support
+Bugzilla: 1058736
+RH-Acked-by: Rob Evers <revers@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+
+This patch changes ISCSI_OP_TEXT handling of SendTargets=[iqn.,eui.]
+payloads to return explicit discovery information.
+
+It adds checks to iscsit_process_text_cmd() and adds the special single
+$TARGETNAME discovery case in iscsit_build_sendtargets_response() code.
+
+Cc: Or Gerlitz <ogerlitz@mellanox.com>
+Cc: Mike Christie <michaelc@cs.wisc.edu>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/target/iscsi/iscsi_target.c b/drivers/target/iscsi/iscsi_target.c
+index b1da04c..ab99bab 100644
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -2021,6 +2021,9 @@ iscsit_process_text_cmd(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
+  }
+  if (!strncmp("=All", text_ptr, 4)) {
+   cmd->cmd_flags |= IFC_SENDTARGETS_ALL;
++ } else if (!strncmp("=iqn.", text_ptr, 5) ||
++     !strncmp("=eui.", text_ptr, 5)) {
++  cmd->cmd_flags |= IFC_SENDTARGETS_SINGLE;
+  } else {
+   pr_err("Unable to locate valid SendTargets=%s value\n", text_ptr);
+   goto reject;
+@@ -3402,6 +3405,7 @@ static int iscsit_build_sendtargets_response(struct iscsi_cmd *cmd)
+  struct iscsi_tpg_np *tpg_np;
+  int buffer_len, end_of_buf = 0, len = 0, payload_len = 0;
+  unsigned char buf[ISCSI_IQN_LEN+12]; /* iqn + "TargetName=" + \0 */
++ unsigned char *text_in = cmd->text_in_ptr, *text_ptr = NULL;
+ 
+  buffer_len = max(conn->conn_ops->MaxRecvDataSegmentLength,
+     SENDTARGETS_BUF_LIMIT);
+@@ -3412,9 +3416,30 @@ static int iscsit_build_sendtargets_response(struct iscsi_cmd *cmd)
+     " response.\n");
+   return -ENOMEM;
+  }
++ /*
++  * Locate pointer to iqn./eui. string for IFC_SENDTARGETS_SINGLE
++  * explicit case..
++  */
++ if (cmd->cmd_flags & IFC_SENDTARGETS_SINGLE) {
++  text_ptr = strchr(text_in, '=');
++  if (!text_ptr) {
++   pr_err("Unable to locate '=' string in text_in:"
++          " %s\n", text_in);
++   return -EINVAL;
++  }
++  /*
++   * Skip over '=' character..
++   */
++  text_ptr += 1;
++ }
+ 
+  spin_lock(&tiqn_lock);
+  list_for_each_entry(tiqn, &g_tiqn_list, tiqn_list) {
++  if ((cmd->cmd_flags & IFC_SENDTARGETS_SINGLE) &&
++       strcmp(tiqn->tiqn, text_ptr)) {
++   continue;
++  }
++
+   len = sprintf(buf, "TargetName=%s", tiqn->tiqn);
+   len += 1;
+ 
+@@ -3466,6 +3491,9 @@ static int iscsit_build_sendtargets_response(struct iscsi_cmd *cmd)
+ eob:
+   if (end_of_buf)
+    break;
++
++  if (cmd->cmd_flags & IFC_SENDTARGETS_SINGLE)
++   break;
+  }
+  spin_unlock(&tiqn_lock);
+ 
+diff --git a/drivers/target/iscsi/iscsi_target_core.h b/drivers/target/iscsi/iscsi_target_core.h
+index 7895f8f..909fde9 100644
+--- a/drivers/target/iscsi/iscsi_target_core.h
++++ b/drivers/target/iscsi/iscsi_target_core.h
+@@ -133,6 +133,7 @@ enum cmd_flags_table {
+  ICF_ATTACHED_TO_RQUEUE   = 0x00000040,
+  ICF_OOO_CMDSN    = 0x00000080,
+  IFC_SENDTARGETS_ALL   = 0x00000100,
++ IFC_SENDTARGETS_SINGLE   = 0x00000200,
+ };
+ 
+ /* struct iscsi_cmd->i_state */
+-- 
+1.7.1

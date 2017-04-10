@@ -1,0 +1,188 @@
+From f11bc23cbdf38f140414bea5d2ab4fbd08b93ad4 Mon Sep 17 00:00:00 2001
+From: Marcelo Leitner <mleitner@redhat.com>
+Date: Tue, 11 Nov 2014 16:57:37 -0500
+Subject: [net] tcp: zero retrans_stamp if all retrans were acked
+
+Message-id: <52be452b85934572cdc2872bd75a2c525ca55016.1415725025.git.mleitner@redhat.com>
+Patchwork-id: 99825
+O-Subject: [RHEL7 net PATCH] tcp: zero retrans_stamp if all retrans were acked
+Bugzilla: 1162193
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+
+Backport of nf-next commit: 1f37bf87aa7523d28e7e4c4f7bb5dba98faa3e00
+BZ: https://bugzilla.redhat.com/show_bug.cgi?id=1162193
+Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=8224142
+Testing: me
+
+ commit 1f37bf87aa7523d28e7e4c4f7bb5dba98faa3e00
+ Author: Marcelo Leitner <mleitner@redhat.com>
+ Date:   Tue Nov 4 17:15:08 2014 -0200
+
+    tcp: zero retrans_stamp if all retrans were acked
+
+    Ueki Kohei reported that when we are using NewReno with connections that
+    have a very low traffic, we may timeout the connection too early if a
+    second loss occurs after the first one was successfully acked but no
+    data was transfered later. Below is his description of it:
+
+    When SACK is disabled, and a socket suffers multiple separate TCP
+    retransmissions, that socket's ETIMEDOUT value is calculated from the
+    time of the *first* retransmission instead of the *latest*
+    retransmission.
+
+    This happens because the tcp_sock's retrans_stamp is set once then never
+    cleared.
+
+    Take the following connection:
+
+                          Linux                    remote-machine
+                            |                           |
+             send#1---->(*1)|--------> data#1 --------->|
+                      |     |                           |
+                     RTO    :                           :
+                      |     |                           |
+                     ---(*2)|----> data#1(retrans) ---->|
+                      | (*3)|<---------- ACK <----------|
+                      |     |                           |
+                      |     :                           :
+                      |     :                           :
+                      |     :                           :
+                    16 minutes (or more)                :
+                      |     :                           :
+                      |     :                           :
+                      |     :                           :
+                      |     |                           |
+             send#2---->(*4)|--------> data#2 --------->|
+                      |     |                           |
+                     RTO    :                           :
+                      |     |                           |
+                     ---(*5)|----> data#2(retrans) ---->|
+                      |     |                           |
+                      |     |                           |
+                    RTO*2   :                           :
+                      |     |                           |
+                      |     |                           |
+          ETIMEDOUT<----(*6)|                           |
+
+    (*1) One data packet sent.
+    (*2) Because no ACK packet is received, the packet is retransmitted.
+    (*3) The ACK packet is received. The transmitted packet is acknowledged.
+
+    At this point the first "retransmission event" has passed and been
+    recovered from. Any future retransmission is a completely new "event".
+
+    (*4) After 16 minutes (to correspond with retries2=15), a new data
+    packet is sent. Note: No data is transmitted between (*3) and (*4).
+
+    The socket's timeout SHOULD be calculated from this point in time, but
+    instead it's calculated from the prior "event" 16 minutes ago.
+
+    (*5) Because no ACK packet is received, the packet is retransmitted.
+    (*6) At the time of the 2nd retransmission, the socket returns
+    ETIMEDOUT.
+
+    Therefore, now we clear retrans_stamp as soon as all data during the
+    loss window is fully acked.
+
+    Reported-by: Ueki Kohei
+    Cc: Neal Cardwell <ncardwell@google.com>
+    Cc: Yuchung Cheng <ycheng@google.com>
+    Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+    Acked-by: Neal Cardwell <ncardwell@google.com>
+    Tested-by: Neal Cardwell <ncardwell@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 35158b5..ee85db0 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -2308,6 +2308,35 @@ static inline bool tcp_packet_delayed(const struct tcp_sock *tp)
+ 
+ /* Undo procedures. */
+ 
++/* We can clear retrans_stamp when there are no retransmissions in the
++ * window. It would seem that it is trivially available for us in
++ * tp->retrans_out, however, that kind of assumptions doesn't consider
++ * what will happen if errors occur when sending retransmission for the
++ * second time. ...It could the that such segment has only
++ * TCPCB_EVER_RETRANS set at the present time. It seems that checking
++ * the head skb is enough except for some reneging corner cases that
++ * are not worth the effort.
++ *
++ * Main reason for all this complexity is the fact that connection dying
++ * time now depends on the validity of the retrans_stamp, in particular,
++ * that successive retransmissions of a segment must not advance
++ * retrans_stamp under any conditions.
++ */
++static bool tcp_any_retrans_done(const struct sock *sk)
++{
++ const struct tcp_sock *tp = tcp_sk(sk);
++ struct sk_buff *skb;
++
++ if (tp->retrans_out)
++  return true;
++
++ skb = tcp_write_queue_head(sk);
++ if (unlikely(skb && TCP_SKB_CB(skb)->sacked & TCPCB_EVER_RETRANS))
++  return true;
++
++ return false;
++}
++
+ #if FASTRETRANS_DEBUG > 1
+ static void DBGUNDO(struct sock *sk, const char *msg)
+ {
+@@ -2391,6 +2420,8 @@ static bool tcp_try_undo_recovery(struct sock *sk)
+    * is ACKed. For Reno it is MUST to prevent false
+    * fast retransmits (RFC2582). SACK TCP is safe. */
+   tcp_moderate_cwnd(tp);
++  if (!tcp_any_retrans_done(sk))
++   tp->retrans_stamp = 0;
+   return true;
+  }
+  tcp_set_ca_state(sk, TCP_CA_Open);
+@@ -2410,35 +2441,6 @@ static void tcp_try_undo_dsack(struct sock *sk)
+  }
+ }
+ 
+-/* We can clear retrans_stamp when there are no retransmissions in the
+- * window. It would seem that it is trivially available for us in
+- * tp->retrans_out, however, that kind of assumptions doesn't consider
+- * what will happen if errors occur when sending retransmission for the
+- * second time. ...It could the that such segment has only
+- * TCPCB_EVER_RETRANS set at the present time. It seems that checking
+- * the head skb is enough except for some reneging corner cases that
+- * are not worth the effort.
+- *
+- * Main reason for all this complexity is the fact that connection dying
+- * time now depends on the validity of the retrans_stamp, in particular,
+- * that successive retransmissions of a segment must not advance
+- * retrans_stamp under any conditions.
+- */
+-static bool tcp_any_retrans_done(const struct sock *sk)
+-{
+- const struct tcp_sock *tp = tcp_sk(sk);
+- struct sk_buff *skb;
+-
+- if (tp->retrans_out)
+-  return true;
+-
+- skb = tcp_write_queue_head(sk);
+- if (unlikely(skb && TCP_SKB_CB(skb)->sacked & TCPCB_EVER_RETRANS))
+-  return true;
+-
+- return false;
+-}
+-
+ /* Undo during fast recovery after partial ACK. */
+ 
+ static int tcp_try_undo_partial(struct sock *sk, int acked)
+-- 
+1.7.1

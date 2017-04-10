@@ -1,0 +1,74 @@
+From c17ab63ce1d56a255365dd20764356d93f6967e5 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:48 -0400
+Subject: [usb] uas: Fix command / task mgmt submission racing with disconnect
+
+Message-id: <1410887463-20674-337-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95502
+O-Subject: [RHEL7 PATCH 336/591] uas: Fix command / task mgmt submission racing with disconnect
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit c6f63207a3ba689025b2120792ea831cf72f9a81
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Wed Nov 13 09:24:15 2013 +0100
+
+    uas: Fix command / task mgmt submission racing with disconnect
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index cfe0102..8c68580 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -670,13 +670,15 @@ static int uas_queuecommand_lck(struct scsi_cmnd *cmnd,
+ 
+  BUILD_BUG_ON(sizeof(struct uas_cmd_info) > sizeof(struct scsi_pointer));
+ 
++ spin_lock_irqsave(&devinfo->lock, flags);
++
+  if (devinfo->resetting) {
+   cmnd->result = DID_ERROR << 16;
+   cmnd->scsi_done(cmnd);
++  spin_unlock_irqrestore(&devinfo->lock, flags);
+   return 0;
+  }
+ 
+- spin_lock_irqsave(&devinfo->lock, flags);
+  if (devinfo->cmnd) {
+   spin_unlock_irqrestore(&devinfo->lock, flags);
+   return SCSI_MLQUEUE_DEVICE_BUSY;
+@@ -740,6 +742,11 @@ static int uas_eh_task_mgmt(struct scsi_cmnd *cmnd,
+ 
+  spin_lock_irqsave(&devinfo->lock, flags);
+ 
++ if (devinfo->resetting) {
++  spin_unlock_irqrestore(&devinfo->lock, flags);
++  return FAILED;
++ }
++
+  if (devinfo->running_task) {
+   shost_printk(KERN_INFO, shost,
+         "%s: %s: error already running a task\n",
+@@ -809,6 +816,12 @@ static int uas_eh_abort_handler(struct scsi_cmnd *cmnd)
+  int ret;
+ 
+  spin_lock_irqsave(&devinfo->lock, flags);
++
++ if (devinfo->resetting) {
++  spin_unlock_irqrestore(&devinfo->lock, flags);
++  return FAILED;
++ }
++
+  uas_mark_cmd_dead(devinfo, cmdinfo, __func__);
+  if (cmdinfo->state & COMMAND_INFLIGHT) {
+   spin_unlock_irqrestore(&devinfo->lock, flags);
+-- 
+1.7.1

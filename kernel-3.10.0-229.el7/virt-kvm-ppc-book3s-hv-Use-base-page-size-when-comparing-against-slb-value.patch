@@ -1,0 +1,115 @@
+From 56af85a3fdc04a377eed1e427905ecb9f57e6e8d Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:12:35 -0400
+Subject: [virt] kvm/ppc: book3s/hv - Use base page size when comparing against slb value
+
+Message-id: <1410765214-16377-20-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94717
+O-Subject: [PATCH 19/78] KVM: PPC: BOOK3S: HV: Use base page size when comparing against slb value
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1123145
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit 341acbb3aabbcfbf069d7de4ad35f51b58176faf
+Author: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Date:   Mon Jun 16 00:17:07 2014 +0530
+
+    KVM: PPC: BOOK3S: HV: Use base page size when comparing against slb value
+
+    With guests supporting Multiple page size per segment (MPSS),
+    hpte_page_size returns the actual page size used. Add a new function to
+    return base page size and use that to compare against the the page size
+    calculated from SLB. Without this patch a hpte lookup can fail since
+    we are comparing wrong page size in kvmppc_hv_find_lock_hpte.
+
+    Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s_64.h b/arch/powerpc/include/asm/kvm_book3s_64.h
+index fddb72b..d645428 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_64.h
++++ b/arch/powerpc/include/asm/kvm_book3s_64.h
+@@ -198,8 +198,10 @@ static inline unsigned long compute_tlbie_rb(unsigned long v, unsigned long r,
+  return rb;
+ }
+ 
+-static inline unsigned long hpte_page_size(unsigned long h, unsigned long l)
++static inline unsigned long __hpte_page_size(unsigned long h, unsigned long l,
++          bool is_base_size)
+ {
++
+  int size, a_psize;
+  /* Look at the 8 bit LP value */
+  unsigned int lp = (l >> LP_SHIFT) & ((1 << LP_BITS) - 1);
+@@ -214,14 +216,27 @@ static inline unsigned long hpte_page_size(unsigned long h, unsigned long l)
+     continue;
+ 
+    a_psize = __hpte_actual_psize(lp, size);
+-   if (a_psize != -1)
++   if (a_psize != -1) {
++    if (is_base_size)
++     return 1ul << mmu_psize_defs[size].shift;
+     return 1ul << mmu_psize_defs[a_psize].shift;
++   }
+   }
+ 
+  }
+  return 0;
+ }
+ 
++static inline unsigned long hpte_page_size(unsigned long h, unsigned long l)
++{
++ return __hpte_page_size(h, l, 0);
++}
++
++static inline unsigned long hpte_base_page_size(unsigned long h, unsigned long l)
++{
++ return __hpte_page_size(h, l, 1);
++}
++
+ static inline unsigned long hpte_rpn(unsigned long ptel, unsigned long psize)
+ {
+  return ((ptel & HPTE_R_RPN) & ~(psize - 1)) >> PAGE_SHIFT;
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 45e495f..b858db3 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -1551,7 +1551,7 @@ static ssize_t kvm_htab_write(struct file *file, const char __user *buf,
+     goto out;
+    }
+    if (!rma_setup && is_vrma_hpte(v)) {
+-    unsigned long psize = hpte_page_size(v, r);
++    unsigned long psize = hpte_base_page_size(v, r);
+     unsigned long senc = slb_pgsize_encoding(psize);
+     unsigned long lpcr;
+ 
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_mmu.c b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index 941c21c..693ba77 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@ -811,13 +811,10 @@ long kvmppc_hv_find_lock_hpte(struct kvm *kvm, gva_t eaddr, unsigned long slb_v,
+    r = hpte[i+1];
+ 
+    /*
+-    * Check the HPTE again, including large page size
+-    * Since we don't currently allow any MPSS (mixed
+-    * page-size segment) page sizes, it is sufficient
+-    * to check against the actual page size.
++    * Check the HPTE again, including base page size
+     */
+    if ((v & valid) && (v & mask) == val &&
+-       hpte_page_size(v, r) == (1ul << pshift))
++       hpte_base_page_size(v, r) == (1ul << pshift))
+     /* Return with the HPTE still locked */
+     return (hash << 3) + (i >> 1);
+ 
+-- 
+1.7.1

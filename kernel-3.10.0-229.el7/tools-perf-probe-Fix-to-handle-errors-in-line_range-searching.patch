@@ -1,0 +1,79 @@
+From 622c076f00abb2f58c25f801f7d11317367fe009 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:06:08 -0400
+Subject: [tools] perf/probe: Fix to handle errors in line_range searching
+
+Message-id: <1410181752-25631-124-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91880
+O-Subject: [PATCH RHEL7.1 BZ1134356 123/307] perf probe: Fix to handle errors in line_range searching
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 182c228ebcf1ac67a44e62236d8f7a8a9a3c5699
+Author: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Date: Wed Apr 2 14:48:31 2014 +0900
+
+description
+===========
+As Namhyung reported(https://lkml.org/lkml/2014/4/1/89),
+current perf-probe -L option doesn't handle errors in line-range
+searching correctly. It causes a SEGV if an error occured in the
+line-range searching.
+
+  ----
+  $ perf probe -x ./perf -v -L map__load
+  Open Debuginfo file: /home/namhyung/project/linux/tools/perf/perf
+  fname: util/map.c, lineno:153
+  New line range: 153 to 2147483647
+  path: (null)
+  Segmentation fault (core dumped)
+  ----
+
+This is because line_range_inline_cb() ignores errors
+from find_line_range_by_line() which means that lr->path is
+already freed on the error path in find_line_range_by_line().
+As a result, get_real_path() accesses the lr->path and it
+causes a NULL pointer exception.
+
+This fixes line_range_inline_cb() to handle the error correctly,
+and report it to the caller.
+
+Anyway, this just fixes a possible SEGV bug, Namhyung's patch
+is also required.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/probe-finder.c b/tools/perf/util/probe-finder.c
+index 3bf0c8c..fae274e 100644
+--- a/tools/perf/util/probe-finder.c
++++ b/tools/perf/util/probe-finder.c
+@@ -1475,14 +1475,15 @@ static int find_line_range_by_line(Dwarf_Die *sp_die, struct line_finder *lf)
+ 
+ static int line_range_inline_cb(Dwarf_Die *in_die, void *data)
+ {
+- find_line_range_by_line(in_die, data);
++ int ret = find_line_range_by_line(in_die, data);
+ 
+  /*
+   * We have to check all instances of inlined function, because
+   * some execution paths can be optimized out depends on the
+-  * function argument of instances
++  * function argument of instances. However, if an error occurs,
++  * it should be handled by the caller.
+   */
+- return 0;
++ return ret < 0 ? ret : 0;
+ }
+ 
+ /* Search function definition from function name */
+-- 
+1.7.1

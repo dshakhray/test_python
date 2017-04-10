@@ -1,0 +1,101 @@
+From c842bda93d7c3be1f0490c2bdf015e733bc9f6fd Mon Sep 17 00:00:00 2001
+From: John Greene <jogreene@redhat.com>
+Date: Thu, 14 Aug 2014 14:41:55 -0400
+Subject: [ethernet] e1000e: Fix 82579 sets LPI too early
+
+Message-id: <1408027348-9610-2-git-send-email-jogreene@redhat.com>
+Patchwork-id: 87699
+O-Subject: [RHEL7.1 PATCH 01/34] e1000e: Fix 82579 sets LPI too early.
+Bugzilla: 1091119
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Enabling EEE LPI sooner than one second after link up on 82579 causes link
+issues with some switches.
+
+Remove EEE enablement for 82579 parts from the link initialization flow to
+avoid initializing too early.  EEE initialization for 82579 will be done
+in e1000e_update_phy_task.
+
+Signed-off-by: Dave Ertman <davidx.m.ertman@intel.com>
+Acked-by: Bruce W Allan <bruce.w.allan@intel.com>
+Tested-by: Jeff Pieper <jeffrey.e.pieper@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit a03206edfffdeea34e7246b5a0e0da6651511062)
+
+BZ: 1091119
+Testing: Acceptable, see BZ
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7834849
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/e1000e/ich8lan.c b/drivers/net/ethernet/intel/e1000e/ich8lan.c
+index 70e16f7..01ef19f 100644
+--- a/drivers/net/ethernet/intel/e1000e/ich8lan.c
++++ b/drivers/net/ethernet/intel/e1000e/ich8lan.c
+@@ -724,8 +724,14 @@ s32 e1000_write_emi_reg_locked(struct e1000_hw *hw, u16 addr, u16 data)
+  *  Enable/disable EEE based on setting in dev_spec structure, the duplex of
+  *  the link and the EEE capabilities of the link partner.  The LPI Control
+  *  register bits will remain set only if/when link is up.
++ *
++ *  EEE LPI must not be asserted earlier than one second after link is up.
++ *  On 82579, EEE LPI should not be enabled until such time otherwise there
++ *  can be link issues with some switches.  Other devices can have EEE LPI
++ *  enabled immediately upon link up since they have a timer in hardware which
++ *  prevents LPI from being asserted too early.
+  **/
+-static s32 e1000_set_eee_pchlan(struct e1000_hw *hw)
++s32 e1000_set_eee_pchlan(struct e1000_hw *hw)
+ {
+  struct e1000_dev_spec_ich8lan *dev_spec = &hw->dev_spec.ich8lan;
+  s32 ret_val;
+@@ -1106,9 +1112,11 @@ static s32 e1000_check_for_copper_link_ich8lan(struct e1000_hw *hw)
+  e1000e_check_downshift(hw);
+ 
+  /* Enable/Disable EEE after link up */
+- ret_val = e1000_set_eee_pchlan(hw);
+- if (ret_val)
+-  return ret_val;
++ if (hw->phy.type > e1000_phy_82579) {
++  ret_val = e1000_set_eee_pchlan(hw);
++  if (ret_val)
++   return ret_val;
++ }
+ 
+  /* If we are forcing speed/duplex, then we simply return since
+   * we have already determined whether we have link or not.
+diff --git a/drivers/net/ethernet/intel/e1000e/ich8lan.h b/drivers/net/ethernet/intel/e1000e/ich8lan.h
+index 5986569..09d3a58 100644
+--- a/drivers/net/ethernet/intel/e1000e/ich8lan.h
++++ b/drivers/net/ethernet/intel/e1000e/ich8lan.h
+@@ -268,4 +268,5 @@ void e1000_copy_rx_addrs_to_phy_ich8lan(struct e1000_hw *hw);
+ s32 e1000_lv_jumbo_workaround_ich8lan(struct e1000_hw *hw, bool enable);
+ s32 e1000_read_emi_reg_locked(struct e1000_hw *hw, u16 addr, u16 *data);
+ s32 e1000_write_emi_reg_locked(struct e1000_hw *hw, u16 addr, u16 data);
++s32 e1000_set_eee_pchlan(struct e1000_hw *hw);
+ #endif /* _E1000E_ICH8LAN_H_ */
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index d959dda..8ebb2d8 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -4483,11 +4483,16 @@ static void e1000e_update_phy_task(struct work_struct *work)
+  struct e1000_adapter *adapter = container_of(work,
+            struct e1000_adapter,
+            update_phy_task);
++ struct e1000_hw *hw = &adapter->hw;
+ 
+  if (test_bit(__E1000_DOWN, &adapter->state))
+   return;
+ 
+- e1000_get_phy_info(&adapter->hw);
++ e1000_get_phy_info(hw);
++
++ /* Enable EEE on 82579 after link up */
++ if (hw->phy.type == e1000_phy_82579)
++  e1000_set_eee_pchlan(hw);
+ }
+ 
+ /**
+-- 
+1.7.1

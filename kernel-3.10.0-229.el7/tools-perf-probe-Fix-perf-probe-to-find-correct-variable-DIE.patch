@@ -1,0 +1,82 @@
+From 0d5e7481c85386591a14db6f347c234a8dcbaea2 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:06:30 -0400
+Subject: [tools] perf/probe: Fix perf probe to find correct variable DIE
+
+Message-id: <1410181752-25631-146-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91999
+O-Subject: [PATCH RHEL7.1 BZ1134356 145/307] perf probe: Fix perf probe to find correct variable DIE
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 082f96a93eb5ba9bf771518a0dda590624568e8e
+Author: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Date: Thu May 29 21:19:30 2014 +0900
+
+description
+===========
+Fix perf probe to find correct variable DIE which has location or
+external instance by tracking down the lexical blocks.
+
+Current die_find_variable() expects that the all variable DIEs
+which has DW_TAG_variable have a location. However, since recent
+dwarf information may have declaration variable DIEs at the
+entry of function (subprogram), die_find_variable() returns it.
+
+To solve this problem, it must track down the DIE tree to find
+a DIE which has an actual location or a reference for external
+instance.
+
+e.g. finding a DIE which origin is <0xdc73>;
+
+ <1><11496>: Abbrev Number: 95 (DW_TAG_subprogram)
+    <11497>   DW_AT_abstract_origin: <0xdc42>
+    <1149b>   DW_AT_low_pc      : 0x1850
+[...]
+ <2><114cc>: Abbrev Number: 119 (DW_TAG_variable) <- this is a declaration
+    <114cd>   DW_AT_abstract_origin: <0xdc73>
+ <2><114d1>: Abbrev Number: 119 (DW_TAG_variable)
+[...]
+ <3><115a7>: Abbrev Number: 105 (DW_TAG_lexical_block)
+    <115a8>   DW_AT_ranges      : 0xaa0
+ <4><115ac>: Abbrev Number: 96 (DW_TAG_variable) <- this has a location
+    <115ad>   DW_AT_abstract_origin: <0xdc73>
+    <115b1>   DW_AT_location    : 0x486c        (location list)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/dwarf-aux.c b/tools/perf/util/dwarf-aux.c
+index 7defd77..cc66c40 100644
+--- a/tools/perf/util/dwarf-aux.c
++++ b/tools/perf/util/dwarf-aux.c
+@@ -747,14 +747,17 @@ struct __find_variable_param {
+ static int __die_find_variable_cb(Dwarf_Die *die_mem, void *data)
+ {
+  struct __find_variable_param *fvp = data;
++ Dwarf_Attribute attr;
+  int tag;
+ 
+  tag = dwarf_tag(die_mem);
+  if ((tag == DW_TAG_formal_parameter ||
+       tag == DW_TAG_variable) &&
+-     die_compare_name(die_mem, fvp->name))
++     die_compare_name(die_mem, fvp->name) &&
++ /* Does the DIE have location information or external instance? */
++     (dwarf_attr(die_mem, DW_AT_external, &attr) ||
++      dwarf_attr(die_mem, DW_AT_location, &attr)))
+   return DIE_FIND_CB_END;
+-
+  if (dwarf_haspc(die_mem, fvp->addr))
+   return DIE_FIND_CB_CONTINUE;
+  else
+-- 
+1.7.1

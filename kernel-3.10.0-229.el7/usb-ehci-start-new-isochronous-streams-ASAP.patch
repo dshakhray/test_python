@@ -1,0 +1,128 @@
+From e73e695b7d562740fbd64a33023da131a18a84e1 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:02:06 -0400
+Subject: [usb] ehci: start new isochronous streams ASAP
+
+Message-id: <1410887463-20674-55-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95562
+O-Subject: [RHEL7 PATCH 054/591] USB: EHCI: start new isochronous streams ASAP
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit a393a807d0c805e7c723315ff0e88a857055e9c6
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Fri Oct 11 11:29:36 2013 -0400
+
+    USB: EHCI: start new isochronous streams ASAP
+
+    This patch changes the initial delay before the startup of a newly
+    scheduled isochronous stream.  Currently the stream doesn't start
+    for at least 5 ms (40 microframes).  This value is just an estimate;
+    it has no real justification.
+
+    Instead, we can start the stream as soon as possible after the
+    scheduling computations are complete.  Essentially this requires
+    nothing more than reading the frame counter after the stream is
+    scheduled, instead of before.
+
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/host/ehci-sched.c b/drivers/usb/host/ehci-sched.c
+index b5f957d..7ce5c2a 100644
+--- a/drivers/usb/host/ehci-sched.c
++++ b/drivers/usb/host/ehci-sched.c
+@@ -1491,8 +1491,6 @@ sitd_slot_ok (
+  * given EHCI_TUNE_FLS and the slop).  Or, write a smarter scheduler!
+  */
+ 
+-#define SCHEDULING_DELAY 40 /* microframes */
+-
+ static int
+ iso_stream_schedule (
+  struct ehci_hcd  *ehci,
+@@ -1506,27 +1504,13 @@ iso_stream_schedule (
+  unsigned  mod = ehci->periodic_size << 3;
+  struct ehci_iso_sched *sched = urb->hcpriv;
+  bool   empty = list_empty(&stream->td_list);
++ bool   new_stream = false;
+ 
+  period = stream->uperiod;
+  span = sched->span;
+  if (!stream->highspeed)
+   span <<= 3;
+ 
+- now = ehci_read_frame_index(ehci) & (mod - 1);
+-
+- /* Take the isochronous scheduling threshold into account */
+- if (ehci->i_thresh)
+-  next = now + ehci->i_thresh; /* uframe cache */
+- else
+-  next = (now + 2 + 7) & ~0x07; /* full frame cache */
+-
+- /*
+-  * Use ehci->last_iso_frame as the base.  There can't be any
+-  * TDs scheduled for earlier than that.
+-  */
+- base = ehci->last_iso_frame << 3;
+- next = (next - base) & (mod - 1);
+-
+  /* Start a new isochronous stream? */
+  if (unlikely(empty && !hcd_periodic_completion_in_progress(
+    ehci_to_hcd(ehci), urb->ep))) {
+@@ -1542,7 +1526,7 @@ iso_stream_schedule (
+    }
+    compute_tt_budget(ehci->tt_budget, tt);
+ 
+-   start = (now & ~0x07) + SCHEDULING_DELAY;
++   start = ((-(++ehci->random_frame)) << 3) & (period - 1);
+ 
+    /* find a uframe slot with enough bandwidth.
+     * Early uframes are more precious because full-speed
+@@ -1585,17 +1569,35 @@ iso_stream_schedule (
+    start = (stream->ps.phase << 3) + stream->ps.phase_uf;
+   }
+ 
+-  start = (start - base) & (mod - 1);
+-  goto use_start;
++  stream->next_uframe = start;
++  new_stream = true;
+  }
+ 
++ now = ehci_read_frame_index(ehci) & (mod - 1);
++
++ /* Take the isochronous scheduling threshold into account */
++ if (ehci->i_thresh)
++  next = now + ehci->i_thresh; /* uframe cache */
++ else
++  next = (now + 2 + 7) & ~0x07; /* full frame cache */
++
++ /*
++  * Use ehci->last_iso_frame as the base.  There can't be any
++  * TDs scheduled for earlier than that.
++  */
++ base = ehci->last_iso_frame << 3;
++ next = (next - base) & (mod - 1);
++ start = (stream->next_uframe - base) & (mod - 1);
++
++ if (unlikely(new_stream))
++  goto do_ASAP;
++
+  /*
+   * Typical case: reuse current schedule, stream may still be active.
+   * Hopefully there are no gaps from the host falling behind
+   * (irq delays etc).  If there are, the behavior depends on
+   * whether URB_ISO_ASAP is set.
+   */
+- start = (stream->next_uframe - base) & (mod - 1);
+  now2 = (now - base) & (mod - 1);
+ 
+  /* Is the schedule already full? */
+-- 
+1.7.1

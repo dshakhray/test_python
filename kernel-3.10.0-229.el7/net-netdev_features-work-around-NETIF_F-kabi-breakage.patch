@@ -1,0 +1,162 @@
+From 6d03aaa455e66ab3d92a45019a68dabf72fe2f12 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Sun, 14 Sep 2014 19:49:54 -0400
+Subject: [net] netdev_features: work around NETIF_F kabi breakage
+
+Message-id: <1410724197-31885-5-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 94696
+O-Subject: [PATCH 58/57 RHEL7.1 net] net: netdev_features: work around NETIF_F kabi breakage
+Bugzilla: 1131999
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+
+BZ: 1131999
+
+Rhel specific.
+
+upstream is free to change NETIF_F_* flag ordering, as these are
+not exported to userspace.
+
+Unfortunately, as Jiri Benc points out, RHEL cannot do this, because
+it breaks KABI (out-of-tree network driver setting NETIF_F_X would
+possibly set an enitely different bit).
+
+This fixes it up, following suggestion from Jiri.
+
+The new values are moved to the end, then net_gso_ok()
+is munged to account for the fact that the GSO_* bits are no longer
+contained in a single range.
+
+This is not very nice, however, this allows to take advantage of nic
+hardware that can compute checksum of headers contained in encapsulation
+tunnels.
+
+Following backported commits are affected (upstream commit ids):
+
+4b28252cada3d0521ab (net: Fix GSO constants to match NETIF flags)
+4749c09c37030ccdc44 (gre: Call gso_make_checksum)
+0f4f4ffa7b7c3d29d05 (net: Add GSO support for UDP tunnels with checksum)
+
+Signed-off-by: Florian Westphal <fwestpha@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/netdev_features.h b/include/linux/netdev_features.h
+index 9c7f20c..c8c838d 100644
+--- a/include/linux/netdev_features.h
++++ b/include/linux/netdev_features.h
+@@ -42,11 +42,9 @@ enum {
+  NETIF_F_TSO6_BIT,  /* ... TCPv6 segmentation */
+  NETIF_F_FSO_BIT,  /* ... FCoE segmentation */
+  NETIF_F_GSO_GRE_BIT,  /* ... GRE with TSO */
+- NETIF_F_GSO_GRE_CSUM_BIT, /* ... GRE with csum with TSO */
+  NETIF_F_GSO_IPIP_BIT,  /* ... IPIP tunnel with TSO */
+  NETIF_F_GSO_SIT_BIT,  /* ... SIT tunnel with TSO */
+  NETIF_F_GSO_UDP_TUNNEL_BIT, /* ... UDP TUNNEL with TSO */
+- NETIF_F_GSO_UDP_TUNNEL_CSUM_BIT,/* ... UDP TUNNEL with TSO & CSUM */
+  NETIF_F_GSO_MPLS_BIT,  /* ... MPLS segmentation */
+  /**/NETIF_F_GSO_LAST =  /* last bit, see GSO_MASK */
+   NETIF_F_GSO_MPLS_BIT,
+@@ -65,6 +63,8 @@ enum {
+  NETIF_F_HW_VLAN_STAG_RX_BIT, /* Receive VLAN STAG HW acceleration */
+  NETIF_F_HW_VLAN_STAG_FILTER_BIT,/* Receive filtering on VLAN STAGs */
+  NETIF_F_BUSY_POLL_BIT,  /* Busy poll */
++ NETIF_F_GSO_GRE_CSUM_BIT, /* ... GRE with csum with TSO */
++ NETIF_F_GSO_UDP_TUNNEL_CSUM_BIT,/* ... UDP TUNNEL with TSO & CSUM */
+ 
+  /*
+   * Add your fresh new feature above and remember to update
+@@ -134,8 +134,14 @@ enum {
+   ~NETIF_F_NEVER_CHANGE)
+ 
+ /* Segmentation offload feature mask */
+-#define NETIF_F_GSO_MASK (__NETIF_F_BIT(NETIF_F_GSO_LAST + 1) - \
+-  __NETIF_F_BIT(NETIF_F_GSO_SHIFT))
++#define NETIF_F_GSO2_MASK (NETIF_F_GSO_GRE_CSUM|NETIF_F_GSO_UDP_TUNNEL_CSUM)
++#define NETIF_F_GSO_MASK ((__NETIF_F_BIT(NETIF_F_GSO_LAST + 1) - \
++     __NETIF_F_BIT(NETIF_F_GSO_SHIFT)) | \
++    NETIF_F_GSO2_MASK)
++
++#define NETIF_F_GSO2_SHIFT (NETIF_F_GSO_GRE_CSUM_BIT - \
++  (NETIF_F_GSO_LAST + 1 - NETIF_F_GSO_SHIFT))
++
+ 
+ /* List of features with software fallbacks. */
+ #define NETIF_F_GSO_SOFTWARE (NETIF_F_TSO | NETIF_F_TSO_ECN | \
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index e6135aa..1fafa0a 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3003,7 +3003,15 @@ netdev_features_t netif_skb_features(struct sk_buff *skb);
+ 
+ static inline bool net_gso_ok(netdev_features_t features, int gso_type)
+ {
+- netdev_features_t feature = gso_type << NETIF_F_GSO_SHIFT;
++ netdev_features_t feature = gso_type & SKB_GSO1_MASK;
++
++ feature <<= NETIF_F_GSO_SHIFT;
++
++ if (gso_type & SKB_GSO2_MASK) {
++  netdev_features_t f = gso_type & SKB_GSO2_MASK;
++  f <<= NETIF_F_GSO2_SHIFT;
++  feature |= f;
++ }
+ 
+  /* check flags correspondence */
+  BUILD_BUG_ON(SKB_GSO_TCPV4   != (NETIF_F_TSO >> NETIF_F_GSO_SHIFT));
+@@ -3013,13 +3021,15 @@ static inline bool net_gso_ok(netdev_features_t features, int gso_type)
+  BUILD_BUG_ON(SKB_GSO_TCPV6   != (NETIF_F_TSO6 >> NETIF_F_GSO_SHIFT));
+  BUILD_BUG_ON(SKB_GSO_FCOE    != (NETIF_F_FSO >> NETIF_F_GSO_SHIFT));
+  BUILD_BUG_ON(SKB_GSO_GRE     != (NETIF_F_GSO_GRE >> NETIF_F_GSO_SHIFT));
+- BUILD_BUG_ON(SKB_GSO_GRE_CSUM != (NETIF_F_GSO_GRE_CSUM >> NETIF_F_GSO_SHIFT));
+  BUILD_BUG_ON(SKB_GSO_IPIP    != (NETIF_F_GSO_IPIP >> NETIF_F_GSO_SHIFT));
+  BUILD_BUG_ON(SKB_GSO_SIT     != (NETIF_F_GSO_SIT >> NETIF_F_GSO_SHIFT));
+  BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL != (NETIF_F_GSO_UDP_TUNNEL >> NETIF_F_GSO_SHIFT));
+- BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL_CSUM != (NETIF_F_GSO_UDP_TUNNEL_CSUM >> NETIF_F_GSO_SHIFT));
+  BUILD_BUG_ON(SKB_GSO_MPLS    != (NETIF_F_GSO_MPLS >> NETIF_F_GSO_SHIFT));
+ 
++ /* GSO2 flags, see netdev_features.h */
++ BUILD_BUG_ON(SKB_GSO_GRE_CSUM != (NETIF_F_GSO_GRE_CSUM >> NETIF_F_GSO2_SHIFT));
++ BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL_CSUM != (NETIF_F_GSO_UDP_TUNNEL_CSUM >> NETIF_F_GSO2_SHIFT));
++
+  return (features & feature) == feature;
+ }
+ 
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 676244d..c9eaa51 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -357,20 +357,24 @@ enum {
+ 
+  SKB_GSO_GRE = 1 << 6,
+ 
+- SKB_GSO_GRE_CSUM = 1 << 7,
++ SKB_GSO_IPIP = 1 << 7,
+ 
+- SKB_GSO_IPIP = 1 << 8,
++ SKB_GSO_SIT = 1 << 8,
+ 
+- SKB_GSO_SIT = 1 << 9,
++ SKB_GSO_UDP_TUNNEL = 1 << 9,
+ 
+- SKB_GSO_UDP_TUNNEL = 1 << 10,
++ SKB_GSO_MPLS = 1 << 10,
+ 
+- SKB_GSO_UDP_TUNNEL_CSUM = 1 << 11,
+-
+- SKB_GSO_MPLS = 1 << 12,
++ /* GSO_MASK2, see netdev_features.h */
++ SKB_GSO_GRE_CSUM = 1 << 11,
+ 
++ SKB_GSO_UDP_TUNNEL_CSUM = 1 << 12,
+ };
+ 
++/* NETIF_F_GSO flags are no longer part of a single range */
++#define SKB_GSO1_MASK (SKB_GSO_GRE_CSUM - 1)
++#define SKB_GSO2_MASK (SKB_GSO_GRE_CSUM|SKB_GSO_UDP_TUNNEL_CSUM)
++
+ #if BITS_PER_LONG > 32
+ #define NET_SKBUFF_DATA_USES_OFFSET 1
+ #endif
+-- 
+1.7.1

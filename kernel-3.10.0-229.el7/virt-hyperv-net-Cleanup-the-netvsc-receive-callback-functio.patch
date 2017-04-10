@@ -1,0 +1,110 @@
+From aac43c877dc8b7852f572cdf6ac647e6f7751bbb Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Mon, 29 Sep 2014 00:58:51 -0400
+Subject: [virt] hyperv/net: Cleanup the netvsc receive callback functio
+
+Message-id: <1411952358-34104-8-git-send-email-jasowang@redhat.com>
+Patchwork-id: 96764
+O-Subject: [RHEL7.1 PATCH 07/34] Drivers: net: hyperv: Cleanup the netvsc receive callback functio
+Bugzilla: 1146357
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+
+From: KY Srinivasan <kys@microsoft.com>
+
+Bugzilla: 1146357
+
+Get rid of the buffer allocation in the receive path for normal packets.
+
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee0c4c39c577d07c05749a5f5b960b4c0fdd8097)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index b1a4aa6..33b42bf 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -508,6 +508,8 @@ struct netvsc_device {
+ 
+  /* Holds rndis device info */
+  void *extension;
++ /* The recive buffer for this device */
++ unsigned char cb_buffer[NETVSC_PACKET_SIZE];
+ };
+ 
+ /* NdisInitialize message */
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 898b6b6..15f899a 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -801,22 +801,16 @@ static void netvsc_channel_cb(void *context)
+  struct netvsc_device *net_device;
+  u32 bytes_recvd;
+  u64 request_id;
+- unsigned char *packet;
+  struct vmpacket_descriptor *desc;
+  unsigned char *buffer;
+  int bufferlen = NETVSC_PACKET_SIZE;
+  struct net_device *ndev;
+ 
+- packet = kzalloc(NETVSC_PACKET_SIZE * sizeof(unsigned char),
+-    GFP_ATOMIC);
+- if (!packet)
+-  return;
+- buffer = packet;
+-
+  net_device = get_inbound_net_device(device);
+  if (!net_device)
+-  goto out;
++  return;
+  ndev = net_device->ndev;
++ buffer = net_device->cb_buffer;
+ 
+  do {
+   ret = vmbus_recvpacket_raw(device->channel, buffer, bufferlen,
+@@ -844,23 +838,16 @@ static void netvsc_channel_cb(void *context)
+      break;
+     }
+ 
+-    /* reset */
+-    if (bufferlen > NETVSC_PACKET_SIZE) {
+-     kfree(buffer);
+-     buffer = packet;
+-     bufferlen = NETVSC_PACKET_SIZE;
+-    }
+    } else {
+-    /* reset */
+-    if (bufferlen > NETVSC_PACKET_SIZE) {
+-     kfree(buffer);
+-     buffer = packet;
+-     bufferlen = NETVSC_PACKET_SIZE;
+-    }
+-
++    /*
++     * We are done for this pass.
++     */
+     break;
+    }
++
+   } else if (ret == -ENOBUFS) {
++   if (bufferlen > NETVSC_PACKET_SIZE)
++    kfree(buffer);
+    /* Handle large packet */
+    buffer = kmalloc(bytes_recvd, GFP_ATOMIC);
+    if (buffer == NULL) {
+@@ -875,8 +862,8 @@ static void netvsc_channel_cb(void *context)
+   }
+  } while (1);
+ 
+-out:
+- kfree(buffer);
++ if (bufferlen > NETVSC_PACKET_SIZE)
++  kfree(buffer);
+  return;
+ }
+ 
+-- 
+1.7.1

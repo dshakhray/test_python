@@ -1,0 +1,66 @@
+From 0069753db081e3e180c91db314d7fdb157a6b678 Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Thu, 23 Oct 2014 19:39:03 -0400
+Subject: [fs] xfs: xfs_vm_write_end truncates too much on failure
+
+Message-id: <1414093144-51675-4-git-send-email-bfoster@redhat.com>
+Patchwork-id: 98333
+O-Subject: [RHEL7.1 PATCH 3/4] xfs: xfs_vm_write_end truncates too much on failure
+Bugzilla: 1032968
+RH-Acked-by: Carlos Maiolino <cmaiolino@redhat.com>
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+commit aad3f3755e7f043789b772856d1a2935f2b41a4b
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Mon Apr 14 18:14:11 2014 +1000
+
+    xfs: xfs_vm_write_end truncates too much on failure
+
+    Similar to the write_begin problem, xfs-vm_write_end will truncate
+    back to the old EOF, potentially removing page cache from over the
+    top of delalloc blocks with valid data in them. Fix this by
+    truncating back to just the start of the failed write.
+
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Tested-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 106d80b..2d0f55e 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -1663,9 +1663,12 @@ xfs_vm_write_begin(
+ }
+ 
+ /*
+- * On failure, we only need to kill delalloc blocks beyond EOF because they
+- * will never be written. For blocks within EOF, generic_write_end() zeros them
+- * so they are safe to leave alone and be written with all the other valid data.
++ * On failure, we only need to kill delalloc blocks beyond EOF in the range of
++ * this specific write because they will never be written. Previous writes
++ * beyond EOF where block allocation succeeded do not need to be trashed, so
++ * only new blocks from this write should be trashed. For blocks within
++ * EOF, generic_write_end() zeros them so they are safe to leave alone and be
++ * written with all the other valid data.
+  */
+ STATIC int
+ xfs_vm_write_end(
+@@ -1688,8 +1691,11 @@ xfs_vm_write_end(
+   loff_t  to = pos + len;
+ 
+   if (to > isize) {
+-   truncate_pagecache(inode, isize);
++   /* only kill blocks in this write beyond EOF */
++   if (pos > isize)
++    isize = pos;
+    xfs_vm_kill_delalloc_range(inode, isize, to);
++   truncate_pagecache_range(inode, isize, to);
+   }
+  }
+  return ret;
+-- 
+1.7.1

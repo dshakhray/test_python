@@ -1,0 +1,244 @@
+From 485d49932027348fca27085668038d220d219850 Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Wed, 18 Jun 2014 10:27:47 -0400
+Subject: [s390] kernel: remove page table walk for user space accesses
+
+Message-id: <1403087280-902-2-git-send-email-brueckner@redhat.com>
+Patchwork-id: 84243
+O-Subject: [RHEL7.1 PATCH 01/14] [s390] kernel: remove page table walk for user space accesses
+Bugzilla: 1099147
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Description
+-----------
+This is a revert of:
+
+    commit 127226847d3a96460eb87a99ed03f6cafeb7868d
+    Author: Hendrik Brueckner <brueckner@redhat.com>
+    Date:   Tue May 20 14:52:38 2014 -0400
+
+        [s390] kernel: avoid page table walk on user space access
+
+        Message-id: <1400597558-12611-1-git-send-email-brueckner@redhat.com>
+        Patchwork-id: 79989
+        O-Subject: [RHEL7.1 PATCH] [s390] kernel: avoid page table walk on user space access
+        Bugzilla: 1097687
+        RH-Acked-by: Steve Best <sbest@redhat.com>
+        RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+        RH-Acked-by: Rik van Riel <riel@redhat.com>
+
+        Description
+        -----------
+        Correct unexpected program crashes and random data corruption.
+
+        The user space access functions perform page table walks in order to
+        translate a user space virtual address to a physical address.  While
+        doing that the kernel must make sure the page table can not be changed
+        concurrently from a different CPU.
+        Therefore the page table lock must be held.  However instead of acquiring
+        the per page table split page table lock the kernel incorrectly acquired
+        the per mm global page table lock.  This allows different CPUs to modify
+        the page table contents while its contents are inspected and being used to
+        access the corresponding user space address space.
+
+        Therefore the kernel might access a page which was concurrently freed on a
+        different CPU, which can lead to data corruption.  This problem exists
+        only on machines prior to IBM System z10.  With the z10 machine the mvcos
+        instruction was made available which is used to access user space without
+        a page table walk.  Furthermore if the "switch_amode" kernel parameter was
+        specified (default since kernel version 3.7) the same problem exists for
+        futex operations also for z10 machines and newer.
+
+        Avoid page table walks and use machine instructions to access user space.
+        This avoids all locking issues.
+
+        Bugzilla
+        --------
+        BZ 1097687
+        https://bugzilla.redhat.com/show_bug.cgi?id=1097687
+
+        Upstream status of the patch
+        ----------------------------
+        This patch is a minimal solution targeted for a RHEL7.0 z-stream release.
+        The main related upstream commit ID is
+        457f2180951cdcbfb4657ddcc83b486e93497f56 "s390/uaccess: rework uaccess
+        code - fix locking issues".
+
+        I am going to post the complete upstream series to solve this issue in
+        RHEL7.1.  The upstream series involves about 12 commit IDs which I considered
+        to be too complex and large for a RHEL7.0 z-stream release.  The Red Hat BZ
+        is 1099147 - kernel: remove page table walk for user space accesses.
+
+        This patch is relevant for a z-stream release.
+
+Note
+----
+This revert is the first patch of a series to remove page table walks and
+rework the user space access code to use machine instructions to access user
+space. This avoids all locking issues.
+
+Bugzilla
+--------
+BZ 1099147
+https://bugzilla.redhat.com/show_bug.cgi?id=1099147
+
+Upstream status of the patch
+----------------------------
+This revert is specific to the RHEL7.0 release.  The reverted patch was
+designated a small solution to be delivered as z-stream (EUS) release.  This
+revert re-creates the base to apply multiple upstream patches.
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7588402
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/s390/lib/uaccess_mvcos.c b/arch/s390/lib/uaccess_mvcos.c
+index 7c232be..1829742 100644
+--- a/arch/s390/lib/uaccess_mvcos.c
++++ b/arch/s390/lib/uaccess_mvcos.c
+@@ -200,79 +200,6 @@ static size_t strncpy_from_user_mvcos(size_t count, const char __user *src,
+  return done;
+ }
+ 
+-#define __futex_atomic_op(insn, ret, oldval, newval, uaddr, oparg) \
+- asm volatile(       \
+-  "   sacf  256\n"     \
+-  "0: l     %1,0(%6)\n"     \
+-  "1:"insn      \
+-  "2: cs    %1,%2,0(%6)\n"    \
+-  "3: jl    1b\n"      \
+-  "   lhi   %0,0\n"     \
+-  "4: sacf  768\n"     \
+-  EX_TABLE(0b,4b) EX_TABLE(2b,4b) EX_TABLE(3b,4b)  \
+-  : "=d" (ret), "=&d" (oldval), "=&d" (newval),  \
+-    "=m" (*uaddr)      \
+-  : "0" (-EFAULT), "d" (oparg), "a" (uaddr),  \
+-    "m" (*uaddr) : "cc");
+-
+-static int futex_atomic_op_mvcos(int op, u32 __user *uaddr, int oparg, int *old)
+-{
+- int oldval = 0, newval, ret;
+- unsigned long asce;
+-
+- __ctl_store(asce, 1, 1);
+- __ctl_load(S390_lowcore.kernel_asce, 1, 1);
+- switch (op) {
+- case FUTEX_OP_SET:
+-  __futex_atomic_op("lr %2,%5\n",
+-      ret, oldval, newval, uaddr, oparg);
+-  break;
+- case FUTEX_OP_ADD:
+-  __futex_atomic_op("lr %2,%1\nar %2,%5\n",
+-      ret, oldval, newval, uaddr, oparg);
+-  break;
+- case FUTEX_OP_OR:
+-  __futex_atomic_op("lr %2,%1\nor %2,%5\n",
+-      ret, oldval, newval, uaddr, oparg);
+-  break;
+- case FUTEX_OP_ANDN:
+-  __futex_atomic_op("lr %2,%1\nnr %2,%5\n",
+-      ret, oldval, newval, uaddr, oparg);
+-  break;
+- case FUTEX_OP_XOR:
+-  __futex_atomic_op("lr %2,%1\nxr %2,%5\n",
+-      ret, oldval, newval, uaddr, oparg);
+-  break;
+- default:
+-  ret = -ENOSYS;
+- }
+- *old = oldval;
+- __ctl_load(asce, 1, 1);
+- return ret;
+-}
+-
+-static int futex_atomic_cmpxchg_mvcos(u32 *uval, u32 __user *uaddr,
+-          u32 oldval, u32 newval)
+-{
+- unsigned long asce;
+- int ret;
+-
+- __ctl_store(asce, 1, 1);
+- __ctl_load(S390_lowcore.kernel_asce, 1, 1);
+- asm volatile(
+-  "   sacf 256\n"
+-  "0: cs   %1,%4,0(%5)\n"
+-  "1: la   %0,0\n"
+-  "2: sacf 768\n"
+-  EX_TABLE(0b,2b) EX_TABLE(1b,2b)
+-  : "=d" (ret), "+d" (oldval), "=m" (*uaddr)
+-  : "0" (-EFAULT), "d" (newval), "a" (uaddr), "m" (*uaddr)
+-  : "cc", "memory" );
+- *uval = oldval;
+- __ctl_load(asce, 1, 1);
+- return ret;
+-}
+-
+ struct uaccess_ops uaccess_mvcos = {
+  .copy_from_user = copy_from_user_mvcos_check,
+  .copy_from_user_small = copy_from_user_std,
+@@ -295,6 +222,6 @@ struct uaccess_ops uaccess_mvcos_switch = {
+  .clear_user = clear_user_mvcos,
+  .strnlen_user = strnlen_user_mvcos,
+  .strncpy_from_user = strncpy_from_user_mvcos,
+- .futex_atomic_op = futex_atomic_op_mvcos,
+- .futex_atomic_cmpxchg = futex_atomic_cmpxchg_mvcos,
++ .futex_atomic_op = futex_atomic_op_pt,
++ .futex_atomic_cmpxchg = futex_atomic_cmpxchg_pt,
+ };
+diff --git a/arch/s390/lib/uaccess_std.c b/arch/s390/lib/uaccess_std.c
+index 3ebd8fc..4a75d47 100644
+--- a/arch/s390/lib/uaccess_std.c
++++ b/arch/s390/lib/uaccess_std.c
+@@ -69,6 +69,14 @@ size_t copy_from_user_std(size_t size, const void __user *ptr, void *x)
+  return size;
+ }
+ 
++static size_t copy_from_user_std_check(size_t size, const void __user *ptr,
++           void *x)
++{
++ if (size <= 1024)
++  return copy_from_user_std(size, ptr, x);
++ return copy_from_user_pt(size, ptr, x);
++}
++
+ size_t copy_to_user_std(size_t size, void __user *ptr, const void *x)
+ {
+  unsigned long tmp1, tmp2;
+@@ -101,6 +109,14 @@ size_t copy_to_user_std(size_t size, void __user *ptr, const void *x)
+  return size;
+ }
+ 
++static size_t copy_to_user_std_check(size_t size, void __user *ptr,
++         const void *x)
++{
++ if (size <= 1024)
++  return copy_to_user_std(size, ptr, x);
++ return copy_to_user_pt(size, ptr, x);
++}
++
+ static size_t copy_in_user_std(size_t size, void __user *to,
+           const void __user *from)
+ {
+@@ -276,9 +292,9 @@ int futex_atomic_cmpxchg_std(u32 *uval, u32 __user *uaddr,
+ }
+ 
+ struct uaccess_ops uaccess_std = {
+- .copy_from_user = copy_from_user_std,
++ .copy_from_user = copy_from_user_std_check,
+  .copy_from_user_small = copy_from_user_std,
+- .copy_to_user = copy_to_user_std,
++ .copy_to_user = copy_to_user_std_check,
+  .copy_to_user_small = copy_to_user_std,
+  .copy_in_user = copy_in_user_std,
+  .clear_user = clear_user_std,
+-- 
+1.7.1

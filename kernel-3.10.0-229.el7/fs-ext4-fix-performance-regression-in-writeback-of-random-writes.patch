@@ -1,0 +1,92 @@
+From 5560becc4ea0f4b73802ea291e071d28bce1843f Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:53:43 -0400
+Subject: [fs] ext4: fix performance regression in writeback of random writes
+
+Message-id: <1414058125-4183-70-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98176
+O-Subject: [RHEL 7.1 PATCH v2 069/171] ext4: fix performance regression in writeback of random writes
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Jan Kara <jack@suse.cz>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit 9c12a831d73dd938a22418d70b39aed4feb4bdf2
+
+ The Linux Kernel Performance project guys have reported that commit
+ 4e7ea81db5 introduces a performance regression for the following fio
+ workload:
+
+ [global]
+ direct=0
+ ioengine=mmap
+ size=1500M
+ bs=4k
+ pre_read=1
+ numjobs=1
+ overwrite=1
+ loops=5
+ runtime=300
+ group_reporting
+ invalidate=0
+ directory=/mnt/
+ file_service_type=random:36
+ file_service_type=random:36
+
+ [job0]
+ startdelay=0
+ rw=randrw
+ filename=data0/f1:data0/f2
+
+ [job1]
+ startdelay=0
+ rw=randrw
+ filename=data0/f2:data0/f1
+ ...
+
+ [job7]
+ startdelay=0
+ rw=randrw
+ filename=data0/f2:data0/f1
+
+ The culprit of the problem is that after the commit ext4_writepages()
+ are more aggressive in writing back pages. Thus we have less consecutive
+ dirty pages resulting in more seeking.
+
+ This increased aggressivity is caused by a bug in the condition
+ terminating ext4_writepages(). We start writing from the beginning of
+ the file even if we should have terminated ext4_writepages() because
+ wbc->nr_to_write <= 0.
+
+ After fixing the condition the throughput of the fio workload is about 20%
+ better than before writeback reorganization.
+
+ Reported-by: "Yan, Zheng" <zheng.z.yan@intel.com>
+ Signed-off-by: Jan Kara <jack@suse.cz>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 4a2a4df..ac4bfa3 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2560,7 +2560,7 @@ retry:
+    break;
+  }
+  blk_finish_plug(&plug);
+- if (!ret && !cycled) {
++ if (!ret && !cycled && wbc->nr_to_write > 0) {
+   cycled = 1;
+   mpd.last_page = writeback_index - 1;
+   mpd.first_page = 0;
+-- 
+1.7.1

@@ -1,0 +1,103 @@
+From efcd6be1a04a2e28ff5eee39e19f02a35709d27f Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 24 Sep 2014 15:21:48 -0400
+Subject: [infiniband] ocrdma: Use non-zero tag in SRQ posting
+
+Message-id: <2bab167ed06412c58ccb56e34746cb8e2c436459.1411571481.git.dledford@redhat.com>
+Patchwork-id: 96612
+O-Subject: [Patch RHEL7 13/48] RDMA/ocrdma: Use non-zero tag in SRQ posting
+Bugzilla: 1081067 1088577
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Selvin Xavier <selvin.xavier@emulex.com>
+
+As part of SRQ receive buffers posting we populate a non-zero tag
+which will be returned in SRQ receive completions.
+
+Signed-off-by: Selvin Xavier <selvin.xavier@emulex.com>
+Signed-off-by: Devesh Sharma <devesh.sharma@emulex.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit cf5788ade718a2cc654170ff11c7d6f6f1ecbdcc)
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index e1b373c..40b5559 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -1536,7 +1536,7 @@ static void ocrdma_discard_cqes(struct ocrdma_qp *qp, struct ocrdma_cq *cq)
+  int discard_cnt = 0;
+  u32 cur_getp, stop_getp;
+  struct ocrdma_cqe *cqe;
+- u32 qpn = 0;
++ u32 qpn = 0, wqe_idx = 0;
+ 
+  spin_lock_irqsave(&cq->cq_lock, cq_flags);
+ 
+@@ -1565,24 +1565,29 @@ static void ocrdma_discard_cqes(struct ocrdma_qp *qp, struct ocrdma_cq *cq)
+   if (qpn == 0 || qpn != qp->id)
+    goto skip_cqe;
+ 
+-  /* mark cqe discarded so that it is not picked up later
+-   * in the poll_cq().
+-   */
+-  discard_cnt += 1;
+-  cqe->cmn.qpn = 0;
+   if (is_cqe_for_sq(cqe)) {
+    ocrdma_hwq_inc_tail(&qp->sq);
+   } else {
+    if (qp->srq) {
++    wqe_idx = (le32_to_cpu(cqe->rq.buftag_qpn) >>
++     OCRDMA_CQE_BUFTAG_SHIFT) &
++     qp->srq->rq.max_wqe_idx;
++    if (wqe_idx < 1)
++     BUG();
+     spin_lock_irqsave(&qp->srq->q_lock, flags);
+     ocrdma_hwq_inc_tail(&qp->srq->rq);
+-    ocrdma_srq_toggle_bit(qp->srq, cur_getp);
++    ocrdma_srq_toggle_bit(qp->srq, wqe_idx - 1);
+     spin_unlock_irqrestore(&qp->srq->q_lock, flags);
+ 
+    } else {
+     ocrdma_hwq_inc_tail(&qp->rq);
+    }
+   }
++  /* mark cqe discarded so that it is not picked up later
++   * in the poll_cq().
++   */
++  discard_cnt += 1;
++  cqe->cmn.qpn = 0;
+ skip_cqe:
+   cur_getp = (cur_getp + 1) % cq->max_hw_cqe;
+  } while (cur_getp != stop_getp);
+@@ -2236,7 +2241,7 @@ static int ocrdma_srq_get_idx(struct ocrdma_srq *srq)
+ 
+  if (row == srq->bit_fields_len)
+   BUG();
+- return indx;
++ return indx + 1; /* Use from index 1 */
+ }
+ 
+ static void ocrdma_ring_srq_db(struct ocrdma_srq *srq)
+@@ -2573,10 +2578,13 @@ static void ocrdma_update_free_srq_cqe(struct ib_wc *ibwc,
+ 
+  srq = get_ocrdma_srq(qp->ibqp.srq);
+  wqe_idx = (le32_to_cpu(cqe->rq.buftag_qpn) >>
+-   OCRDMA_CQE_BUFTAG_SHIFT) & srq->rq.max_wqe_idx;
++  OCRDMA_CQE_BUFTAG_SHIFT) & srq->rq.max_wqe_idx;
++ if (wqe_idx < 1)
++  BUG();
++
+  ibwc->wr_id = srq->rqe_wr_id_tbl[wqe_idx];
+  spin_lock_irqsave(&srq->q_lock, flags);
+- ocrdma_srq_toggle_bit(srq, wqe_idx);
++ ocrdma_srq_toggle_bit(srq, wqe_idx - 1);
+  spin_unlock_irqrestore(&srq->q_lock, flags);
+  ocrdma_hwq_inc_tail(&srq->rq);
+ }
+-- 
+1.7.1

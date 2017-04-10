@@ -1,0 +1,101 @@
+From b1f1c1c89df83a9e0999a91a72c0d70b43b832e8 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:02:09 -0400
+Subject: [ethernet] mlx4: Correctly configure single ported VFs from the host
+
+Message-id: <3e2ad1d73f742fe482ed9d2d60612448fc29c7d9.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93698
+O-Subject: [Patch RHEL7.1 V1 193/197] net/mlx4: Correctly configure single ported VFs from the host
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Matan Barak <matanb@mellanox.com>
+
+Single port VFs are seen PCI wise on both ports of the PF (we don't have
+single port PFs with ConnectX). With this in mind, it's possible for
+virtualization tools to try and configure a single ported VF through
+the "wrong" PF port.
+
+To handle that, we use the PF driver mapping of single port VFs to NIC
+ports and adjust the port value before calling into the low level
+code that does the actual VF configuration
+
+Fixes: 449fc48 ('net/mlx4: Adapt code for N-Port VF')
+Signed-off-by: Matan Barak <matanb@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a91c772fa0275163508e1078ff6d474d423244fb)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/cmd.c b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+index b04c02e..2699c4b 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+@@ -2389,6 +2389,22 @@ struct mlx4_slaves_pport mlx4_phys_to_slaves_pport_actv(
+ }
+ EXPORT_SYMBOL_GPL(mlx4_phys_to_slaves_pport_actv);
+ 
++static int mlx4_slaves_closest_port(struct mlx4_dev *dev, int slave, int port)
++{
++ struct mlx4_active_ports actv_ports = mlx4_get_active_ports(dev, slave);
++ int min_port = find_first_bit(actv_ports.ports, dev->caps.num_ports)
++   + 1;
++ int max_port = min_port +
++  bitmap_weight(actv_ports.ports, dev->caps.num_ports);
++
++ if (port < min_port)
++  port = min_port;
++ else if (port >= max_port)
++  port = max_port - 1;
++
++ return port;
++}
++
+ int mlx4_set_vf_mac(struct mlx4_dev *dev, int port, int vf, u64 mac)
+ {
+  struct mlx4_priv *priv = mlx4_priv(dev);
+@@ -2402,6 +2418,7 @@ int mlx4_set_vf_mac(struct mlx4_dev *dev, int port, int vf, u64 mac)
+  if (slave < 0)
+   return -EINVAL;
+ 
++ port = mlx4_slaves_closest_port(dev, slave, port);
+  s_info = &priv->mfunc.master.vf_admin[slave].vport[port];
+  s_info->mac = mac;
+  mlx4_info(dev, "default mac on vf %d port %d to %llX will take afect only after vf restart\n",
+@@ -2428,6 +2445,7 @@ int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos)
+  if (slave < 0)
+   return -EINVAL;
+ 
++ port = mlx4_slaves_closest_port(dev, slave, port);
+  vf_admin = &priv->mfunc.master.vf_admin[slave].vport[port];
+ 
+  if ((0 == vlan) && (0 == qos))
+@@ -2455,6 +2473,7 @@ bool mlx4_get_slave_default_vlan(struct mlx4_dev *dev, int port, int slave,
+  struct mlx4_priv *priv;
+ 
+  priv = mlx4_priv(dev);
++ port = mlx4_slaves_closest_port(dev, slave, port);
+  vp_oper = &priv->mfunc.master.vf_oper[slave].vport[port];
+ 
+  if (MLX4_VGT != vp_oper->state.default_vlan) {
+@@ -2482,6 +2501,7 @@ int mlx4_set_vf_spoofchk(struct mlx4_dev *dev, int port, int vf, bool setting)
+  if (slave < 0)
+   return -EINVAL;
+ 
++ port = mlx4_slaves_closest_port(dev, slave, port);
+  s_info = &priv->mfunc.master.vf_admin[slave].vport[port];
+  s_info->spoofchk = setting;
+ 
+@@ -2534,6 +2554,7 @@ int mlx4_set_vf_link_state(struct mlx4_dev *dev, int port, int vf, int link_stat
+  if (slave < 0)
+   return -EINVAL;
+ 
++ port = mlx4_slaves_closest_port(dev, slave, port);
+  switch (link_state) {
+  case IFLA_VF_LINK_STATE_AUTO:
+   /* get current link state */
+-- 
+1.7.1

@@ -1,0 +1,132 @@
+From 788fd5bc026014dac2293e538524bbd2e2086f79 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Mon, 13 Oct 2014 21:34:40 -0400
+Subject: [block] blk-mq: pass along blk_mq_alloc_tag_set return values
+
+Message-id: <x49d29vwt5b.fsf_-_@segfault.boston.devel.redhat.com>
+Patchwork-id: 97529
+O-Subject: [RHEL7 PATCH 15/34][V2] blk-mq: pass along blk_mq_alloc_tag_set return values
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a backport of the following commit.  This resolves bug
+1146660.
+
+  commit dc501dc0d9dc9cbabc18b920f91a26c207e9476c
+  Author: Robert Elliott <elliott@hp.com>
+  Date:   Tue Sep 2 11:38:49 2014 -0500
+
+    blk-mq: pass along blk_mq_alloc_tag_set return values
+
+    Two of the blk-mq based drivers do not pass back the return value
+    from blk_mq_alloc_tag_set, instead just returning -ENOMEM.
+
+    blk_mq_alloc_tag_set returns -EINVAL if the number of queues or
+    queue depth is bad.  -ENOMEM implies that retrying after freeing some
+    memory might be more successful, but that won't ever change
+    in the -EINVAL cases.
+
+    Change the null_blk and mtip32xx drivers to pass along
+    the return value.
+
+    Signed-off-by: Robert Elliott <elliott@hp.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/mtip32xx/mtip32xx.c b/drivers/block/mtip32xx/mtip32xx.c
+index 07f8a1d..90564c8 100644
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@ -3918,7 +3918,6 @@ skip_create_disk:
+  if (rv) {
+   dev_err(&dd->pdev->dev,
+    "Unable to allocate request queue\n");
+-  rv = -ENOMEM;
+   goto block_queue_alloc_init_error;
+  }
+ 
+diff --git a/drivers/block/null_blk.c b/drivers/block/null_blk.c
+index 3f16cd7..925e543 100644
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@ -462,14 +462,18 @@ static int null_add_dev(void)
+  struct gendisk *disk;
+  struct nullb *nullb;
+  sector_t size;
++ int rv;
+ 
+  nullb = kzalloc_node(sizeof(*nullb), GFP_KERNEL, home_node);
+- if (!nullb)
++ if (!nullb) {
++  rv = -ENOMEM;
+   goto out;
++ }
+ 
+  spin_lock_init(&nullb->lock);
+ 
+- if (setup_queues(nullb))
++ rv = setup_queues(nullb);
++ if (rv)
+   goto out_free_nullb;
+ 
+  if (queue_mode == NULL_Q_MQ) {
+@@ -481,22 +485,29 @@ static int null_add_dev(void)
+   nullb->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+   nullb->tag_set.driver_data = nullb;
+ 
+-  if (blk_mq_alloc_tag_set(&nullb->tag_set))
++  rv = blk_mq_alloc_tag_set(&nullb->tag_set);
++  if (rv)
+    goto out_cleanup_queues;
+ 
+   nullb->q = blk_mq_init_queue(&nullb->tag_set);
+-  if (!nullb->q)
++  if (!nullb->q) {
++   rv = -ENOMEM;
+    goto out_cleanup_tags;
++  }
+  } else if (queue_mode == NULL_Q_BIO) {
+   nullb->q = blk_alloc_queue_node(GFP_KERNEL, home_node);
+-  if (!nullb->q)
++  if (!nullb->q) {
++   rv = -ENOMEM;
+    goto out_cleanup_queues;
++  }
+   blk_queue_make_request(nullb->q, null_queue_bio);
+   init_driver_queues(nullb);
+  } else {
+   nullb->q = blk_init_queue_node(null_request_fn, &nullb->lock, home_node);
+-  if (!nullb->q)
++  if (!nullb->q) {
++   rv = -ENOMEM;
+    goto out_cleanup_queues;
++  }
+   blk_queue_prep_rq(nullb->q, null_rq_prep_fn);
+   blk_queue_softirq_done(nullb->q, null_softirq_done_fn);
+   init_driver_queues(nullb);
+@@ -507,8 +518,10 @@ static int null_add_dev(void)
+  queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, nullb->q);
+ 
+  disk = nullb->disk = alloc_disk_node(1, home_node);
+- if (!disk)
++ if (!disk) {
++  rv = -ENOMEM;
+   goto out_cleanup_blk_queue;
++ }
+ 
+  mutex_lock(&lock);
+  list_add_tail(&nullb->list, &nullb_list);
+@@ -542,7 +555,7 @@ out_cleanup_queues:
+ out_free_nullb:
+  kfree(nullb);
+ out:
+- return -ENOMEM;
++ return rv;
+ }
+ 
+ static int __init null_init(void)
+-- 
+1.7.1

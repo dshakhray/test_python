@@ -1,0 +1,347 @@
+From 93d46fc7a29275e12ed05b4156739dd6fb7d098f Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:00:06 -0400
+Subject: [infiniband] mlx5: Collect signature error completion
+
+Message-id: <4c0128c0d0ffed1b08cbbe68a56752df918fd9df.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93603
+O-Subject: [Patch RHEL7.1 V1 070/197] IB/mlx5: Collect signature error completion
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Sagi Grimberg <sagig@mellanox.com>
+
+This commit takes care of the generated signature error CQE generated
+by the HW (if happened).  The underlying mlx5 driver will handle
+signature error completions and will mark the relevant memory region
+as dirty.
+
+Once the consumer gets the completion for the transaction, it must
+check for signature errors on signature memory region using a new
+lightweight verb ib_check_mr_status().
+
+In case the user doesn't check for signature error (i.e. doesn't call
+ib_check_mr_status() with status check IB_MR_CHECK_SIG_STATUS), the
+memory region cannot be used for another signature operation
+(REG_SIG_MR work request will fail).
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit d5436ba01075ef4629015f7a00914d64ffd795d6)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx5/cq.c b/drivers/infiniband/hw/mlx5/cq.c
+index b1705ce..62bb6b4 100644
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -366,6 +366,38 @@ static void free_cq_buf(struct mlx5_ib_dev *dev, struct mlx5_ib_cq_buf *buf)
+  mlx5_buf_free(&dev->mdev, &buf->buf);
+ }
+ 
++static void get_sig_err_item(struct mlx5_sig_err_cqe *cqe,
++        struct ib_sig_err *item)
++{
++ u16 syndrome = be16_to_cpu(cqe->syndrome);
++
++#define GUARD_ERR   (1 << 13)
++#define APPTAG_ERR  (1 << 12)
++#define REFTAG_ERR  (1 << 11)
++
++ if (syndrome & GUARD_ERR) {
++  item->err_type = IB_SIG_BAD_GUARD;
++  item->expected = be32_to_cpu(cqe->expected_trans_sig) >> 16;
++  item->actual = be32_to_cpu(cqe->actual_trans_sig) >> 16;
++ } else
++ if (syndrome & REFTAG_ERR) {
++  item->err_type = IB_SIG_BAD_REFTAG;
++  item->expected = be32_to_cpu(cqe->expected_reftag);
++  item->actual = be32_to_cpu(cqe->actual_reftag);
++ } else
++ if (syndrome & APPTAG_ERR) {
++  item->err_type = IB_SIG_BAD_APPTAG;
++  item->expected = be32_to_cpu(cqe->expected_trans_sig) & 0xffff;
++  item->actual = be32_to_cpu(cqe->actual_trans_sig) & 0xffff;
++ } else {
++  pr_err("Got signature completion error with bad syndrome %04x\n",
++         syndrome);
++ }
++
++ item->sig_err_offset = be64_to_cpu(cqe->err_offset);
++ item->key = be32_to_cpu(cqe->mkey);
++}
++
+ static int mlx5_poll_one(struct mlx5_ib_cq *cq,
+     struct mlx5_ib_qp **cur_qp,
+     struct ib_wc *wc)
+@@ -375,6 +407,9 @@ static int mlx5_poll_one(struct mlx5_ib_cq *cq,
+  struct mlx5_cqe64 *cqe64;
+  struct mlx5_core_qp *mqp;
+  struct mlx5_ib_wq *wq;
++ struct mlx5_sig_err_cqe *sig_err_cqe;
++ struct mlx5_core_mr *mmr;
++ struct mlx5_ib_mr *mr;
+  uint8_t opcode;
+  uint32_t qpn;
+  u16 wqe_ctr;
+@@ -475,6 +510,33 @@ repoll:
+    }
+   }
+   break;
++ case MLX5_CQE_SIG_ERR:
++  sig_err_cqe = (struct mlx5_sig_err_cqe *)cqe64;
++
++  read_lock(&dev->mdev.priv.mr_table.lock);
++  mmr = __mlx5_mr_lookup(&dev->mdev,
++           mlx5_base_mkey(be32_to_cpu(sig_err_cqe->mkey)));
++  if (unlikely(!mmr)) {
++   read_unlock(&dev->mdev.priv.mr_table.lock);
++   mlx5_ib_warn(dev, "CQE@CQ %06x for unknown MR %6x\n",
++         cq->mcq.cqn, be32_to_cpu(sig_err_cqe->mkey));
++   return -EINVAL;
++  }
++
++  mr = to_mibmr(mmr);
++  get_sig_err_item(sig_err_cqe, &mr->sig->err_item);
++  mr->sig->sig_err_exists = true;
++  mr->sig->sigerr_count++;
++
++  mlx5_ib_warn(dev, "CQN: 0x%x Got SIGERR on key: 0x%x err_type %x err_offset %llx expected %x actual %x\n",
++        cq->mcq.cqn, mr->sig->err_item.key,
++        mr->sig->err_item.err_type,
++        mr->sig->err_item.sig_err_offset,
++        mr->sig->err_item.expected,
++        mr->sig->err_item.actual);
++
++  read_unlock(&dev->mdev.priv.mr_table.lock);
++  goto repoll;
+  }
+ 
+  return 0;
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 41ce281..3258d4d 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1431,6 +1431,7 @@ static int init_one(struct pci_dev *pdev,
+  dev->ib_dev.alloc_fast_reg_mr = mlx5_ib_alloc_fast_reg_mr;
+  dev->ib_dev.alloc_fast_reg_page_list = mlx5_ib_alloc_fast_reg_page_list;
+  dev->ib_dev.free_fast_reg_page_list  = mlx5_ib_free_fast_reg_page_list;
++ dev->ib_dev.check_mr_status = mlx5_ib_check_mr_status;
+ 
+  if (mdev->caps.flags & MLX5_DEV_CAP_FLAG_XRC) {
+   dev->ib_dev.alloc_xrcd = mlx5_ib_alloc_xrcd;
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index e438f08..5054158 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -400,6 +400,11 @@ static inline struct mlx5_ib_qp *to_mibqp(struct mlx5_core_qp *mqp)
+  return container_of(mqp, struct mlx5_ib_qp, mqp);
+ }
+ 
++static inline struct mlx5_ib_mr *to_mibmr(struct mlx5_core_mr *mmr)
++{
++ return container_of(mmr, struct mlx5_ib_mr, mmr);
++}
++
+ static inline struct mlx5_ib_pd *to_mpd(struct ib_pd *ibpd)
+ {
+  return container_of(ibpd, struct mlx5_ib_pd, ibpd);
+@@ -537,6 +542,8 @@ int mlx5_mr_cache_init(struct mlx5_ib_dev *dev);
+ int mlx5_mr_cache_cleanup(struct mlx5_ib_dev *dev);
+ int mlx5_mr_ib_cont_pages(struct ib_umem *umem, u64 addr, int *count, int *shift);
+ void mlx5_umr_cq_handler(struct ib_cq *cq, void *cq_context);
++int mlx5_ib_check_mr_status(struct ib_mr *ibmr, u32 check_mask,
++       struct ib_mr_status *mr_status);
+ 
+ static inline void init_query_mad(struct ib_smp *mad)
+ {
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index 032445c..81392b2 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -1038,6 +1038,11 @@ struct ib_mr *mlx5_ib_create_mr(struct ib_pd *pd,
+   access_mode = MLX5_ACCESS_MODE_KLM;
+   mr->sig->psv_memory.psv_idx = psv_index[0];
+   mr->sig->psv_wire.psv_idx = psv_index[1];
++
++  mr->sig->sig_status_checked = true;
++  mr->sig->sig_err_exists = false;
++  /* Next UMR, Arm SIGERR */
++  ++mr->sig->sigerr_count;
+  }
+ 
+  in->seg.flags = MLX5_PERM_UMR_EN | access_mode;
+@@ -1188,3 +1193,44 @@ void mlx5_ib_free_fast_reg_page_list(struct ib_fast_reg_page_list *page_list)
+  kfree(mfrpl->ibfrpl.page_list);
+  kfree(mfrpl);
+ }
++
++int mlx5_ib_check_mr_status(struct ib_mr *ibmr, u32 check_mask,
++       struct ib_mr_status *mr_status)
++{
++ struct mlx5_ib_mr *mmr = to_mmr(ibmr);
++ int ret = 0;
++
++ if (check_mask & ~IB_MR_CHECK_SIG_STATUS) {
++  pr_err("Invalid status check mask\n");
++  ret = -EINVAL;
++  goto done;
++ }
++
++ mr_status->fail_status = 0;
++ if (check_mask & IB_MR_CHECK_SIG_STATUS) {
++  if (!mmr->sig) {
++   ret = -EINVAL;
++   pr_err("signature status check requested on a non-signature enabled MR\n");
++   goto done;
++  }
++
++  mmr->sig->sig_status_checked = true;
++  if (!mmr->sig->sig_err_exists)
++   goto done;
++
++  if (ibmr->lkey == mmr->sig->err_item.key)
++   memcpy(&mr_status->sig_err, &mmr->sig->err_item,
++          sizeof(mr_status->sig_err));
++  else {
++   mr_status->sig_err.err_type = IB_SIG_BAD_GUARD;
++   mr_status->sig_err.sig_err_offset = 0;
++   mr_status->sig_err.key = mmr->sig->err_item.key;
++  }
++
++  mmr->sig->sig_err_exists = false;
++  mr_status->fail_status |= IB_MR_CHECK_SIG_STATUS;
++ }
++
++done:
++ return ret;
++}
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 67e7998..ae788d2 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -1784,6 +1784,7 @@ static __be64 sig_mkey_mask(void)
+  result = MLX5_MKEY_MASK_LEN  |
+   MLX5_MKEY_MASK_PAGE_SIZE |
+   MLX5_MKEY_MASK_START_ADDR |
++  MLX5_MKEY_MASK_EN_SIGERR |
+   MLX5_MKEY_MASK_EN_RINVAL |
+   MLX5_MKEY_MASK_KEY  |
+   MLX5_MKEY_MASK_LR  |
+@@ -2219,13 +2220,14 @@ static void set_sig_mkey_segment(struct mlx5_mkey_seg *seg,
+ {
+  struct ib_mr *sig_mr = wr->wr.sig_handover.sig_mr;
+  u32 sig_key = sig_mr->rkey;
++ u8 sigerr = to_mmr(sig_mr)->sig->sigerr_count & 1;
+ 
+  memset(seg, 0, sizeof(*seg));
+ 
+  seg->flags = get_umr_flags(wr->wr.sig_handover.access_flags) |
+        MLX5_ACCESS_MODE_KLM;
+  seg->qpn_mkey7_0 = cpu_to_be32((sig_key & 0xff) | 0xffffff00);
+- seg->flags_pd = cpu_to_be32(MLX5_MKEY_REMOTE_INVAL |
++ seg->flags_pd = cpu_to_be32(MLX5_MKEY_REMOTE_INVAL | sigerr << 26 |
+         MLX5_MKEY_BSF_EN | pdn);
+  seg->len = cpu_to_be64(length);
+  seg->xlt_oct_size = cpu_to_be32(be16_to_cpu(get_klm_octo(nelements)));
+@@ -2255,7 +2257,8 @@ static int set_sig_umr_wr(struct ib_send_wr *wr, struct mlx5_ib_qp *qp,
+  if (unlikely(wr->num_sge != 1) ||
+      unlikely(wr->wr.sig_handover.access_flags &
+        IB_ACCESS_REMOTE_ATOMIC) ||
+-     unlikely(!sig_mr->sig) || unlikely(!qp->signature_en))
++     unlikely(!sig_mr->sig) || unlikely(!qp->signature_en) ||
++     unlikely(!sig_mr->sig->sig_status_checked))
+   return -EINVAL;
+ 
+  /* length of the protected region, data + protection */
+@@ -2286,6 +2289,7 @@ static int set_sig_umr_wr(struct ib_send_wr *wr, struct mlx5_ib_qp *qp,
+  if (ret)
+   return ret;
+ 
++ sig_mr->sig->sig_status_checked = false;
+  return 0;
+ }
+ 
+diff --git a/include/linux/mlx5/cq.h b/include/linux/mlx5/cq.h
+index 2202c7f..f6b17ac 100644
+--- a/include/linux/mlx5/cq.h
++++ b/include/linux/mlx5/cq.h
+@@ -80,6 +80,7 @@ enum {
+  MLX5_CQE_RESP_SEND_IMM = 3,
+  MLX5_CQE_RESP_SEND_INV = 4,
+  MLX5_CQE_RESIZE_CQ = 5,
++ MLX5_CQE_SIG_ERR = 12,
+  MLX5_CQE_REQ_ERR = 13,
+  MLX5_CQE_RESP_ERR = 14,
+  MLX5_CQE_INVALID = 15,
+diff --git a/include/linux/mlx5/device.h b/include/linux/mlx5/device.h
+index f714fc4..407bdb6 100644
+--- a/include/linux/mlx5/device.h
++++ b/include/linux/mlx5/device.h
+@@ -118,6 +118,7 @@ enum {
+  MLX5_MKEY_MASK_START_ADDR = 1ull << 6,
+  MLX5_MKEY_MASK_PD  = 1ull << 7,
+  MLX5_MKEY_MASK_EN_RINVAL = 1ull << 8,
++ MLX5_MKEY_MASK_EN_SIGERR = 1ull << 9,
+  MLX5_MKEY_MASK_BSF_EN  = 1ull << 12,
+  MLX5_MKEY_MASK_KEY  = 1ull << 13,
+  MLX5_MKEY_MASK_QPN  = 1ull << 14,
+@@ -557,6 +558,23 @@ struct mlx5_cqe64 {
+  u8  op_own;
+ };
+ 
++struct mlx5_sig_err_cqe {
++ u8  rsvd0[16];
++ __be32  expected_trans_sig;
++ __be32  actual_trans_sig;
++ __be32  expected_reftag;
++ __be32  actual_reftag;
++ __be16  syndrome;
++ u8  rsvd22[2];
++ __be32  mkey;
++ __be64  err_offset;
++ u8  rsvd30[8];
++ __be32  qpn;
++ u8  rsvd38[2];
++ u8  signature;
++ u8  op_own;
++};
++
+ struct mlx5_wqe_srq_next_seg {
+  u8   rsvd0[2];
+  __be16   next_wqe_index;
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index e562e01..93cef63 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -416,6 +416,10 @@ struct mlx5_core_psv {
+ struct mlx5_core_sig_ctx {
+  struct mlx5_core_psv psv_memory;
+  struct mlx5_core_psv psv_wire;
++ struct ib_sig_err       err_item;
++ bool   sig_status_checked;
++ bool   sig_err_exists;
++ u32   sigerr_count;
+ };
+ 
+ struct mlx5_core_mr {
+diff --git a/include/linux/mlx5/qp.h b/include/linux/mlx5/qp.h
+index 49af74f..f829ad8 100644
+--- a/include/linux/mlx5/qp.h
++++ b/include/linux/mlx5/qp.h
+@@ -506,6 +506,11 @@ static inline struct mlx5_core_qp *__mlx5_qp_lookup(struct mlx5_core_dev *dev, u
+  return radix_tree_lookup(&dev->priv.qp_table.tree, qpn);
+ }
+ 
++static inline struct mlx5_core_mr *__mlx5_mr_lookup(struct mlx5_core_dev *dev, u32 key)
++{
++ return radix_tree_lookup(&dev->priv.mr_table.tree, key);
++}
++
+ int mlx5_core_create_qp(struct mlx5_core_dev *dev,
+    struct mlx5_core_qp *qp,
+    struct mlx5_create_qp_mbox_in *in,
+-- 
+1.7.1

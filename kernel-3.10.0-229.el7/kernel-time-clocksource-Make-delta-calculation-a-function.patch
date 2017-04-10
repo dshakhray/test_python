@@ -1,0 +1,204 @@
+From d245a59a1c386d1b972616d5c4b7f758f9c8fd78 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 25 Sep 2014 17:52:31 -0400
+Subject: [kernel] time/clocksource: Make delta calculation a function
+
+Message-id: <1411667552-17225-2-git-send-email-prarit@redhat.com>
+Patchwork-id: 96730
+O-Subject: [RHEL7.1 PATCH BZ 1145751 1/2] clocksource: Make delta calculation a function
+Bugzilla: 1148398
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1145751
+
+Conflict: linux commit 5c83545, power: Add option to log time spent in
+suspend, introduces timekeeping_internal.h for a debug option that we
+would likely never set in RHEL.  This patch differs from upstream in that
+this patch now introduces the file to the RHEL source.
+
+commit 3a97837784acbf9fed699fc04d1799b0eb742fdf
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Jul 16 21:05:10 2014 +0000
+
+    clocksource: Make delta calculation a function
+
+    We want to move the TSC sanity check into core code to make NMI safe
+    accessors to clock monotonic[_raw] possible. For this we need to
+    sanity check the delta calculation. Create a helper function and
+    convert all sites to use it.
+
+    [ Build fix from jstultz ]
+
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: John Stultz <john.stultz@linaro.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/time/clocksource.c b/kernel/time/clocksource.c
+index c958338..44b0410 100644
+--- a/kernel/time/clocksource.c
++++ b/kernel/time/clocksource.c
+@@ -31,6 +31,8 @@
+ #include <linux/tick.h>
+ #include <linux/kthread.h>
+ 
++#include "timekeeping_internal.h"
++
+ void timecounter_init(struct timecounter *tc,
+         const struct cyclecounter *cc,
+         u64 start_tstamp)
+@@ -246,7 +248,7 @@ void clocksource_mark_unstable(struct clocksource *cs)
+ static void clocksource_watchdog(unsigned long data)
+ {
+  struct clocksource *cs;
+- cycle_t csnow, wdnow;
++ cycle_t csnow, wdnow, delta;
+  int64_t wd_nsec, cs_nsec;
+  int next_cpu, reset_pending;
+ 
+@@ -279,11 +281,12 @@ static void clocksource_watchdog(unsigned long data)
+    continue;
+   }
+ 
+-  wd_nsec = clocksource_cyc2ns((wdnow - cs->wd_last) & watchdog->mask,
+-          watchdog->mult, watchdog->shift);
++  delta = clocksource_delta(wdnow, cs->wd_last, watchdog->mask);
++  wd_nsec = clocksource_cyc2ns(delta, watchdog->mult,
++          watchdog->shift);
+ 
+-  cs_nsec = clocksource_cyc2ns((csnow - cs->cs_last) &
+-          cs->mask, cs->mult, cs->shift);
++  delta = clocksource_delta(csnow, cs->cs_last, cs->mask);
++  cs_nsec = clocksource_cyc2ns(delta, cs->mult, cs->shift);
+   cs->cs_last = csnow;
+   cs->wd_last = wdnow;
+ 
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 1c5b0fc..73cb0b4 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -25,6 +25,7 @@
+ 
+ #include "tick-internal.h"
+ #include "ntp_internal.h"
++#include "timekeeping_internal.h"
+ 
+ static struct timekeeper timekeeper;
+ static DEFINE_RAW_SPINLOCK(timekeeper_lock);
+@@ -160,7 +161,7 @@ static inline u32 get_arch_timeoffset(void) { return 0; }
+ 
+ static inline s64 timekeeping_get_ns(struct timekeeper *tk)
+ {
+- cycle_t cycle_now, cycle_delta;
++ cycle_t cycle_now, delta;
+  struct clocksource *clock;
+  s64 nsec;
+ 
+@@ -169,9 +170,9 @@ static inline s64 timekeeping_get_ns(struct timekeeper *tk)
+  cycle_now = clock->read(clock);
+ 
+  /* calculate the delta since the last update_wall_time: */
+- cycle_delta = (cycle_now - clock->cycle_last) & clock->mask;
++ delta = clocksource_delta(cycle_now, clock->cycle_last, clock->mask);
+ 
+- nsec = cycle_delta * tk->mult + tk->xtime_nsec;
++ nsec = delta * tk->mult + tk->xtime_nsec;
+  nsec >>= tk->shift;
+ 
+  /* If arch requires, add in get_arch_timeoffset() */
+@@ -180,7 +181,7 @@ static inline s64 timekeeping_get_ns(struct timekeeper *tk)
+ 
+ static inline s64 timekeeping_get_ns_raw(struct timekeeper *tk)
+ {
+- cycle_t cycle_now, cycle_delta;
++ cycle_t cycle_now, delta;
+  struct clocksource *clock;
+  s64 nsec;
+ 
+@@ -189,10 +190,10 @@ static inline s64 timekeeping_get_ns_raw(struct timekeeper *tk)
+  cycle_now = clock->read(clock);
+ 
+  /* calculate the delta since the last update_wall_time: */
+- cycle_delta = (cycle_now - clock->cycle_last) & clock->mask;
++ delta = clocksource_delta(cycle_now, clock->cycle_last, clock->mask);
+ 
+  /* convert delta to nanoseconds. */
+- nsec = clocksource_cyc2ns(cycle_delta, clock->mult, clock->shift);
++ nsec = clocksource_cyc2ns(delta, clock->mult, clock->shift);
+ 
+  /* If arch requires, add in get_arch_timeoffset() */
+  return nsec + get_arch_timeoffset();
+@@ -263,23 +264,23 @@ static void timekeeping_update(struct timekeeper *tk, bool clearntp, bool mirror
+  */
+ static void timekeeping_forward_now(struct timekeeper *tk)
+ {
+- cycle_t cycle_now, cycle_delta;
++ cycle_t cycle_now, delta;
+  struct clocksource *clock;
+  s64 nsec;
+ 
+  clock = tk->clock;
+  cycle_now = clock->read(clock);
+- cycle_delta = (cycle_now - clock->cycle_last) & clock->mask;
++ delta = clocksource_delta(cycle_now, clock->cycle_last, clock->mask);
+  tk->cycle_last = clock->cycle_last = cycle_now;
+ 
+- tk->xtime_nsec += cycle_delta * tk->mult;
++ tk->xtime_nsec += delta * tk->mult;
+ 
+  /* If arch requires, add in get_arch_timeoffset() */
+  tk->xtime_nsec += (u64)get_arch_timeoffset() << tk->shift;
+ 
+  tk_normalize_xtime(tk);
+ 
+- nsec = clocksource_cyc2ns(cycle_delta, clock->mult, clock->shift);
++ nsec = clocksource_cyc2ns(delta, clock->mult, clock->shift);
+  timespec_add_ns(&tk->raw_time, nsec);
+ }
+ 
+@@ -925,7 +926,8 @@ static void timekeeping_resume(void)
+   u32 shift = clock->shift;
+   s64 nsec = 0;
+ 
+-  cycle_delta = (cycle_now - clock->cycle_last) & clock->mask;
++  cycle_delta = clocksource_delta(cycle_now, clock->cycle_last,
++      clock->mask);
+ 
+   /*
+    * "cycle_delta * mutl" may cause 64 bits overflow, if the
+@@ -1360,7 +1362,8 @@ static void update_wall_time(void)
+ #ifdef CONFIG_ARCH_USES_GETTIMEOFFSET
+  offset = real_tk->cycle_interval;
+ #else
+- offset = (clock->read(clock) - clock->cycle_last) & clock->mask;
++ offset = clocksource_delta(clock->read(clock), clock->cycle_last,
++       clock->mask);
+ #endif
+ 
+  /* Check if there's really nothing to do */
+diff --git a/kernel/time/timekeeping_internal.h b/kernel/time/timekeeping_internal.h
+new file mode 100644
+index 0000000..e613d8a
+--- /dev/null
++++ b/kernel/time/timekeeping_internal.h
+@@ -0,0 +1,14 @@
++#ifndef _TIMEKEEPING_INTERNAL_H
++#define _TIMEKEEPING_INTERNAL_H
++/*
++ * timekeeping debug functions
++ */
++#include <linux/time.h>
++#include <linux/clocksource.h>
++
++static inline cycle_t clocksource_delta(cycle_t now, cycle_t last, cycle_t mask)
++{
++ return (now - last) & mask;
++}
++
++#endif /* _TIMEKEEPING_INTERNAL_H */
+-- 
+1.7.1

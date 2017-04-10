@@ -1,0 +1,84 @@
+From 7183dd1f8437e2cfee291f46f47f7c8b1a0b1c81 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:26:50 -0400
+Subject: [fs] vfs: call d_op->d_prune() before unhashing dentry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-304-git-send-email-sweil@redhat.com>
+Patchwork-id: 89758
+O-Subject: [PATCH 303/303] vfs: call d_op->d_prune() before unhashing dentry
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+commit: 590fb51f1cf99c4a48a3b1bd65885192e877b561
+
+From: "Yan, Zheng" <zheng.z.yan@intel.com>
+
+The d_prune dentry operation is used to notify filesystem when VFS
+about to prune a hashed dentry from the dcache. There are three
+code paths that prune dentries: shrink_dcache_for_umount_subtree(),
+prune_dcache_sb() and d_prune_aliases(). For the d_prune_aliases()
+case, VFS unhashes the dentry first, then call the d_prune dentry
+operation. This confuses ceph_d_prune() (ceph uses the d_prune
+dentry operation to maintain a flag indicating whether the complete
+contents of a directory are in the dcache, pruning unhashed dentry
+does not affect dir's completeness)
+
+This patch fixes the issue by calling the d_prune dentry operation
+in d_prune_aliases(), before unhashing the dentry. Also make VFS
+only call the d_prune dentry operation for hashed dentry, to avoid
+calling the d_prune dentry operation twice when dentry is pruned
+by d_prune_aliases().
+
+Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ fs/dcache.c
+---
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index f2d03e0..18778e9 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -506,7 +506,7 @@ relock:
+   * inform the fs via d_prune that this dentry is about to be
+   * unhashed and destroyed.
+   */
+- if (dentry->d_flags & DCACHE_OP_PRUNE)
++ if ((dentry->d_flags & DCACHE_OP_PRUNE) && !d_unhashed(dentry))
+   dentry->d_op->d_prune(dentry);
+ 
+  dentry_lru_del(dentry);
+@@ -759,6 +759,14 @@ restart:
+  hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
+   spin_lock(&dentry->d_lock);
+   if (!dentry->d_lockref.count) {
++   /*
++    * inform the fs via d_prune that this dentry
++    * is about to be unhashed and destroyed.
++    */
++   if ((dentry->d_flags & DCACHE_OP_PRUNE) &&
++       !d_unhashed(dentry))
++    dentry->d_op->d_prune(dentry);
++
+    __dget_dlock(dentry);
+    __d_drop(dentry);
+    spin_unlock(&dentry->d_lock);
+@@ -943,7 +951,8 @@ static void shrink_dcache_for_umount_subtree(struct dentry *dentry)
+     * inform the fs that this dentry is about to be
+     * unhashed and destroyed.
+     */
+-   if (dentry->d_flags & DCACHE_OP_PRUNE)
++   if ((dentry->d_flags & DCACHE_OP_PRUNE) &&
++       !d_unhashed(dentry))
+     dentry->d_op->d_prune(dentry);
+ 
+    dentry_lru_del(dentry);
+-- 
+1.7.1

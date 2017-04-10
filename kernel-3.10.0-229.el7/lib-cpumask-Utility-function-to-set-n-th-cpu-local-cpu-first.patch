@@ -1,0 +1,136 @@
+From 0aa80118bca6d19115065cf8b195f41a44019178 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 11:58:59 -0400
+Subject: [lib] cpumask: Utility function to set n'th cpu - local cpu first
+
+Message-id: <1e9ea5374c0672f90060c29f3361cd77ce18cd00.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93573
+O-Subject: [Patch RHEL7.1 V1 003/197] cpumask: Utility function to set n'th cpu - local cpu first
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Amir Vadai <amirv@mellanox.com>
+
+This function sets the n'th cpu - local cpu's first.
+For example: in a 16 cores server with even cpu's local, will get the
+following values:
+cpumask_set_cpu_local_first(0, numa, cpumask) => cpu 0 is set
+cpumask_set_cpu_local_first(1, numa, cpumask) => cpu 2 is set
+...
+cpumask_set_cpu_local_first(7, numa, cpumask) => cpu 14 is set
+cpumask_set_cpu_local_first(8, numa, cpumask) => cpu 1 is set
+cpumask_set_cpu_local_first(9, numa, cpumask) => cpu 3 is set
+...
+cpumask_set_cpu_local_first(15, numa, cpumask) => cpu 15 is set
+
+Curently this function will be used by multi queue networking devices to
+calculate the irq affinity mask, such that as many local cpu's as
+possible will be utilized to handle the mq device irq's.
+
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit da91309e0a7e8966d916a74cce42ed170fde06bf)
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/cpumask.h b/include/linux/cpumask.h
+index d08e4d2..d5ef249 100644
+--- a/include/linux/cpumask.h
++++ b/include/linux/cpumask.h
+@@ -142,6 +142,13 @@ static inline unsigned int cpumask_any_but(const struct cpumask *mask,
+  return 1;
+ }
+ 
++static inline int cpumask_set_cpu_local_first(int i, int numa_node, cpumask_t *dstp)
++{
++ set_bit(0, cpumask_bits(dstp));
++
++ return 0;
++}
++
+ #define for_each_cpu(cpu, mask)   \
+  for ((cpu) = 0; (cpu) < 1; (cpu)++, (void)mask)
+ #define for_each_cpu_not(cpu, mask)  \
+@@ -192,6 +199,7 @@ static inline unsigned int cpumask_next_zero(int n, const struct cpumask *srcp)
+ 
+ int cpumask_next_and(int n, const struct cpumask *, const struct cpumask *);
+ int cpumask_any_but(const struct cpumask *mask, unsigned int cpu);
++int cpumask_set_cpu_local_first(int i, int numa_node, cpumask_t *dstp);
+ 
+ /**
+  * for_each_cpu - iterate over every cpu in a mask
+diff --git a/lib/cpumask.c b/lib/cpumask.c
+index d327b87..be5f391 100644
+--- a/lib/cpumask.c
++++ b/lib/cpumask.c
+@@ -164,3 +164,66 @@ void __init free_bootmem_cpumask_var(cpumask_var_t mask)
+  free_bootmem(__pa(mask), cpumask_size());
+ }
+ #endif
++
++/**
++ * cpumask_set_cpu_local_first - set i'th cpu with local numa cpu's first
++ *
++ * @i: index number
++ * @numa_node: local numa_node
++ * @dstp: cpumask with the relevant cpu bit set according to the policy
++ *
++ * This function sets the cpumask according to a numa aware policy.
++ * cpumask could be used as an affinity hint for the IRQ related to a
++ * queue. When the policy is to spread queues across cores - local cores
++ * first.
++ *
++ * Returns 0 on success, -ENOMEM for no memory, and -EAGAIN when failed to set
++ * the cpu bit and need to re-call the function.
++ */
++int cpumask_set_cpu_local_first(int i, int numa_node, cpumask_t *dstp)
++{
++ cpumask_var_t mask;
++ int cpu;
++ int ret = 0;
++
++ if (!zalloc_cpumask_var(&mask, GFP_KERNEL))
++  return -ENOMEM;
++
++ i %= num_online_cpus();
++
++ if (!cpumask_of_node(numa_node)) {
++  /* Use all online cpu's for non numa aware system */
++  cpumask_copy(mask, cpu_online_mask);
++ } else {
++  int n;
++
++  cpumask_and(mask,
++       cpumask_of_node(numa_node), cpu_online_mask);
++
++  n = cpumask_weight(mask);
++  if (i >= n) {
++   i -= n;
++
++   /* If index > number of local cpu's, mask out local
++    * cpu's
++    */
++   cpumask_andnot(mask, cpu_online_mask, mask);
++  }
++ }
++
++ for_each_cpu(cpu, mask) {
++  if (--i < 0)
++   goto out;
++ }
++
++ ret = -EAGAIN;
++
++out:
++ free_cpumask_var(mask);
++
++ if (!ret)
++  cpumask_set_cpu(cpu, dstp);
++
++ return ret;
++}
++EXPORT_SYMBOL(cpumask_set_cpu_local_first);
+-- 
+1.7.1

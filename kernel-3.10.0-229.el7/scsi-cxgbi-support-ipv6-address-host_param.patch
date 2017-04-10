@@ -1,0 +1,108 @@
+From eb156ca7eaaf0b04591c66291cae395125d303c5 Mon Sep 17 00:00:00 2001
+From: Sai Vemuri <svemuri@redhat.com>
+Date: Fri, 17 Oct 2014 19:44:41 -0400
+Subject: [scsi] cxgbi: support ipv6 address host_param
+
+Message-id: <1413575081-32047-7-git-send-email-svemuri@redhat.com>
+Patchwork-id: 97659
+O-Subject: [RHEL7.1 PATCH BZ 1153834 6/6] libcxgbi : support ipv6 address host_param
+Bugzilla: 1153834
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+Upstream: dd9ad67e9bcb71e2efeb5b2f38c9202c013aa74c
+
+libcxgbi was always returning an ipv4 address for ISCSI_HOST_PARAM_IPADDRESS,
+return appropriate address based on address family
+
+Signed-off-by: Anish Bhatt <anish@chelsio.com>
+Signed-off-by: Karen Xie <kxie@chelsio.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/cxgbi/libcxgbi.c b/drivers/scsi/cxgbi/libcxgbi.c
+index d38cd0e..d090b7f 100644
+--- a/drivers/scsi/cxgbi/libcxgbi.c
++++ b/drivers/scsi/cxgbi/libcxgbi.c
+@@ -399,6 +399,35 @@ EXPORT_SYMBOL_GPL(cxgbi_hbas_add);
+  *   If the source port is outside our allocation range, the caller is
+  *   responsible for keeping track of their port usage.
+  */
++
++static struct cxgbi_sock *find_sock_on_port(struct cxgbi_device *cdev,
++         unsigned char port_id)
++{
++ struct cxgbi_ports_map *pmap = &cdev->pmap;
++ unsigned int i;
++ unsigned int used;
++
++ if (!pmap->max_connect || !pmap->used)
++  return NULL;
++
++ spin_lock_bh(&pmap->lock);
++ used = pmap->used;
++ for (i = 0; used && i < pmap->max_connect; i++) {
++  struct cxgbi_sock *csk = pmap->port_csk[i];
++
++  if (csk) {
++   if (csk->port_id == port_id) {
++    spin_unlock_bh(&pmap->lock);
++    return csk;
++   }
++   used--;
++  }
++ }
++ spin_unlock_bh(&pmap->lock);
++
++ return NULL;
++}
++
+ static int sock_get_port(struct cxgbi_sock *csk)
+ {
+  struct cxgbi_device *cdev = csk->cdev;
+@@ -749,6 +778,7 @@ static struct cxgbi_sock *cxgbi_check_route6(struct sockaddr *dst_addr)
+  csk->daddr6.sin6_addr = daddr6->sin6_addr;
+  csk->daddr6.sin6_port = daddr6->sin6_port;
+  csk->daddr6.sin6_family = daddr6->sin6_family;
++ csk->saddr6.sin6_family = daddr6->sin6_family;
+  csk->saddr6.sin6_addr = pref_saddr;
+ 
+  neigh_release(n);
+@@ -2647,12 +2677,14 @@ int cxgbi_get_host_param(struct Scsi_Host *shost, enum iscsi_host_param param,
+   break;
+  case ISCSI_HOST_PARAM_IPADDRESS:
+  {
+-  __be32 addr;
+-
+-  addr = cxgbi_get_iscsi_ipv4(chba);
+-  len = sprintf(buf, "%pI4", &addr);
++  struct cxgbi_sock *csk = find_sock_on_port(chba->cdev,
++          chba->port_id);
++  if (csk) {
++   len = sprintf(buf, "%pIS",
++          (struct sockaddr *)&csk->saddr);
++  }
+   log_debug(1 << CXGBI_DBG_ISCSI,
+-   "hba %s, ipv4 %pI4.\n", chba->ndev->name, &addr);
++     "hba %s, addr %s.\n", chba->ndev->name, buf);
+   break;
+  }
+  default:
+diff --git a/drivers/scsi/cxgbi/libcxgbi.h b/drivers/scsi/cxgbi/libcxgbi.h
+index c37aab2..25dc1dc 100644
+--- a/drivers/scsi/cxgbi/libcxgbi.h
++++ b/drivers/scsi/cxgbi/libcxgbi.h
+@@ -700,11 +700,6 @@ static inline void cxgbi_set_iscsi_ipv4(struct cxgbi_hba *chba, __be32 ipaddr)
+    chba->ndev->name);
+ }
+ 
+-static inline __be32 cxgbi_get_iscsi_ipv4(struct cxgbi_hba *chba)
+-{
+- return chba->ipv4addr;
+-}
+-
+ struct cxgbi_device *cxgbi_device_register(unsigned int, unsigned int);
+ void cxgbi_device_unregister(struct cxgbi_device *);
+ void cxgbi_device_unregister_all(unsigned int flag);
+-- 
+1.7.1

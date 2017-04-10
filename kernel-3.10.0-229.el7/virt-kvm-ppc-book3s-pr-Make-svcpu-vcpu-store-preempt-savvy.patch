@@ -1,0 +1,111 @@
+From 581503e0e83c89d74e1eae1831048c626e841f3b Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:13:04 -0400
+Subject: [virt] kvm/ppc: book3s/pr - Make svcpu -> vcpu store preempt savvy
+
+Message-id: <1410765214-16377-49-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94757
+O-Subject: [PATCH 48/78] KVM: PPC: Book3S: PR: Make svcpu -> vcpu store preempt savvy
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit 40fdd8c88c4a5e9b26bfbed2215ac661f24aef07
+Author: Alexander Graf <agraf@suse.de>
+Date:   Fri Nov 29 02:29:00 2013 +0100
+
+    KVM: PPC: Book3S: PR: Make svcpu -> vcpu store preempt savvy
+
+    As soon as we get back to our "highmem" handler in virtual address
+    space we may get preempted. Today the reason we can get preempted is
+    that we replay interrupts and all the lazy logic thinks we have
+    interrupts enabled.
+
+    However, it's not hard to make the code interruptible and that way
+    we can enable and handle interrupts even earlier.
+
+    This fixes random guest crashes that happened with CONFIG_PREEMPT=y
+    for me.
+
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s_asm.h b/arch/powerpc/include/asm/kvm_book3s_asm.h
+index b0c8ed5..821725c 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_asm.h
++++ b/arch/powerpc/include/asm/kvm_book3s_asm.h
+@@ -108,6 +108,7 @@ struct kvmppc_host_state {
+ };
+ 
+ struct kvmppc_book3s_shadow_vcpu {
++ bool in_use;
+  ulong gpr[14];
+  u32 cr;
+  u32 xer;
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 8b0c384..2896901 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -67,6 +67,7 @@ static void kvmppc_core_vcpu_load_pr(struct kvm_vcpu *vcpu, int cpu)
+  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+  memcpy(svcpu->slb, to_book3s(vcpu)->slb_shadow, sizeof(svcpu->slb));
+  svcpu->slb_max = to_book3s(vcpu)->slb_shadow_max;
++ svcpu->in_use = 0;
+  svcpu_put(svcpu);
+ #endif
+  vcpu->cpu = smp_processor_id();
+@@ -79,6 +80,9 @@ static void kvmppc_core_vcpu_put_pr(struct kvm_vcpu *vcpu)
+ {
+ #ifdef CONFIG_PPC_BOOK3S_64
+  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
++ if (svcpu->in_use) {
++  kvmppc_copy_from_svcpu(vcpu, svcpu);
++ }
+  memcpy(to_book3s(vcpu)->slb_shadow, svcpu->slb, sizeof(svcpu->slb));
+  to_book3s(vcpu)->slb_shadow_max = svcpu->slb_max;
+  svcpu_put(svcpu);
+@@ -111,12 +115,26 @@ void kvmppc_copy_to_svcpu(struct kvmppc_book3s_shadow_vcpu *svcpu,
+  svcpu->ctr = vcpu->arch.ctr;
+  svcpu->lr  = vcpu->arch.lr;
+  svcpu->pc  = vcpu->arch.pc;
++ svcpu->in_use = true;
+ }
+ 
+ /* Copy data touched by real-mode code from shadow vcpu back to vcpu */
+ void kvmppc_copy_from_svcpu(struct kvm_vcpu *vcpu,
+        struct kvmppc_book3s_shadow_vcpu *svcpu)
+ {
++ /*
++  * vcpu_put would just call us again because in_use hasn't
++  * been updated yet.
++  */
++ preempt_disable();
++
++ /*
++  * Maybe we were already preempted and synced the svcpu from
++  * our preempt notifiers. Don't bother touching this svcpu then.
++  */
++ if (!svcpu->in_use)
++  goto out;
++
+  vcpu->arch.gpr[0] = svcpu->gpr[0];
+  vcpu->arch.gpr[1] = svcpu->gpr[1];
+  vcpu->arch.gpr[2] = svcpu->gpr[2];
+@@ -140,6 +158,10 @@ void kvmppc_copy_from_svcpu(struct kvm_vcpu *vcpu,
+  vcpu->arch.fault_dar   = svcpu->fault_dar;
+  vcpu->arch.fault_dsisr = svcpu->fault_dsisr;
+  vcpu->arch.last_inst   = svcpu->last_inst;
++ svcpu->in_use = false;
++
++out:
++ preempt_enable();
+ }
+ 
+ static int kvmppc_core_check_requests_pr(struct kvm_vcpu *vcpu)
+-- 
+1.7.1

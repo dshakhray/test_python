@@ -1,0 +1,116 @@
+From 07e88f69bc0ace68aad994767f0d6e792c30d568 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:08:30 -0400
+Subject: [usb] sierra: refactor delayed-urb submission
+
+Message-id: <1410887463-20674-439-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95432
+O-Subject: [RHEL7 PATCH 438/591] USB: sierra: refactor delayed-urb submission
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 71c149b901e367db5dae1ec83bb82d14d01ad4cb
+Author: Johan Hovold <jhovold@gmail.com>
+Date:   Mon May 26 19:23:07 2014 +0200
+
+    USB: sierra: refactor delayed-urb submission
+
+    Refactor and clean up delayed-urb submission at resume.
+
+    Signed-off-by: Johan Hovold <jhovold@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/serial/sierra.c b/drivers/usb/serial/sierra.c
+index 1d42e83..9673319 100644
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -981,12 +981,51 @@ static int sierra_suspend(struct usb_serial *serial, pm_message_t message)
+  return 0;
+ }
+ 
++/* Caller must hold susp_lock. */
++static int sierra_submit_delayed_urbs(struct usb_serial_port *port)
++{
++ struct sierra_port_private *portdata = usb_get_serial_port_data(port);
++ struct sierra_intf_private *intfdata;
++ struct urb *urb;
++ int ec = 0;
++ int err;
++
++ intfdata = usb_get_serial_data(port->serial);
++
++ for (;;) {
++  urb = usb_get_from_anchor(&portdata->delayed);
++  if (!urb)
++   break;
++
++  usb_anchor_urb(urb, &portdata->active);
++  intfdata->in_flight++;
++  err = usb_submit_urb(urb, GFP_ATOMIC);
++  if (err) {
++   dev_err(&port->dev, "%s - submit urb failed: %d",
++     __func__, err);
++   ec++;
++   intfdata->in_flight--;
++   usb_unanchor_urb(urb);
++   kfree(urb->transfer_buffer);
++   usb_free_urb(urb);
++
++   spin_lock(&portdata->lock);
++   portdata->outstanding_urbs--;
++   spin_unlock(&portdata->lock);
++  }
++ }
++
++ if (ec)
++  return -EIO;
++
++ return 0;
++}
++
+ static int sierra_resume(struct usb_serial *serial)
+ {
+  struct usb_serial_port *port;
+  struct sierra_intf_private *intfdata = usb_get_serial_data(serial);
+  struct sierra_port_private *portdata;
+- struct urb *urb;
+  int ec = 0;
+  int i, err;
+ 
+@@ -998,25 +1037,9 @@ static int sierra_resume(struct usb_serial *serial)
+   if (!portdata || !portdata->opened)
+    continue;
+ 
+-  while ((urb = usb_get_from_anchor(&portdata->delayed))) {
+-   usb_anchor_urb(urb, &portdata->active);
+-   intfdata->in_flight++;
+-   err = usb_submit_urb(urb, GFP_ATOMIC);
+-   if (err < 0) {
+-    dev_err(&port->dev,
+-     "%s - submit urb failed: %d",
+-     __func__, err);
+-    ec++;
+-    intfdata->in_flight--;
+-    usb_unanchor_urb(urb);
+-    kfree(urb->transfer_buffer);
+-    usb_free_urb(urb);
+-    spin_lock(&portdata->lock);
+-    portdata->outstanding_urbs--;
+-    spin_unlock(&portdata->lock);
+-    continue;
+-   }
+-  }
++  err = sierra_submit_delayed_urbs(port);
++  if (err)
++   ec++;
+ 
+   err = sierra_submit_rx_urbs(port, GFP_ATOMIC);
+   if (err)
+-- 
+1.7.1

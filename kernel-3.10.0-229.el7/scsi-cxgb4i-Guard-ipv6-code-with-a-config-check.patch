@@ -1,0 +1,121 @@
+From 28c6ad14da3edb84b2adc4f0e46615739d1b9b4b Mon Sep 17 00:00:00 2001
+From: Sai Vemuri <svemuri@redhat.com>
+Date: Thu, 11 Sep 2014 23:17:29 -0400
+Subject: [scsi] cxgb4i Guard ipv6 code with a config check
+
+Message-id: <1410477451-95647-5-git-send-email-svemuri@redhat.com>
+Patchwork-id: 93909
+O-Subject: [RHEL7.1 PATCH BZ 1126539 4/6] libcxgbi:cxgb4i Guard ipv6 code with a config check
+Bugzilla: 1126539
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Fixes: fc8d0590d914 ("libcxgbi: Add ipv6 api to driver")
+Fixes: 759a0cc5a3e1 ("cxgb4i: Add ipv6 code to driver, call into libcxgbi ipv6
+api")
+Signed-off-by: Anish Bhatt <anish@chelsio.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
+(cherry picked from commit e81fbf6cd65247e6c65719eacf2af5856db3d5a9)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
+index 1e07e10..7a30597 100644
+--- a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
++++ b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
+@@ -1289,8 +1289,14 @@ static int init_act_open(struct cxgbi_sock *csk)
+ 
+  if (csk->csk_family == AF_INET)
+   daddr = &csk->daddr.sin_addr.s_addr;
+- else
++#if IS_ENABLED(CONFIG_IPV6)
++ else if (csk->csk_family == AF_INET6)
+   daddr = &csk->daddr6.sin6_addr;
++#endif
++ else {
++  pr_err("address family 0x%x not supported\n", csk->csk_family);
++  goto rel_resource;
++ }
+ 
+  n = dst_neigh_lookup(csk->dst, daddr);
+ 
+@@ -1629,6 +1635,7 @@ static int cxgb4i_ddp_init(struct cxgbi_device *cdev)
+  return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_IPV6)
+ static int cxgbi_inet6addr_handler(struct notifier_block *this,
+        unsigned long event, void *data)
+ {
+@@ -1753,6 +1760,7 @@ static void cxgbi_update_clip(struct cxgbi_device *cdev)
+  }
+  rcu_read_unlock();
+ }
++#endif /* IS_ENABLED(CONFIG_IPV6) */
+ 
+ static void *t4_uld_add(const struct cxgb4_lld_info *lldi)
+ {
+@@ -1872,7 +1880,9 @@ static int t4_uld_state_change(void *handle, enum cxgb4_state state)
+  switch (state) {
+  case CXGB4_STATE_UP:
+   pr_info("cdev 0x%p, UP.\n", cdev);
++#if IS_ENABLED(CONFIG_IPV6)
+   cxgbi_update_clip(cdev);
++#endif
+   /* re-initialize */
+   break;
+  case CXGB4_STATE_START_RECOVERY:
+@@ -1904,15 +1914,17 @@ static int __init cxgb4i_init_module(void)
+   return rc;
+  cxgb4_register_uld(CXGB4_ULD_ISCSI, &cxgb4i_uld_info);
+ 
++#if IS_ENABLED(CONFIG_IPV6)
+  register_inet6addr_notifier(&cxgbi_inet6addr_notifier);
+-
++#endif
+  return 0;
+ }
+ 
+ static void __exit cxgb4i_exit_module(void)
+ {
++#if IS_ENABLED(CONFIG_IPV6)
+  unregister_inet6addr_notifier(&cxgbi_inet6addr_notifier);
+-
++#endif
+  cxgb4_unregister_uld(CXGB4_ULD_ISCSI);
+  cxgbi_device_unregister_all(CXGBI_FLAG_DEV_T4);
+  cxgbi_iscsi_cleanup(&cxgb4i_iscsi_transport, &cxgb4i_stt);
+diff --git a/drivers/scsi/cxgbi/libcxgbi.c b/drivers/scsi/cxgbi/libcxgbi.c
+index d2fe507..3d5322d 100644
+--- a/drivers/scsi/cxgbi/libcxgbi.c
++++ b/drivers/scsi/cxgbi/libcxgbi.c
+@@ -602,6 +602,7 @@ err_out:
+  return ERR_PTR(err);
+ }
+ 
++#if IS_ENABLED(CONFIG_IPV6)
+ static struct rt6_info *find_route_ipv6(const struct in6_addr *saddr,
+      const struct in6_addr *daddr)
+ {
+@@ -716,6 +717,7 @@ rel_rt:
+ err_out:
+  return ERR_PTR(err);
+ }
++#endif /* IS_ENABLED(CONFIG_IPV6) */
+ 
+ void cxgbi_sock_established(struct cxgbi_sock *csk, unsigned int snd_isn,
+    unsigned int opt)
+@@ -2638,8 +2640,10 @@ struct iscsi_endpoint *cxgbi_ep_connect(struct Scsi_Host *shost,
+ 
+  if (dst_addr->sa_family == AF_INET) {
+   csk = cxgbi_check_route(dst_addr);
++#if IS_ENABLED(CONFIG_IPV6)
+  } else if (dst_addr->sa_family == AF_INET6) {
+   csk = cxgbi_check_route6(dst_addr);
++#endif
+  } else {
+   pr_info("address family 0x%x NOT supported.\n",
+    dst_addr->sa_family);
+-- 
+1.7.1

@@ -1,0 +1,1560 @@
+From 7c1d08f2030aae721c35fe6904177fbf074e374a Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 11:59:09 -0400
+Subject: [infiniband] Refactor umem to use linear SG table
+
+Message-id: <7fbdd7e1150b907d571b4287ea04ad592599e1e5.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93578
+O-Subject: [Patch RHEL7.1 V1 013/197] IB: Refactor umem to use linear SG table
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Yishai Hadas <yishaih@mellanox.com>
+
+This patch refactors the IB core umem code and vendor drivers to use a
+linear (chained) SG table instead of chunk list.  With this change the
+relevant code becomes clearer-no need for nested loops to build and
+use umem.
+
+Signed-off-by: Shachar Raindel <raindel@mellanox.com>
+Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit eeb8461e36c99fdf2d058751be924a2aab215005)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
+index a841123..a3a2e9c 100644
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@ -42,29 +42,29 @@
+ 
+ #include "uverbs.h"
+ 
+-#define IB_UMEM_MAX_PAGE_CHUNK      \
+- ((PAGE_SIZE - offsetof(struct ib_umem_chunk, page_list)) / \
+-  ((void *) &((struct ib_umem_chunk *) 0)->page_list[1] - \
+-   (void *) &((struct ib_umem_chunk *) 0)->page_list[0]))
+ 
+ static void __ib_umem_release(struct ib_device *dev, struct ib_umem *umem, int dirty)
+ {
+- struct ib_umem_chunk *chunk, *tmp;
++ struct scatterlist *sg;
++ struct page *page;
+  int i;
+ 
+- list_for_each_entry_safe(chunk, tmp, &umem->chunk_list, list) {
+-  ib_dma_unmap_sg(dev, chunk->page_list,
+-    chunk->nents, DMA_BIDIRECTIONAL);
+-  for (i = 0; i < chunk->nents; ++i) {
+-   struct page *page = sg_page(&chunk->page_list[i]);
++ if (umem->nmap > 0)
++  ib_dma_unmap_sg(dev, umem->sg_head.sgl,
++    umem->nmap,
++    DMA_BIDIRECTIONAL);
+ 
+-   if (umem->writable && dirty)
+-    set_page_dirty_lock(page);
+-   put_page(page);
+-  }
++ for_each_sg(umem->sg_head.sgl, sg, umem->npages, i) {
+ 
+-  kfree(chunk);
++  page = sg_page(sg);
++  if (umem->writable && dirty)
++   set_page_dirty_lock(page);
++  put_page(page);
+  }
++
++ sg_free_table(&umem->sg_head);
++ return;
++
+ }
+ 
+ /**
+@@ -81,15 +81,15 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+  struct ib_umem *umem;
+  struct page **page_list;
+  struct vm_area_struct **vma_list;
+- struct ib_umem_chunk *chunk;
+  unsigned long locked;
+  unsigned long lock_limit;
+  unsigned long cur_base;
+  unsigned long npages;
+  int ret;
+- int off;
+  int i;
+  DEFINE_DMA_ATTRS(attrs);
++ struct scatterlist *sg, *sg_list_start;
++ int need_release = 0;
+ 
+  if (dmasync)
+   dma_set_attr(DMA_ATTR_WRITE_BARRIER, &attrs);
+@@ -97,7 +97,7 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+  if (!can_do_mlock())
+   return ERR_PTR(-EPERM);
+ 
+- umem = kmalloc(sizeof *umem, GFP_KERNEL);
++ umem = kzalloc(sizeof *umem, GFP_KERNEL);
+  if (!umem)
+   return ERR_PTR(-ENOMEM);
+ 
+@@ -117,8 +117,6 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+  /* We assume the memory is from hugetlb until proved otherwise */
+  umem->hugetlb   = 1;
+ 
+- INIT_LIST_HEAD(&umem->chunk_list);
+-
+  page_list = (struct page **) __get_free_page(GFP_KERNEL);
+  if (!page_list) {
+   kfree(umem);
+@@ -147,7 +145,18 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+ 
+  cur_base = addr & PAGE_MASK;
+ 
+- ret = 0;
++ if (npages == 0) {
++  ret = -EINVAL;
++  goto out;
++ }
++
++ ret = sg_alloc_table(&umem->sg_head, npages, GFP_KERNEL);
++ if (ret)
++  goto out;
++
++ need_release = 1;
++ sg_list_start = umem->sg_head.sgl;
++
+  while (npages) {
+   ret = get_user_pages(current, current->mm, cur_base,
+          min_t(unsigned long, npages,
+@@ -157,54 +166,38 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+   if (ret < 0)
+    goto out;
+ 
++  umem->npages += ret;
+   cur_base += ret * PAGE_SIZE;
+   npages   -= ret;
+ 
+-  off = 0;
+-
+-  while (ret) {
+-   chunk = kmalloc(sizeof *chunk + sizeof (struct scatterlist) *
+-     min_t(int, ret, IB_UMEM_MAX_PAGE_CHUNK),
+-     GFP_KERNEL);
+-   if (!chunk) {
+-    ret = -ENOMEM;
+-    goto out;
+-   }
+-
+-   chunk->nents = min_t(int, ret, IB_UMEM_MAX_PAGE_CHUNK);
+-   sg_init_table(chunk->page_list, chunk->nents);
+-   for (i = 0; i < chunk->nents; ++i) {
+-    if (vma_list &&
+-        !is_vm_hugetlb_page(vma_list[i + off]))
+-     umem->hugetlb = 0;
+-    sg_set_page(&chunk->page_list[i], page_list[i + off], PAGE_SIZE, 0);
+-   }
+-
+-   chunk->nmap = ib_dma_map_sg_attrs(context->device,
+-         &chunk->page_list[0],
+-         chunk->nents,
+-         DMA_BIDIRECTIONAL,
+-         &attrs);
+-   if (chunk->nmap <= 0) {
+-    for (i = 0; i < chunk->nents; ++i)
+-     put_page(sg_page(&chunk->page_list[i]));
+-    kfree(chunk);
+-
+-    ret = -ENOMEM;
+-    goto out;
+-   }
+-
+-   ret -= chunk->nents;
+-   off += chunk->nents;
+-   list_add_tail(&chunk->list, &umem->chunk_list);
++  for_each_sg(sg_list_start, sg, ret, i) {
++   if (vma_list && !is_vm_hugetlb_page(vma_list[i]))
++    umem->hugetlb = 0;
++
++   sg_set_page(sg, page_list[i], PAGE_SIZE, 0);
+   }
+ 
+-  ret = 0;
++  /* preparing for next loop */
++  sg_list_start = sg;
+  }
+ 
++ umem->nmap = ib_dma_map_sg_attrs(context->device,
++      umem->sg_head.sgl,
++      umem->npages,
++      DMA_BIDIRECTIONAL,
++      &attrs);
++
++ if (umem->nmap <= 0) {
++  ret = -ENOMEM;
++  goto out;
++ }
++
++ ret = 0;
++
+ out:
+  if (ret < 0) {
+-  __ib_umem_release(context->device, umem, 0);
++  if (need_release)
++   __ib_umem_release(context->device, umem, 0);
+   kfree(umem);
+  } else
+   current->mm->pinned_vm = locked;
+@@ -278,17 +271,16 @@ EXPORT_SYMBOL(ib_umem_release);
+ 
+ int ib_umem_page_count(struct ib_umem *umem)
+ {
+- struct ib_umem_chunk *chunk;
+  int shift;
+  int i;
+  int n;
++ struct scatterlist *sg;
+ 
+  shift = ilog2(umem->page_size);
+ 
+  n = 0;
+- list_for_each_entry(chunk, &umem->chunk_list, list)
+-  for (i = 0; i < chunk->nmap; ++i)
+-   n += sg_dma_len(&chunk->page_list[i]) >> shift;
++ for_each_sg(umem->sg_head.sgl, sg, umem->nmap, i)
++  n += sg_dma_len(sg) >> shift;
+ 
+  return n;
+ }
+diff --git a/drivers/infiniband/hw/amso1100/c2_provider.c b/drivers/infiniband/hw/amso1100/c2_provider.c
+index 07eb3a8..8af33cf 100644
+--- a/drivers/infiniband/hw/amso1100/c2_provider.c
++++ b/drivers/infiniband/hw/amso1100/c2_provider.c
+@@ -431,9 +431,9 @@ static struct ib_mr *c2_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  u64 *pages;
+  u64 kva = 0;
+  int shift, n, len;
+- int i, j, k;
++ int i, k, entry;
+  int err = 0;
+- struct ib_umem_chunk *chunk;
++ struct scatterlist *sg;
+  struct c2_pd *c2pd = to_c2pd(pd);
+  struct c2_mr *c2mr;
+ 
+@@ -452,10 +452,7 @@ static struct ib_mr *c2_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  }
+ 
+  shift = ffs(c2mr->umem->page_size) - 1;
+-
+- n = 0;
+- list_for_each_entry(chunk, &c2mr->umem->chunk_list, list)
+-  n += chunk->nents;
++ n = c2mr->umem->nmap;
+ 
+  pages = kmalloc(n * sizeof(u64), GFP_KERNEL);
+  if (!pages) {
+@@ -464,14 +461,12 @@ static struct ib_mr *c2_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  }
+ 
+  i = 0;
+- list_for_each_entry(chunk, &c2mr->umem->chunk_list, list) {
+-  for (j = 0; j < chunk->nmap; ++j) {
+-   len = sg_dma_len(&chunk->page_list[j]) >> shift;
+-   for (k = 0; k < len; ++k) {
+-    pages[i++] =
+-     sg_dma_address(&chunk->page_list[j]) +
+-     (c2mr->umem->page_size * k);
+-   }
++ for_each_sg(c2mr->umem->sg_head.sgl, sg, c2mr->umem->nmap, entry) {
++  len = sg_dma_len(sg) >> shift;
++  for (k = 0; k < len; ++k) {
++   pages[i++] =
++    sg_dma_address(sg) +
++    (c2mr->umem->page_size * k);
+   }
+  }
+ 
+diff --git a/drivers/infiniband/hw/cxgb3/iwch_provider.c b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+index d228383..811b24a 100644
+--- a/drivers/infiniband/hw/cxgb3/iwch_provider.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+@@ -618,14 +618,13 @@ static struct ib_mr *iwch_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ {
+  __be64 *pages;
+  int shift, n, len;
+- int i, j, k;
++ int i, k, entry;
+  int err = 0;
+- struct ib_umem_chunk *chunk;
+  struct iwch_dev *rhp;
+  struct iwch_pd *php;
+  struct iwch_mr *mhp;
+  struct iwch_reg_user_mr_resp uresp;
+-
++ struct scatterlist *sg;
+  PDBG("%s ib_pd %p\n", __func__, pd);
+ 
+  php = to_iwch_pd(pd);
+@@ -645,9 +644,7 @@ static struct ib_mr *iwch_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 
+  shift = ffs(mhp->umem->page_size) - 1;
+ 
+- n = 0;
+- list_for_each_entry(chunk, &mhp->umem->chunk_list, list)
+-  n += chunk->nents;
++ n = mhp->umem->nmap;
+ 
+  err = iwch_alloc_pbl(mhp, n);
+  if (err)
+@@ -661,12 +658,10 @@ static struct ib_mr *iwch_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 
+  i = n = 0;
+ 
+- list_for_each_entry(chunk, &mhp->umem->chunk_list, list)
+-  for (j = 0; j < chunk->nmap; ++j) {
+-   len = sg_dma_len(&chunk->page_list[j]) >> shift;
++ for_each_sg(mhp->umem->sg_head.sgl, sg, mhp->umem->nmap, entry) {
++   len = sg_dma_len(sg) >> shift;
+    for (k = 0; k < len; ++k) {
+-    pages[i++] = cpu_to_be64(sg_dma_address(
+-     &chunk->page_list[j]) +
++    pages[i++] = cpu_to_be64(sg_dma_address(sg) +
+      mhp->umem->page_size * k);
+     if (i == PAGE_SIZE / sizeof *pages) {
+      err = iwch_write_pbl(mhp, pages, i, n);
+@@ -676,7 +671,7 @@ static struct ib_mr *iwch_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+      i = 0;
+     }
+    }
+-  }
++ }
+ 
+  if (i)
+   err = iwch_write_pbl(mhp, pages, i, n);
+diff --git a/drivers/infiniband/hw/cxgb4/mem.c b/drivers/infiniband/hw/cxgb4/mem.c
+index 84e4500..aa9d3f6 100644
+--- a/drivers/infiniband/hw/cxgb4/mem.c
++++ b/drivers/infiniband/hw/cxgb4/mem.c
+@@ -678,9 +678,9 @@ struct ib_mr *c4iw_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ {
+  __be64 *pages;
+  int shift, n, len;
+- int i, j, k;
++ int i, k, entry;
+  int err = 0;
+- struct ib_umem_chunk *chunk;
++ struct scatterlist *sg;
+  struct c4iw_dev *rhp;
+  struct c4iw_pd *php;
+  struct c4iw_mr *mhp;
+@@ -710,10 +710,7 @@ struct ib_mr *c4iw_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 
+  shift = ffs(mhp->umem->page_size) - 1;
+ 
+- n = 0;
+- list_for_each_entry(chunk, &mhp->umem->chunk_list, list)
+-  n += chunk->nents;
+-
++ n = mhp->umem->nmap;
+  err = alloc_pbl(mhp, n);
+  if (err)
+   goto err;
+@@ -726,24 +723,22 @@ struct ib_mr *c4iw_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 
+  i = n = 0;
+ 
+- list_for_each_entry(chunk, &mhp->umem->chunk_list, list)
+-  for (j = 0; j < chunk->nmap; ++j) {
+-   len = sg_dma_len(&chunk->page_list[j]) >> shift;
+-   for (k = 0; k < len; ++k) {
+-    pages[i++] = cpu_to_be64(sg_dma_address(
+-     &chunk->page_list[j]) +
+-     mhp->umem->page_size * k);
+-    if (i == PAGE_SIZE / sizeof *pages) {
+-     err = write_pbl(&mhp->rhp->rdev,
+-           pages,
+-           mhp->attr.pbl_addr + (n << 3), i);
+-     if (err)
+-      goto pbl_done;
+-     n += i;
+-     i = 0;
+-    }
++ for_each_sg(mhp->umem->sg_head.sgl, sg, mhp->umem->nmap, entry) {
++  len = sg_dma_len(sg) >> shift;
++  for (k = 0; k < len; ++k) {
++   pages[i++] = cpu_to_be64(sg_dma_address(sg) +
++    mhp->umem->page_size * k);
++   if (i == PAGE_SIZE / sizeof *pages) {
++    err = write_pbl(&mhp->rhp->rdev,
++          pages,
++          mhp->attr.pbl_addr + (n << 3), i);
++    if (err)
++     goto pbl_done;
++    n += i;
++    i = 0;
+    }
+   }
++ }
+ 
+  if (i)
+   err = write_pbl(&mhp->rhp->rdev, pages,
+diff --git a/drivers/infiniband/hw/ehca/ehca_classes.h b/drivers/infiniband/hw/ehca/ehca_classes.h
+index f08f6ea..bd45e0f 100644
+--- a/drivers/infiniband/hw/ehca/ehca_classes.h
++++ b/drivers/infiniband/hw/ehca/ehca_classes.h
+@@ -322,7 +322,7 @@ struct ehca_mr_pginfo {
+   } phy;
+   struct { /* type EHCA_MR_PGI_USER section */
+    struct ib_umem *region;
+-   struct ib_umem_chunk *next_chunk;
++   struct scatterlist *next_sg;
+    u64 next_nmap;
+   } usr;
+   struct { /* type EHCA_MR_PGI_FMR section */
+diff --git a/drivers/infiniband/hw/ehca/ehca_mrmw.c b/drivers/infiniband/hw/ehca/ehca_mrmw.c
+index bcfb0c1..7168f59 100644
+--- a/drivers/infiniband/hw/ehca/ehca_mrmw.c
++++ b/drivers/infiniband/hw/ehca/ehca_mrmw.c
+@@ -400,10 +400,7 @@ reg_user_mr_fallback:
+  pginfo.num_hwpages = num_hwpages;
+  pginfo.u.usr.region = e_mr->umem;
+  pginfo.next_hwpage = e_mr->umem->offset / hwpage_size;
+- pginfo.u.usr.next_chunk = list_prepare_entry(pginfo.u.usr.next_chunk,
+-           (&e_mr->umem->chunk_list),
+-           list);
+-
++ pginfo.u.usr.next_sg = pginfo.u.usr.region->sg_head.sgl;
+  ret = ehca_reg_mr(shca, e_mr, (u64 *)virt, length, mr_access_flags,
+      e_pd, &pginfo, &e_mr->ib.ib_mr.lkey,
+      &e_mr->ib.ib_mr.rkey, EHCA_REG_MR);
+@@ -1858,61 +1855,39 @@ static int ehca_set_pagebuf_user1(struct ehca_mr_pginfo *pginfo,
+       u64 *kpage)
+ {
+  int ret = 0;
+- struct ib_umem_chunk *prev_chunk;
+- struct ib_umem_chunk *chunk;
+  u64 pgaddr;
+- u32 i = 0;
+  u32 j = 0;
+  int hwpages_per_kpage = PAGE_SIZE / pginfo->hwpage_size;
+-
+- /* loop over desired chunk entries */
+- chunk      = pginfo->u.usr.next_chunk;
+- prev_chunk = pginfo->u.usr.next_chunk;
+- list_for_each_entry_continue(
+-  chunk, (&(pginfo->u.usr.region->chunk_list)), list) {
+-  for (i = pginfo->u.usr.next_nmap; i < chunk->nmap; ) {
+-   pgaddr = page_to_pfn(sg_page(&chunk->page_list[i]))
+-    << PAGE_SHIFT ;
+-   *kpage = pgaddr + (pginfo->next_hwpage *
+-        pginfo->hwpage_size);
+-   if ( !(*kpage) ) {
+-    ehca_gen_err("pgaddr=%llx "
+-          "chunk->page_list[i]=%llx "
+-          "i=%x next_hwpage=%llx",
+-          pgaddr, (u64)sg_dma_address(
+-           &chunk->page_list[i]),
+-          i, pginfo->next_hwpage);
+-    return -EFAULT;
+-   }
+-   (pginfo->hwpage_cnt)++;
+-   (pginfo->next_hwpage)++;
+-   kpage++;
+-   if (pginfo->next_hwpage % hwpages_per_kpage == 0) {
+-    (pginfo->kpage_cnt)++;
+-    (pginfo->u.usr.next_nmap)++;
+-    pginfo->next_hwpage = 0;
+-    i++;
+-   }
+-   j++;
+-   if (j >= number) break;
++ struct scatterlist **sg = &pginfo->u.usr.next_sg;
++
++ while (*sg != NULL) {
++  pgaddr = page_to_pfn(sg_page(*sg))
++   << PAGE_SHIFT;
++  *kpage = pgaddr + (pginfo->next_hwpage *
++       pginfo->hwpage_size);
++  if (!(*kpage)) {
++   ehca_gen_err("pgaddr=%llx "
++         "sg_dma_address=%llx "
++         "entry=%llx next_hwpage=%llx",
++         pgaddr, (u64)sg_dma_address(*sg),
++         pginfo->u.usr.next_nmap,
++         pginfo->next_hwpage);
++   return -EFAULT;
+   }
+-  if ((pginfo->u.usr.next_nmap >= chunk->nmap) &&
+-      (j >= number)) {
+-   pginfo->u.usr.next_nmap = 0;
+-   prev_chunk = chunk;
+-   break;
+-  } else if (pginfo->u.usr.next_nmap >= chunk->nmap) {
+-   pginfo->u.usr.next_nmap = 0;
+-   prev_chunk = chunk;
+-  } else if (j >= number)
++  (pginfo->hwpage_cnt)++;
++  (pginfo->next_hwpage)++;
++  kpage++;
++  if (pginfo->next_hwpage % hwpages_per_kpage == 0) {
++   (pginfo->kpage_cnt)++;
++   (pginfo->u.usr.next_nmap)++;
++   pginfo->next_hwpage = 0;
++   *sg = sg_next(*sg);
++  }
++  j++;
++  if (j >= number)
+    break;
+-  else
+-   prev_chunk = chunk;
+  }
+- pginfo->u.usr.next_chunk =
+-  list_prepare_entry(prev_chunk,
+-       (&(pginfo->u.usr.region->chunk_list)),
+-       list);
++
+  return ret;
+ }
+ 
+@@ -1920,20 +1895,19 @@ static int ehca_set_pagebuf_user1(struct ehca_mr_pginfo *pginfo,
+  * check given pages for contiguous layout
+  * last page addr is returned in prev_pgaddr for further check
+  */
+-static int ehca_check_kpages_per_ate(struct scatterlist *page_list,
+-         int start_idx, int end_idx,
++static int ehca_check_kpages_per_ate(struct scatterlist **sg,
++         int num_pages,
+          u64 *prev_pgaddr)
+ {
+- int t;
+- for (t = start_idx; t <= end_idx; t++) {
+-  u64 pgaddr = page_to_pfn(sg_page(&page_list[t])) << PAGE_SHIFT;
++ for (; *sg && num_pages > 0; *sg = sg_next(*sg), num_pages--) {
++  u64 pgaddr = page_to_pfn(sg_page(*sg)) << PAGE_SHIFT;
+   if (ehca_debug_level >= 3)
+    ehca_gen_dbg("chunk_page=%llx value=%016llx", pgaddr,
+          *(u64 *)__va(pgaddr));
+   if (pgaddr - PAGE_SIZE != *prev_pgaddr) {
+    ehca_gen_err("uncontiguous page found pgaddr=%llx "
+-         "prev_pgaddr=%llx page_list_i=%x",
+-         pgaddr, *prev_pgaddr, t);
++         "prev_pgaddr=%llx entries_left_in_hwpage=%x",
++         pgaddr, *prev_pgaddr, num_pages);
+    return -EINVAL;
+   }
+   *prev_pgaddr = pgaddr;
+@@ -1947,111 +1921,80 @@ static int ehca_set_pagebuf_user2(struct ehca_mr_pginfo *pginfo,
+       u64 *kpage)
+ {
+  int ret = 0;
+- struct ib_umem_chunk *prev_chunk;
+- struct ib_umem_chunk *chunk;
+  u64 pgaddr, prev_pgaddr;
+- u32 i = 0;
+  u32 j = 0;
+  int kpages_per_hwpage = pginfo->hwpage_size / PAGE_SIZE;
+  int nr_kpages = kpages_per_hwpage;
++ struct scatterlist **sg = &pginfo->u.usr.next_sg;
++
++ while (*sg != NULL) {
+ 
+- /* loop over desired chunk entries */
+- chunk      = pginfo->u.usr.next_chunk;
+- prev_chunk = pginfo->u.usr.next_chunk;
+- list_for_each_entry_continue(
+-  chunk, (&(pginfo->u.usr.region->chunk_list)), list) {
+-  for (i = pginfo->u.usr.next_nmap; i < chunk->nmap; ) {
+-   if (nr_kpages == kpages_per_hwpage) {
+-    pgaddr = ( page_to_pfn(sg_page(&chunk->page_list[i]))
+-        << PAGE_SHIFT );
+-    *kpage = pgaddr;
+-    if ( !(*kpage) ) {
+-     ehca_gen_err("pgaddr=%llx i=%x",
+-           pgaddr, i);
++  if (nr_kpages == kpages_per_hwpage) {
++   pgaddr = (page_to_pfn(sg_page(*sg))
++       << PAGE_SHIFT);
++   *kpage = pgaddr;
++   if (!(*kpage)) {
++    ehca_gen_err("pgaddr=%llx entry=%llx",
++          pgaddr, pginfo->u.usr.next_nmap);
++    ret = -EFAULT;
++    return ret;
++   }
++   /*
++    * The first page in a hwpage must be aligned;
++    * the first MR page is exempt from this rule.
++    */
++   if (pgaddr & (pginfo->hwpage_size - 1)) {
++    if (pginfo->hwpage_cnt) {
++     ehca_gen_err(
++      "invalid alignment "
++      "pgaddr=%llx entry=%llx "
++      "mr_pgsize=%llx",
++      pgaddr, pginfo->u.usr.next_nmap,
++      pginfo->hwpage_size);
+      ret = -EFAULT;
+      return ret;
+     }
+-    /*
+-     * The first page in a hwpage must be aligned;
+-     * the first MR page is exempt from this rule.
+-     */
+-    if (pgaddr & (pginfo->hwpage_size - 1)) {
+-     if (pginfo->hwpage_cnt) {
+-      ehca_gen_err(
+-       "invalid alignment "
+-       "pgaddr=%llx i=%x "
+-       "mr_pgsize=%llx",
+-       pgaddr, i,
+-       pginfo->hwpage_size);
+-      ret = -EFAULT;
+-      return ret;
+-     }
+-     /* first MR page */
+-     pginfo->kpage_cnt =
+-      (pgaddr &
+-       (pginfo->hwpage_size - 1)) >>
+-      PAGE_SHIFT;
+-     nr_kpages -= pginfo->kpage_cnt;
+-     *kpage = pgaddr &
+-       ~(pginfo->hwpage_size - 1);
+-    }
+-    if (ehca_debug_level >= 3) {
+-     u64 val = *(u64 *)__va(pgaddr);
+-     ehca_gen_dbg("kpage=%llx chunk_page=%llx "
+-           "value=%016llx",
+-           *kpage, pgaddr, val);
+-    }
+-    prev_pgaddr = pgaddr;
+-    i++;
+-    pginfo->kpage_cnt++;
+-    pginfo->u.usr.next_nmap++;
+-    nr_kpages--;
+-    if (!nr_kpages)
+-     goto next_kpage;
+-    continue;
++    /* first MR page */
++    pginfo->kpage_cnt =
++     (pgaddr &
++      (pginfo->hwpage_size - 1)) >>
++     PAGE_SHIFT;
++    nr_kpages -= pginfo->kpage_cnt;
++    *kpage = pgaddr &
++      ~(pginfo->hwpage_size - 1);
+    }
+-   if (i + nr_kpages > chunk->nmap) {
+-    ret = ehca_check_kpages_per_ate(
+-     chunk->page_list, i,
+-     chunk->nmap - 1, &prev_pgaddr);
+-    if (ret) return ret;
+-    pginfo->kpage_cnt += chunk->nmap - i;
+-    pginfo->u.usr.next_nmap += chunk->nmap - i;
+-    nr_kpages -= chunk->nmap - i;
+-    break;
++   if (ehca_debug_level >= 3) {
++    u64 val = *(u64 *)__va(pgaddr);
++    ehca_gen_dbg("kpage=%llx page=%llx "
++          "value=%016llx",
++          *kpage, pgaddr, val);
+    }
++   prev_pgaddr = pgaddr;
++   *sg = sg_next(*sg);
++   pginfo->kpage_cnt++;
++   pginfo->u.usr.next_nmap++;
++   nr_kpages--;
++   if (!nr_kpages)
++    goto next_kpage;
++   continue;
++  }
++
++  ret = ehca_check_kpages_per_ate(sg, nr_kpages,
++      &prev_pgaddr);
++  if (ret)
++   return ret;
++  pginfo->kpage_cnt += nr_kpages;
++  pginfo->u.usr.next_nmap += nr_kpages;
+ 
+-   ret = ehca_check_kpages_per_ate(chunk->page_list, i,
+-       i + nr_kpages - 1,
+-       &prev_pgaddr);
+-   if (ret) return ret;
+-   i += nr_kpages;
+-   pginfo->kpage_cnt += nr_kpages;
+-   pginfo->u.usr.next_nmap += nr_kpages;
+ next_kpage:
+-   nr_kpages = kpages_per_hwpage;
+-   (pginfo->hwpage_cnt)++;
+-   kpage++;
+-   j++;
+-   if (j >= number) break;
+-  }
+-  if ((pginfo->u.usr.next_nmap >= chunk->nmap) &&
+-      (j >= number)) {
+-   pginfo->u.usr.next_nmap = 0;
+-   prev_chunk = chunk;
+-   break;
+-  } else if (pginfo->u.usr.next_nmap >= chunk->nmap) {
+-   pginfo->u.usr.next_nmap = 0;
+-   prev_chunk = chunk;
+-  } else if (j >= number)
++  nr_kpages = kpages_per_hwpage;
++  (pginfo->hwpage_cnt)++;
++  kpage++;
++  j++;
++  if (j >= number)
+    break;
+-  else
+-   prev_chunk = chunk;
+  }
+- pginfo->u.usr.next_chunk =
+-  list_prepare_entry(prev_chunk,
+-       (&(pginfo->u.usr.region->chunk_list)),
+-       list);
++
+  return ret;
+ }
+ 
+diff --git a/drivers/infiniband/hw/ipath/ipath_mr.c b/drivers/infiniband/hw/ipath/ipath_mr.c
+index e346d38..5e61e9b 100644
+--- a/drivers/infiniband/hw/ipath/ipath_mr.c
++++ b/drivers/infiniband/hw/ipath/ipath_mr.c
+@@ -188,8 +188,8 @@ struct ib_mr *ipath_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ {
+  struct ipath_mr *mr;
+  struct ib_umem *umem;
+- struct ib_umem_chunk *chunk;
+- int n, m, i;
++ int n, m, entry;
++ struct scatterlist *sg;
+  struct ib_mr *ret;
+ 
+  if (length == 0) {
+@@ -202,10 +202,7 @@ struct ib_mr *ipath_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  if (IS_ERR(umem))
+   return (void *) umem;
+ 
+- n = 0;
+- list_for_each_entry(chunk, &umem->chunk_list, list)
+-  n += chunk->nents;
+-
++ n = umem->nmap;
+  mr = alloc_mr(n, &to_idev(pd->device)->lk_table);
+  if (!mr) {
+   ret = ERR_PTR(-ENOMEM);
+@@ -224,22 +221,20 @@ struct ib_mr *ipath_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 
+  m = 0;
+  n = 0;
+- list_for_each_entry(chunk, &umem->chunk_list, list) {
+-  for (i = 0; i < chunk->nents; i++) {
+-   void *vaddr;
+-
+-   vaddr = page_address(sg_page(&chunk->page_list[i]));
+-   if (!vaddr) {
+-    ret = ERR_PTR(-EINVAL);
+-    goto bail;
+-   }
+-   mr->mr.map[m]->segs[n].vaddr = vaddr;
+-   mr->mr.map[m]->segs[n].length = umem->page_size;
+-   n++;
+-   if (n == IPATH_SEGSZ) {
+-    m++;
+-    n = 0;
+-   }
++ for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
++  void *vaddr;
++
++  vaddr = page_address(sg_page(sg));
++  if (!vaddr) {
++   ret = ERR_PTR(-EINVAL);
++   goto bail;
++  }
++  mr->mr.map[m]->segs[n].vaddr = vaddr;
++  mr->mr.map[m]->segs[n].length = umem->page_size;
++  n++;
++  if (n == IPATH_SEGSZ) {
++   m++;
++   n = 0;
+   }
+  }
+  ret = &mr->ibmr;
+diff --git a/drivers/infiniband/hw/mlx4/doorbell.c b/drivers/infiniband/hw/mlx4/doorbell.c
+index 8aee423..c517409 100644
+--- a/drivers/infiniband/hw/mlx4/doorbell.c
++++ b/drivers/infiniband/hw/mlx4/doorbell.c
+@@ -45,7 +45,6 @@ int mlx4_ib_db_map_user(struct mlx4_ib_ucontext *context, unsigned long virt,
+    struct mlx4_db *db)
+ {
+  struct mlx4_ib_user_db_page *page;
+- struct ib_umem_chunk *chunk;
+  int err = 0;
+ 
+  mutex_lock(&context->db_page_mutex);
+@@ -73,8 +72,7 @@ int mlx4_ib_db_map_user(struct mlx4_ib_ucontext *context, unsigned long virt,
+  list_add(&page->list, &context->db_page_list);
+ 
+ found:
+- chunk = list_entry(page->umem->chunk_list.next, struct ib_umem_chunk, list);
+- db->dma  = sg_dma_address(chunk->page_list) + (virt & ~PAGE_MASK);
++ db->dma = sg_dma_address(page->umem->sg_head.sgl) + (virt & ~PAGE_MASK);
+  db->u.user_page = page;
+  ++page->refcnt;
+ 
+diff --git a/drivers/infiniband/hw/mlx4/mr.c b/drivers/infiniband/hw/mlx4/mr.c
+index e471f08..cb2a872 100644
+--- a/drivers/infiniband/hw/mlx4/mr.c
++++ b/drivers/infiniband/hw/mlx4/mr.c
+@@ -90,11 +90,11 @@ int mlx4_ib_umem_write_mtt(struct mlx4_ib_dev *dev, struct mlx4_mtt *mtt,
+       struct ib_umem *umem)
+ {
+  u64 *pages;
+- struct ib_umem_chunk *chunk;
+- int i, j, k;
++ int i, k, entry;
+  int n;
+  int len;
+  int err = 0;
++ struct scatterlist *sg;
+ 
+  pages = (u64 *) __get_free_page(GFP_KERNEL);
+  if (!pages)
+@@ -102,26 +102,25 @@ int mlx4_ib_umem_write_mtt(struct mlx4_ib_dev *dev, struct mlx4_mtt *mtt,
+ 
+  i = n = 0;
+ 
+- list_for_each_entry(chunk, &umem->chunk_list, list)
+-  for (j = 0; j < chunk->nmap; ++j) {
+-   len = sg_dma_len(&chunk->page_list[j]) >> mtt->page_shift;
+-   for (k = 0; k < len; ++k) {
+-    pages[i++] = sg_dma_address(&chunk->page_list[j]) +
+-     umem->page_size * k;
+-    /*
+-     * Be friendly to mlx4_write_mtt() and
+-     * pass it chunks of appropriate size.
+-     */
+-    if (i == PAGE_SIZE / sizeof (u64)) {
+-     err = mlx4_write_mtt(dev->dev, mtt, n,
+-            i, pages);
+-     if (err)
+-      goto out;
+-     n += i;
+-     i = 0;
+-    }
++ for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
++  len = sg_dma_len(sg) >> mtt->page_shift;
++  for (k = 0; k < len; ++k) {
++   pages[i++] = sg_dma_address(sg) +
++    umem->page_size * k;
++   /*
++    * Be friendly to mlx4_write_mtt() and
++    * pass it chunks of appropriate size.
++    */
++   if (i == PAGE_SIZE / sizeof (u64)) {
++    err = mlx4_write_mtt(dev->dev, mtt, n,
++           i, pages);
++    if (err)
++     goto out;
++    n += i;
++    i = 0;
+    }
+   }
++ }
+ 
+  if (i)
+   err = mlx4_write_mtt(dev->dev, mtt, n, i, pages);
+diff --git a/drivers/infiniband/hw/mlx5/doorbell.c b/drivers/infiniband/hw/mlx5/doorbell.c
+index 256a233..ece028f 100644
+--- a/drivers/infiniband/hw/mlx5/doorbell.c
++++ b/drivers/infiniband/hw/mlx5/doorbell.c
+@@ -47,7 +47,6 @@ int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
+    struct mlx5_db *db)
+ {
+  struct mlx5_ib_user_db_page *page;
+- struct ib_umem_chunk *chunk;
+  int err = 0;
+ 
+  mutex_lock(&context->db_page_mutex);
+@@ -75,8 +74,7 @@ int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
+  list_add(&page->list, &context->db_page_list);
+ 
+ found:
+- chunk = list_entry(page->umem->chunk_list.next, struct ib_umem_chunk, list);
+- db->dma  = sg_dma_address(chunk->page_list) + (virt & ~PAGE_MASK);
++ db->dma = sg_dma_address(page->umem->sg_head.sgl) + (virt & ~PAGE_MASK);
+  db->u.user_page = page;
+  ++page->refcnt;
+ 
+diff --git a/drivers/infiniband/hw/mlx5/mem.c b/drivers/infiniband/hw/mlx5/mem.c
+index 3a53228..8499aec 100644
+--- a/drivers/infiniband/hw/mlx5/mem.c
++++ b/drivers/infiniband/hw/mlx5/mem.c
+@@ -44,16 +44,17 @@
+ void mlx5_ib_cont_pages(struct ib_umem *umem, u64 addr, int *count, int *shift,
+    int *ncont, int *order)
+ {
+- struct ib_umem_chunk *chunk;
+  unsigned long tmp;
+  unsigned long m;
+- int i, j, k;
++ int i, k;
+  u64 base = 0;
+  int p = 0;
+  int skip;
+  int mask;
+  u64 len;
+  u64 pfn;
++ struct scatterlist *sg;
++ int entry;
+ 
+  addr = addr >> PAGE_SHIFT;
+  tmp = (unsigned long)addr;
+@@ -61,32 +62,31 @@ void mlx5_ib_cont_pages(struct ib_umem *umem, u64 addr, int *count, int *shift,
+  skip = 1 << m;
+  mask = skip - 1;
+  i = 0;
+- list_for_each_entry(chunk, &umem->chunk_list, list)
+-  for (j = 0; j < chunk->nmap; j++) {
+-   len = sg_dma_len(&chunk->page_list[j]) >> PAGE_SHIFT;
+-   pfn = sg_dma_address(&chunk->page_list[j]) >> PAGE_SHIFT;
+-   for (k = 0; k < len; k++) {
+-    if (!(i & mask)) {
+-     tmp = (unsigned long)pfn;
+-     m = min(m, find_first_bit(&tmp, sizeof(tmp)));
++ for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
++  len = sg_dma_len(sg) >> PAGE_SHIFT;
++  pfn = sg_dma_address(sg) >> PAGE_SHIFT;
++  for (k = 0; k < len; k++) {
++   if (!(i & mask)) {
++    tmp = (unsigned long)pfn;
++    m = min(m, find_first_bit(&tmp, sizeof(tmp)));
++    skip = 1 << m;
++    mask = skip - 1;
++    base = pfn;
++    p = 0;
++   } else {
++    if (base + p != pfn) {
++     tmp = (unsigned long)p;
++     m = find_first_bit(&tmp, sizeof(tmp));
+      skip = 1 << m;
+      mask = skip - 1;
+      base = pfn;
+      p = 0;
+-    } else {
+-     if (base + p != pfn) {
+-      tmp = (unsigned long)p;
+-      m = find_first_bit(&tmp, sizeof(tmp));
+-      skip = 1 << m;
+-      mask = skip - 1;
+-      base = pfn;
+-      p = 0;
+-     }
+     }
+-    p++;
+-    i++;
+    }
++   p++;
++   i++;
+   }
++ }
+ 
+  if (i) {
+   m = min_t(unsigned long, ilog2(roundup_pow_of_two(i)), m);
+@@ -112,32 +112,32 @@ void mlx5_ib_populate_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
+ {
+  int shift = page_shift - PAGE_SHIFT;
+  int mask = (1 << shift) - 1;
+- struct ib_umem_chunk *chunk;
+- int i, j, k;
++ int i, k;
+  u64 cur = 0;
+  u64 base;
+  int len;
++ struct scatterlist *sg;
++ int entry;
+ 
+  i = 0;
+- list_for_each_entry(chunk, &umem->chunk_list, list)
+-  for (j = 0; j < chunk->nmap; j++) {
+-   len = sg_dma_len(&chunk->page_list[j]) >> PAGE_SHIFT;
+-   base = sg_dma_address(&chunk->page_list[j]);
+-   for (k = 0; k < len; k++) {
+-    if (!(i & mask)) {
+-     cur = base + (k << PAGE_SHIFT);
+-     if (umr)
+-      cur |= 3;
++ for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
++  len = sg_dma_len(sg) >> PAGE_SHIFT;
++  base = sg_dma_address(sg);
++  for (k = 0; k < len; k++) {
++   if (!(i & mask)) {
++    cur = base + (k << PAGE_SHIFT);
++    if (umr)
++     cur |= 3;
+ 
+-     pas[i >> shift] = cpu_to_be64(cur);
+-     mlx5_ib_dbg(dev, "pas[%d] 0x%llx\n",
+-          i >> shift, be64_to_cpu(pas[i >> shift]));
+-    }  else
+-     mlx5_ib_dbg(dev, "=====> 0x%llx\n",
+-          base + (k << PAGE_SHIFT));
+-    i++;
+-   }
++    pas[i >> shift] = cpu_to_be64(cur);
++    mlx5_ib_dbg(dev, "pas[%d] 0x%llx\n",
++         i >> shift, be64_to_cpu(pas[i >> shift]));
++   }  else
++    mlx5_ib_dbg(dev, "=====> 0x%llx\n",
++         base + (k << PAGE_SHIFT));
++   i++;
+   }
++ }
+ }
+ 
+ int mlx5_ib_get_buf_offset(u64 addr, int page_shift, u32 *offset)
+diff --git a/drivers/infiniband/hw/mthca/mthca_provider.c b/drivers/infiniband/hw/mthca/mthca_provider.c
+index 5b71d43..6440800 100644
+--- a/drivers/infiniband/hw/mthca/mthca_provider.c
++++ b/drivers/infiniband/hw/mthca/mthca_provider.c
+@@ -976,12 +976,12 @@ static struct ib_mr *mthca_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+            u64 virt, int acc, struct ib_udata *udata)
+ {
+  struct mthca_dev *dev = to_mdev(pd->device);
+- struct ib_umem_chunk *chunk;
++ struct scatterlist *sg;
+  struct mthca_mr *mr;
+  struct mthca_reg_mr ucmd;
+  u64 *pages;
+  int shift, n, len;
+- int i, j, k;
++ int i, k, entry;
+  int err = 0;
+  int write_mtt_size;
+ 
+@@ -1009,10 +1009,7 @@ static struct ib_mr *mthca_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  }
+ 
+  shift = ffs(mr->umem->page_size) - 1;
+-
+- n = 0;
+- list_for_each_entry(chunk, &mr->umem->chunk_list, list)
+-  n += chunk->nents;
++ n = mr->umem->nmap;
+ 
+  mr->mtt = mthca_alloc_mtt(dev, n);
+  if (IS_ERR(mr->mtt)) {
+@@ -1030,25 +1027,24 @@ static struct ib_mr *mthca_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 
+  write_mtt_size = min(mthca_write_mtt_size(dev), (int) (PAGE_SIZE / sizeof *pages));
+ 
+- list_for_each_entry(chunk, &mr->umem->chunk_list, list)
+-  for (j = 0; j < chunk->nmap; ++j) {
+-   len = sg_dma_len(&chunk->page_list[j]) >> shift;
+-   for (k = 0; k < len; ++k) {
+-    pages[i++] = sg_dma_address(&chunk->page_list[j]) +
+-     mr->umem->page_size * k;
+-    /*
+-     * Be friendly to write_mtt and pass it chunks
+-     * of appropriate size.
+-     */
+-    if (i == write_mtt_size) {
+-     err = mthca_write_mtt(dev, mr->mtt, n, pages, i);
+-     if (err)
+-      goto mtt_done;
+-     n += i;
+-     i = 0;
+-    }
++ for_each_sg(mr->umem->sg_head.sgl, sg, mr->umem->nmap, entry) {
++  len = sg_dma_len(sg) >> shift;
++  for (k = 0; k < len; ++k) {
++   pages[i++] = sg_dma_address(sg) +
++    mr->umem->page_size * k;
++   /*
++    * Be friendly to write_mtt and pass it chunks
++    * of appropriate size.
++    */
++   if (i == write_mtt_size) {
++    err = mthca_write_mtt(dev, mr->mtt, n, pages, i);
++    if (err)
++     goto mtt_done;
++    n += i;
++    i = 0;
+    }
+   }
++ }
+ 
+  if (i)
+   err = mthca_write_mtt(dev, mr->mtt, n, pages, i);
+diff --git a/drivers/infiniband/hw/nes/nes_verbs.c b/drivers/infiniband/hw/nes/nes_verbs.c
+index 8f67fe2..707acc0 100644
+--- a/drivers/infiniband/hw/nes/nes_verbs.c
++++ b/drivers/infiniband/hw/nes/nes_verbs.c
+@@ -2306,7 +2306,7 @@ static struct ib_mr *nes_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  struct nes_device *nesdev = nesvnic->nesdev;
+  struct nes_adapter *nesadapter = nesdev->nesadapter;
+  struct ib_mr *ibmr = ERR_PTR(-EINVAL);
+- struct ib_umem_chunk *chunk;
++ struct scatterlist *sg;
+  struct nes_ucontext *nes_ucontext;
+  struct nes_pbl *nespbl;
+  struct nes_mr *nesmr;
+@@ -2314,7 +2314,7 @@ static struct ib_mr *nes_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  struct nes_mem_reg_req req;
+  struct nes_vpbl vpbl;
+  struct nes_root_vpbl root_vpbl;
+- int nmap_index, page_index;
++ int entry, page_index;
+  int page_count = 0;
+  int err, pbl_depth = 0;
+  int chunk_pages;
+@@ -2329,6 +2329,7 @@ static struct ib_mr *nes_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  u16 pbl_count;
+  u8 single_page = 1;
+  u8 stag_key;
++ int first_page = 1;
+ 
+  region = ib_umem_get(pd->uobject->context, start, length, acc, 0);
+  if (IS_ERR(region)) {
+@@ -2379,128 +2380,125 @@ static struct ib_mr *nes_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+    }
+    nesmr->region = region;
+ 
+-   list_for_each_entry(chunk, &region->chunk_list, list) {
+-    nes_debug(NES_DBG_MR, "Chunk: nents = %u, nmap = %u .\n",
+-      chunk->nents, chunk->nmap);
+-    for (nmap_index = 0; nmap_index < chunk->nmap; ++nmap_index) {
+-     if (sg_dma_address(&chunk->page_list[nmap_index]) & ~PAGE_MASK) {
+-      ib_umem_release(region);
+-      nes_free_resource(nesadapter, nesadapter->allocated_mrs, stag_index);
+-      nes_debug(NES_DBG_MR, "Unaligned Memory Buffer: 0x%x\n",
+-        (unsigned int) sg_dma_address(&chunk->page_list[nmap_index]));
+-      ibmr = ERR_PTR(-EINVAL);
+-      kfree(nesmr);
+-      goto reg_user_mr_err;
+-     }
++   for_each_sg(region->sg_head.sgl, sg, region->nmap, entry) {
++    if (sg_dma_address(sg) & ~PAGE_MASK) {
++     ib_umem_release(region);
++     nes_free_resource(nesadapter, nesadapter->allocated_mrs, stag_index);
++     nes_debug(NES_DBG_MR, "Unaligned Memory Buffer: 0x%x\n",
++        (unsigned int) sg_dma_address(sg));
++     ibmr = ERR_PTR(-EINVAL);
++     kfree(nesmr);
++     goto reg_user_mr_err;
++    }
+ 
+-     if (!sg_dma_len(&chunk->page_list[nmap_index])) {
+-      ib_umem_release(region);
+-      nes_free_resource(nesadapter, nesadapter->allocated_mrs,
+-        stag_index);
+-      nes_debug(NES_DBG_MR, "Invalid Buffer Size\n");
+-      ibmr = ERR_PTR(-EINVAL);
+-      kfree(nesmr);
+-      goto reg_user_mr_err;
+-     }
++    if (!sg_dma_len(sg)) {
++     ib_umem_release(region);
++     nes_free_resource(nesadapter, nesadapter->allocated_mrs,
++         stag_index);
++     nes_debug(NES_DBG_MR, "Invalid Buffer Size\n");
++     ibmr = ERR_PTR(-EINVAL);
++     kfree(nesmr);
++     goto reg_user_mr_err;
++    }
+ 
+-     region_length += sg_dma_len(&chunk->page_list[nmap_index]);
+-     chunk_pages = sg_dma_len(&chunk->page_list[nmap_index]) >> 12;
+-     region_length -= skip_pages << 12;
+-     for (page_index=skip_pages; page_index < chunk_pages; page_index++) {
+-      skip_pages = 0;
+-      if ((page_count!=0)&&(page_count<<12)-(region->offset&(4096-1))>=region->length)
+-       goto enough_pages;
+-      if ((page_count&0x01FF) == 0) {
+-       if (page_count >= 1024 * 512) {
++    region_length += sg_dma_len(sg);
++    chunk_pages = sg_dma_len(sg) >> 12;
++    region_length -= skip_pages << 12;
++    for (page_index = skip_pages; page_index < chunk_pages; page_index++) {
++     skip_pages = 0;
++     if ((page_count != 0) && (page_count<<12)-(region->offset&(4096-1)) >= region->length)
++      goto enough_pages;
++     if ((page_count&0x01FF) == 0) {
++      if (page_count >= 1024 * 512) {
++       ib_umem_release(region);
++       nes_free_resource(nesadapter,
++           nesadapter->allocated_mrs, stag_index);
++       kfree(nesmr);
++       ibmr = ERR_PTR(-E2BIG);
++       goto reg_user_mr_err;
++      }
++      if (root_pbl_index == 1) {
++       root_vpbl.pbl_vbase = pci_alloc_consistent(nesdev->pcidev,
++         8192, &root_vpbl.pbl_pbase);
++       nes_debug(NES_DBG_MR, "Allocating root PBL, va = %p, pa = 0x%08X\n",
++          root_vpbl.pbl_vbase, (unsigned int)root_vpbl.pbl_pbase);
++       if (!root_vpbl.pbl_vbase) {
+         ib_umem_release(region);
+-        nes_free_resource(nesadapter,
+-          nesadapter->allocated_mrs, stag_index);
++        pci_free_consistent(nesdev->pcidev, 4096, vpbl.pbl_vbase,
++              vpbl.pbl_pbase);
++        nes_free_resource(nesadapter, nesadapter->allocated_mrs,
++            stag_index);
+         kfree(nesmr);
+-        ibmr = ERR_PTR(-E2BIG);
++        ibmr = ERR_PTR(-ENOMEM);
+         goto reg_user_mr_err;
+        }
+-       if (root_pbl_index == 1) {
+-        root_vpbl.pbl_vbase = pci_alloc_consistent(nesdev->pcidev,
+-          8192, &root_vpbl.pbl_pbase);
+-        nes_debug(NES_DBG_MR, "Allocating root PBL, va = %p, pa = 0x%08X\n",
+-          root_vpbl.pbl_vbase, (unsigned int)root_vpbl.pbl_pbase);
+-        if (!root_vpbl.pbl_vbase) {
+-         ib_umem_release(region);
+-         pci_free_consistent(nesdev->pcidev, 4096, vpbl.pbl_vbase,
+-           vpbl.pbl_pbase);
+-         nes_free_resource(nesadapter, nesadapter->allocated_mrs,
+-           stag_index);
+-         kfree(nesmr);
+-         ibmr = ERR_PTR(-ENOMEM);
+-         goto reg_user_mr_err;
+-        }
+-        root_vpbl.leaf_vpbl = kzalloc(sizeof(*root_vpbl.leaf_vpbl)*1024,
+-          GFP_KERNEL);
+-        if (!root_vpbl.leaf_vpbl) {
+-         ib_umem_release(region);
+-         pci_free_consistent(nesdev->pcidev, 8192, root_vpbl.pbl_vbase,
+-           root_vpbl.pbl_pbase);
+-         pci_free_consistent(nesdev->pcidev, 4096, vpbl.pbl_vbase,
+-           vpbl.pbl_pbase);
+-         nes_free_resource(nesadapter, nesadapter->allocated_mrs,
+-           stag_index);
+-         kfree(nesmr);
+-         ibmr = ERR_PTR(-ENOMEM);
+-         goto reg_user_mr_err;
+-        }
+-        root_vpbl.pbl_vbase[0].pa_low =
+-          cpu_to_le32((u32)vpbl.pbl_pbase);
+-        root_vpbl.pbl_vbase[0].pa_high =
+-          cpu_to_le32((u32)((((u64)vpbl.pbl_pbase) >> 32)));
+-        root_vpbl.leaf_vpbl[0] = vpbl;
+-       }
+-       vpbl.pbl_vbase = pci_alloc_consistent(nesdev->pcidev, 4096,
+-         &vpbl.pbl_pbase);
+-       nes_debug(NES_DBG_MR, "Allocating leaf PBL, va = %p, pa = 0x%08X\n",
+-         vpbl.pbl_vbase, (unsigned int)vpbl.pbl_pbase);
+-       if (!vpbl.pbl_vbase) {
++       root_vpbl.leaf_vpbl = kzalloc(sizeof(*root_vpbl.leaf_vpbl)*1024,
++         GFP_KERNEL);
++       if (!root_vpbl.leaf_vpbl) {
+         ib_umem_release(region);
+-        nes_free_resource(nesadapter, nesadapter->allocated_mrs, stag_index);
+-        ibmr = ERR_PTR(-ENOMEM);
++        pci_free_consistent(nesdev->pcidev, 8192, root_vpbl.pbl_vbase,
++              root_vpbl.pbl_pbase);
++        pci_free_consistent(nesdev->pcidev, 4096, vpbl.pbl_vbase,
++              vpbl.pbl_pbase);
++        nes_free_resource(nesadapter, nesadapter->allocated_mrs,
++            stag_index);
+         kfree(nesmr);
++        ibmr = ERR_PTR(-ENOMEM);
+         goto reg_user_mr_err;
+        }
+-       if (1 <= root_pbl_index) {
+-        root_vpbl.pbl_vbase[root_pbl_index].pa_low =
+-          cpu_to_le32((u32)vpbl.pbl_pbase);
+-        root_vpbl.pbl_vbase[root_pbl_index].pa_high =
+-          cpu_to_le32((u32)((((u64)vpbl.pbl_pbase)>>32)));
+-        root_vpbl.leaf_vpbl[root_pbl_index] = vpbl;
+-       }
+-       root_pbl_index++;
+-       cur_pbl_index = 0;
++       root_vpbl.pbl_vbase[0].pa_low =
++         cpu_to_le32((u32)vpbl.pbl_pbase);
++       root_vpbl.pbl_vbase[0].pa_high =
++         cpu_to_le32((u32)((((u64)vpbl.pbl_pbase) >> 32)));
++       root_vpbl.leaf_vpbl[0] = vpbl;
+       }
+-      if (single_page) {
+-       if (page_count != 0) {
+-        if ((last_dma_addr+4096) !=
+-          (sg_dma_address(&chunk->page_list[nmap_index])+
+-          (page_index*4096)))
+-         single_page = 0;
+-        last_dma_addr = sg_dma_address(&chunk->page_list[nmap_index])+
+-          (page_index*4096);
+-       } else {
+-        first_dma_addr = sg_dma_address(&chunk->page_list[nmap_index])+
+-          (page_index*4096);
+-        last_dma_addr = first_dma_addr;
+-       }
++      vpbl.pbl_vbase = pci_alloc_consistent(nesdev->pcidev, 4096,
++        &vpbl.pbl_pbase);
++      nes_debug(NES_DBG_MR, "Allocating leaf PBL, va = %p, pa = 0x%08X\n",
++         vpbl.pbl_vbase, (unsigned int)vpbl.pbl_pbase);
++      if (!vpbl.pbl_vbase) {
++       ib_umem_release(region);
++       nes_free_resource(nesadapter, nesadapter->allocated_mrs, stag_index);
++       ibmr = ERR_PTR(-ENOMEM);
++       kfree(nesmr);
++       goto reg_user_mr_err;
++      }
++      if (1 <= root_pbl_index) {
++       root_vpbl.pbl_vbase[root_pbl_index].pa_low =
++         cpu_to_le32((u32)vpbl.pbl_pbase);
++       root_vpbl.pbl_vbase[root_pbl_index].pa_high =
++         cpu_to_le32((u32)((((u64)vpbl.pbl_pbase)>>32)));
++       root_vpbl.leaf_vpbl[root_pbl_index] = vpbl;
++      }
++      root_pbl_index++;
++      cur_pbl_index = 0;
++     }
++     if (single_page) {
++      if (page_count != 0) {
++       if ((last_dma_addr+4096) !=
++         (sg_dma_address(sg)+
++         (page_index*4096)))
++        single_page = 0;
++       last_dma_addr = sg_dma_address(sg)+
++         (page_index*4096);
++      } else {
++       first_dma_addr = sg_dma_address(sg)+
++         (page_index*4096);
++       last_dma_addr = first_dma_addr;
+       }
+-
+-      vpbl.pbl_vbase[cur_pbl_index].pa_low =
+-        cpu_to_le32((u32)(sg_dma_address(&chunk->page_list[nmap_index])+
+-        (page_index*4096)));
+-      vpbl.pbl_vbase[cur_pbl_index].pa_high =
+-        cpu_to_le32((u32)((((u64)(sg_dma_address(&chunk->page_list[nmap_index])+
+-        (page_index*4096))) >> 32)));
+-      cur_pbl_index++;
+-      page_count++;
+      }
++
++     vpbl.pbl_vbase[cur_pbl_index].pa_low =
++       cpu_to_le32((u32)(sg_dma_address(sg)+
++       (page_index*4096)));
++     vpbl.pbl_vbase[cur_pbl_index].pa_high =
++       cpu_to_le32((u32)((((u64)(sg_dma_address(sg)+
++       (page_index*4096))) >> 32)));
++     cur_pbl_index++;
++     page_count++;
+     }
+    }
++
+    enough_pages:
+    nes_debug(NES_DBG_MR, "calculating stag, stag_index=0x%08x, driver_key=0x%08x,"
+      " stag_key=0x%08x\n",
+@@ -2612,25 +2610,28 @@ static struct ib_mr *nes_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+       nespbl->pbl_size, (unsigned long) nespbl->pbl_pbase,
+       (void *) nespbl->pbl_vbase, nespbl->user_base);
+ 
+-   list_for_each_entry(chunk, &region->chunk_list, list) {
+-    for (nmap_index = 0; nmap_index < chunk->nmap; ++nmap_index) {
+-     chunk_pages = sg_dma_len(&chunk->page_list[nmap_index]) >> 12;
+-     chunk_pages += (sg_dma_len(&chunk->page_list[nmap_index]) & (4096-1)) ? 1 : 0;
+-     nespbl->page = sg_page(&chunk->page_list[0]);
+-     for (page_index=0; page_index<chunk_pages; page_index++) {
+-      ((__le32 *)pbl)[0] = cpu_to_le32((u32)
+-        (sg_dma_address(&chunk->page_list[nmap_index])+
+-        (page_index*4096)));
+-      ((__le32 *)pbl)[1] = cpu_to_le32(((u64)
+-        (sg_dma_address(&chunk->page_list[nmap_index])+
+-        (page_index*4096)))>>32);
+-      nes_debug(NES_DBG_MR, "pbl=%p, *pbl=0x%016llx, 0x%08x%08x\n", pbl,
+-        (unsigned long long)*pbl,
+-        le32_to_cpu(((__le32 *)pbl)[1]), le32_to_cpu(((__le32 *)pbl)[0]));
+-      pbl++;
+-     }
++   for_each_sg(region->sg_head.sgl, sg, region->nmap, entry) {
++    chunk_pages = sg_dma_len(sg) >> 12;
++    chunk_pages += (sg_dma_len(sg) & (4096-1)) ? 1 : 0;
++    if (first_page) {
++     nespbl->page = sg_page(sg);
++     first_page = 0;
++    }
++
++    for (page_index = 0; page_index < chunk_pages; page_index++) {
++     ((__le32 *)pbl)[0] = cpu_to_le32((u32)
++       (sg_dma_address(sg)+
++       (page_index*4096)));
++     ((__le32 *)pbl)[1] = cpu_to_le32(((u64)
++       (sg_dma_address(sg)+
++       (page_index*4096)))>>32);
++     nes_debug(NES_DBG_MR, "pbl=%p, *pbl=0x%016llx, 0x%08x%08x\n", pbl,
++        (unsigned long long)*pbl,
++        le32_to_cpu(((__le32 *)pbl)[1]), le32_to_cpu(((__le32 *)pbl)[0]));
++     pbl++;
+     }
+    }
++
+    if (req.reg_type == IWNES_MEMREG_TYPE_QP) {
+     list_add_tail(&nespbl->list, &nes_ucontext->qp_reg_mem_list);
+    } else {
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index da6c018..4f8fb8b 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -726,10 +726,10 @@ static void build_user_pbes(struct ocrdma_dev *dev, struct ocrdma_mr *mr,
+        u32 num_pbes)
+ {
+  struct ocrdma_pbe *pbe;
+- struct ib_umem_chunk *chunk;
++ struct scatterlist *sg;
+  struct ocrdma_pbl *pbl_tbl = mr->hwmr.pbl_table;
+  struct ib_umem *umem = mr->umem;
+- int i, shift, pg_cnt, pages, pbe_cnt, total_num_pbes = 0;
++ int shift, pg_cnt, pages, pbe_cnt, entry, total_num_pbes = 0;
+ 
+  if (!mr->hwmr.num_pbes)
+   return;
+@@ -739,39 +739,37 @@ static void build_user_pbes(struct ocrdma_dev *dev, struct ocrdma_mr *mr,
+ 
+  shift = ilog2(umem->page_size);
+ 
+- list_for_each_entry(chunk, &umem->chunk_list, list) {
+-  /* get all the dma regions from the chunk. */
+-  for (i = 0; i < chunk->nmap; i++) {
+-   pages = sg_dma_len(&chunk->page_list[i]) >> shift;
+-   for (pg_cnt = 0; pg_cnt < pages; pg_cnt++) {
+-    /* store the page address in pbe */
+-    pbe->pa_lo =
+-        cpu_to_le32(sg_dma_address
+-      (&chunk->page_list[i]) +
+-      (umem->page_size * pg_cnt));
+-    pbe->pa_hi =
+-        cpu_to_le32(upper_32_bits
+-      ((sg_dma_address
+-        (&chunk->page_list[i]) +
+-        umem->page_size * pg_cnt)));
+-    pbe_cnt += 1;
+-    total_num_pbes += 1;
+-    pbe++;
+-
+-    /* if done building pbes, issue the mbx cmd. */
+-    if (total_num_pbes == num_pbes)
+-     return;
+-
+-    /* if the given pbl is full storing the pbes,
+-     * move to next pbl.
+-     */
+-    if (pbe_cnt ==
+-     (mr->hwmr.pbl_size / sizeof(u64))) {
+-     pbl_tbl++;
+-     pbe = (struct ocrdma_pbe *)pbl_tbl->va;
+-     pbe_cnt = 0;
+-    }
++ for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
++  pages = sg_dma_len(sg) >> shift;
++  for (pg_cnt = 0; pg_cnt < pages; pg_cnt++) {
++   /* store the page address in pbe */
++   pbe->pa_lo =
++       cpu_to_le32(sg_dma_address
++     (sg) +
++     (umem->page_size * pg_cnt));
++   pbe->pa_hi =
++       cpu_to_le32(upper_32_bits
++     ((sg_dma_address
++       (sg) +
++       umem->page_size * pg_cnt)));
++   pbe_cnt += 1;
++   total_num_pbes += 1;
++   pbe++;
++
++   /* if done building pbes, issue the mbx cmd. */
++   if (total_num_pbes == num_pbes)
++    return;
++
++   /* if the given pbl is full storing the pbes,
++    * move to next pbl.
++    */
++   if (pbe_cnt ==
++    (mr->hwmr.pbl_size / sizeof(u64))) {
++    pbl_tbl++;
++    pbe = (struct ocrdma_pbe *)pbl_tbl->va;
++    pbe_cnt = 0;
+    }
++
+   }
+  }
+ }
+diff --git a/drivers/infiniband/hw/qib/qib_mr.c b/drivers/infiniband/hw/qib/qib_mr.c
+index e6687de..9bbb553 100644
+--- a/drivers/infiniband/hw/qib/qib_mr.c
++++ b/drivers/infiniband/hw/qib/qib_mr.c
+@@ -232,8 +232,8 @@ struct ib_mr *qib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ {
+  struct qib_mr *mr;
+  struct ib_umem *umem;
+- struct ib_umem_chunk *chunk;
+- int n, m, i;
++ struct scatterlist *sg;
++ int n, m, entry;
+  struct ib_mr *ret;
+ 
+  if (length == 0) {
+@@ -246,9 +246,7 @@ struct ib_mr *qib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+  if (IS_ERR(umem))
+   return (void *) umem;
+ 
+- n = 0;
+- list_for_each_entry(chunk, &umem->chunk_list, list)
+-  n += chunk->nents;
++ n = umem->nmap;
+ 
+  mr = alloc_mr(n, pd);
+  if (IS_ERR(mr)) {
+@@ -268,11 +266,10 @@ struct ib_mr *qib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+   mr->mr.page_shift = ilog2(umem->page_size);
+  m = 0;
+  n = 0;
+- list_for_each_entry(chunk, &umem->chunk_list, list) {
+-  for (i = 0; i < chunk->nents; i++) {
++ for_each_sg(umem->sg_head.sgl, sg, umem->nmap, entry) {
+    void *vaddr;
+ 
+-   vaddr = page_address(sg_page(&chunk->page_list[i]));
++   vaddr = page_address(sg_page(sg));
+    if (!vaddr) {
+     ret = ERR_PTR(-EINVAL);
+     goto bail;
+@@ -284,7 +281,6 @@ struct ib_mr *qib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+     m++;
+     n = 0;
+    }
+-  }
+  }
+  ret = &mr->ibmr;
+ 
+diff --git a/include/rdma/ib_umem.h b/include/rdma/ib_umem.h
+index 9ee0d2e..1ea0b65 100644
+--- a/include/rdma/ib_umem.h
++++ b/include/rdma/ib_umem.h
+@@ -46,17 +46,12 @@ struct ib_umem {
+  int   page_size;
+  int                     writable;
+  int                     hugetlb;
+- struct list_head chunk_list;
+  struct work_struct work;
+  struct mm_struct       *mm;
+  unsigned long  diff;
+-};
+-
+-struct ib_umem_chunk {
+- struct list_head list;
+- int                     nents;
+- int                     nmap;
+- struct scatterlist      page_list[0];
++ struct sg_table sg_head;
++ int             nmap;
++ int             npages;
+ };
+ 
+ #ifdef CONFIG_INFINIBAND_USER_MEM
+-- 
+1.7.1

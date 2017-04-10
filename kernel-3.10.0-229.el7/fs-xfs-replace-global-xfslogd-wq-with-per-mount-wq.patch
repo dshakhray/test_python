@@ -1,0 +1,150 @@
+From ddaea5984d0db40bd1a031286fc516527c43db89 Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Tue, 2 Dec 2014 15:21:15 -0500
+Subject: [fs] xfs: replace global xfslogd wq with per-mount wq
+
+Message-id: <1417533675-27934-3-git-send-email-bfoster@redhat.com>
+Patchwork-id: 101031
+O-Subject: [RHEL7 PATCH 2/2] xfs: replace global xfslogd wq with per-mount wq
+Bugzilla: 1155929
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+commit 78c931b8be75456562b55ed4e27878f1519e1367
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Fri Nov 28 13:59:58 2014 +1100
+
+    xfs: replace global xfslogd wq with per-mount wq
+
+    The xfslogd workqueue is a global, single-job workqueue for buffer ioend
+    processing. This means we allow for a single work item at a time for all
+    possible XFS mounts on a system. fsstress testing in loopback XFS over
+    XFS configurations has reproduced xfslogd deadlocks due to the single
+    threaded nature of the queue and dependencies introduced between the
+    separate XFS instances by online discard (-o discard).
+
+    Discard over a loopback device converts the discard request to a hole
+    punch (fallocate) on the underlying file. Online discard requests are
+    issued synchronously and from xfslogd context in XFS, hence the xfslogd
+    workqueue is blocked in the upper fs waiting on a hole punch request to
+    be servied in the lower fs. If the lower fs issues I/O that depends on
+    xfslogd to complete, both filesystems end up hung indefinitely. This is
+    reproduced reliabily by generic/013 on XFS->loop->XFS test devices with
+    the '-o discard' mount option.
+
+    Further, docker implementations appear to use this kind of configuration
+    for container instance filesystems by default (container fs->dm->
+    loop->base fs) and therefore are subject to this deadlock when running
+    on XFS.
+
+    Replace the global xfslogd workqueue with a per-mount variant. This
+    guarantees each mount access to a single worker and prevents deadlocks
+    due to inter-fs dependencies introduced by discard. Since the queue is
+    only responsible for buffer iodone processing at this point in time,
+    rename xfslogd to xfs-buf.
+
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_buf.c b/fs/xfs/xfs_buf.c
+index 680cd94..1069c2b 100644
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -44,8 +44,6 @@
+ 
+ static kmem_zone_t *xfs_buf_zone;
+ 
+-static struct workqueue_struct *xfslogd_workqueue;
+-
+ #ifdef XFS_BUF_LOCK_TRACKING
+ # define XB_SET_OWNER(bp) ((bp)->b_last_holder = current->pid)
+ # define XB_CLEAR_OWNER(bp) ((bp)->b_last_holder = -1)
+@@ -1059,7 +1057,8 @@ xfs_buf_ioend(
+  if (bp->b_iodone || (read && bp->b_ops) || (bp->b_flags & XBF_ASYNC)) {
+   if (schedule) {
+    INIT_WORK(&bp->b_iodone_work, xfs_buf_iodone_work);
+-   queue_work(xfslogd_workqueue, &bp->b_iodone_work);
++   queue_work(bp->b_target->bt_mount->m_buf_workqueue,
++       &bp->b_iodone_work);
+   } else {
+    xfs_buf_iodone_work(&bp->b_iodone_work);
+   }
+@@ -1864,15 +1863,8 @@ xfs_buf_init(void)
+  if (!xfs_buf_zone)
+   goto out;
+ 
+- xfslogd_workqueue = alloc_workqueue("xfslogd",
+-    WQ_MEM_RECLAIM | WQ_HIGHPRI | WQ_FREEZABLE, 1);
+- if (!xfslogd_workqueue)
+-  goto out_free_buf_zone;
+-
+  return 0;
+ 
+- out_free_buf_zone:
+- kmem_zone_destroy(xfs_buf_zone);
+  out:
+  return -ENOMEM;
+ }
+@@ -1880,6 +1872,5 @@ xfs_buf_init(void)
+ void
+ xfs_buf_terminate(void)
+ {
+- destroy_workqueue(xfslogd_workqueue);
+  kmem_zone_destroy(xfs_buf_zone);
+ }
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index a466c5e..42da9ed 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -173,6 +173,7 @@ typedef struct xfs_mount {
+  int64_t   m_low_space[XFS_LOWSP_MAX];
+       /* low free space thresholds */
+ 
++ struct workqueue_struct *m_buf_workqueue;
+  struct workqueue_struct *m_data_workqueue;
+  struct workqueue_struct *m_unwritten_workqueue;
+  struct workqueue_struct *m_cil_workqueue;
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index e984509..93c31d6 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -847,10 +847,16 @@ STATIC int
+ xfs_init_mount_workqueues(
+  struct xfs_mount *mp)
+ {
++ mp->m_buf_workqueue = alloc_workqueue("xfs-buf/%s",
++   WQ_MEM_RECLAIM|WQ_HIGHPRI|WQ_FREEZABLE, 1,
++   mp->m_fsname);
++ if (!mp->m_buf_workqueue)
++  goto out;
++
+  mp->m_data_workqueue = alloc_workqueue("xfs-data/%s",
+    WQ_MEM_RECLAIM|WQ_FREEZABLE, 0, mp->m_fsname);
+  if (!mp->m_data_workqueue)
+-  goto out;
++  goto out_destroy_buf;
+ 
+  mp->m_unwritten_workqueue = alloc_workqueue("xfs-conv/%s",
+    WQ_MEM_RECLAIM|WQ_FREEZABLE, 0, mp->m_fsname);
+@@ -889,6 +895,8 @@ out_destroy_unwritten:
+  destroy_workqueue(mp->m_unwritten_workqueue);
+ out_destroy_data_iodone_queue:
+  destroy_workqueue(mp->m_data_workqueue);
++out_destroy_buf:
++ destroy_workqueue(mp->m_buf_workqueue);
+ out:
+  return -ENOMEM;
+ }
+@@ -903,6 +911,7 @@ xfs_destroy_mount_workqueues(
+  destroy_workqueue(mp->m_cil_workqueue);
+  destroy_workqueue(mp->m_data_workqueue);
+  destroy_workqueue(mp->m_unwritten_workqueue);
++ destroy_workqueue(mp->m_buf_workqueue);
+ }
+ 
+ /*
+-- 
+1.7.1

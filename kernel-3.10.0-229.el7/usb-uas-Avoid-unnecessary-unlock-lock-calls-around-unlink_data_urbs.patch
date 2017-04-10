@@ -1,0 +1,93 @@
+From dd6a816d8304c038047a911b9fa448b1aac5b340 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:12 -0400
+Subject: [usb] uas: Avoid unnecessary unlock / lock calls around unlink_data_urbs
+
+Message-id: <1410887463-20674-301-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95441
+O-Subject: [RHEL7 PATCH 300/591] uas: Avoid unnecessary unlock / lock calls around unlink_data_urbs
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 7e50e0bec45897caeb978e5aecc9184a2dc00df2
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Thu Oct 17 19:19:04 2013 +0200
+
+    uas: Avoid unnecessary unlock / lock calls around unlink_data_urbs
+
+    All callers of unlink_data_urbs drop devinfo->lock before calling it, and
+    then immediately take it again after the call. And the first thing
+    unlink_data_urbs does is take the lock again, and the last thing it does
+    is drop it. This commit removes all the unnecessary lock dropping and taking.
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index ec1b22d..dcaf611 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -93,28 +93,26 @@ static void uas_configure_endpoints(struct uas_dev_info *devinfo);
+ static void uas_free_streams(struct uas_dev_info *devinfo);
+ static void uas_log_cmd_state(struct scsi_cmnd *cmnd, const char *caller);
+ 
++/* Must be called with devinfo->lock held, will temporary unlock the lock */
+ static void uas_unlink_data_urbs(struct uas_dev_info *devinfo,
+-     struct uas_cmd_info *cmdinfo)
++     struct uas_cmd_info *cmdinfo,
++     unsigned long *lock_flags)
+ {
+- unsigned long flags;
+-
+  /*
+   * The UNLINK_DATA_URBS flag makes sure uas_try_complete
+   * (called by urb completion) doesn't release cmdinfo
+   * underneath us.
+   */
+- spin_lock_irqsave(&devinfo->lock, flags);
+  cmdinfo->state |= UNLINK_DATA_URBS;
+- spin_unlock_irqrestore(&devinfo->lock, flags);
++ spin_unlock_irqrestore(&devinfo->lock, *lock_flags);
+ 
+  if (cmdinfo->data_in_urb)
+   usb_unlink_urb(cmdinfo->data_in_urb);
+  if (cmdinfo->data_out_urb)
+   usb_unlink_urb(cmdinfo->data_out_urb);
+ 
+- spin_lock_irqsave(&devinfo->lock, flags);
++ spin_lock_irqsave(&devinfo->lock, *lock_flags);
+  cmdinfo->state &= ~UNLINK_DATA_URBS;
+- spin_unlock_irqrestore(&devinfo->lock, flags);
+ }
+ 
+ static void uas_do_work(struct work_struct *work)
+@@ -361,9 +359,7 @@ static void uas_stat_cmplt(struct urb *urb)
+    uas_sense(urb, cmnd);
+   if (cmnd->result != 0) {
+    /* cancel data transfers on error */
+-   spin_unlock_irqrestore(&devinfo->lock, flags);
+-   uas_unlink_data_urbs(devinfo, cmdinfo);
+-   spin_lock_irqsave(&devinfo->lock, flags);
++   uas_unlink_data_urbs(devinfo, cmdinfo, &flags);
+   }
+   cmdinfo->state &= ~COMMAND_INFLIGHT;
+   uas_try_complete(cmnd, __func__);
+@@ -787,9 +783,7 @@ static int uas_eh_abort_handler(struct scsi_cmnd *cmnd)
+   spin_unlock_irqrestore(&devinfo->lock, flags);
+   ret = uas_eh_task_mgmt(cmnd, "ABORT TASK", TMF_ABORT_TASK);
+  } else {
+-  spin_unlock_irqrestore(&devinfo->lock, flags);
+-  uas_unlink_data_urbs(devinfo, cmdinfo);
+-  spin_lock_irqsave(&devinfo->lock, flags);
++  uas_unlink_data_urbs(devinfo, cmdinfo, &flags);
+   uas_try_complete(cmnd, __func__);
+   spin_unlock_irqrestore(&devinfo->lock, flags);
+   ret = SUCCESS;
+-- 
+1.7.1

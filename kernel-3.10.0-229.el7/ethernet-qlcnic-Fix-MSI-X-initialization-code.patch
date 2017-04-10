@@ -1,0 +1,99 @@
+From 23ba3b29c3927705747ab85f0b9a9f47b5808151 Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:06:33 -0400
+Subject: [ethernet] qlcnic: Fix MSI-X initialization code
+
+Message-id: <1408626422-3941-110-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88621
+O-Subject: [PATCH RHEL 7.1 109/138] qlcnic: Fix MSI-X initialization code
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Alexander Gordeev <agordeev@redhat.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id 8564ae09e08340a26c5408637cc4b32dba9f1640
+
+Function qlcnic_setup_tss_rss_intr() might enter endless
+loop in case pci_enable_msix() contiguously returns a
+positive number of MSI-Xs that could have been allocated.
+Besides, the function contains 'err = -EIO;' assignment
+that never could be reached. This update fixes the
+aforementioned issues.
+
+Cc: Shahed Shaikh <shahed.shaikh@qlogic.com>
+Cc: Dept-HSGLinuxNICDev@qlogic.com
+Cc: netdev@vger.kernel.org
+Cc: linux-pci@vger.kernel.org
+
+Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+Acked-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index 87edac6..d0d5a51 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -671,7 +671,7 @@ int qlcnic_setup_tss_rss_intr(struct qlcnic_adapter *adapter)
+  else
+   num_msix += adapter->drv_tx_rings;
+ 
+- if (adapter->drv_rss_rings  > 0)
++ if (adapter->drv_rss_rings > 0)
+   num_msix += adapter->drv_rss_rings;
+  else
+   num_msix += adapter->drv_sds_rings;
+@@ -687,19 +687,15 @@ int qlcnic_setup_tss_rss_intr(struct qlcnic_adapter *adapter)
+    return -ENOMEM;
+  }
+ 
+-restore:
+  for (vector = 0; vector < num_msix; vector++)
+   adapter->msix_entries[vector].entry = vector;
+ 
++restore:
+  err = pci_enable_msix(pdev, adapter->msix_entries, num_msix);
+- if (err == 0) {
+-  adapter->ahw->num_msix = num_msix;
+-  if (adapter->drv_tss_rings > 0)
+-   adapter->drv_tx_rings = adapter->drv_tss_rings;
++ if (err > 0) {
++  if (!adapter->drv_tss_rings && !adapter->drv_rss_rings)
++   return -ENOSPC;
+ 
+-  if (adapter->drv_rss_rings > 0)
+-   adapter->drv_sds_rings = adapter->drv_rss_rings;
+- } else {
+   netdev_info(adapter->netdev,
+        "Unable to allocate %d MSI-X vectors, Available vectors %d\n",
+        num_msix, err);
+@@ -717,12 +713,20 @@ restore:
+        "Restoring %d Tx, %d SDS rings for total %d vectors.\n",
+        adapter->drv_tx_rings, adapter->drv_sds_rings,
+        num_msix);
+-  goto restore;
+ 
+-  err = -EIO;
++  goto restore;
++ } else if (err < 0) {
++  return err;
+  }
+ 
+- return err;
++ adapter->ahw->num_msix = num_msix;
++ if (adapter->drv_tss_rings > 0)
++  adapter->drv_tx_rings = adapter->drv_tss_rings;
++
++ if (adapter->drv_rss_rings > 0)
++  adapter->drv_sds_rings = adapter->drv_rss_rings;
++
++ return 0;
+ }
+ 
+ int qlcnic_enable_msix(struct qlcnic_adapter *adapter, u32 num_msix)
+-- 
+1.7.1

@@ -1,0 +1,130 @@
+From 4fbcf9698fed7808a0375be36531006afc9644ca Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Mon, 3 Nov 2014 07:52:12 -0500
+Subject: [infiniband] iser: Implement check_protection
+
+Message-id: <7a73b913219adb5d8cc1158759b9f49ffc8dbf20.1415000301.git.avadai@redhat.com>
+Patchwork-id: 98683
+O-Subject: [Patch RHEL7.1 14/37] IB/iser: Implement check_protection
+Bugzilla: 1107622
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Doug Ledford <dledford@redhat.com>
+
+From: Sagi Grimberg <sagig@mellanox.com>
+
+Once the iSCSI transaction is completed we must implement
+check_protection in order to notify on DIF errors that may have
+occured.
+
+The routine boils down to calling ib_check_mr_status to get the
+signature status of the transaction.
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Alex Tabachnik <alext@mellanox.com>
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 0a7a08ad6f5f344d592fe63403f48e67395e08bf)
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.c b/drivers/infiniband/ulp/iser/iscsi_iser.c
+index a64b878..f13d7e9 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@ -306,6 +306,18 @@ static void iscsi_iser_cleanup_task(struct iscsi_task *task)
+  }
+ }
+ 
++static u8 iscsi_iser_check_protection(struct iscsi_task *task, sector_t *sector)
++{
++ struct iscsi_iser_task *iser_task = task->dd_data;
++
++ if (iser_task->dir[ISER_DIR_IN])
++  return iser_check_task_pi_status(iser_task, ISER_DIR_IN,
++       sector);
++ else
++  return iser_check_task_pi_status(iser_task, ISER_DIR_OUT,
++       sector);
++}
++
+ static struct iscsi_cls_conn *
+ iscsi_iser_conn_create(struct iscsi_cls_session *cls_session, uint32_t conn_idx)
+ {
+@@ -742,6 +754,7 @@ static struct iscsi_transport iscsi_iser_transport = {
+  .xmit_task  = iscsi_iser_task_xmit,
+  .cleanup_task  = iscsi_iser_cleanup_task,
+  .alloc_pdu  = iscsi_iser_pdu_alloc,
++ .check_protection = iscsi_iser_check_protection,
+  /* recovery */
+  .session_recovery_timedout = iscsi_session_recovery_timedout,
+ 
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.h b/drivers/infiniband/ulp/iser/iscsi_iser.h
+index fce5409..95f291f 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@ -483,4 +483,6 @@ int iser_create_fmr_pool(struct iser_conn *ib_conn, unsigned cmds_max);
+ void iser_free_fmr_pool(struct iser_conn *ib_conn);
+ int iser_create_fastreg_pool(struct iser_conn *ib_conn, unsigned cmds_max);
+ void iser_free_fastreg_pool(struct iser_conn *ib_conn);
++u8 iser_check_task_pi_status(struct iscsi_iser_task *iser_task,
++        enum iser_data_dir cmd_dir, sector_t *sector);
+ #endif
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index 0404c71..abbb6ec 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -1153,3 +1153,50 @@ static void iser_cq_callback(struct ib_cq *cq, void *cq_context)
+ 
+  tasklet_schedule(&device->cq_tasklet[cq_index]);
+ }
++
++u8 iser_check_task_pi_status(struct iscsi_iser_task *iser_task,
++        enum iser_data_dir cmd_dir, sector_t *sector)
++{
++ struct iser_mem_reg *reg = &iser_task->rdma_regd[cmd_dir].reg;
++ struct fast_reg_descriptor *desc = reg->mem_h;
++ unsigned long sector_size = iser_task->sc->device->sector_size;
++ struct ib_mr_status mr_status;
++ int ret;
++
++ if (desc && desc->reg_indicators & ISER_FASTREG_PROTECTED) {
++  desc->reg_indicators &= ~ISER_FASTREG_PROTECTED;
++  ret = ib_check_mr_status(desc->pi_ctx->sig_mr,
++      IB_MR_CHECK_SIG_STATUS, &mr_status);
++  if (ret) {
++   pr_err("ib_check_mr_status failed, ret %d\n", ret);
++   goto err;
++  }
++
++  if (mr_status.fail_status & IB_MR_CHECK_SIG_STATUS) {
++   sector_t sector_off = mr_status.sig_err.sig_err_offset;
++
++   do_div(sector_off, sector_size + 8);
++   *sector = scsi_get_lba(iser_task->sc) + sector_off;
++
++   pr_err("PI error found type %d at sector %lx "
++          "expected %x vs actual %x\n",
++          mr_status.sig_err.err_type, *sector,
++          mr_status.sig_err.expected,
++          mr_status.sig_err.actual);
++
++   switch (mr_status.sig_err.err_type) {
++   case IB_SIG_BAD_GUARD:
++    return 0x1;
++   case IB_SIG_BAD_REFTAG:
++    return 0x3;
++   case IB_SIG_BAD_APPTAG:
++    return 0x2;
++   }
++  }
++ }
++
++ return 0;
++err:
++ /* Not alot we can do here, return ambiguous guard error */
++ return 0x1;
++}
+-- 
+1.7.1

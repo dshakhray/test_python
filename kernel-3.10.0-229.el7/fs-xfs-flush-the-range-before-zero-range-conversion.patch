@@ -1,0 +1,92 @@
+From 255ffac77600962b46f03a6a29f8a17c792387b9 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Fri, 10 Oct 2014 16:27:42 -0400
+Subject: [fs] xfs: flush the range before zero range conversion
+
+Message-id: <543808FE.707@redhat.com>
+Patchwork-id: 97442
+O-Subject: [RHEL7.1 PATCH 48/47] [fs] xfs: flush the range before zero range conversion
+Bugzilla: 1145837
+RH-Acked-by: Brian Foster <bfoster@redhat.com>
+RH-Acked-by: Dave Chinner <dchinner@redhat.com>
+
+Bugzilla: 1145837
+Upstream Status: Committed upstream (xfs git tree)
+Build Info: https://brewweb.devel.redhat.com/taskinfo?taskID=8082426
+Tested: locally using xfstests
+
+Note: An error sign was flipped in the backport, because upstream this
+function has been switched to return negative errors, but in RHEL7 core
+xfs functions still return positive, and the caller at the VFS
+interface switches things.
+
+Thanks,
+-Eric
+
+    commit da5f10969d54006a24777a84ed3eaeeb2a21047f
+    Author: Brian Foster <bfoster@redhat.com>
+    Date:   Thu Oct 2 09:44:54 2014 +1000
+
+    xfs: flush the range before zero range conversion
+
+    XFS currently discards delalloc blocks within the target range of a
+    zero range request. Unaligned start and end offsets are zeroed
+    through the page cache and the internal, aligned blocks are
+    converted to unwritten extents.
+
+    If EOF is page aligned and covered by a delayed allocation extent.
+    The inode size is not updated until I/O completion. If a zero range
+    request discards a delalloc range that covers page aligned EOF as
+    such, the inode size update never occurs. For example:
+
+    $ rm -f /mnt/file
+    $ xfs_io -fc "pwrite 0 64k" -c "zero 60k 4k" /mnt/file
+    $ stat -c "%s" /mnt/file
+    65536
+    $ umount /mnt
+    $ mount <dev> /mnt
+    $ stat -c "%s" /mnt/file
+    61440
+
+    Update xfs_zero_file_space() to flush the range rather than discard
+    delalloc blocks to ensure that inode size updates occur
+    appropriately.
+
+    [dchinner: Note that this is really a workaround to avoid the
+    underlying problems. More work is needed (and ongoing) to fix those
+    issues so this fix is being added as a temporary stop-gap measure. ]
+
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index ce5cc28..e2ea28f 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -1393,14 +1393,14 @@ xfs_zero_file_space(
+ 
+  if (start_boundary < end_boundary - 1) {
+   /*
+-   * punch out delayed allocation blocks and the page cache over
+-   * the conversion range
++   * Writeback the range to ensure any inode size updates due to
++   * appending writes make it to disk (otherwise we could just
++   * punch out the delalloc blocks).
+    */
+-  xfs_ilock(ip, XFS_ILOCK_EXCL);
+-  error = xfs_bmap_punch_delalloc_range(ip,
+-    XFS_B_TO_FSBT(mp, start_boundary),
+-    XFS_B_TO_FSB(mp, end_boundary - start_boundary));
+-  xfs_iunlock(ip, XFS_ILOCK_EXCL);
++  error = -filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
++    start_boundary, end_boundary - 1);
++  if (error)
++   goto out;
+   truncate_pagecache_range(VFS_I(ip), start_boundary,
+       end_boundary - 1);
+ 
+-- 
+1.7.1

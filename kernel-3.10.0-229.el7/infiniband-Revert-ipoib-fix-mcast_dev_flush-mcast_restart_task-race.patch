@@ -1,0 +1,77 @@
+From b52c5c043bdded048886278fdd962475dccff65a Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 28 Jan 2015 23:10:34 -0500
+Subject: [infiniband] Revert: ipoib: fix mcast_dev_flush/mcast_restart_task race
+
+Message-id: <f5e39b897e73bea943e02a110923b29ef456b070.1422486318.git.dledford@redhat.com>
+Patchwork-id: 103875
+O-Subject: [Patch RHEL7 5/8] Revert "[infiniband] ipoib: fix mcast_dev_flush/mcast_restart_task race"
+Bugzilla: 1179740
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+This reverts commit 184c547e8754149994943c0cd24e750bb2d45b5e.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+index 19e3fe7..f5e8da5 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -810,10 +810,7 @@ void ipoib_mcast_dev_flush(struct net_device *dev)
+ 
+  spin_unlock_irqrestore(&priv->lock, flags);
+ 
+- /*
+-  * make sure the in-flight joins have finished before we attempt
+-  * to leave
+-  */
++ /* seperate between the wait to the leave*/
+  list_for_each_entry_safe(mcast, tmcast, &remove_list, list)
+   if (test_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags))
+    wait_for_completion(&mcast->done);
+@@ -934,38 +931,14 @@ void ipoib_mcast_restart_task(struct work_struct *work)
+  netif_addr_unlock(dev);
+  local_irq_restore(flags);
+ 
+- /*
+-  * make sure the in-flight joins have finished before we attempt
+-  * to leave
+-  */
+- list_for_each_entry_safe(mcast, tmcast, &remove_list, list)
+-  if (test_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags))
+-   wait_for_completion(&mcast->done);
+-
+- /*
+-  * We have to cancel outside of the spinlock, but we have to
+-  * take the rtnl lock or else we race with the removal of
+-  * entries from the remove list in mcast_dev_flush as part
+-  * of ipoib_stop() which will call mcast_stop_thread with
+-  * flush == 1 while holding the rtnl lock, and the
+-  * flush_workqueue won't complete until this restart_mcast_task
+-  * completes.  So do like the carrier on task and attempt to
+-  * take the rtnl lock, but if we can't before the ADMIN_UP flag
+-  * goes away, then just return and know that the remove list will
+-  * get flushed later by mcast_dev_flush.
+-  */
+- while (!rtnl_trylock()) {
+-  if (!test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags))
+-   return;
+-  else
+-   msleep(20);
+- }
++ /* We have to cancel outside of the spinlock */
+  list_for_each_entry_safe(mcast, tmcast, &remove_list, list) {
+   ipoib_mcast_leave(mcast->dev, mcast);
+   ipoib_mcast_free(mcast);
+  }
+- ipoib_mcast_start_thread(dev);
+- rtnl_unlock();
++
++ if (test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags))
++  ipoib_mcast_start_thread(dev);
+ }
+ 
+ #ifdef CONFIG_INFINIBAND_IPOIB_DEBUG
+-- 
+1.7.1

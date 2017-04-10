@@ -1,0 +1,97 @@
+From c9a7b28112ca6faa67e3692e2de49691da661363 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 4 Sep 2014 14:59:13 -0400
+Subject: [kernel] timekeeping: Use cached ntp_tick_length when accumulating error
+
+Message-id: <1409842753-18799-3-git-send-email-prarit@redhat.com>
+Patchwork-id: 91235
+O-Subject: [RHEL7.1 PATCH BZ 1136839 2/2] timekeeping: Use cached ntp_tick_length when accumulating error
+Bugzilla: 1136839
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1136839
+
+commit 375f45b5b53a91dfa8f0c11328e0e044f82acbed
+Author: John Stultz <john.stultz@linaro.org>
+Date:   Wed Apr 23 20:53:29 2014 -0700
+
+    timekeeping: Use cached ntp_tick_length when accumulating error
+
+    By caching the ntp_tick_length() when we correct the frequency error,
+    and then using that cached value to accumulate error, we avoid large
+    initial errors when the tick length is changed.
+
+    This makes convergence happen much faster in the simulator, since the
+    initial error doesn't have to be slowly whittled away.
+
+    This initially seems like an accounting error, but Miroslav pointed out
+    that ntp_tick_length() can change mid-tick, so when we apply it in the
+    error accumulation, we are applying any recent change to the entire tick.
+
+    This approach chooses to apply changes in the ntp_tick_length() only to
+    the next tick, which allows us to calculate the freq correction before
+    using the new tick length, which avoids accummulating error.
+
+    Credit to Miroslav for pointing this out and providing the original patch
+    this functionality has been pulled out from, along with the rational.
+
+    Cc: Miroslav Lichvar <mlichvar@redhat.com>
+    Cc: Richard Cochran <richardcochran@gmail.com>
+    Cc: Prarit Bhargava <prarit@redhat.com>
+    Reported-by: Miroslav Lichvar <mlichvar@redhat.com>
+    Signed-off-by: John Stultz <john.stultz@linaro.org>
+
+Cc: Miroslav Lichvar <mlichvar@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/timekeeper_internal.h b/include/linux/timekeeper_internal.h
+index df5a159..4e31044 100644
+--- a/include/linux/timekeeper_internal.h
++++ b/include/linux/timekeeper_internal.h
+@@ -69,6 +69,13 @@ struct timekeeper {
+  /* Offset clock monotonic -> clock tai */
+  ktime_t   offs_tai;
+ 
++ /* The ntp_tick_length() value currently being used.
++  * This cached copy ensures we consistently apply the tick
++  * length for an entire tick, as ntp_tick_length may change
++  * mid-tick, and we don't want to apply that new value to
++  * the tick in progress.
++  */
++ u64   ntp_tick;
+  u32   ntp_err_mult;
+ };
+ 
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 4f712a7..41e6b5b 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -135,6 +135,7 @@ static void tk_setup_internals(struct timekeeper *tk, struct clocksource *clock)
+ 
+  tk->ntp_error = 0;
+  tk->ntp_error_shift = NTP_SCALE_SHIFT - clock->shift;
++ tk->ntp_tick = ntpinterval << tk->ntp_error_shift;
+ 
+  /*
+   * The timekeeper keeps its own mult values for the currently
+@@ -1125,6 +1126,8 @@ static __always_inline void timekeeping_freqadjust(struct timekeeper *tk,
+  if (tk->ntp_err_mult)
+   xinterval -= tk->cycle_interval;
+ 
++ tk->ntp_tick = ntp_tick_length();
++
+  /* Calculate current error per tick */
+  tick_error = ntp_tick_length() >> tk->ntp_error_shift;
+  tick_error -= (xinterval + tk->xtime_remainder);
+@@ -1267,7 +1270,7 @@ static cycle_t logarithmic_accumulation(struct timekeeper *tk, cycle_t offset,
+  tk->raw_time.tv_nsec = raw_nsecs;
+ 
+  /* Accumulate error between NTP and clock interval */
+- tk->ntp_error += ntp_tick_length() << shift;
++ tk->ntp_error += tk->ntp_tick << shift;
+  tk->ntp_error -= (tk->xtime_interval + tk->xtime_remainder) <<
+       (tk->ntp_error_shift + shift);
+ 
+-- 
+1.7.1

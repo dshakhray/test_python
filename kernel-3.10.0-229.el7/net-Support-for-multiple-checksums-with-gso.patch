@@ -1,0 +1,160 @@
+From ce9c269ccfb4f7fd272791fb61494eacd6965c11 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:14:48 -0400
+Subject: [net] Support for multiple checksums with gso
+
+Message-id: <1409652920-431-26-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90191
+O-Subject: [PATCH 25/57] [RHEL7.1 net] net: Support for multiple checksums with gso
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+KABI: wrap new skbuff struct member in GENKSYSMS.
+It is safe, since this is a bit member that does
+not cause any existing member to alter its location.
+
+small conflict due to updated skbuff.h comment in
+4590672 ("skbuff: size of hole is wrong in a comment").
+
+commit 7e2b10c1e52ca37fb522be49f4be367f9311d0cd
+Author: Tom Herbert <therbert@google.com>
+Date:   Wed Jun 4 17:20:02 2014 -0700
+
+    net: Support for multiple checksums with gso
+
+    When creating a GSO packet segment we may need to set more than
+    one checksum in the packet (for instance a TCP checksum and
+    UDP checksum for VXLAN encapsulation). To be efficient, we want
+    to do checksum calculation for any part of the packet at most once.
+
+    This patch adds csum_start offset to skb_gso_cb. This tracks the
+    starting offset for skb->csum which is initially set in skb_segment.
+    When a protocol needs to compute a transport checksum it calls
+    gso_make_checksum which computes the checksum value from the start
+    of transport header to csum_start and then adds in skb->csum to get
+    the full checksum. skb->csum and csum_start are then updated to reflect
+    the checksum of the resultant packet starting from the transport header.
+
+    This patch also adds a flag to skbuff, encap_hdr_csum, which is set
+    in *gso_segment fucntions to indicate that a tunnel protocol needs
+    checksum calculation
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index bbab65a..ec1672d 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -493,7 +493,10 @@ struct sk_buff {
+   * headers if needed
+   */
+  __u8   encapsulation:1;
+- /* 7/9 bit hole (depending on ndisc_nodetype presence) */
++#ifndef __GENKSYMS__
++ __u8   encap_hdr_csum:1;
++#endif
++ /* 5/7 bit hole (depending on ndisc_nodetype presence) */
+  kmemcheck_bitfield_end(flags2);
+ 
+ #if defined CONFIG_NET_DMA || defined CONFIG_NET_RX_BUSY_POLL
+@@ -2899,6 +2902,7 @@ static inline struct sec_path *skb_sec_path(struct sk_buff *skb)
+ struct skb_gso_cb {
+  int mac_offset;
+  int encap_level;
++ __u16 csum_start;
+ };
+ #define SKB_GSO_CB(skb) ((struct skb_gso_cb *)(skb)->cb)
+ 
+@@ -2923,6 +2927,28 @@ static inline int gso_pskb_expand_head(struct sk_buff *skb, int extra)
+  return 0;
+ }
+ 
++/* Compute the checksum for a gso segment. First compute the checksum value
++ * from the start of transport header to SKB_GSO_CB(skb)->csum_start, and
++ * then add in skb->csum (checksum from csum_start to end of packet).
++ * skb->csum and csum_start are then updated to reflect the checksum of the
++ * resultant packet starting from the transport header-- the resultant checksum
++ * is in the res argument (i.e. normally zero or ~ of checksum of a pseudo
++ * header.
++ */
++static inline __sum16 gso_make_checksum(struct sk_buff *skb, __wsum res)
++{
++ int plen = SKB_GSO_CB(skb)->csum_start - skb_headroom(skb) -
++     skb_transport_offset(skb);
++ __u16 csum;
++
++ csum = csum_fold(csum_partial(skb_transport_header(skb),
++          plen, skb->csum));
++ skb->csum = res;
++ SKB_GSO_CB(skb)->csum_start -= plen;
++
++ return csum;
++}
++
+ static inline bool skb_is_gso(const struct sk_buff *skb)
+ {
+  return skb_shinfo(skb)->gso_size;
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 9b90c92..18f0121 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -2876,7 +2876,9 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
+  if (unlikely(!proto))
+   return ERR_PTR(-EINVAL);
+ 
+- csum = !!can_checksum_protocol(features, proto);
++ csum = !head_skb->encap_hdr_csum &&
++     !!can_checksum_protocol(features, proto);
++
+  __skb_push(head_skb, doffset);
+  headroom = skb_headroom(head_skb);
+  pos = skb_headlen(head_skb);
+@@ -2974,6 +2976,8 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
+    nskb->csum = skb_copy_and_csum_bits(head_skb, offset,
+            skb_put(nskb, len),
+            len, 0);
++   SKB_GSO_CB(nskb)->csum_start =
++       skb_headroom(nskb) + offset;
+    continue;
+   }
+ 
+@@ -3043,6 +3047,8 @@ perform_csum_check:
+    nskb->csum = skb_checksum(nskb, doffset,
+         nskb->len - doffset, 0);
+    nskb->ip_summed = CHECKSUM_NONE;
++   SKB_GSO_CB(nskb)->csum_start =
++       skb_headroom(nskb) + doffset;
+   }
+  } while ((offset += len) < head_skb->len);
+ 
+diff --git a/net/ipv4/ip_tunnel_core.c b/net/ipv4/ip_tunnel_core.c
+index 348d7d7..2e7692c 100644
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -137,6 +137,14 @@ struct sk_buff *iptunnel_handle_offloads(struct sk_buff *skb,
+   return skb;
+  }
+ 
++ /* If packet is not gso and we are resolving any partial checksum,
++  * clear encapsulation flag. This allows setting CHECKSUM_PARTIAL
++  * on the outer header without confusing devices that implement
++  * NETIF_F_IP_CSUM with encapsulation.
++  */
++ if (csum_help)
++  skb->encapsulation = 0;
++
+  if (skb->ip_summed == CHECKSUM_PARTIAL && csum_help) {
+   err = skb_checksum_help(skb);
+   if (unlikely(err))
+-- 
+1.7.1

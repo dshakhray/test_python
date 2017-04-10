@@ -1,0 +1,128 @@
+From 7ff6f6e13a9b0ed85bbfb0a6c391033de21460f9 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:58 -0400
+Subject: [usb] xhci: Refactor command watchdog and fix split string
+
+Message-id: <1410887463-20674-347-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95429
+O-Subject: [RHEL7 PATCH 346/591] xhci: Refactor command watchdog and fix split string.
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 50e8725e7c429701e530439013f9681e1fa36b5d
+Author: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date:   Fri Feb 21 09:27:30 2014 -0800
+
+    xhci: Refactor command watchdog and fix split string.
+
+    In preparation for fixing this function for streams endpoints, refactor
+    code in the command watchdog timeout function into two new functions.
+    One kills all URBs on a ring (either stream or endpoint), the other
+    kills all URBs associated with an endpoint.  Fix a split string while
+    we're at it.
+
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index a2ad037..919c8fa 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -899,6 +899,43 @@ remove_finished_td:
+  /* Return to the event handler with xhci->lock re-acquired */
+ }
+ 
++static void xhci_kill_ring_urbs(struct xhci_hcd *xhci, struct xhci_ring *ring)
++{
++ struct xhci_td *cur_td;
++
++ while (!list_empty(&ring->td_list)) {
++  cur_td = list_first_entry(&ring->td_list,
++    struct xhci_td, td_list);
++  list_del_init(&cur_td->td_list);
++  if (!list_empty(&cur_td->cancelled_td_list))
++   list_del_init(&cur_td->cancelled_td_list);
++  xhci_giveback_urb_in_irq(xhci, cur_td, -ESHUTDOWN);
++ }
++}
++
++static void xhci_kill_endpoint_urbs(struct xhci_hcd *xhci,
++  int slot_id, int ep_index)
++{
++ struct xhci_td *cur_td;
++ struct xhci_virt_ep *ep;
++ struct xhci_ring *ring;
++
++ ep = &xhci->devs[slot_id]->eps[ep_index];
++ ring = ep->ring;
++ if (!ring)
++  return;
++ xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
++   "Killing URBs for slot ID %u, ep index %u",
++   slot_id, ep_index);
++ xhci_kill_ring_urbs(xhci, ring);
++ while (!list_empty(&ep->cancelled_td_list)) {
++  cur_td = list_first_entry(&ep->cancelled_td_list,
++    struct xhci_td, cancelled_td_list);
++  list_del_init(&cur_td->cancelled_td_list);
++  xhci_giveback_urb_in_irq(xhci, cur_td, -ESHUTDOWN);
++ }
++}
++
+ /* Watchdog timer function for when a stop endpoint command fails to complete.
+  * In this case, we assume the host controller is broken or dying or dead.  The
+  * host may still be completing some other events, so we have to be careful to
+@@ -922,9 +959,6 @@ void xhci_stop_endpoint_command_watchdog(unsigned long arg)
+ {
+  struct xhci_hcd *xhci;
+  struct xhci_virt_ep *ep;
+- struct xhci_virt_ep *temp_ep;
+- struct xhci_ring *ring;
+- struct xhci_td *cur_td;
+  int ret, i, j;
+  unsigned long flags;
+ 
+@@ -981,34 +1015,8 @@ void xhci_stop_endpoint_command_watchdog(unsigned long arg)
+  for (i = 0; i < MAX_HC_SLOTS; i++) {
+   if (!xhci->devs[i])
+    continue;
+-  for (j = 0; j < 31; j++) {
+-   temp_ep = &xhci->devs[i]->eps[j];
+-   ring = temp_ep->ring;
+-   if (!ring)
+-    continue;
+-   xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
+-     "Killing URBs for slot ID %u, "
+-     "ep index %u", i, j);
+-   while (!list_empty(&ring->td_list)) {
+-    cur_td = list_first_entry(&ring->td_list,
+-      struct xhci_td,
+-      td_list);
+-    list_del_init(&cur_td->td_list);
+-    if (!list_empty(&cur_td->cancelled_td_list))
+-     list_del_init(&cur_td->cancelled_td_list);
+-    xhci_giveback_urb_in_irq(xhci, cur_td,
+-      -ESHUTDOWN);
+-   }
+-   while (!list_empty(&temp_ep->cancelled_td_list)) {
+-    cur_td = list_first_entry(
+-      &temp_ep->cancelled_td_list,
+-      struct xhci_td,
+-      cancelled_td_list);
+-    list_del_init(&cur_td->cancelled_td_list);
+-    xhci_giveback_urb_in_irq(xhci, cur_td,
+-      -ESHUTDOWN);
+-   }
+-  }
++  for (j = 0; j < 31; j++)
++   xhci_kill_endpoint_urbs(xhci, i, j);
+  }
+  spin_unlock_irqrestore(&xhci->lock, flags);
+  xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
+-- 
+1.7.1

@@ -1,0 +1,180 @@
+From f85ca7d1c1c0aa97acac0104c7030266811a1185 Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Wed, 21 Jan 2015 15:20:33 -0500
+Subject: [net] bridge: Program port vlan filters only if filtering is enabled in bridge
+
+Message-id: <1421853633-6641-1-git-send-email-vyasevic@redhat.com>
+Patchwork-id: 103324
+O-Subject: [RHEL7 PATCH] bridge: Program port vlan filters only if filtering is enabled in bridge.
+Bugzilla: 1183958
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1183958
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8591819
+Upstream: RHEL-7 only
+
+Currently, when a vlan filter is set on a port of a bridge, the
+bridge will also push this information down to the driver for
+a given port.  For HW, this sets the HW vlan filters enabling
+the card to receive vlans that the bridge is interested in.
+
+After RHEL7 commit a320a5345218228875b2b1197c83c043f9eacfcf
+([net] bridge: Add filtering support for default_pvid),
+the above actions happen even when vlan filtering is disabled
+and the user has not specified any filtering information.
+This causes a regression when a port is a bond which uses
+arp monitoring to track link state.  The root cause of the
+regression is that the bonding driver is currently incapable
+of always correctly verifying the source device of the arp if
+vlans are configured above the bond.  The solution to this
+problem is not trivial and has been defered till RHEL-7.2
+(BZ 1166647).
+
+This patch is here to restore the bonding behavior to
+pre-a320a53452182.  It accomplishes this by setting the port
+HW vlan filtering data only when vlan filtering feature
+is enabled in the bridge.  This way, default bridge configuration
+will not impact bond opertation.  However, if vlan filtering
+is enabled on the bridge, the arp monitoring on the bond will
+break again.  This functions the same as all RHEL7 kernels
+prior to RHEL7 commit a320a5345218228875b2b1197c83c043f9eacfcf
+([net] bridge: Add filtering support for default_pvid).
+
+Targeting this as a RHEL7 only patch as upstream does not
+have this problem.
+
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index a6c0427..7754c6b 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -53,7 +53,8 @@ static int __vlan_add(struct net_port_vlans *v, u16 vid, u16 flags)
+   dev = br->dev;
+  }
+ 
+- if (p) {
++ /* Toggle HW filters when filtering is enabled */
++ if (p && p->br->vlan_enabled) {
+   /* Add VLAN to the device filter if it is supported.
+    * Stricly speaking, this is not necessary now, since
+    * devices are made promiscuous by the bridge, but if
+@@ -79,7 +80,7 @@ static int __vlan_add(struct net_port_vlans *v, u16 vid, u16 flags)
+  return 0;
+ 
+ out_filt:
+- if (p)
++ if (p && p->br->vlan_enabled)
+   vlan_vid_del(dev, br->vlan_proto, vid);
+  return err;
+ }
+@@ -94,7 +95,10 @@ static int __vlan_del(struct net_port_vlans *v, u16 vid)
+ 
+  if (v->port_idx) {
+   struct net_bridge_port *p = v->parent.port;
+-  vlan_vid_del(p->dev, p->br->vlan_proto, vid);
++
++  /* Toggle HW filters when filtering is enabled */
++  if (p->br->vlan_enabled)
++   vlan_vid_del(p->dev, p->br->vlan_proto, vid);
+  }
+ 
+  clear_bit(vid, v->vlan_bitmap);
+@@ -380,6 +384,72 @@ out:
+  return found;
+ }
+ 
++static void br_set_hw_filters(struct net_bridge *br)
++{
++ struct net_bridge_port *p;
++ struct net_port_vlans *pv;
++ u16 vid, errvid;
++ int err;
++
++ /* For each port, walk the vlan bitmap and write the vlan
++  * info to port driver.
++  */
++ list_for_each_entry(p, &br->port_list, list) {
++  pv = rtnl_dereference(p->vlan_info);
++  if (!pv)
++   continue;
++
++  for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID) {
++   err = vlan_vid_add(p->dev, br->vlan_proto, vid);
++   if (err)
++    goto err_flt;
++  }
++ }
++
++ return;
++
++err_flt:
++ errvid = vid;
++ for_each_set_bit(vid, pv->vlan_bitmap, errvid)
++  vlan_vid_del(p->dev, br->vlan_proto, vid);
++
++ list_for_each_entry_continue_reverse(p, &br->port_list, list) {
++  pv = rtnl_dereference(p->vlan_info);
++  if (!pv)
++   continue;
++
++  for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID)
++   vlan_vid_del(p->dev, br->vlan_proto, vid);
++ }
++}
++
++static void br_clear_hw_filters(struct net_bridge *br)
++{
++ struct net_bridge_port *p;
++ struct net_port_vlans *pv;
++ u16 vid;
++
++ /* For each port, walk the vlan bitmap and clear
++  * the vlan info from the port driver.
++  */
++ list_for_each_entry(p, &br->port_list, list) {
++  pv = rtnl_dereference(p->vlan_info);
++  if (!pv)
++   continue;
++
++  for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID)
++   vlan_vid_del(p->dev, br->vlan_proto, vid);
++ }
++}
++
++static void br_manage_vlans(struct net_bridge *br)
++{
++ if (br->vlan_enabled)
++  br_set_hw_filters(br);
++ else
++  br_clear_hw_filters(br);
++}
++
+ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+ {
+  if (!rtnl_trylock())
+@@ -389,6 +459,7 @@ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+   goto unlock;
+ 
+  br->vlan_enabled = val;
++ br_manage_vlans(br);
+  br_manage_promisc(br);
+ 
+ unlock:
+@@ -600,8 +671,10 @@ void nbp_vlan_flush(struct net_bridge_port *port)
+  if (!pv)
+   return;
+ 
+- for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID)
+-  vlan_vid_del(port->dev, port->br->vlan_proto, vid);
++ if (port->br->vlan_enabled) {
++  for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID)
++   vlan_vid_del(port->dev, port->br->vlan_proto, vid);
++ }
+ 
+  __vlan_flush(pv);
+ }
+-- 
+1.7.1

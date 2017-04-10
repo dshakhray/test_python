@@ -1,0 +1,95 @@
+From 8645dc0015473826347705e9cf12fd2dcba20daa Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:54:47 -0400
+Subject: [fs] ext4: kill i_version support for Hurd-castrated file systems
+
+Message-id: <1414058125-4183-134-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98218
+O-Subject: [RHEL 7.1 PATCH v2 133/171] ext4: kill i_version support for Hurd-castrated file systems
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Theodore Ts'o <tytso@mit.edu>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit c4f65706056e9f0c2cf126b29c6920a179d91150
+
+ The Hurd file system uses uses the inode field which is now used for
+ i_version for its translator block.  This means that ext2 file systems
+ that are formatted for GNU Hurd can't be used to support NFSv4.  Given
+ that Hurd file systems don't support extents, and a huge number of
+ modern file system features, this is no great loss.
+
+ If we don't do this, the attempt to update the i_version field will
+ stomp over the translator block field, which will cause file system
+ corruption for Hurd file systems.  This can be replicated via:
+
+ mke2fs -t ext2 -o hurd /dev/vdc
+ mount -t ext4 /dev/vdc /vdc
+ touch /vdc/bug0000
+ umount /dev/vdc
+ e2fsck -f /dev/vdc
+
+ Addresses-Debian-Bug: #738758
+
+ Reported-By: Gabriele Giacone <1o5g4r8o@gmail.com>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 503ec48..6e6b321 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4178,11 +4178,14 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
+  EXT4_INODE_GET_XTIME(i_atime, inode, raw_inode);
+  EXT4_EINODE_GET_XTIME(i_crtime, ei, raw_inode);
+ 
+- inode->i_version = le32_to_cpu(raw_inode->i_disk_version);
+- if (EXT4_INODE_SIZE(inode->i_sb) > EXT4_GOOD_OLD_INODE_SIZE) {
+-  if (EXT4_FITS_IN_INODE(raw_inode, ei, i_version_hi))
+-   inode->i_version |=
+-   (__u64)(le32_to_cpu(raw_inode->i_version_hi)) << 32;
++ if (EXT4_SB(inode->i_sb)->s_es->s_creator_os !=
++     cpu_to_le32(EXT4_OS_HURD)) {
++  inode->i_version = le32_to_cpu(raw_inode->i_disk_version);
++  if (EXT4_INODE_SIZE(inode->i_sb) > EXT4_GOOD_OLD_INODE_SIZE) {
++   if (EXT4_FITS_IN_INODE(raw_inode, ei, i_version_hi))
++    inode->i_version |=
++      (__u64)(le32_to_cpu(raw_inode->i_version_hi)) << 32;
++  }
+  }
+ 
+  ret = 0;
+@@ -4398,12 +4401,16 @@ static int ext4_do_update_inode(handle_t *handle,
+    raw_inode->i_block[block] = ei->i_data[block];
+  }
+ 
+- raw_inode->i_disk_version = cpu_to_le32(inode->i_version);
+- if (ei->i_extra_isize) {
+-  if (EXT4_FITS_IN_INODE(raw_inode, ei, i_version_hi))
+-   raw_inode->i_version_hi =
+-   cpu_to_le32(inode->i_version >> 32);
+-  raw_inode->i_extra_isize = cpu_to_le16(ei->i_extra_isize);
++ if (EXT4_SB(inode->i_sb)->s_es->s_creator_os !=
++     cpu_to_le32(EXT4_OS_HURD)) {
++  raw_inode->i_disk_version = cpu_to_le32(inode->i_version);
++  if (ei->i_extra_isize) {
++   if (EXT4_FITS_IN_INODE(raw_inode, ei, i_version_hi))
++    raw_inode->i_version_hi =
++     cpu_to_le32(inode->i_version >> 32);
++   raw_inode->i_extra_isize =
++    cpu_to_le16(ei->i_extra_isize);
++  }
+  }
+ 
+  ext4_inode_csum_set(inode, raw_inode, ei);
+-- 
+1.7.1

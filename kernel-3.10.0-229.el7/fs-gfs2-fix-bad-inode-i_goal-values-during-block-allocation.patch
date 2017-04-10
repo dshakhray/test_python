@@ -1,0 +1,88 @@
+From 87a7525ed4e395893fa2d60ecc61199358a5be3b Mon Sep 17 00:00:00 2001
+From: Abhijith Das <adas@redhat.com>
+Date: Fri, 19 Sep 2014 03:08:48 -0400
+Subject: [fs] gfs2: fix bad inode i_goal values during block allocation
+
+Message-id: <1411096128-60572-1-git-send-email-adas@redhat.com>
+Patchwork-id: 96328
+O-Subject: [RHEL7.1 PATCH] gfs2: fix bad inode i_goal values during block allocation
+Bugzilla: 1144209
+RH-Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+RH-Acked-by: Robert S Peterson <rpeterso@redhat.com>
+
+This patch checks if i_goal is either zero or if doesn't exist
+within any rgrp (i.e gfs2_blk2rgrpd() returns NULL). If so, it
+assigns the ip->i_no_addr block as the i_goal.
+
+There are two scenarios where a bad i_goal can result in a
+-EBADSLT error.
+
+1. Attempting to allocate to an existing inode:
+Control reaches gfs2_inplace_reserve() and ip->i_goal is bad.
+We need to fix i_goal here.
+
+2. A new inode is created in a directory whose i_goal is hosed:
+In this case, the parent dir's i_goal is copied onto the new
+inode. Since the new inode is not yet created, the ip->i_no_addr
+field is invalid and so, the fix in gfs2_inplace_reserve() as per
+1) won't work in this scenario. We need to catch and fix it sooner
+in the parent dir itself (gfs2_create_inode()), before it is
+copied to the new inode.
+
+This patch has been posted upstream as well.
+
+Resolves: rhbz#1144209
+Upstream: 00a158be83839f2d5370612d633eb2643ddf844e
+Signed-off-by: Abhi Das <adas@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/gfs2/inode.c b/fs/gfs2/inode.c
+index 0587fa4..e5fe744 100644
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@ -628,6 +628,7 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
+  inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
+  gfs2_set_inode_blocks(inode, 1);
+  munge_mode_uid_gid(dip, inode);
++ check_and_update_goal(dip);
+  ip->i_goal = dip->i_goal;
+  ip->i_diskflags = 0;
+  ip->i_eattr = 0;
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index abeb9d7..8c4d6d6 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -550,6 +550,13 @@ struct gfs2_rgrpd *gfs2_rgrpd_get_next(struct gfs2_rgrpd *rgd)
+  return rgd;
+ }
+ 
++void check_and_update_goal(struct gfs2_inode *ip)
++{
++ struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
++ if (!ip->i_goal || gfs2_blk2rgrpd(sdp, ip->i_goal, 1) == NULL)
++  ip->i_goal = ip->i_no_addr;
++}
++
+ void gfs2_free_clones(struct gfs2_rgrpd *rgd)
+ {
+  int x;
+@@ -1925,6 +1932,7 @@ int gfs2_inplace_reserve(struct gfs2_inode *ip, const struct gfs2_alloc_parms *a
+  } else if (ip->i_rgd && rgrp_contains_block(ip->i_rgd, ip->i_goal)) {
+   rs->rs_rbm.rgd = begin = ip->i_rgd;
+  } else {
++  check_and_update_goal(ip);
+   rs->rs_rbm.rgd = begin = gfs2_blk2rgrpd(sdp, ip->i_goal, 1);
+  }
+  if (S_ISDIR(ip->i_inode.i_mode) && (ap->aflags & GFS2_AF_ORLOV))
+diff --git a/fs/gfs2/rgrp.h b/fs/gfs2/rgrp.h
+index af87509..fa653ce 100644
+--- a/fs/gfs2/rgrp.h
++++ b/fs/gfs2/rgrp.h
+@@ -81,4 +81,5 @@ static inline bool gfs2_rs_active(struct gfs2_blkreserv *rs)
+  return rs && !RB_EMPTY_NODE(&rs->rs_node);
+ }
+ 
++extern void check_and_update_goal(struct gfs2_inode *ip);
+ #endif /* __RGRP_DOT_H__ */
+-- 
+1.7.1

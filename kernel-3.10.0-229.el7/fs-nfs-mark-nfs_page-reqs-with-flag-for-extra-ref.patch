@@ -1,0 +1,69 @@
+From edbe18965966690e30111ab8abcf4cc294f77529 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:20:26 -0400
+Subject: [fs] nfs: mark nfs_page reqs with flag for extra ref
+
+Message-id: <1411050057-12417-64-git-send-email-steved@redhat.com>
+Patchwork-id: 96229
+O-Subject: [RHEL7.1 PATCH 63/94] nfs: mark nfs_page reqs with flag for extra ref
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+Change the use of PG_INODE_REF - set it when taking extra reference on
+subrequests and take care to only release once for each request.
+
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 17089a29a25a3bfe8d14520cd866b7d635ffe5ba
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 0a30122..9d7b6fe 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -257,8 +257,10 @@ nfs_page_group_init(struct nfs_page *req, struct nfs_page *prev)
+   /* grab extra ref if head request has extra ref from
+    * the write/commit path to handle handoff between write
+    * and commit lists */
+-  if (test_bit(PG_INODE_REF, &prev->wb_head->wb_flags))
++  if (test_bit(PG_INODE_REF, &prev->wb_head->wb_flags)) {
++   set_bit(PG_INODE_REF, &req->wb_flags);
+    kref_get(&req->wb_kref);
++  }
+  }
+ }
+ 
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 2ee97b8..faa3a4b 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -676,7 +676,9 @@ static void nfs_inode_add_request(struct inode *inode, struct nfs_page *req)
+   set_page_private(req->wb_page, (unsigned long)req);
+  }
+  nfsi->npages++;
+- set_bit(PG_INODE_REF, &req->wb_flags);
++ /* this a head request for a page group - mark it as having an
++  * extra reference so sub groups can follow suit */
++ WARN_ON(test_and_set_bit(PG_INODE_REF, &req->wb_flags));
+  kref_get(&req->wb_kref);
+  spin_unlock(&inode->i_lock);
+ }
+@@ -702,7 +704,9 @@ static void nfs_inode_remove_request(struct nfs_page *req)
+   nfsi->npages--;
+   spin_unlock(&inode->i_lock);
+  }
+- nfs_release_request(req);
++
++ if (test_and_clear_bit(PG_INODE_REF, &req->wb_flags))
++  nfs_release_request(req);
+ }
+ 
+ static void
+-- 
+1.7.1

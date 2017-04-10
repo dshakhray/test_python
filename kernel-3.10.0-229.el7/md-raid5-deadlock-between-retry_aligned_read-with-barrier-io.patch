@@ -1,0 +1,49 @@
+From d3005fed107d8a16b64aabff781e2806f63e3a70 Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:26:10 -0400
+Subject: [md] raid5: deadlock between retry_aligned_read with barrier io
+
+Message-id: <1409563584-9000-69-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 90011
+O-Subject: [RHEL7.1 PATCH 68/82] md/raid5: deadlock between retry_aligned_read with barrier io
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: hui jiao <simonjiaoh@gmail.com>
+
+A chunk aligned read increases counter active_aligned_reads and
+decreases it after sub-device handle it successfully. But when a read
+error occurs,  the read redispatched by raid5d, and the
+active_aligned_reads will not be decreased until we can grab a stripe
+head in retry_aligned_read. Now suppose, a barrier io comes, set
+conf->quiesce to 2, and wait until both active_stripes and
+active_aligned_reads are zero. The retried chunk aligned read gets
+stuck at get_active_stripe waiting until conf->quiesce becomes 0.
+Retry_aligned_read and barrier io are waiting each other now.
+One possible solution is that we ignore conf->quiesce, let the retried
+aligned read finish. I reproduced this deadlock and test this patch on
+centos6.0
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit 2844dc32ea67044b345221067207ce67ffe8da76)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 75ea0ba..5528e3f 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5115,7 +5115,7 @@ static int  retry_aligned_read(struct r5conf *conf, struct bio *raid_bio)
+    /* already done this stripe */
+    continue;
+ 
+-  sh = get_active_stripe(conf, sector, 0, 1, 0);
++  sh = get_active_stripe(conf, sector, 0, 1, 1);
+ 
+   if (!sh) {
+    /* failed to get a stripe - must wait */
+-- 
+1.7.1

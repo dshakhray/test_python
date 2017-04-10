@@ -1,0 +1,122 @@
+From 1238774ec49acb491847f8389feb19bacaf82877 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:08:41 -0400
+Subject: [usb] usb_wwan: fix potential blocked I/O after resume
+
+Message-id: <1410887463-20674-450-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95640
+O-Subject: [RHEL7 PATCH 449/591] USB: usb_wwan: fix potential blocked I/O after resume
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit fb7ad4f93d9f0f7d49beda32f5e7becb94b29a4d
+Author: Johan Hovold <jhovold@gmail.com>
+Date:   Mon May 26 19:23:18 2014 +0200
+
+    USB: usb_wwan: fix potential blocked I/O after resume
+
+    Keep trying to submit urbs rather than bail out on first read-urb
+    submission error, which would also prevent I/O for any further ports
+    from being resumed.
+
+    Instead keep an error count, for all types of failed submissions, and
+    let USB core know that something went wrong.
+
+    Also make sure to always clear the suspended flag. Currently a failed
+    read-urb submission would prevent cached writes as well as any
+    subsequent writes from being submitted until next suspend-resume cycle,
+    something which may not even necessarily happen.
+
+    Note that USB core currently only logs an error if an interface resume
+    failed.
+
+    Fixes: 383cedc3bb43 ("USB: serial: full autosuspend support for the
+    option driver")
+
+    Cc: <stable@vger.kernel.org> # v2.6.32
+    Signed-off-by: Johan Hovold <jhovold@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/serial/usb_wwan.c b/drivers/usb/serial/usb_wwan.c
+index c5b9deb..d91a988 100644
+--- a/drivers/usb/serial/usb_wwan.c
++++ b/drivers/usb/serial/usb_wwan.c
+@@ -619,12 +619,12 @@ int usb_wwan_suspend(struct usb_serial *serial, pm_message_t message)
+ }
+ EXPORT_SYMBOL(usb_wwan_suspend);
+ 
+-static void play_delayed(struct usb_serial_port *port)
++static int play_delayed(struct usb_serial_port *port)
+ {
+  struct usb_wwan_intf_private *data;
+  struct usb_wwan_port_private *portdata;
+  struct urb *urb;
+- int err;
++ int err = 0;
+ 
+  portdata = usb_get_serial_port_data(port);
+  data = port->serial->private;
+@@ -641,6 +641,8 @@ static void play_delayed(struct usb_serial_port *port)
+    break;
+   }
+  }
++
++ return err;
+ }
+ 
+ int usb_wwan_resume(struct usb_serial *serial)
+@@ -650,7 +652,8 @@ int usb_wwan_resume(struct usb_serial *serial)
+  struct usb_wwan_intf_private *intfdata = serial->private;
+  struct usb_wwan_port_private *portdata;
+  struct urb *urb;
+- int err = 0;
++ int err;
++ int err_count = 0;
+ 
+  spin_lock_irq(&intfdata->susp_lock);
+  for (i = 0; i < serial->num_ports; i++) {
+@@ -669,25 +672,31 @@ int usb_wwan_resume(struct usb_serial *serial)
+     dev_err(&port->dev,
+      "%s: submit int urb failed: %d\n",
+      __func__, err);
++    err_count++;
+    }
+   }
+ 
++  err = play_delayed(port);
++  if (err)
++   err_count++;
++
+   for (j = 0; j < N_IN_URB; j++) {
+    urb = portdata->in_urbs[j];
+    err = usb_submit_urb(urb, GFP_ATOMIC);
+    if (err < 0) {
+     dev_err(&port->dev, "%s: Error %d for bulk URB %d\n",
+      __func__, err, i);
+-    spin_unlock_irq(&intfdata->susp_lock);
+-    goto err_out;
++    err_count++;
+    }
+   }
+-  play_delayed(port);
+  }
+  intfdata->suspended = 0;
+  spin_unlock_irq(&intfdata->susp_lock);
+-err_out:
+- return err;
++
++ if (err_count)
++  return -EIO;
++
++ return 0;
+ }
+ EXPORT_SYMBOL(usb_wwan_resume);
+ #endif
+-- 
+1.7.1

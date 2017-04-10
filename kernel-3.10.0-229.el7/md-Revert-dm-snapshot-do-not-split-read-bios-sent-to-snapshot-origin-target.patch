@@ -1,0 +1,74 @@
+From 7394e0d94dc4217e92ccbc51a5fc9cff838730f6 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@gmail.com>
+Date: Tue, 30 Sep 2014 15:26:28 -0400
+Subject: [md] Revert: dm-snapshot: do not split read bios sent to snapshot-origin target
+
+Message-id: <1412090791-9864-2-git-send-email-y>
+Patchwork-id: 96806
+O-Subject: [RHEL7.1 PATCH 1/4] Revert "[md] dm-snapshot: do not split read bios sent to snapshot-origin target"
+Bugzilla: 1147574
+RH-Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+
+From: Mike Snitzer <snitzer@redhat.com>
+
+BZ: 1147574
+
+This reverts rhel7.git commit cbf3190a87e79a2a865b69f242eb8027b05130b6.
+
+RHEL7 doesn't have upstream's immutable biovec changes.  This commit
+(and the associated DM core change) causes serious problems in that all
+origin changes are _not_ getting copied to the snapshot -- so the
+snapshot no longer maintains the data from the associated point in time.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-snap.c b/drivers/md/dm-snap.c
+index a8a7bed..18d757e 100644
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@ -2142,7 +2142,6 @@ static int origin_write_extent(struct dm_snapshot *merging_snap,
+ 
+ struct dm_origin {
+  struct dm_dev *dev;
+- unsigned split_boundary;
+ };
+ 
+ /*
+@@ -2194,24 +2193,13 @@ static void origin_dtr(struct dm_target *ti)
+ static int origin_map(struct dm_target *ti, struct bio *bio)
+ {
+  struct dm_origin *o = ti->private;
+- unsigned available_sectors;
+-
+  bio->bi_bdev = o->dev->bdev;
+ 
+- if (unlikely(bio->bi_rw & REQ_FLUSH))
+-  return DM_MAPIO_REMAPPED;
+-
+- if (bio_rw(bio) != WRITE)
++ if (bio->bi_rw & REQ_FLUSH)
+   return DM_MAPIO_REMAPPED;
+ 
+- available_sectors = o->split_boundary -
+-  ((unsigned)bio->bi_sector & (o->split_boundary - 1));
+-
+- if (bio_sectors(bio) > available_sectors)
+-  dm_accept_partial_bio(bio, available_sectors);
+-
+  /* Only tell snapshots if this is a write */
+- return do_origin(o->dev, bio);
++ return (bio_rw(bio) == WRITE) ? do_origin(o->dev, bio) : DM_MAPIO_REMAPPED;
+ }
+ 
+ /*
+@@ -2222,7 +2210,7 @@ static void origin_resume(struct dm_target *ti)
+ {
+  struct dm_origin *o = ti->private;
+ 
+- o->split_boundary = get_origin_minimum_chunksize(o->dev->bdev);
++ ti->max_io_len = get_origin_minimum_chunksize(o->dev->bdev);
+ }
+ 
+ static void origin_status(struct dm_target *ti, status_type_t type,
+-- 
+1.7.1

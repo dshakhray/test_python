@@ -1,0 +1,111 @@
+From 6a191c5be206031589376c3e2787025231b9a7f2 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:05:39 -0400
+Subject: [usb] ehci: add delay during suspend to prevent erroneous wakeups
+
+Message-id: <1410887463-20674-268-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95194
+O-Subject: [RHEL7 PATCH 267/591] USB: EHCI: add delay during suspend to prevent erroneous wakeups
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 3e8d6d85adedc59115a564c0a54b36e42087c4d9
+Author: Alan Stern <stern@rowland.harvard.edu>
+Date:   Thu Feb 13 15:49:17 2014 -0500
+
+    USB: EHCI: add delay during suspend to prevent erroneous wakeups
+
+    High-speed USB connections revert back to full-speed signalling when
+    the device goes into suspend.  This takes several milliseconds, and
+    during that time it's not possible to tell reliably whether the device
+    has been disconnected.
+
+    On some platforms, the Wake-On-Disconnect circuitry gets confused
+    during this intermediate state.  It generates a false wakeup signal,
+    which can prevent the controller from going to sleep.
+
+    To avoid this problem, this patch adds a 5-ms delay to the
+    ehci_bus_suspend() routine if any ports have to switch over to
+    full-speed signalling.  (Actually, the delay was already present for
+    devices using a particular kind of PHY power management; the patch
+    merely causes the delay to be used more widely.)
+
+    Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+    Reviewed-by: Peter Chen <Peter.Chen@freescale.com>
+    CC: <stable@vger.kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/host/ehci-hub.c b/drivers/usb/host/ehci-hub.c
+index d594db3..2c00a28 100644
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -238,6 +238,7 @@ static int ehci_bus_suspend (struct usb_hcd *hcd)
+  int   port;
+  int   mask;
+  int   changed;
++ bool   fs_idle_delay;
+ 
+  ehci_dbg(ehci, "suspend root hub\n");
+ 
+@@ -272,6 +273,7 @@ static int ehci_bus_suspend (struct usb_hcd *hcd)
+  ehci->bus_suspended = 0;
+  ehci->owned_ports = 0;
+  changed = 0;
++ fs_idle_delay = false;
+  port = HCS_N_PORTS(ehci->hcs_params);
+  while (port--) {
+   u32 __iomem *reg = &ehci->regs->port_status [port];
+@@ -300,16 +302,32 @@ static int ehci_bus_suspend (struct usb_hcd *hcd)
+   }
+ 
+   if (t1 != t2) {
++   /*
++    * On some controllers, Wake-On-Disconnect will
++    * generate false wakeup signals until the bus
++    * switches over to full-speed idle.  For their
++    * sake, add a delay if we need one.
++    */
++   if ((t2 & PORT_WKDISC_E) &&
++     ehci_port_speed(ehci, t2) ==
++      USB_PORT_STAT_HIGH_SPEED)
++    fs_idle_delay = true;
+    ehci_writel(ehci, t2, reg);
+    changed = 1;
+   }
+  }
++ spin_unlock_irq(&ehci->lock);
++
++ if ((changed && ehci->has_hostpc) || fs_idle_delay) {
++  /*
++   * Wait for HCD to enter low-power mode or for the bus
++   * to switch to full-speed idle.
++   */
++  usleep_range(5000, 5500);
++ }
+ 
+  if (changed && ehci->has_hostpc) {
+-  spin_unlock_irq(&ehci->lock);
+-  msleep(5); /* 5 ms for HCD to enter low-power mode */
+   spin_lock_irq(&ehci->lock);
+-
+   port = HCS_N_PORTS(ehci->hcs_params);
+   while (port--) {
+    u32 __iomem *hostpc_reg = &ehci->regs->hostpc[port];
+@@ -322,8 +340,8 @@ static int ehci_bus_suspend (struct usb_hcd *hcd)
+      port, (t3 & HOSTPC_PHCD) ?
+      "succeeded" : "failed");
+   }
++  spin_unlock_irq(&ehci->lock);
+  }
+- spin_unlock_irq(&ehci->lock);
+ 
+  /* Apparently some devices need a >= 1-uframe delay here */
+  if (ehci->bus_suspended)
+-- 
+1.7.1

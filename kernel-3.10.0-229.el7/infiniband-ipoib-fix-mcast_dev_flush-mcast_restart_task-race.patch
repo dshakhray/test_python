@@ -1,0 +1,104 @@
+From 184c547e8754149994943c0cd24e750bb2d45b5e Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 24 Sep 2014 17:28:14 -0400
+Subject: [infiniband] ipoib: fix mcast_dev_flush/mcast_restart_task race
+
+Message-id: <eff88db2b7b38fd34e957c262a1ee0a58f5738fe.1411578494.git.dledford@redhat.com>
+Patchwork-id: 96682
+O-Subject: [Patch RHEL7 21/26] IPoIB: fix mcast_dev_flush/mcast_restart_task race
+Bugzilla: 1107621
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+Our mcast_dev_flush routine and our mcast_restart_task can race against
+each other.  In particular, they both hold the priv->lock while
+manipulating the rbtree and while removing mcast entries from the
+multicast_list and while adding entries to the remove_list, but they
+also both drop their locks prior to doing the actual removes.  The
+mcast_dev_flush routine is run entirely under the rtnl lock and so has
+at least some locking.  The actual race condition is like this:
+
+Thread 1                                Thread 2
+ifconfig ib0 up
+  start multicast join for broadcast
+  multicast join completes for broadcast
+  start to add more multicast joins
+    call mcast_restart_task to add new entries
+                                        ifconfig ib0 down
+       mcast_dev_flush
+         mcast_leave(mcast A)
+    mcast_leave(mcast A)
+
+As mcast_leave calls ib_sa_multicast_leave, and as member in
+core/multicast.c is ref counted, we run into an unbalanced refcount
+issue.  To avoid stomping on each others removes, take the rtnl lock
+specifically when we are deleting the entries from the remove list.
+
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 5733b2f880b97796e51452b60a9f7a03d0fad2db)
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+index f5e8da5..19e3fe7 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -810,7 +810,10 @@ void ipoib_mcast_dev_flush(struct net_device *dev)
+ 
+  spin_unlock_irqrestore(&priv->lock, flags);
+ 
+- /* seperate between the wait to the leave*/
++ /*
++  * make sure the in-flight joins have finished before we attempt
++  * to leave
++  */
+  list_for_each_entry_safe(mcast, tmcast, &remove_list, list)
+   if (test_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags))
+    wait_for_completion(&mcast->done);
+@@ -931,14 +934,38 @@ void ipoib_mcast_restart_task(struct work_struct *work)
+  netif_addr_unlock(dev);
+  local_irq_restore(flags);
+ 
+- /* We have to cancel outside of the spinlock */
++ /*
++  * make sure the in-flight joins have finished before we attempt
++  * to leave
++  */
++ list_for_each_entry_safe(mcast, tmcast, &remove_list, list)
++  if (test_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags))
++   wait_for_completion(&mcast->done);
++
++ /*
++  * We have to cancel outside of the spinlock, but we have to
++  * take the rtnl lock or else we race with the removal of
++  * entries from the remove list in mcast_dev_flush as part
++  * of ipoib_stop() which will call mcast_stop_thread with
++  * flush == 1 while holding the rtnl lock, and the
++  * flush_workqueue won't complete until this restart_mcast_task
++  * completes.  So do like the carrier on task and attempt to
++  * take the rtnl lock, but if we can't before the ADMIN_UP flag
++  * goes away, then just return and know that the remove list will
++  * get flushed later by mcast_dev_flush.
++  */
++ while (!rtnl_trylock()) {
++  if (!test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags))
++   return;
++  else
++   msleep(20);
++ }
+  list_for_each_entry_safe(mcast, tmcast, &remove_list, list) {
+   ipoib_mcast_leave(mcast->dev, mcast);
+   ipoib_mcast_free(mcast);
+  }
+-
+- if (test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags))
+-  ipoib_mcast_start_thread(dev);
++ ipoib_mcast_start_thread(dev);
++ rtnl_unlock();
+ }
+ 
+ #ifdef CONFIG_INFINIBAND_IPOIB_DEBUG
+-- 
+1.7.1

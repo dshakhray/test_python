@@ -1,0 +1,108 @@
+From 673387d82e068f33c79e5deac57e2985496e9b50 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Tue, 23 Sep 2014 19:02:05 -0400
+Subject: [fs] nfsv4: nfs4_state_manager() vs. nfs_server_remove_lists()
+
+Message-id: <1411498926-30119-3-git-send-email-steved@redhat.com>
+Patchwork-id: 96499
+O-Subject: [RHEL7.1 PATCH 2/3] NFSv4: nfs4_state_manager() vs. nfs_server_remove_lists()
+Bugzilla: 1111708
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+There is a race between nfs4_state_manager() and
+nfs_server_remove_lists() that happens during a nfsv3 mount.
+
+The v3 mount notices there is already a supper block so
+nfs_server_remove_lists() called which uses the nfs_client_lock
+spin lock to synchronize access to the client list.
+
+At the same time nfs4_state_manager() is running through
+the client list looking for work to do, using the same
+lock. When nfs4_state_manager() wins the race to the
+list, a v3 client pointer is found and not ignored
+properly which causes the panic.
+
+Moving some protocol checks before the state checking
+avoids the panic.
+
+CC: Stable Tree <stable@vger.kernel.org>
+Signed-off-by: Steve Dickson <steved@redhat.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 080af20cc945d110f9912d01cf6b66f94a375b8d
+Bugzilla: 1111708
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/nfs4client.c b/fs/nfs/nfs4client.c
+index 53e435a..ffdb28d 100644
+--- a/fs/nfs/nfs4client.c
++++ b/fs/nfs/nfs4client.c
+@@ -482,6 +482,16 @@ int nfs40_walk_client_list(struct nfs_client *new,
+ 
+  spin_lock(&nn->nfs_client_lock);
+  list_for_each_entry(pos, &nn->nfs_client_list, cl_share_link) {
++
++  if (pos->rpc_ops != new->rpc_ops)
++   continue;
++
++  if (pos->cl_proto != new->cl_proto)
++   continue;
++
++  if (pos->cl_minorversion != new->cl_minorversion)
++   continue;
++
+   /* If "pos" isn't marked ready, we can't trust the
+    * remaining fields in "pos" */
+   if (pos->cl_cons_state > NFS_CS_READY) {
+@@ -501,15 +511,6 @@ int nfs40_walk_client_list(struct nfs_client *new,
+   if (pos->cl_cons_state != NFS_CS_READY)
+    continue;
+ 
+-  if (pos->rpc_ops != new->rpc_ops)
+-   continue;
+-
+-  if (pos->cl_proto != new->cl_proto)
+-   continue;
+-
+-  if (pos->cl_minorversion != new->cl_minorversion)
+-   continue;
+-
+   if (pos->cl_clientid != new->cl_clientid)
+    continue;
+ 
+@@ -622,6 +623,16 @@ int nfs41_walk_client_list(struct nfs_client *new,
+ 
+  spin_lock(&nn->nfs_client_lock);
+  list_for_each_entry(pos, &nn->nfs_client_list, cl_share_link) {
++
++  if (pos->rpc_ops != new->rpc_ops)
++   continue;
++
++  if (pos->cl_proto != new->cl_proto)
++   continue;
++
++  if (pos->cl_minorversion != new->cl_minorversion)
++   continue;
++
+   /* If "pos" isn't marked ready, we can't trust the
+    * remaining fields in "pos", especially the client
+    * ID and serverowner fields.  Wait for CREATE_SESSION
+@@ -647,15 +658,6 @@ int nfs41_walk_client_list(struct nfs_client *new,
+   if (pos->cl_cons_state != NFS_CS_READY)
+    continue;
+ 
+-  if (pos->rpc_ops != new->rpc_ops)
+-   continue;
+-
+-  if (pos->cl_proto != new->cl_proto)
+-   continue;
+-
+-  if (pos->cl_minorversion != new->cl_minorversion)
+-   continue;
+-
+   if (!nfs4_match_clientids(pos, new))
+    continue;
+ 
+-- 
+1.7.1

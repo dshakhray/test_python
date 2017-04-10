@@ -1,0 +1,166 @@
+From 41caf7d000e2b748e59dfdf4f82bcfeb7494c5ac Mon Sep 17 00:00:00 2001
+From: Steve Best <sbest@redhat.com>
+Date: Mon, 3 Nov 2014 21:42:51 -0500
+Subject: [powerpc] pseries: Fix endian issues in cpu hot-removal
+
+Message-id: <20141103214251.10436.73595.sendpatchset@ibm-p7r2-01.lab.bos.redhat.com>
+Patchwork-id: 99375
+O-Subject: [PATCH RHEL7.1 BZ1159579 2/3] pseries: Fix endian issues in cpu hot-removal
+Bugzilla: 1159579
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+RHBZ#:
+------
+https://bugzilla.redhat.com/show_bug.cgi?id=1159579
+
+Description:
+------------
+When removing a cpu, this patch makes sure that values
+gotten from or passed to firmware are in the correct
+endian format.
+
+Signed-off-by: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+RHEL Version Found:
+-------------------
+7.0
+
+Upstream Status:
+----------------
+http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=e36d1227776a2daa2c9aa7f997ac7083d6783f2c
+
+----------------
+Steve Best
+
+Proposed Patch:
+---------------
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/platforms/pseries/dlpar.c b/arch/powerpc/platforms/pseries/dlpar.c
+index 3eb3781..54d4e78 100644
+--- a/arch/powerpc/platforms/pseries/dlpar.c
++++ b/arch/powerpc/platforms/pseries/dlpar.c
+@@ -444,7 +444,8 @@ static int dlpar_offline_cpu(struct device_node *dn)
+  int rc = 0;
+  unsigned int cpu;
+  int len, nthreads, i;
+- const u32 *intserv;
++ const __be32 *intserv;
++ u32 thread;
+ 
+  intserv = of_get_property(dn, "ibm,ppc-interrupt-server#s", &len);
+  if (!intserv)
+@@ -454,8 +455,9 @@ static int dlpar_offline_cpu(struct device_node *dn)
+ 
+  cpu_maps_update_begin();
+  for (i = 0; i < nthreads; i++) {
++  thread = be32_to_cpu(intserv[i]);
+   for_each_present_cpu(cpu) {
+-   if (get_hard_smp_processor_id(cpu) != intserv[i])
++   if (get_hard_smp_processor_id(cpu) != thread)
+     continue;
+ 
+    if (get_cpu_current_state(cpu) == CPU_STATE_OFFLINE)
+@@ -477,14 +479,14 @@ static int dlpar_offline_cpu(struct device_node *dn)
+     * Upgrade it's state to CPU_STATE_OFFLINE.
+     */
+    set_preferred_offline_state(cpu, CPU_STATE_OFFLINE);
+-   BUG_ON(plpar_hcall_norets(H_PROD, intserv[i])
++   BUG_ON(plpar_hcall_norets(H_PROD, thread)
+         != H_SUCCESS);
+    __cpu_die(cpu);
+    break;
+   }
+   if (cpu == num_possible_cpus())
+    printk(KERN_WARNING "Could not find cpu to offline "
+-          "with physical id 0x%x\n", intserv[i]);
++          "with physical id 0x%x\n", thread);
+  }
+  cpu_maps_update_done();
+ 
+@@ -496,15 +498,15 @@ out:
+ static ssize_t dlpar_cpu_release(const char *buf, size_t count)
+ {
+  struct device_node *dn;
+- const u32 *drc_index;
++ u32 drc_index;
+  int rc;
+ 
+  dn = of_find_node_by_path(buf);
+  if (!dn)
+   return -EINVAL;
+ 
+- drc_index = of_get_property(dn, "ibm,my-drc-index", NULL);
+- if (!drc_index) {
++ rc = of_property_read_u32(dn, "ibm,my-drc-index", &drc_index);
++ if (rc) {
+   of_node_put(dn);
+   return -EINVAL;
+  }
+@@ -515,7 +517,7 @@ static ssize_t dlpar_cpu_release(const char *buf, size_t count)
+   return -EINVAL;
+  }
+ 
+- rc = dlpar_release_drc(*drc_index);
++ rc = dlpar_release_drc(drc_index);
+  if (rc) {
+   of_node_put(dn);
+   return rc;
+@@ -523,7 +525,7 @@ static ssize_t dlpar_cpu_release(const char *buf, size_t count)
+ 
+  rc = dlpar_detach_node(dn);
+  if (rc) {
+-  dlpar_acquire_drc(*drc_index);
++  dlpar_acquire_drc(drc_index);
+   return rc;
+  }
+ 
+diff --git a/arch/powerpc/platforms/pseries/hotplug-cpu.c b/arch/powerpc/platforms/pseries/hotplug-cpu.c
+index 20d6297..b174fa7 100644
+--- a/arch/powerpc/platforms/pseries/hotplug-cpu.c
++++ b/arch/powerpc/platforms/pseries/hotplug-cpu.c
+@@ -90,7 +90,7 @@ static void rtas_stop_self(void)
+ {
+  static struct rtas_args args = {
+   .nargs = 0,
+-  .nret = 1,
++  .nret = cpu_to_be32(1),
+   .rets = &args.args[0],
+  };
+ 
+@@ -312,7 +312,8 @@ static void pseries_remove_processor(struct device_node *np)
+ {
+  unsigned int cpu;
+  int len, nthreads, i;
+- const u32 *intserv;
++ const __be32 *intserv;
++ u32 thread;
+ 
+  intserv = of_get_property(np, "ibm,ppc-interrupt-server#s", &len);
+  if (!intserv)
+@@ -322,8 +323,9 @@ static void pseries_remove_processor(struct device_node *np)
+ 
+  cpu_maps_update_begin();
+  for (i = 0; i < nthreads; i++) {
++  thread = be32_to_cpu(intserv[i]);
+   for_each_present_cpu(cpu) {
+-   if (get_hard_smp_processor_id(cpu) != intserv[i])
++   if (get_hard_smp_processor_id(cpu) != thread)
+     continue;
+    BUG_ON(cpu_online(cpu));
+    set_cpu_present(cpu, false);
+@@ -332,7 +334,7 @@ static void pseries_remove_processor(struct device_node *np)
+   }
+   if (cpu >= nr_cpu_ids)
+    printk(KERN_WARNING "Could not find cpu to remove "
+-          "with physical id 0x%x\n", intserv[i]);
++          "with physical id 0x%x\n", thread);
+  }
+  cpu_maps_update_done();
+ }
+-- 
+1.7.1

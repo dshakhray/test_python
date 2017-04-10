@@ -1,0 +1,254 @@
+From 0c67c229bea321b4e3db78a3a46faf9b84371a12 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 12 Sep 2014 14:27:44 -0400
+Subject: [net] netlink: Eliminate kmalloc in netlink dump operation
+
+Message-id: <a7e9ed8f061a9c2b5304ab063e1b1be3f905c9d5.1410528971.git.jbenc@redhat.com>
+Patchwork-id: 93980
+O-Subject: [RHEL7.1 net PATCH 01/14] netlink: Eliminate kmalloc in netlink dump operation.
+Bugzilla: 1140661
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1140661
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7948291
+
+commit 16b304f3404f8e0243d5ee2b70b68767b7b59b2b
+Author: Pravin B Shelar <pshelar@nicira.com>
+Date:   Thu Aug 15 15:31:06 2013 -0700
+
+    netlink: Eliminate kmalloc in netlink dump operation.
+
+    Following patch stores struct netlink_callback in netlink_sock
+    to avoid allocating and freeing it on every netlink dump msg.
+    Only one dump operation is allowed for a given socket at a time
+    therefore we can safely convert cb pointer to cb struct inside
+    netlink_sock.
+
+    Signed-off-by: Pravin B Shelar <pshelar@nicira.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index f3bab1b..a4458d6 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -625,7 +625,7 @@ static unsigned int netlink_poll(struct file *file, struct socket *sock,
+    * for dumps is performed here. A dump is allowed to continue
+    * if at least half the ring is unused.
+    */
+-  while (nlk->cb != NULL && netlink_dump_space(nlk)) {
++  while (nlk->cb_running && netlink_dump_space(nlk)) {
+    err = netlink_dump(sk);
+    if (err < 0) {
+     sk->sk_err = err;
+@@ -832,18 +832,6 @@ static void netlink_ring_set_copied(struct sock *sk, struct sk_buff *skb)
+ #define netlink_mmap_sendmsg(sk, msg, dst_portid, dst_group, siocb) 0
+ #endif /* CONFIG_NETLINK_MMAP */
+ 
+-static void netlink_destroy_callback(struct netlink_callback *cb)
+-{
+- kfree_skb(cb->skb);
+- kfree(cb);
+-}
+-
+-static void netlink_consume_callback(struct netlink_callback *cb)
+-{
+- consume_skb(cb->skb);
+- kfree(cb);
+-}
+-
+ static void netlink_skb_destructor(struct sk_buff *skb)
+ {
+ #ifdef CONFIG_NETLINK_MMAP
+@@ -902,12 +890,12 @@ static void netlink_sock_destruct(struct sock *sk)
+ {
+  struct netlink_sock *nlk = nlk_sk(sk);
+ 
+- if (nlk->cb) {
+-  if (nlk->cb->done)
+-   nlk->cb->done(nlk->cb);
++ if (nlk->cb_running) {
++  if (nlk->cb.done)
++   nlk->cb.done(&nlk->cb);
+ 
+-  module_put(nlk->cb->module);
+-  netlink_destroy_callback(nlk->cb);
++  module_put(nlk->cb.module);
++  kfree_skb(nlk->cb.skb);
+  }
+ 
+  skb_queue_purge(&sk->sk_receive_queue);
+@@ -2442,7 +2430,8 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
+ 
+  skb_free_datagram(sk, skb);
+ 
+- if (nlk->cb && atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf / 2) {
++ if (nlk->cb_running &&
++     atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf / 2) {
+   ret = netlink_dump(sk);
+   if (ret) {
+    sk->sk_err = ret;
+@@ -2656,13 +2645,12 @@ static int netlink_dump(struct sock *sk)
+  int alloc_size;
+ 
+  mutex_lock(nlk->cb_mutex);
+-
+- cb = nlk->cb;
+- if (cb == NULL) {
++ if (!nlk->cb_running) {
+   err = -EINVAL;
+   goto errout_skb;
+  }
+ 
++ cb = &nlk->cb;
+  alloc_size = max_t(int, cb->min_dump_alloc, NLMSG_GOODSIZE);
+ 
+  if (!netlink_rx_is_mmaped(sk) &&
+@@ -2700,11 +2688,11 @@ static int netlink_dump(struct sock *sk)
+ 
+  if (cb->done)
+   cb->done(cb);
+- nlk->cb = NULL;
+- mutex_unlock(nlk->cb_mutex);
+ 
++ nlk->cb_running = false;
++ mutex_unlock(nlk->cb_mutex);
+  module_put(cb->module);
+- netlink_consume_callback(cb);
++ consume_skb(cb->skb);
+  return 0;
+ 
+ errout_skb:
+@@ -2722,59 +2710,51 @@ int __netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
+  struct netlink_sock *nlk;
+  int ret;
+ 
+- cb = kzalloc(sizeof(*cb), GFP_KERNEL);
+- if (cb == NULL)
+-  return -ENOBUFS;
+-
+  /* Memory mapped dump requests need to be copied to avoid looping
+   * on the pending state in netlink_mmap_sendmsg() while the CB hold
+   * a reference to the skb.
+   */
+  if (netlink_skb_is_mmaped(skb)) {
+   skb = skb_copy(skb, GFP_KERNEL);
+-  if (skb == NULL) {
+-   kfree(cb);
++  if (skb == NULL)
+    return -ENOBUFS;
+-  }
+  } else
+   atomic_inc(&skb->users);
+ 
+- cb->dump = control->dump;
+- cb->done = control->done;
+- cb->nlh = nlh;
+- cb->data = control->data;
+- cb->module = control->module;
+- cb->min_dump_alloc = control->min_dump_alloc;
+- cb->skb = skb;
+-
+  sk = netlink_lookup(sock_net(ssk), ssk->sk_protocol, NETLINK_CB(skb).portid);
+  if (sk == NULL) {
+-  netlink_destroy_callback(cb);
+-  return -ECONNREFUSED;
++  ret = -ECONNREFUSED;
++  goto error_free;
+  }
+- nlk = nlk_sk(sk);
+ 
++ nlk = nlk_sk(sk);
+  mutex_lock(nlk->cb_mutex);
+  /* A dump is in progress... */
+- if (nlk->cb) {
+-  mutex_unlock(nlk->cb_mutex);
+-  netlink_destroy_callback(cb);
++ if (nlk->cb_running) {
+   ret = -EBUSY;
+-  goto out;
++  goto error_unlock;
+  }
+  /* add reference of module which cb->dump belongs to */
+- if (!try_module_get(cb->module)) {
+-  mutex_unlock(nlk->cb_mutex);
+-  netlink_destroy_callback(cb);
++ if (!try_module_get(control->module)) {
+   ret = -EPROTONOSUPPORT;
+-  goto out;
++  goto error_unlock;
+  }
+ 
+- nlk->cb = cb;
++ cb = &nlk->cb;
++ memset(cb, 0, sizeof(*cb));
++ cb->dump = control->dump;
++ cb->done = control->done;
++ cb->nlh = nlh;
++ cb->data = control->data;
++ cb->module = control->module;
++ cb->min_dump_alloc = control->min_dump_alloc;
++ cb->skb = skb;
++
++ nlk->cb_running = true;
++
+  mutex_unlock(nlk->cb_mutex);
+ 
+  ret = netlink_dump(sk);
+-out:
+  sock_put(sk);
+ 
+  if (ret)
+@@ -2784,6 +2764,13 @@ out:
+   * signal not to send ACK even if it was requested.
+   */
+  return -EINTR;
++
++error_unlock:
++ sock_put(sk);
++ mutex_unlock(nlk->cb_mutex);
++error_free:
++ kfree_skb(skb);
++ return ret;
+ }
+ EXPORT_SYMBOL(__netlink_dump_start);
+ 
+@@ -3003,14 +2990,14 @@ static int netlink_seq_show(struct seq_file *seq, void *v)
+   struct sock *s = v;
+   struct netlink_sock *nlk = nlk_sk(s);
+ 
+-  seq_printf(seq, "%pK %-3d %-6u %08x %-8d %-8d %pK %-8d %-8d %-8lu\n",
++  seq_printf(seq, "%pK %-3d %-6u %08x %-8d %-8d %d %-8d %-8d %-8lu\n",
+       s,
+       s->sk_protocol,
+       nlk->portid,
+       nlk->groups ? (u32)nlk->groups[0] : 0,
+       sk_rmem_alloc_get(s),
+       sk_wmem_alloc_get(s),
+-      nlk->cb,
++      nlk->cb_running,
+       atomic_read(&s->sk_refcnt),
+       atomic_read(&s->sk_drops),
+       sock_i_ino(s)
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index ed85222..74c16f0 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -32,7 +32,8 @@ struct netlink_sock {
+  unsigned long  *groups;
+  unsigned long  state;
+  wait_queue_head_t wait;
+- struct netlink_callback *cb;
++ bool   cb_running;
++ struct netlink_callback cb;
+  struct mutex  *cb_mutex;
+  struct mutex  cb_def_mutex;
+  void   (*netlink_rcv)(struct sk_buff *skb);
+-- 
+1.7.1

@@ -1,0 +1,346 @@
+From 6d52e02fef2029de7515ddbbedca3d5ba19efd87 Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:25:05 -0400
+Subject: [lib] raid6: add ARM-NEON accelerated syndrome calculation
+
+Message-id: <1409563584-9000-4-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 89940
+O-Subject: [RHEL7.1 PATCH 03/82] lib/raid6: add ARM-NEON accelerated syndrome calculation
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+
+Rebased/reworked a patch contributed by Rob Herring that uses
+NEON intrinsics to perform the RAID-6 syndrome calculations.
+It uses the existing unroll.awk code to generate several
+unrolled versions of which the best performing one is selected
+at boot time.
+
+Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Acked-by: Nicolas Pitre <nico@linaro.org>
+Cc: hpa@linux.intel.com
+(cherry picked from commit 7d11965ddb9b9b1e0a5d13c58345ada1ccbc663b)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+ create mode 100644 lib/raid6/neon.c
+ create mode 100644 lib/raid6/neon.uc
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/raid/pq.h b/include/linux/raid/pq.h
+index 8dfaa2c..0f42469 100644
+--- a/include/linux/raid/pq.h
++++ b/include/linux/raid/pq.h
+@@ -114,6 +114,11 @@ extern const struct raid6_recov_calls raid6_recov_intx1;
+ extern const struct raid6_recov_calls raid6_recov_ssse3;
+ extern const struct raid6_recov_calls raid6_recov_avx2;
+ 
++extern const struct raid6_calls raid6_neonx1;
++extern const struct raid6_calls raid6_neonx2;
++extern const struct raid6_calls raid6_neonx4;
++extern const struct raid6_calls raid6_neonx8;
++
+ /* Algorithm list */
+ extern const struct raid6_calls * const raid6_algos[];
+ extern const struct raid6_recov_calls *const raid6_recov_algos[];
+diff --git a/lib/raid6/.gitignore b/lib/raid6/.gitignore
+index 162beca..0a7e494 100644
+--- a/lib/raid6/.gitignore
++++ b/lib/raid6/.gitignore
+@@ -2,3 +2,4 @@ mktables
+ altivec*.c
+ int*.c
+ tables.c
++neon?.c
+diff --git a/lib/raid6/Makefile b/lib/raid6/Makefile
+index 9f7c184..b462578 100644
+--- a/lib/raid6/Makefile
++++ b/lib/raid6/Makefile
+@@ -5,6 +5,7 @@ raid6_pq-y += algos.o recov.o tables.o int1.o int2.o int4.o \
+ 
+ raid6_pq-$(CONFIG_X86) += recov_ssse3.o recov_avx2.o mmx.o sse1.o sse2.o avx2.o
+ raid6_pq-$(CONFIG_ALTIVEC) += altivec1.o altivec2.o altivec4.o altivec8.o
++raid6_pq-$(CONFIG_KERNEL_MODE_NEON) += neon.o neon1.o neon2.o neon4.o neon8.o
+ 
+ hostprogs-y += mktables
+ 
+@@ -16,6 +17,21 @@ ifeq ($(CONFIG_ALTIVEC),y)
+ altivec_flags := -maltivec -mabi=altivec
+ endif
+ 
++# The GCC option -ffreestanding is required in order to compile code containing
++# ARM/NEON intrinsics in a non C99-compliant environment (such as the kernel)
++ifeq ($(CONFIG_KERNEL_MODE_NEON),y)
++NEON_FLAGS := -ffreestanding
++ifeq ($(ARCH),arm)
++NEON_FLAGS += -mfloat-abi=softfp -mfpu=neon
++endif
++ifeq ($(ARCH),arm64)
++CFLAGS_REMOVE_neon1.o += -mgeneral-regs-only
++CFLAGS_REMOVE_neon2.o += -mgeneral-regs-only
++CFLAGS_REMOVE_neon4.o += -mgeneral-regs-only
++CFLAGS_REMOVE_neon8.o += -mgeneral-regs-only
++endif
++endif
++
+ targets += int1.c
+ $(obj)/int1.c:   UNROLL := 1
+ $(obj)/int1.c:   $(src)/int.uc $(src)/unroll.awk FORCE
+@@ -70,6 +86,30 @@ $(obj)/altivec8.c:   UNROLL := 8
+ $(obj)/altivec8.c:   $(src)/altivec.uc $(src)/unroll.awk FORCE
+  $(call if_changed,unroll)
+ 
++CFLAGS_neon1.o += $(NEON_FLAGS)
++targets += neon1.c
++$(obj)/neon1.c:   UNROLL := 1
++$(obj)/neon1.c:   $(src)/neon.uc $(src)/unroll.awk FORCE
++ $(call if_changed,unroll)
++
++CFLAGS_neon2.o += $(NEON_FLAGS)
++targets += neon2.c
++$(obj)/neon2.c:   UNROLL := 2
++$(obj)/neon2.c:   $(src)/neon.uc $(src)/unroll.awk FORCE
++ $(call if_changed,unroll)
++
++CFLAGS_neon4.o += $(NEON_FLAGS)
++targets += neon4.c
++$(obj)/neon4.c:   UNROLL := 4
++$(obj)/neon4.c:   $(src)/neon.uc $(src)/unroll.awk FORCE
++ $(call if_changed,unroll)
++
++CFLAGS_neon8.o += $(NEON_FLAGS)
++targets += neon8.c
++$(obj)/neon8.c:   UNROLL := 8
++$(obj)/neon8.c:   $(src)/neon.uc $(src)/unroll.awk FORCE
++ $(call if_changed,unroll)
++
+ quiet_cmd_mktable = TABLE   $@
+       cmd_mktable = $(obj)/mktables > $@ || ( rm -f $@ && exit 1 )
+ 
+diff --git a/lib/raid6/algos.c b/lib/raid6/algos.c
+index 6d7316f..74e6f56 100644
+--- a/lib/raid6/algos.c
++++ b/lib/raid6/algos.c
+@@ -70,6 +70,12 @@ const struct raid6_calls * const raid6_algos[] = {
+  &raid6_intx2,
+  &raid6_intx4,
+  &raid6_intx8,
++#ifdef CONFIG_KERNEL_MODE_NEON
++ &raid6_neonx1,
++ &raid6_neonx2,
++ &raid6_neonx4,
++ &raid6_neonx8,
++#endif
+  NULL
+ };
+ 
+diff --git a/lib/raid6/neon.c b/lib/raid6/neon.c
+new file mode 100644
+index 0000000..36ad470
+--- /dev/null
++++ b/lib/raid6/neon.c
+@@ -0,0 +1,58 @@
++/*
++ * linux/lib/raid6/neon.c - RAID6 syndrome calculation using ARM NEON intrinsics
++ *
++ * Copyright (C) 2013 Linaro Ltd <ard.biesheuvel@linaro.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/raid/pq.h>
++
++#ifdef __KERNEL__
++#include <asm/neon.h>
++#else
++#define kernel_neon_begin()
++#define kernel_neon_end()
++#define cpu_has_neon()  (1)
++#endif
++
++/*
++ * There are 2 reasons these wrappers are kept in a separate compilation unit
++ * from the actual implementations in neonN.c (generated from neon.uc by
++ * unroll.awk):
++ * - the actual implementations use NEON intrinsics, and the GCC support header
++ *   (arm_neon.h) is not fully compatible (type wise) with the kernel;
++ * - the neonN.c files are compiled with -mfpu=neon and optimization enabled,
++ *   and we have to make sure that we never use *any* NEON/VFP instructions
++ *   outside a kernel_neon_begin()/kernel_neon_end() pair.
++ */
++
++#define RAID6_NEON_WRAPPER(_n)      \
++ static void raid6_neon ## _n ## _gen_syndrome(int disks, \
++     size_t bytes, void **ptrs) \
++ {        \
++  void raid6_neon ## _n  ## _gen_syndrome_real(int, \
++      unsigned long, void**); \
++  kernel_neon_begin();     \
++  raid6_neon ## _n ## _gen_syndrome_real(disks,  \
++     (unsigned long)bytes, ptrs); \
++  kernel_neon_end();     \
++ }        \
++ struct raid6_calls const raid6_neonx ## _n = {   \
++  raid6_neon ## _n ## _gen_syndrome,   \
++  raid6_have_neon,     \
++  "neonx" #_n,      \
++  0       \
++ }
++
++static int raid6_have_neon(void)
++{
++ return cpu_has_neon();
++}
++
++RAID6_NEON_WRAPPER(1);
++RAID6_NEON_WRAPPER(2);
++RAID6_NEON_WRAPPER(4);
++RAID6_NEON_WRAPPER(8);
+diff --git a/lib/raid6/neon.uc b/lib/raid6/neon.uc
+new file mode 100644
+index 0000000..1b9ed79
+--- /dev/null
++++ b/lib/raid6/neon.uc
+@@ -0,0 +1,80 @@
++/* -----------------------------------------------------------------------
++ *
++ *   neon.uc - RAID-6 syndrome calculation using ARM NEON instructions
++ *
++ *   Copyright (C) 2012 Rob Herring
++ *
++ *   Based on altivec.uc:
++ *     Copyright 2002-2004 H. Peter Anvin - All Rights Reserved
++ *
++ *   This program is free software; you can redistribute it and/or modify
++ *   it under the terms of the GNU General Public License as published by
++ *   the Free Software Foundation, Inc., 53 Temple Place Ste 330,
++ *   Boston MA 02111-1307, USA; either version 2 of the License, or
++ *   (at your option) any later version; incorporated herein by reference.
++ *
++ * ----------------------------------------------------------------------- */
++
++/*
++ * neon$#.c
++ *
++ * $#-way unrolled NEON intrinsics math RAID-6 instruction set
++ *
++ * This file is postprocessed using unroll.awk
++ */
++
++#include <arm_neon.h>
++
++typedef uint8x16_t unative_t;
++
++#define NBYTES(x) ((unative_t){x,x,x,x, x,x,x,x, x,x,x,x, x,x,x,x})
++#define NSIZE sizeof(unative_t)
++
++/*
++ * The SHLBYTE() operation shifts each byte left by 1, *not*
++ * rolling over into the next byte
++ */
++static inline unative_t SHLBYTE(unative_t v)
++{
++ return vshlq_n_u8(v, 1);
++}
++
++/*
++ * The MASK() operation returns 0xFF in any byte for which the high
++ * bit is 1, 0x00 for any byte for which the high bit is 0.
++ */
++static inline unative_t MASK(unative_t v)
++{
++ const uint8x16_t temp = NBYTES(0);
++ return (unative_t)vcltq_s8((int8x16_t)v, (int8x16_t)temp);
++}
++
++void raid6_neon$#_gen_syndrome_real(int disks, unsigned long bytes, void **ptrs)
++{
++ uint8_t **dptr = (uint8_t **)ptrs;
++ uint8_t *p, *q;
++ int d, z, z0;
++
++ register unative_t wd$$, wq$$, wp$$, w1$$, w2$$;
++ const unative_t x1d = NBYTES(0x1d);
++
++ z0 = disks - 3;  /* Highest data disk */
++ p = dptr[z0+1];  /* XOR parity */
++ q = dptr[z0+2];  /* RS syndrome */
++
++ for ( d = 0 ; d < bytes ; d += NSIZE*$# ) {
++  wq$$ = wp$$ = vld1q_u8(&dptr[z0][d+$$*NSIZE]);
++  for ( z = z0-1 ; z >= 0 ; z-- ) {
++   wd$$ = vld1q_u8(&dptr[z][d+$$*NSIZE]);
++   wp$$ = veorq_u8(wp$$, wd$$);
++   w2$$ = MASK(wq$$);
++   w1$$ = SHLBYTE(wq$$);
++
++   w2$$ = vandq_u8(w2$$, x1d);
++   w1$$ = veorq_u8(w1$$, w2$$);
++   wq$$ = veorq_u8(w1$$, wd$$);
++  }
++  vst1q_u8(&p[d+NSIZE*$$], wp$$);
++  vst1q_u8(&q[d+NSIZE*$$], wq$$);
++ }
++}
+diff --git a/lib/raid6/test/Makefile b/lib/raid6/test/Makefile
+index 087332d..28afa1a 100644
+--- a/lib/raid6/test/Makefile
++++ b/lib/raid6/test/Makefile
+@@ -22,11 +22,23 @@ ifeq ($(ARCH),x86_64)
+         IS_X86 = yes
+ endif
+ 
++ifeq ($(ARCH),arm)
++        CFLAGS += -I../../../arch/arm/include -mfpu=neon
++        HAS_NEON = yes
++endif
++ifeq ($(ARCH),arm64)
++        CFLAGS += -I../../../arch/arm64/include
++        HAS_NEON = yes
++endif
++
+ ifeq ($(IS_X86),yes)
+         OBJS   += mmx.o sse1.o sse2.o avx2.o recov_ssse3.o recov_avx2.o
+         CFLAGS += $(shell echo "vpbroadcastb %xmm0, %ymm1" | \
+                     gcc -c -x assembler - >&/dev/null && \
+                     rm ./-.o && echo -DCONFIG_AS_AVX2=1)
++else ifeq ($(HAS_NEON),yes)
++        OBJS   += neon.o neon1.o neon2.o neon4.o neon8.o
++        CFLAGS += -DCONFIG_KERNEL_MODE_NEON=1
+ else
+         HAS_ALTIVEC := $(shell echo -e '\#include <altivec.h>\nvector int a;' |\
+                          gcc -c -x c - >&/dev/null && \
+@@ -55,6 +67,18 @@ raid6.a: $(OBJS)
+ raid6test: test.c raid6.a
+  $(CC) $(CFLAGS) -o raid6test $^
+ 
++neon1.c: neon.uc ../unroll.awk
++ $(AWK) ../unroll.awk -vN=1 < neon.uc > $@
++
++neon2.c: neon.uc ../unroll.awk
++ $(AWK) ../unroll.awk -vN=2 < neon.uc > $@
++
++neon4.c: neon.uc ../unroll.awk
++ $(AWK) ../unroll.awk -vN=4 < neon.uc > $@
++
++neon8.c: neon.uc ../unroll.awk
++ $(AWK) ../unroll.awk -vN=8 < neon.uc > $@
++
+ altivec1.c: altivec.uc ../unroll.awk
+  $(AWK) ../unroll.awk -vN=1 < altivec.uc > $@
+ 
+@@ -89,7 +113,7 @@ tables.c: mktables
+  ./mktables > tables.c
+ 
+ clean:
+- rm -f *.o *.a mktables mktables.c *.uc int*.c altivec*.c tables.c raid6test
++ rm -f *.o *.a mktables mktables.c *.uc int*.c altivec*.c neon*.c tables.c raid6test
+ 
+ spotless: clean
+  rm -f *~
+-- 
+1.7.1

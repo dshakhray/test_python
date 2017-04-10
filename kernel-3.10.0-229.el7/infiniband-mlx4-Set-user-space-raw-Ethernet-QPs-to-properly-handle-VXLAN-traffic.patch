@@ -1,0 +1,98 @@
+From 9ad13a967a323c7bfc21168299b9eafee892f558 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:02:07 -0400
+Subject: [infiniband] mlx4: Set user-space raw Ethernet QPs to properly handle VXLAN traffic
+
+Message-id: <d27618d1d3fcdcb90d9209e8e72df599b69bc13f.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93692
+O-Subject: [Patch RHEL7.1 V1 191/197] mlx4: Set user-space raw Ethernet QPs to properly handle VXLAN traffic
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Or Gerlitz <ogerlitz@mellanox.com>
+
+Raw Ethernet QPs opened from user-space lack the proper setup to
+recieve/handle VXLAN traffic when VXLAN offloads are enabled.
+
+Fix that by adding a tunnel steering rule on top of the normal unicast
+steering rule and set the tunnel_type field in the QP context.
+
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d2fce8a9060db3af7e1b25e259b251da17f6a0d6)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index 3242fbb..01b46a6 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -1089,6 +1089,30 @@ static int __mlx4_ib_destroy_flow(struct mlx4_dev *dev, u64 reg_id)
+  return err;
+ }
+ 
++static int mlx4_ib_tunnel_steer_add(struct ib_qp *qp, struct ib_flow_attr *flow_attr,
++        u64 *reg_id)
++{
++ void *ib_flow;
++ union ib_flow_spec *ib_spec;
++ struct mlx4_dev *dev = to_mdev(qp->device)->dev;
++ int err = 0;
++
++ if (dev->caps.tunnel_offload_mode != MLX4_TUNNEL_OFFLOAD_MODE_VXLAN)
++  return 0; /* do nothing */
++
++ ib_flow = flow_attr + 1;
++ ib_spec = (union ib_flow_spec *)ib_flow;
++
++ if (ib_spec->type !=  IB_FLOW_SPEC_ETH || flow_attr->num_of_specs != 1)
++  return 0; /* do nothing */
++
++ err = mlx4_tunnel_steer_add(to_mdev(qp->device)->dev, ib_spec->eth.val.dst_mac,
++        flow_attr->port, qp->qp_num,
++        MLX4_DOMAIN_UVERBS | (flow_attr->priority & 0xff),
++        reg_id);
++ return err;
++}
++
+ static struct ib_flow *mlx4_ib_create_flow(struct ib_qp *qp,
+         struct ib_flow_attr *flow_attr,
+         int domain)
+@@ -1136,6 +1160,12 @@ static struct ib_flow *mlx4_ib_create_flow(struct ib_qp *qp,
+   i++;
+  }
+ 
++ if (i < ARRAY_SIZE(type) && flow_attr->type == IB_FLOW_ATTR_NORMAL) {
++  err = mlx4_ib_tunnel_steer_add(qp, flow_attr, &mflow->reg_id[i]);
++  if (err)
++   goto err_free;
++ }
++
+  return &mflow->ibflow;
+ 
+ err_free:
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index 6778045..efb9eff 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -1677,9 +1677,15 @@ static int __mlx4_ib_modify_qp(struct ib_qp *ibqp,
+   }
+  }
+ 
+- if (qp->ibqp.qp_type == IB_QPT_RAW_PACKET)
++ if (qp->ibqp.qp_type == IB_QPT_RAW_PACKET) {
+   context->pri_path.ackto = (context->pri_path.ackto & 0xf8) |
+      MLX4_IB_LINK_TYPE_ETH;
++  if (dev->dev->caps.tunnel_offload_mode ==  MLX4_TUNNEL_OFFLOAD_MODE_VXLAN) {
++   /* set QP to receive both tunneled & non-tunneled packets */
++   if (!(context->flags & (1 << MLX4_RSS_QPC_FLAG_OFFSET)))
++    context->srqn = cpu_to_be32(7 << 28);
++  }
++ }
+ 
+  if (ibqp->qp_type == IB_QPT_UD && (new_state == IB_QPS_RTR)) {
+   int is_eth = rdma_port_get_link_layer(
+-- 
+1.7.1

@@ -1,0 +1,78 @@
+From 76c867afbcdda35bd639e05b1a5925a604000530 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Tue, 25 Nov 2014 16:17:33 -0500
+Subject: [block] genhd: fix leftover might_sleep() in blk_free_devt()
+
+Message-id: <x49a93fntk2.fsf@segfault.boston.devel.redhat.com>
+Patchwork-id: 100896
+O-Subject: [RHEL7 PATCH] genhd: fix leftover might_sleep() in blk_free_devt()
+Bugzilla: 1167728
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Hi,
+
+QE hit the following backtrace after the addition of commit d5fe260:
+
+BUG: sleeping function called from invalid context at block/genhd.c:448
+in_atomic(): 1, irqs_disabled(): 0, pid: 74, name: rcuos/0
+no locks held by rcuos/0/74.
+CPU: 1 PID: 74 Comm: rcuos/0 Not tainted 3.10.0-207.el7.x86_64.debug #1
+Hardware name: HP ProLiant DL160 Gen8, BIOS J03 02/10/2014
+ ffff88026c472780 00000000faec5cd9 ffff88026c47bc80 ffffffff816c5995
+ ffff88026c47bca8 ffffffff810befe3 0000000000800041 ffff88026685a828
+ ffff880266533e00 ffff88026c47bcc0 ffffffff8132900f ffff88026685a828
+Call Trace:
+ [<ffffffff816c5995>] dump_stack+0x19/0x1b
+ [<ffffffff810befe3>] __might_sleep+0x173/0x230
+ [<ffffffff8132900f>] blk_free_devt+0x1f/0x70
+ [<ffffffff8132ab98>] part_release+0x18/0x40
+ [<ffffffff81445f02>] device_release+0x32/0xa0
+ [<ffffffff81344d9e>] kobject_release+0x7e/0x1b0
+ [<ffffffff81344c58>] kobject_put+0x28/0x60
+ [<ffffffff81446267>] put_device+0x17/0x20
+ [<ffffffff8132ae3c>] delete_partition_rcu_cb+0x16c/0x180
+ [<ffffffff8114ad9e>] rcu_nocb_kthread+0x25e/0x3a0
+ [<ffffffff810b1880>] ? wake_up_bit+0x30/0x30
+ [<ffffffff8114ab40>] ? rcu_start_gp+0x40/0x40
+ [<ffffffff810b057d>] kthread+0xed/0x100
+ [<ffffffff810b0490>] ? insert_kthread_work+0x80/0x80
+ [<ffffffff816d947c>] ret_from_fork+0x7c/0xb0
+ [<ffffffff810b0490>] ? insert_kthread_work+0x80/0x80
+
+The following commit from upstream fixes this:
+
+  commit 46f341ffcfb5d8530f7d1e60f3be06cce6661b62
+  Author: Jens Axboe <axboe@fb.com>
+  Date:   Tue Sep 16 13:38:51 2014 -0600
+
+    genhd: fix leftover might_sleep() in blk_free_devt()
+
+    Commit 2da78092 changed the locking from a mutex to a spinlock,
+    so we now longer sleep in this context. But there was a leftover
+    might_sleep() in there, which now triggers since we do the final
+    free from an RCU callback. Get rid of it.
+
+    Reported-by: Pontus Fuchs <pontus.fuchs@gmail.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+This fixes bug 1167728.
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/genhd.c b/block/genhd.c
+index 6190449..e670148 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -445,8 +445,6 @@ int blk_alloc_devt(struct hd_struct *part, dev_t *devt)
+  */
+ void blk_free_devt(dev_t devt)
+ {
+- might_sleep();
+-
+  if (devt == MKDEV(0, 0))
+   return;
+ 
+-- 
+1.7.1

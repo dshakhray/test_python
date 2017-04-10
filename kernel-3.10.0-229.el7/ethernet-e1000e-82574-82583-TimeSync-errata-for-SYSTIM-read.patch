@@ -1,0 +1,85 @@
+From 527279513706d275f1cbb81d383850fe70cc3754 Mon Sep 17 00:00:00 2001
+From: John Greene <jogreene@redhat.com>
+Date: Thu, 14 Aug 2014 14:42:19 -0400
+Subject: [ethernet] e1000e: 82574/82583 TimeSync errata for SYSTIM read
+
+Message-id: <1408027348-9610-26-git-send-email-jogreene@redhat.com>
+Patchwork-id: 87726
+O-Subject: [RHEL7.1 PATCH 25/34] e1000e: 82574/82583 TimeSync errata for SYSTIM read
+Bugzilla: 1091119
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Due to a synchronization error, the value read from SYSTIML/SYSTIMH
+might be incorrect.
+
+Signed-off-by: Todd Fujinaka <todd.fujinaka@intel.com>
+Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 5e7ff970041321a26f2dc3aa41ba79e787fcf8f9)
+
+BZ: 1091119
+Testing: Acceptable, see BZ
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7834849
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/e1000e/e1000.h b/drivers/net/ethernet/intel/e1000e/e1000.h
+index ad0edd1..c538d46 100644
+--- a/drivers/net/ethernet/intel/e1000e/e1000.h
++++ b/drivers/net/ethernet/intel/e1000e/e1000.h
+@@ -397,6 +397,8 @@ s32 e1000e_get_base_timinca(struct e1000_adapter *adapter, u32 *timinca);
+  * 25MHz 46-bit 2^46 / 10^9 / 3600 = 19.55 hours
+  */
+ #define E1000_SYSTIM_OVERFLOW_PERIOD (HZ * 60 * 60 * 4)
++#define E1000_MAX_82574_SYSTIM_REREADS 50
++#define E1000_82574_SYSTIM_EPSILON (1ULL << 35ULL)
+ 
+ /* hardware capability, feature, and workaround flags */
+ #define FLAG_HAS_AMT                      (1 << 0)
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index e3313eb..d959dda 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -4060,12 +4060,37 @@ static cycle_t e1000e_cyclecounter_read(const struct cyclecounter *cc)
+  struct e1000_adapter *adapter = container_of(cc, struct e1000_adapter,
+            cc);
+  struct e1000_hw *hw = &adapter->hw;
+- cycle_t systim;
++ cycle_t systim, systim_next;
+ 
+  /* latch SYSTIMH on read of SYSTIML */
+  systim = (cycle_t)er32(SYSTIML);
+  systim |= (cycle_t)er32(SYSTIMH) << 32;
+ 
++ if ((hw->mac.type == e1000_82574) || (hw->mac.type == e1000_82583)) {
++  u64 incvalue, time_delta, rem, temp;
++  int i;
++
++  /* errata for 82574/82583 possible bad bits read from SYSTIMH/L
++   * check to see that the time is incrementing at a reasonable
++   * rate and is a multiple of incvalue
++   */
++  incvalue = er32(TIMINCA) & E1000_TIMINCA_INCVALUE_MASK;
++  for (i = 0; i < E1000_MAX_82574_SYSTIM_REREADS; i++) {
++   /* latch SYSTIMH on read of SYSTIML */
++   systim_next = (cycle_t)er32(SYSTIML);
++   systim_next |= (cycle_t)er32(SYSTIMH) << 32;
++
++   time_delta = systim_next - systim;
++   temp = time_delta;
++   rem = do_div(temp, incvalue);
++
++   systim = systim_next;
++
++   if ((time_delta < E1000_82574_SYSTIM_EPSILON) &&
++       (rem == 0))
++    break;
++  }
++ }
+  return systim;
+ }
+ 
+-- 
+1.7.1

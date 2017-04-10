@@ -1,0 +1,97 @@
+From b7d2a92ff908ff3cce5d289474440ca24e30b63c Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 19 Sep 2014 12:28:58 -0400
+Subject: [acpi] hotplug/pci: Simplify disable_slot()
+
+Message-id: <1411129776-21656-24-git-send-email-prarit@redhat.com>
+Patchwork-id: 96362
+O-Subject: [RHEL7.1 PATCH BZ 1141846 23/61] ACPI / hotplug / PCI: Simplify disable_slot()
+Bugzilla: 1141846
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1141846
+
+commit 1c0c5443de5f1f03ae2abce569fb673377f0fd0e
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Tue Feb 4 00:37:02 2014 +0100
+
+    ACPI / hotplug / PCI: Simplify disable_slot()
+
+    After recent PCI core changes related to the rescan/remove locking,
+    the ACPIPHP's disable_slot() function is only called under the
+    general PCI rescan/remove lock, so it doesn't have to use
+    dev_in_slot() any more to avoid race conditions.  Make it simply
+    walk the devices on the bus and drop the ones in the slot being
+    disabled and drop dev_in_slot() which has no more users.
+
+    Moreover, to avoid problems described in the changelog of commit
+    29ed1f29b68a (PCI: pciehp: Fix null pointer deref when hot-removing
+    SR-IOV device), make disable_slot() carry out the list walk in
+    reverse order.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+
+Cc: Myron Stowe <mstowe@redhat.com>
+Cc: Andy Gospodarek <agospoda@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index ada4c1c..21c73eb 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -625,32 +625,15 @@ static void __ref enable_slot(struct acpiphp_slot *slot)
+  }
+ }
+ 
+-/* return first device in slot, acquiring a reference on it */
+-static struct pci_dev *dev_in_slot(struct acpiphp_slot *slot)
+-{
+- struct pci_bus *bus = slot->bus;
+- struct pci_dev *dev;
+- struct pci_dev *ret = NULL;
+-
+- down_read(&pci_bus_sem);
+- list_for_each_entry(dev, &bus->devices, bus_list)
+-  if (PCI_SLOT(dev->devfn) == slot->device) {
+-   ret = pci_dev_get(dev);
+-   break;
+-  }
+- up_read(&pci_bus_sem);
+-
+- return ret;
+-}
+-
+ /**
+  * disable_slot - disable a slot
+  * @slot: ACPI PHP slot
+  */
+ static void disable_slot(struct acpiphp_slot *slot)
+ {
++ struct pci_bus *bus = slot->bus;
++ struct pci_dev *dev, *prev;
+  struct acpiphp_func *func;
+- struct pci_dev *pdev;
+ 
+  /*
+   * enable_slot() enumerates all functions in this device via
+@@ -658,10 +641,9 @@ static void disable_slot(struct acpiphp_slot *slot)
+   * methods (_EJ0, etc.) or not.  Therefore, we remove all functions
+   * here.
+   */
+- while ((pdev = dev_in_slot(slot))) {
+-  pci_stop_and_remove_bus_device(pdev);
+-  pci_dev_put(pdev);
+- }
++ list_for_each_entry_safe_reverse(dev, prev, &bus->devices, bus_list)
++  if (PCI_SLOT(dev->devfn) == slot->device)
++   pci_stop_and_remove_bus_device(dev);
+ 
+  list_for_each_entry(func, &slot->funcs, sibling)
+   acpiphp_bus_trim(func_to_handle(func));
+-- 
+1.7.1

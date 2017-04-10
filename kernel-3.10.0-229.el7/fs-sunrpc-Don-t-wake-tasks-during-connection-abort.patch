@@ -1,0 +1,65 @@
+From 934a5303591282498198077c83ae15d613e15599 Mon Sep 17 00:00:00 2001
+From: Benjamin Coddington <bcodding@redhat.com>
+Date: Wed, 8 Oct 2014 19:46:07 -0400
+Subject: [fs] sunrpc: Don't wake tasks during connection abort
+
+Message-id: <03b36ceb78e86aea26086b3d9e20a40bb4bfced9.1412792619.git.bcodding@redhat.com>
+Patchwork-id: 97278
+O-Subject: [RHEL7.1 PATCH fs 1/2] SUNRPC: Don't wake tasks during connection abort
+Bugzilla: 1120850
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+When aborting a connection to preserve source ports, don't wake the task in
+xs_error_report.  This allows tasks with RPC_TASK_SOFTCONN to succeed if the
+connection needs to be re-established since it preserves the task's status
+instead of setting it to the status of the aborting kernel_connect().
+
+This may also avoid a potential conflict on the socket's lock.
+
+Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+Cc: stable@vger.kernel.org # 3.14+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: a743419f420a64d442280845c0377a915b76644f
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1120850
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index 5903d2c..407f0bd 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -357,6 +357,7 @@ int   xs_swapper(struct rpc_xprt *xprt, int enable);
+ #define XPRT_CONNECTION_ABORT (7)
+ #define XPRT_CONNECTION_CLOSE (8)
+ #define XPRT_CONGESTED  (9)
++#define XPRT_CONNECTION_REUSE (10)
+ 
+ static inline void xprt_set_connected(struct rpc_xprt *xprt)
+ {
+diff --git a/net/sunrpc/xprtsock.c b/net/sunrpc/xprtsock.c
+index da6f04d..c7390d1 100644
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -845,6 +845,8 @@ static void xs_error_report(struct sock *sk)
+  dprintk("RPC:       xs_error_report client %p, error=%d...\n",
+    xprt, -err);
+  trace_rpc_socket_error(xprt, sk->sk_socket, err);
++ if (test_bit(XPRT_CONNECTION_REUSE, &xprt->state))
++  goto out;
+  xprt_wake_pending_tasks(xprt, err);
+  out:
+  read_unlock_bh(&sk->sk_callback_lock);
+@@ -2245,7 +2247,9 @@ static void xs_tcp_setup_socket(struct work_struct *work)
+   abort_and_exit = test_and_clear_bit(XPRT_CONNECTION_ABORT,
+     &xprt->state);
+   /* "close" the socket, preserving the local port */
++  set_bit(XPRT_CONNECTION_REUSE, &xprt->state);
+   xs_tcp_reuse_connection(transport);
++  clear_bit(XPRT_CONNECTION_REUSE, &xprt->state);
+ 
+   if (abort_and_exit)
+    goto out_eagain;
+-- 
+1.7.1

@@ -1,0 +1,161 @@
+From 4b577d31dd1c3e8b4c29ac83de72bbb26ba40727 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 19 Sep 2014 12:29:28 -0400
+Subject: [acpi] dock: Add .uevent() callback to struct acpi_hotplug_context
+
+Message-id: <1411129776-21656-54-git-send-email-prarit@redhat.com>
+Patchwork-id: 96373
+O-Subject: [RHEL7.1 PATCH BZ 1141846 53/61] ACPI / dock: Add .uevent() callback to struct acpi_hotplug_context
+Bugzilla: 1141846
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1141846
+
+commit be27b3dcb02335ec093b81053fc8c84b32d3106e
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Fri Feb 21 01:10:27 2014 +0100
+
+    ACPI / dock: Add .uevent() callback to struct acpi_hotplug_context
+
+    In order to avoid the need to register special ACPI dock
+    operations for SATA devices add a .uevent() callback pointer to
+    struct acpi_hotplug_context and make dock_hotplug_event() use that
+    callback if available.  Also rename the existing .event() callback
+    in struct acpi_hotplug_context to .notify() to avoid possible
+    confusion in the future.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Cc: Stefan Assmann <sassmann@redhat.com>
+Cc: Myron Stowe <mstowe@redhat.com>
+Cc: Andy Gospodarek <agospoda@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/dock.c b/drivers/acpi/dock.c
+index 988a7d0..c215a92 100644
+--- a/drivers/acpi/dock.c
++++ b/drivers/acpi/dock.c
+@@ -205,10 +205,19 @@ static void dock_hotplug_event(struct dock_dependent_device *dd, u32 event,
+    fixup(adev);
+    return;
+   }
++ } else if (cb_type == DOCK_CALL_UEVENT) {
++  void (*uevent)(struct acpi_device *, u32);
++
++  uevent = adev->hp->uevent;
++  if (uevent) {
++   acpi_unlock_hp_context();
++   uevent(adev, event);
++   return;
++  }
+  } else {
+   int (*notify)(struct acpi_device *, u32);
+ 
+-  notify = adev->hp->event;
++  notify = adev->hp->notify;
+   if (notify) {
+    acpi_unlock_hp_context();
+    notify(adev, event);
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index 15f2647..9fd2556 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -437,17 +437,17 @@ void acpi_device_hotplug(void *data, u32 src)
+    goto err_out;
+   }
+  } else {
+-  int (*event)(struct acpi_device *, u32);
++  int (*notify)(struct acpi_device *, u32);
+ 
+   acpi_lock_hp_context();
+-  event = adev->hp ? adev->hp->event : NULL;
++  notify = adev->hp ? adev->hp->notify : NULL;
+   acpi_unlock_hp_context();
+   /*
+    * There may be additional notify handlers for device objects
+    * without the .event() callback, so ignore them here.
+    */
+-  if (event)
+-   error = event(adev, src);
++  if (notify)
++   error = notify(adev, src);
+   else
+    goto out;
+  }
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index f21f32a..0d46d2f 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -59,7 +59,7 @@
+ static LIST_HEAD(bridge_list);
+ static DEFINE_MUTEX(bridge_mutex);
+ 
+-static int acpiphp_hotplug_event(struct acpi_device *adev, u32 type);
++static int acpiphp_hotplug_notify(struct acpi_device *adev, u32 type);
+ static void acpiphp_post_dock_fixup(struct acpi_device *adev);
+ static void acpiphp_sanitize_bus(struct pci_bus *bus);
+ static void acpiphp_set_hpp_values(struct pci_bus *bus);
+@@ -81,7 +81,7 @@ static struct acpiphp_context *acpiphp_init_context(struct acpi_device *adev)
+   return NULL;
+ 
+  context->refcount = 1;
+- acpi_set_hp_context(adev, &context->hp, acpiphp_hotplug_event,
++ acpi_set_hp_context(adev, &context->hp, acpiphp_hotplug_notify, NULL,
+        acpiphp_post_dock_fixup);
+  return context;
+ }
+@@ -400,7 +400,7 @@ static void cleanup_bridge(struct acpiphp_bridge *bridge)
+    struct acpi_device *adev = func_to_acpi_device(func);
+ 
+    acpi_lock_hp_context();
+-   adev->hp->event = NULL;
++   adev->hp->notify = NULL;
+    adev->hp->fixup = NULL;
+    acpi_unlock_hp_context();
+   }
+@@ -833,7 +833,7 @@ static void hotplug_event(u32 type, struct acpiphp_context *context)
+   put_bridge(bridge);
+ }
+ 
+-static int acpiphp_hotplug_event(struct acpi_device *adev, u32 type)
++static int acpiphp_hotplug_notify(struct acpi_device *adev, u32 type)
+ {
+  struct acpiphp_context *context;
+ 
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index 18f204c..e953940 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -119,7 +119,8 @@ struct acpi_scan_handler {
+ 
+ struct acpi_hotplug_context {
+  struct acpi_device *self;
+- int (*event)(struct acpi_device *, u32);
++ int (*notify)(struct acpi_device *, u32);
++ void (*uevent)(struct acpi_device *, u32);
+  void (*fixup)(struct acpi_device *);
+ };
+ 
+@@ -341,11 +342,13 @@ static inline void acpi_set_device_status(struct acpi_device *adev, u32 sta)
+ 
+ static inline void acpi_set_hp_context(struct acpi_device *adev,
+            struct acpi_hotplug_context *hp,
+-           int (*event)(struct acpi_device *, u32),
++           int (*notify)(struct acpi_device *, u32),
++           void (*uevent)(struct acpi_device *, u32),
+            void (*fixup)(struct acpi_device *))
+ {
+  hp->self = adev;
+- hp->event = event;
++ hp->notify = notify;
++ hp->uevent = uevent;
+  hp->fixup = fixup;
+  adev->hp = hp;
+ }
+-- 
+1.7.1

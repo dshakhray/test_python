@@ -1,0 +1,91 @@
+From c9d9ea6fe5173888e9bfeab2654405defa702d32 Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Tue, 18 Nov 2014 14:24:53 -0500
+Subject: [char] hwrng/pseries: port to new read API and fix stack corruption
+
+Message-id: <1416320693-20265-1-git-send-email-gduarte@redhat.com>
+Patchwork-id: 100190
+O-Subject: [RHEL7.1 PATCH BZ 1163659] hwrng: pseries - port to new read API and fix stack corruption
+Bugzilla: 1163659
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+BZ 1163659
+Upstream Status: 24c65bc7037e7d0f362c0df70d17dd72ee64b8b9
+Build Info: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=8256126
+ppc64le: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=8256138
+Tested: IBM could successfuly rebuild the ppc64 RPM (based on -201), install, boot and test:
+* pseries-rng loads and unloads gracefully
+* reading from /dev/hwrng behaves as expected
+
+Backport-by: Greg Kurz <gkurz@linux.vnet.ibm.com>
+
+commit 24c65bc7037e7d0f362c0df70d17dd72ee64b8b9
+Author: Greg Kurz <gkurz@linux.vnet.ibm.com>
+Date:   Fri Oct 31 07:50:11 2014 +0100
+
+    hwrng: pseries - port to new read API and fix stack corruption
+
+    The add_early_randomness() function in drivers/char/hw_random/core.c passes
+    a 16-byte buffer to pseries_rng_data_read(). Unfortunately, plpar_hcall()
+    returns four 64-bit values and trashes 16 bytes on the stack.
+
+    This bug has been lying around for a long time. It got unveiled by:
+
+    commit d3cc7996473a7bdd33256029988ea690754e4e2a
+    Author: Amit Shah <amit.shah@redhat.com>
+    Date:   Thu Jul 10 15:42:34 2014 +0530
+
+        hwrng: fetch randomness only after device init
+
+    It may trig a oops while loading or unloading the pseries-rng module for both
+    PowerVM and PowerKVM guests.
+
+    This patch does two things:
+    - pass an intermediate well sized buffer to plpar_hcall(). This is acceptalbe
+      since we're not on a hot path.
+    - move to the new read API so that we know the return buffer size for sure.
+
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Greg Kurz <gkurz@linux.vnet.ibm.com>
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/char/hw_random/pseries-rng.c b/drivers/char/hw_random/pseries-rng.c
+index 5f11979..c63d7bf 100644
+--- a/drivers/char/hw_random/pseries-rng.c
++++ b/drivers/char/hw_random/pseries-rng.c
+@@ -23,13 +23,17 @@
+ 
+ #define MODULE_NAME "pseries-rng"
+ 
+-static int pseries_rng_data_read(struct hwrng *rng, u32 *data)
++static int pseries_rng_read(struct hwrng *rng, void *data, size_t max, bool wait)
+ {
+- if (plpar_hcall(H_RANDOM, (unsigned long *)data) != H_SUCCESS) {
++ u64 buffer[PLPAR_HCALL_BUFSIZE];
++ size_t size = max < 8 ? max : 8;
++
++ if (plpar_hcall(H_RANDOM, (unsigned long *)buffer) != H_SUCCESS) {
+   printk(KERN_ERR "pseries rng hcall error\n");
+   return 0;
+  }
+- return 8;
++ memcpy(data, buffer, size);
++ return size;
+ }
+ 
+ /**
+@@ -48,7 +52,7 @@ static unsigned long pseries_rng_get_desired_dma(struct vio_dev *vdev)
+ 
+ static struct hwrng pseries_rng = {
+  .name  = MODULE_NAME,
+- .data_read = pseries_rng_data_read,
++ .read  = pseries_rng_read,
+ };
+ 
+ static int __init pseries_rng_probe(struct vio_dev *dev,
+-- 
+1.7.1

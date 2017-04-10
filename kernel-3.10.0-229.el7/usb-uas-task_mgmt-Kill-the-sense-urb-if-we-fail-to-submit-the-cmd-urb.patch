@@ -1,0 +1,103 @@
+From 1e79642f07fba9f728b02302ad5fc7f9d8c2ff64 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:38 -0400
+Subject: [usb] uas: task_mgmt - Kill the sense-urb if we fail to submit the cmd urb
+
+Message-id: <1410887463-20674-327-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95422
+O-Subject: [RHEL7 PATCH 326/591] uas: task_mgmt: Kill the sense-urb if we fail to submit the cmd urb
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 70cf0fba7625987ef16085f458e3869c6e3043c1
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Tue Oct 29 10:37:23 2013 +0100
+
+    uas: task_mgmt: Kill the sense-urb if we fail to submit the cmd urb
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index d758fae..9c6f9f9 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -550,39 +550,38 @@ err:
+  * daft to me.
+  */
+ 
+-static int uas_submit_sense_urb(struct Scsi_Host *shost,
+-    gfp_t gfp, unsigned int stream)
++static struct urb *uas_submit_sense_urb(struct Scsi_Host *shost,
++     gfp_t gfp, unsigned int stream)
+ {
+  struct uas_dev_info *devinfo = (void *)shost->hostdata[0];
+  struct urb *urb;
+ 
+  urb = uas_alloc_sense_urb(devinfo, gfp, shost, stream);
+  if (!urb)
+-  return SCSI_MLQUEUE_DEVICE_BUSY;
++  return NULL;
+  usb_anchor_urb(urb, &devinfo->sense_urbs);
+  if (usb_submit_urb(urb, gfp)) {
+   usb_unanchor_urb(urb);
+   shost_printk(KERN_INFO, shost,
+         "sense urb submission failure\n");
+   usb_free_urb(urb);
+-  return SCSI_MLQUEUE_DEVICE_BUSY;
++  return NULL;
+  }
+- return 0;
++ return urb;
+ }
+ 
+ static int uas_submit_urbs(struct scsi_cmnd *cmnd,
+       struct uas_dev_info *devinfo, gfp_t gfp)
+ {
+  struct uas_cmd_info *cmdinfo = (void *)&cmnd->SCp;
+- int err;
++ struct urb *urb;
+ 
+  WARN_ON_ONCE(!spin_is_locked(&devinfo->lock));
+  if (cmdinfo->state & SUBMIT_STATUS_URB) {
+-  err = uas_submit_sense_urb(cmnd->device->host, gfp,
++  urb = uas_submit_sense_urb(cmnd->device->host, gfp,
+         cmdinfo->stream);
+-  if (err) {
+-   return err;
+-  }
++  if (!urb)
++   return SCSI_MLQUEUE_DEVICE_BUSY;
+   cmdinfo->state &= ~SUBMIT_STATUS_URB;
+  }
+ 
+@@ -726,10 +725,12 @@ static int uas_eh_task_mgmt(struct scsi_cmnd *cmnd,
+  struct uas_dev_info *devinfo = (void *)shost->hostdata[0];
+  u16 tag = devinfo->qdepth;
+  unsigned long flags;
++ struct urb *sense_urb;
+ 
+  spin_lock_irqsave(&devinfo->lock, flags);
+  memset(&devinfo->response, 0, sizeof(devinfo->response));
+- if (uas_submit_sense_urb(shost, GFP_ATOMIC, tag)) {
++ sense_urb = uas_submit_sense_urb(shost, GFP_ATOMIC, tag);
++ if (!sense_urb) {
+   shost_printk(KERN_INFO, shost,
+         "%s: %s: submit sense urb failed\n",
+         __func__, fname);
+@@ -741,6 +742,7 @@ static int uas_eh_task_mgmt(struct scsi_cmnd *cmnd,
+         "%s: %s: submit task mgmt urb failed\n",
+         __func__, fname);
+   spin_unlock_irqrestore(&devinfo->lock, flags);
++  usb_kill_urb(sense_urb);
+   return FAILED;
+  }
+  spin_unlock_irqrestore(&devinfo->lock, flags);
+-- 
+1.7.1

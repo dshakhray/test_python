@@ -1,0 +1,79 @@
+From 1dda7d6e067efd198500cd989852787ba30e89de Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 23 Oct 2014 20:01:22 -0400
+Subject: [block] fix alignment_offset math that assumes io_min is a power-of-2
+
+Message-id: <1414094494-22068-13-git-send-email-snitzer@redhat.com>
+Patchwork-id: 98343
+O-Subject: [RHEL7.2 PATCH 12/24] block: fix alignment_offset math that assumes io_min is a power-of-2
+Bugzilla: 1156164
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1156164
+
+Upstream commit b8839b8c55f3fdd60dc36abcda7e0266aff7985c
+Author: Mike Snitzer <snitzer@redhat.com>
+Date:   Wed Oct 8 18:26:13 2014 -0400
+
+    block: fix alignment_offset math that assumes io_min is a power-of-2
+
+    The math in both blk_stack_limits() and queue_limit_alignment_offset()
+    assume that a block device's io_min (aka minimum_io_size) is always a
+    power-of-2.  Fix the math such that it works for non-power-of-2 io_min.
+
+    This issue (of alignment_offset != 0) became apparent when testing
+    dm-thinp with a thinp blocksize that matches a RAID6 stripesize of
+    1280K.  Commit fdfb4c8c1 ("dm thin: set minimum_io_size to pool's data
+    block size") unlocked the potential for alignment_offset != 0 due to
+    the dm-thin-pool's io_min possibly being a non-power-of-2.
+
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Cc: stable@vger.kernel.org
+    Acked-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index b928e68..cf4895f 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -574,7 +574,7 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
+   bottom = max(b->physical_block_size, b->io_min) + alignment;
+ 
+   /* Verify that top and bottom intervals line up */
+-  if (max(top, bottom) & (min(top, bottom) - 1)) {
++  if (max(top, bottom) % min(top, bottom)) {
+    t->misaligned = 1;
+    ret = -1;
+   }
+@@ -615,7 +615,7 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
+ 
+  /* Find lowest common alignment_offset */
+  t->alignment_offset = lcm(t->alignment_offset, alignment)
+-  & (max(t->physical_block_size, t->io_min) - 1);
++  % max(t->physical_block_size, t->io_min);
+ 
+  /* Verify that new alignment_offset is on a logical block boundary */
+  if (t->alignment_offset & (t->logical_block_size - 1)) {
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 2b1eb29..4a2b2af 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1332,10 +1332,9 @@ static inline int queue_alignment_offset(struct request_queue *q)
+ static inline int queue_limit_alignment_offset(struct queue_limits *lim, sector_t sector)
+ {
+  unsigned int granularity = max(lim->physical_block_size, lim->io_min);
+- unsigned int alignment = (sector << 9) & (granularity - 1);
++ unsigned int alignment = sector_div(sector, granularity >> 9) << 9;
+ 
+- return (granularity + lim->alignment_offset - alignment)
+-  & (granularity - 1);
++ return (granularity + lim->alignment_offset - alignment) % granularity;
+ }
+ 
+ static inline int bdev_alignment_offset(struct block_device *bdev)
+-- 
+1.7.1

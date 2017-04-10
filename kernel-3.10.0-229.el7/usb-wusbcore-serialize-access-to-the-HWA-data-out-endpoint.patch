@@ -1,0 +1,363 @@
+From 7091469b2407dce55625c94229376511be8eb578 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:03:01 -0400
+Subject: [usb] wusbcore: serialize access to the HWA data out endpoint
+
+Message-id: <1410887463-20674-110-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95208
+O-Subject: [RHEL7 PATCH 109/591] usb: wusbcore: serialize access to the HWA data out endpoint
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 679ee475a1c19243c8f50a5a76f6b7519b24c1a3
+Author: Thomas Pugliese <thomas.pugliese@gmail.com>
+Date:   Mon Oct 7 10:53:57 2013 -0500
+
+    usb: wusbcore: serialize access to the HWA data out endpoint
+
+    This patch serializes access to the HWA data transfer out (DTO)
+    endpoint.  This prevents a situation where two transfer requests being
+    sent concurrently to separate downstream endpoints could interleave
+    their transfer request and transfer data packets causing data
+    corruption.  The transfer processing code will now attempt to acquire
+    the DTO resource before sending a transfer to the HWA.  If it cannot
+    acquire the resource, the RPIPE that the transfer is assigned to will
+    be placed on a waiting list.  When the DTO resource is released, the
+    actor releasing the resource will serivce the RPIPEs that are waiting.
+
+    Signed-off-by: Thomas Pugliese <thomas.pugliese@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/wusbcore/wa-hc.h b/drivers/usb/wusbcore/wa-hc.h
+index b44aca3..41afaa6 100644
+--- a/drivers/usb/wusbcore/wa-hc.h
++++ b/drivers/usb/wusbcore/wa-hc.h
+@@ -117,6 +117,7 @@ struct wa_rpipe {
+  struct wahc *wa;
+  spinlock_t seg_lock;
+  struct list_head seg_list;
++ struct list_head list_node;
+  atomic_t segs_available;
+  u8 buffer[1]; /* For reads/writes on USB */
+ };
+@@ -183,7 +184,8 @@ struct wahc {
+ 
+  u16 rpipes;
+  unsigned long *rpipe_bm; /* rpipe usage bitmap */
+- spinlock_t rpipe_bm_lock; /* protect rpipe_bm */
++ struct list_head rpipe_delayed_list; /* delayed RPIPES. */
++ spinlock_t rpipe_lock; /* protect rpipe_bm and delayed list */
+  struct mutex rpipe_mutex; /* assigning resources to endpoints */
+ 
+  /*
+@@ -201,6 +203,8 @@ struct wahc {
+  void *dti_buf;
+  size_t dti_buf_size;
+ 
++ unsigned long dto_in_use; /* protect dto endoint serialization. */
++
+  s32 status;   /* For reading status */
+ 
+  struct list_head xfer_list;
+@@ -253,7 +257,8 @@ static inline void wa_nep_disarm(struct wahc *wa)
+ /* RPipes */
+ static inline void wa_rpipe_init(struct wahc *wa)
+ {
+- spin_lock_init(&wa->rpipe_bm_lock);
++ INIT_LIST_HEAD(&wa->rpipe_delayed_list);
++ spin_lock_init(&wa->rpipe_lock);
+  mutex_init(&wa->rpipe_mutex);
+ }
+ 
+@@ -270,6 +275,7 @@ static inline void wa_init(struct wahc *wa)
+  spin_lock_init(&wa->xfer_list_lock);
+  INIT_WORK(&wa->xfer_enqueue_work, wa_urb_enqueue_run);
+  INIT_WORK(&wa->xfer_error_work, wa_process_errored_transfers_run);
++ wa->dto_in_use = 0;
+  atomic_set(&wa->xfer_id_count, 1);
+ }
+ 
+diff --git a/drivers/usb/wusbcore/wa-rpipe.c b/drivers/usb/wusbcore/wa-rpipe.c
+index a76e2d9..1ed068a 100644
+--- a/drivers/usb/wusbcore/wa-rpipe.c
++++ b/drivers/usb/wusbcore/wa-rpipe.c
+@@ -143,17 +143,18 @@ static void rpipe_init(struct wa_rpipe *rpipe)
+  kref_init(&rpipe->refcnt);
+  spin_lock_init(&rpipe->seg_lock);
+  INIT_LIST_HEAD(&rpipe->seg_list);
++ INIT_LIST_HEAD(&rpipe->list_node);
+ }
+ 
+ static unsigned rpipe_get_idx(struct wahc *wa, unsigned rpipe_idx)
+ {
+  unsigned long flags;
+ 
+- spin_lock_irqsave(&wa->rpipe_bm_lock, flags);
++ spin_lock_irqsave(&wa->rpipe_lock, flags);
+  rpipe_idx = find_next_zero_bit(wa->rpipe_bm, wa->rpipes, rpipe_idx);
+  if (rpipe_idx < wa->rpipes)
+   set_bit(rpipe_idx, wa->rpipe_bm);
+- spin_unlock_irqrestore(&wa->rpipe_bm_lock, flags);
++ spin_unlock_irqrestore(&wa->rpipe_lock, flags);
+ 
+  return rpipe_idx;
+ }
+@@ -162,9 +163,9 @@ static void rpipe_put_idx(struct wahc *wa, unsigned rpipe_idx)
+ {
+  unsigned long flags;
+ 
+- spin_lock_irqsave(&wa->rpipe_bm_lock, flags);
++ spin_lock_irqsave(&wa->rpipe_lock, flags);
+  clear_bit(rpipe_idx, wa->rpipe_bm);
+- spin_unlock_irqrestore(&wa->rpipe_bm_lock, flags);
++ spin_unlock_irqrestore(&wa->rpipe_lock, flags);
+ }
+ 
+ void rpipe_destroy(struct kref *_rpipe)
+diff --git a/drivers/usb/wusbcore/wa-xfer.c b/drivers/usb/wusbcore/wa-xfer.c
+index fd00e1a..f1e9a38 100644
+--- a/drivers/usb/wusbcore/wa-xfer.c
++++ b/drivers/usb/wusbcore/wa-xfer.c
+@@ -107,6 +107,7 @@ enum wa_seg_status {
+ };
+ 
+ static void wa_xfer_delayed_run(struct wa_rpipe *);
++static int __wa_xfer_delayed_run(struct wa_rpipe *rpipe, int *dto_waiting);
+ 
+ /*
+  * Life cycle governed by 'struct urb' (the refcount of the struct is
+@@ -204,6 +205,59 @@ static void wa_xfer_put(struct wa_xfer *xfer)
+ }
+ 
+ /*
++ * Try to get exclusive access to the DTO endpoint resource.  Return true
++ * if successful.
++ */
++static inline int __wa_dto_try_get(struct wahc *wa)
++{
++ return (test_and_set_bit(0, &wa->dto_in_use) == 0);
++}
++
++/* Release the DTO endpoint resource. */
++static inline void __wa_dto_put(struct wahc *wa)
++{
++ clear_bit_unlock(0, &wa->dto_in_use);
++}
++
++/* Service RPIPEs that are waiting on the DTO resource. */
++static void wa_check_for_delayed_rpipes(struct wahc *wa)
++{
++ unsigned long flags;
++ int dto_waiting = 0;
++ struct wa_rpipe *rpipe;
++
++ spin_lock_irqsave(&wa->rpipe_lock, flags);
++ while (!list_empty(&wa->rpipe_delayed_list) && !dto_waiting) {
++  rpipe = list_first_entry(&wa->rpipe_delayed_list,
++    struct wa_rpipe, list_node);
++  __wa_xfer_delayed_run(rpipe, &dto_waiting);
++  /* remove this RPIPE from the list if it is not waiting. */
++  if (!dto_waiting) {
++   pr_debug("%s: RPIPE %d serviced and removed from delayed list.\n",
++    __func__,
++    le16_to_cpu(rpipe->descr.wRPipeIndex));
++   list_del_init(&rpipe->list_node);
++  }
++ }
++ spin_unlock_irqrestore(&wa->rpipe_lock, flags);
++}
++
++/* add this RPIPE to the end of the delayed RPIPE list. */
++static void wa_add_delayed_rpipe(struct wahc *wa, struct wa_rpipe *rpipe)
++{
++ unsigned long flags;
++
++ spin_lock_irqsave(&wa->rpipe_lock, flags);
++ /* add rpipe to the list if it is not already on it. */
++ if (list_empty(&rpipe->list_node)) {
++  pr_debug("%s: adding RPIPE %d to the delayed list.\n",
++   __func__, le16_to_cpu(rpipe->descr.wRPipeIndex));
++  list_add_tail(&rpipe->list_node, &wa->rpipe_delayed_list);
++ }
++ spin_unlock_irqrestore(&wa->rpipe_lock, flags);
++}
++
++/*
+  * xfer is referenced
+  *
+  * xfer->lock has to be unlocked
+@@ -1099,9 +1153,13 @@ error_setup_sizes:
+  * rpipe->seg_lock is held!
+  */
+ static int __wa_seg_submit(struct wa_rpipe *rpipe, struct wa_xfer *xfer,
+-      struct wa_seg *seg)
++      struct wa_seg *seg, int *dto_done)
+ {
+  int result;
++
++ /* default to done unless we encounter a multi-frame isoc segment. */
++ *dto_done = 1;
++
+  /* submit the transfer request. */
+  result = usb_submit_urb(&seg->tr_urb, GFP_ATOMIC);
+  if (result < 0) {
+@@ -1142,28 +1200,34 @@ error_seg_submit:
+ }
+ 
+ /*
+- * Execute more queued request segments until the maximum concurrent allowed
++ * Execute more queued request segments until the maximum concurrent allowed.
++ * Return true if the DTO resource was acquired and released.
+  *
+  * The ugly unlock/lock sequence on the error path is needed as the
+  * xfer->lock normally nests the seg_lock and not viceversa.
+- *
+  */
+-static void wa_xfer_delayed_run(struct wa_rpipe *rpipe)
++static int __wa_xfer_delayed_run(struct wa_rpipe *rpipe, int *dto_waiting)
+ {
+- int result;
++ int result, dto_acquired = 0, dto_done = 0;
+  struct device *dev = &rpipe->wa->usb_iface->dev;
+  struct wa_seg *seg;
+  struct wa_xfer *xfer;
+  unsigned long flags;
+ 
++ *dto_waiting = 0;
++
+  spin_lock_irqsave(&rpipe->seg_lock, flags);
+  while (atomic_read(&rpipe->segs_available) > 0
+-       && !list_empty(&rpipe->seg_list)) {
++       && !list_empty(&rpipe->seg_list)
++       && (dto_acquired = __wa_dto_try_get(rpipe->wa))) {
+   seg = list_first_entry(&(rpipe->seg_list), struct wa_seg,
+      list_node);
+   list_del(&seg->list_node);
+   xfer = seg->xfer;
+-  result = __wa_seg_submit(rpipe, xfer, seg);
++  result = __wa_seg_submit(rpipe, xfer, seg, &dto_done);
++  /* release the dto resource if this RPIPE is done with it. */
++  if (dto_done)
++   __wa_dto_put(rpipe->wa);
+   dev_dbg(dev, "xfer %p ID %08X#%u submitted from delayed [%d segments available] %d\n",
+    xfer, wa_xfer_id(xfer), seg->index,
+    atomic_read(&rpipe->segs_available), result);
+@@ -1176,7 +1240,37 @@ static void wa_xfer_delayed_run(struct wa_rpipe *rpipe)
+    spin_lock_irqsave(&rpipe->seg_lock, flags);
+   }
+  }
++ /*
++  * Mark this RPIPE as waiting if dto was not acquired, there are
++  * delayed segs and no active transfers to wake us up later.
++  */
++ if (!dto_acquired && !list_empty(&rpipe->seg_list)
++  && (atomic_read(&rpipe->segs_available) ==
++   le16_to_cpu(rpipe->descr.wRequests)))
++  *dto_waiting = 1;
++
+  spin_unlock_irqrestore(&rpipe->seg_lock, flags);
++
++ return dto_done;
++}
++
++static void wa_xfer_delayed_run(struct wa_rpipe *rpipe)
++{
++ int dto_waiting;
++ int dto_done = __wa_xfer_delayed_run(rpipe, &dto_waiting);
++
++ /*
++  * If this RPIPE is waiting on the DTO resource, add it to the tail of
++  * the waiting list.
++  * Otherwise, if the WA DTO resource was acquired and released by
++  *  __wa_xfer_delayed_run, another RPIPE may have attempted to acquire
++  * DTO and failed during that time.  Check the delayed list and process
++  * any waiters.  Start searching from the next RPIPE index.
++  */
++ if (dto_waiting)
++  wa_add_delayed_rpipe(rpipe->wa, rpipe);
++ else if (dto_done)
++  wa_check_for_delayed_rpipes(rpipe->wa);
+ }
+ 
+ /*
+@@ -1188,7 +1282,7 @@ static void wa_xfer_delayed_run(struct wa_rpipe *rpipe)
+  */
+ static int __wa_xfer_submit(struct wa_xfer *xfer)
+ {
+- int result;
++ int result, dto_acquired = 0, dto_done = 0, dto_waiting = 0;
+  struct wahc *wa = xfer->wa;
+  struct device *dev = &wa->usb_iface->dev;
+  unsigned cnt;
+@@ -1207,26 +1301,56 @@ static int __wa_xfer_submit(struct wa_xfer *xfer)
+  result = 0;
+  spin_lock_irqsave(&rpipe->seg_lock, flags);
+  for (cnt = 0; cnt < xfer->segs; cnt++) {
++  int delay_seg = 1;
++
+   available = atomic_read(&rpipe->segs_available);
+   empty = list_empty(&rpipe->seg_list);
+   seg = xfer->seg[cnt];
+   dev_dbg(dev, "xfer %p ID 0x%08X#%u: available %u empty %u (%s)\n",
+    xfer, wa_xfer_id(xfer), cnt, available, empty,
+    available == 0 || !empty ? "delayed" : "submitted");
+-  if (available == 0 || !empty) {
++  if (available && empty) {
++   /*
++    * Only attempt to acquire DTO if we have a segment
++    * to send.
++    */
++   dto_acquired = __wa_dto_try_get(rpipe->wa);
++   if (dto_acquired) {
++    delay_seg = 0;
++    result = __wa_seg_submit(rpipe, xfer, seg,
++       &dto_done);
++    if (dto_done)
++     __wa_dto_put(rpipe->wa);
++
++    if (result < 0) {
++     __wa_xfer_abort(xfer);
++     goto error_seg_submit;
++    }
++   }
++  }
++
++  if (delay_seg) {
+    seg->status = WA_SEG_DELAYED;
+    list_add_tail(&seg->list_node, &rpipe->seg_list);
+-  } else {
+-   result = __wa_seg_submit(rpipe, xfer, seg);
+-   if (result < 0) {
+-    __wa_xfer_abort(xfer);
+-    goto error_seg_submit;
+-   }
+   }
+   xfer->segs_submitted++;
+  }
+ error_seg_submit:
++ /*
++  * Mark this RPIPE as waiting if dto was not acquired, there are
++  * delayed segs and no active transfers to wake us up later.
++  */
++ if (!dto_acquired && !list_empty(&rpipe->seg_list)
++  && (atomic_read(&rpipe->segs_available) ==
++   le16_to_cpu(rpipe->descr.wRequests)))
++  dto_waiting = 1;
+  spin_unlock_irqrestore(&rpipe->seg_lock, flags);
++
++ if (dto_waiting)
++  wa_add_delayed_rpipe(rpipe->wa, rpipe);
++ else if (dto_done)
++  wa_check_for_delayed_rpipes(rpipe->wa);
++
+  return result;
+ }
+ 
+-- 
+1.7.1

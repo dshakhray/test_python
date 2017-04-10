@@ -1,0 +1,62 @@
+From 8655a81818e211ceffc07dba76e92bc2709d63b1 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 10:12:32 -0400
+Subject: [fs] ext4: fix COLLAPSE_RANGE test failure in data journalling mode
+
+Message-id: <1414059176-6044-9-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98278
+O-Subject: [RHEL 7.1 PATCH 08/32] ext4: fix COLLAPSE_RANGE test failure in data journalling mode
+Bugzilla: 1150171
+
+From: Namjae Jeon <namjae.jeon@samsung.com>
+
+BZ 1150171
+https://bugzilla.redhat.com/show_bug.cgi?id=1150171
+
+BREW 8149772
+https://brewweb.devel.redhat.com/taskinfo?taskID=8149772
+
+Upstream commit 1ce01c4a199c50b023802be25261c0c02b2f0214
+
+ When mounting ext4 with data=journal option, xfstest shared/002 and
+ shared/004 are currently failing as checksum computed for testfile
+ does not match with the checksum computed in other journal modes.
+ In case of data=journal mode, a call to filemap_write_and_wait_range
+ will not flush anything to disk as buffers are not marked dirty in
+ write_end. In collapse range this call is followed by a call to
+ truncate_pagecache_range. Due to this, when checksum is computed,
+ a portion of file is re-read from disk which replace valid data with
+ NULL bytes and hence the reason for the difference in checksum.
+
+ Calling ext4_force_commit before filemap_write_and_wait_range solves
+ the issue as it will mark the buffers dirty during commit transaction
+ which can be later synced by a call to filemap_write_and_wait_range.
+
+ Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+ Signed-off-by: Ashish Sangwan <a.sangwan@samsung.com>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 54df636..fd3003f 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -5379,6 +5379,13 @@ int ext4_collapse_range(struct inode *inode, loff_t offset, loff_t len)
+  punch_start = offset >> EXT4_BLOCK_SIZE_BITS(sb);
+  punch_stop = (offset + len) >> EXT4_BLOCK_SIZE_BITS(sb);
+ 
++ /* Call ext4_force_commit to flush all data in case of data=journal. */
++ if (ext4_should_journal_data(inode)) {
++  ret = ext4_force_commit(inode->i_sb);
++  if (ret)
++   return ret;
++ }
++
+  /* Write out all dirty pages */
+  ret = filemap_write_and_wait_range(inode->i_mapping, offset, -1);
+  if (ret)
+-- 
+1.7.1

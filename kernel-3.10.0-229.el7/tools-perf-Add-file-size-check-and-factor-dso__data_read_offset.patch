@@ -1,0 +1,173 @@
+From cec3b1270765c61c3106f7fd8358c5d901b34815 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:09:04 -0400
+Subject: [tools] perf: Add file size check and factor dso__data_read_offset
+
+Message-id: <1410181752-25631-300-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91948
+O-Subject: [PATCH RHEL7.1 BZ1134356 299/307] perf tools: Add file size check and factor dso__data_read_offset
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit c3fbd2a606c5f88de0079b027727a1fb0ae27b65
+Author: Jiri Olsa <jolsa@kernel.org>
+Date: Wed May 7 18:51:41 2014 +0200
+
+description
+===========
+Adding file size check, because the lseek will succeed for
+any offset behind file size and thus succeed when it was
+expected to fail.
+
+Factoring the code to check the offset against file size
+earlier in the flow.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index fbf6cc9..db63438 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -205,6 +205,7 @@ static void close_data_fd(struct dso *dso)
+  if (dso->data.fd >= 0) {
+   close(dso->data.fd);
+   dso->data.fd = -1;
++  dso->data.file_size = 0;
+   dso__list_del(dso);
+  }
+ }
+@@ -373,16 +374,10 @@ dso_cache__memcpy(struct dso_cache *cache, u64 offset,
+ }
+ 
+ static ssize_t
+-dso_cache__read(struct dso *dso, struct machine *machine,
+-   u64 offset, u8 *data, ssize_t size)
++dso_cache__read(struct dso *dso, u64 offset, u8 *data, ssize_t size)
+ {
+  struct dso_cache *cache;
+  ssize_t ret;
+- int fd;
+-
+- fd = dso__data_fd(dso, machine);
+- if (fd < 0)
+-  return -1;
+ 
+  do {
+   u64 cache_offset;
+@@ -396,10 +391,10 @@ dso_cache__read(struct dso *dso, struct machine *machine,
+   cache_offset = offset & DSO__DATA_CACHE_MASK;
+   ret = -EINVAL;
+ 
+-  if (-1 == lseek(fd, cache_offset, SEEK_SET))
++  if (-1 == lseek(dso->data.fd, cache_offset, SEEK_SET))
+    break;
+ 
+-  ret = read(fd, cache->data, DSO__DATA_CACHE_SIZE);
++  ret = read(dso->data.fd, cache->data, DSO__DATA_CACHE_SIZE);
+   if (ret <= 0)
+    break;
+ 
+@@ -417,8 +412,8 @@ dso_cache__read(struct dso *dso, struct machine *machine,
+  return ret;
+ }
+ 
+-static ssize_t dso_cache_read(struct dso *dso, struct machine *machine,
+-         u64 offset, u8 *data, ssize_t size)
++static ssize_t dso_cache_read(struct dso *dso, u64 offset,
++         u8 *data, ssize_t size)
+ {
+  struct dso_cache *cache;
+ 
+@@ -426,11 +421,10 @@ static ssize_t dso_cache_read(struct dso *dso, struct machine *machine,
+  if (cache)
+   return dso_cache__memcpy(cache, offset, data, size);
+  else
+-  return dso_cache__read(dso, machine, offset, data, size);
++  return dso_cache__read(dso, offset, data, size);
+ }
+ 
+-ssize_t dso__data_read_offset(struct dso *dso, struct machine *machine,
+-         u64 offset, u8 *data, ssize_t size)
++static ssize_t cached_read(struct dso *dso, u64 offset, u8 *data, ssize_t size)
+ {
+  ssize_t r = 0;
+  u8 *p = data;
+@@ -438,7 +432,7 @@ ssize_t dso__data_read_offset(struct dso *dso, struct machine *machine,
+  do {
+   ssize_t ret;
+ 
+-  ret = dso_cache_read(dso, machine, offset, p, size);
++  ret = dso_cache_read(dso, offset, p, size);
+   if (ret < 0)
+    return ret;
+ 
+@@ -458,6 +452,46 @@ ssize_t dso__data_read_offset(struct dso *dso, struct machine *machine,
+  return r;
+ }
+ 
++static int data_file_size(struct dso *dso)
++{
++ struct stat st;
++
++ if (!dso->data.file_size) {
++  if (fstat(dso->data.fd, &st)) {
++   pr_err("dso mmap failed, fstat: %s\n", strerror(errno));
++   return -1;
++  }
++  dso->data.file_size = st.st_size;
++ }
++
++ return 0;
++}
++
++static ssize_t data_read_offset(struct dso *dso, u64 offset,
++    u8 *data, ssize_t size)
++{
++ if (data_file_size(dso))
++  return -1;
++
++ /* Check the offset sanity. */
++ if (offset > dso->data.file_size)
++  return -1;
++
++ if (offset + size < offset)
++  return -1;
++
++ return cached_read(dso, offset, data, size);
++}
++
++ssize_t dso__data_read_offset(struct dso *dso, struct machine *machine,
++         u64 offset, u8 *data, ssize_t size)
++{
++ if (dso__data_fd(dso, machine) < 0)
++  return -1;
++
++ return data_read_offset(dso, offset, data, size);
++}
++
+ ssize_t dso__data_read_addr(struct dso *dso, struct map *map,
+        struct machine *machine, u64 addr,
+        u8 *data, ssize_t size)
+diff --git a/tools/perf/util/dso.h b/tools/perf/util/dso.h
+index 90988bf..da47b13 100644
+--- a/tools/perf/util/dso.h
++++ b/tools/perf/util/dso.h
+@@ -103,6 +103,7 @@ struct dso {
+  struct {
+   struct rb_root  cache;
+   int   fd;
++  size_t   file_size;
+   struct list_head open_entry;
+  } data;
+ 
+-- 
+1.7.1

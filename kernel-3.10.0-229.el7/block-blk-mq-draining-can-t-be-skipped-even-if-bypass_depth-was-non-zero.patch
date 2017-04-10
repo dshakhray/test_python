@@ -1,0 +1,108 @@
+From 3108d05e6009c7e9ca06ab3ff0cd0e090df8cbd5 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 10 Oct 2014 21:03:03 -0400
+Subject: [block] blk-mq: draining can't be skipped even if bypass_depth was non-zero
+
+Message-id: <1412975015-5370-3-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 97443
+O-Subject: [RHEL7 PATCH 02/34] block, blk-mq: draining can't be skipped even if bypass_depth was non-zero
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a backport of the following commit.  This resolves bug
+1146660.
+
+  commit 776687bce42bb22cce48b5da950e48ebbb9a948f
+  Author: Tejun Heo <tj@kernel.org>
+  Date:   Tue Jul 1 10:29:17 2014 -0600
+
+    block, blk-mq: draining can't be skipped even if bypass_depth was non-zero
+
+    Currently, both blk_queue_bypass_start() and blk_mq_freeze_queue()
+    skip queue draining if bypass_depth was already above zero.  The
+    assumption is that the one which bumped the bypass_depth should have
+    performed draining already; however, there's nothing which prevents a
+    new instance of bypassing/freezing from starting before the previous
+    one finishes draining.  The current code may allow the later
+    bypassing/freezing instances to complete while there still are
+    in-flight requests which haven't finished draining.
+
+    Fix it by draining regardless of bypass_depth.  We still skip draining
+    from blk_queue_bypass_start() while the queue is initializing to avoid
+    introducing excessive delays during boot.  INIT_DONE setting is moved
+    above the initial blk_queue_bypass_end() so that bypassing attempts
+    can't slip inbetween.
+
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: Nicholas A. Bellinger <nab@linux-iscsi.org>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 0886b68..c949a6e 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -438,14 +438,17 @@ static void __blk_drain_queue(struct request_queue *q, bool drain_all)
+  */
+ void blk_queue_bypass_start(struct request_queue *q)
+ {
+- bool drain;
+-
+  spin_lock_irq(q->queue_lock);
+- drain = !q->bypass_depth++;
++ q->bypass_depth++;
+  queue_flag_set(QUEUE_FLAG_BYPASS, q);
+  spin_unlock_irq(q->queue_lock);
+ 
+- if (drain) {
++ /*
++  * Queues start drained.  Skip actual draining till init is
++  * complete.  This avoids lenghty delays during queue init which
++  * can happen many times during boot.
++  */
++ if (blk_queue_init_done(q)) {
+   spin_lock_irq(q->queue_lock);
+   __blk_drain_queue(q, false);
+   spin_unlock_irq(q->queue_lock);
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 9541f51..f4bdddd 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -131,15 +131,12 @@ void blk_mq_drain_queue(struct request_queue *q)
+  */
+ static void blk_mq_freeze_queue(struct request_queue *q)
+ {
+- bool drain;
+-
+  spin_lock_irq(q->queue_lock);
+- drain = !q->bypass_depth++;
++ q->bypass_depth++;
+  queue_flag_set(QUEUE_FLAG_BYPASS, q);
+  spin_unlock_irq(q->queue_lock);
+ 
+- if (drain)
+-  blk_mq_drain_queue(q);
++ blk_mq_drain_queue(q);
+ }
+ 
+ static void blk_mq_unfreeze_queue(struct request_queue *q)
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 35b4176..654bfe8 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -587,8 +587,8 @@ int blk_register_queue(struct gendisk *disk)
+   * Initialization must be complete by now.  Finish the initial
+   * bypass from queue allocation.
+   */
+- blk_queue_bypass_end(q);
+  queue_flag_set_unlocked(QUEUE_FLAG_INIT_DONE, q);
++ blk_queue_bypass_end(q);
+ 
+  ret = blk_trace_init_sysfs(dev);
+  if (ret)
+-- 
+1.7.1

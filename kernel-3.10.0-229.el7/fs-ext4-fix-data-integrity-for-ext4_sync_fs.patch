@@ -1,0 +1,131 @@
+From 9dca62a8d145ac2a0630a82fdda80a8bfa71281c Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:53:06 -0400
+Subject: [fs] ext4: fix data integrity for ext4_sync_fs
+
+Message-id: <1414058125-4183-33-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98124
+O-Subject: [RHEL 7.1 PATCH v2 032/171] ext4: fix data integrity for ext4_sync_fs
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Dmitry Monakhov <dmonakhov@openvz.org>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit 06a407f13daf9e48f0ef7189c7e54082b53940c7
+
+ Inode's data or non journaled quota may be written w/o jounral so we
+ _must_ send a barrier at the end of ext4_sync_fs. But it can be
+ skipped if journal commit will do it for us.
+
+ Also fix data integrity for nojournal mode.
+
+ Signed-off-by: Dmitry Monakhov <dmonakhov@openvz.org>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 92a76dd..779e2f4 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -69,6 +69,7 @@ static void ext4_mark_recovery_complete(struct super_block *sb,
+ static void ext4_clear_journal_err(struct super_block *sb,
+        struct ext4_super_block *es);
+ static int ext4_sync_fs(struct super_block *sb, int wait);
++static int ext4_sync_fs_nojournal(struct super_block *sb, int wait);
+ static int ext4_remount(struct super_block *sb, int *flags, char *data);
+ static int ext4_statfs(struct dentry *dentry, struct kstatfs *buf);
+ static int ext4_unfreeze(struct super_block *sb);
+@@ -1126,6 +1127,7 @@ static const struct super_operations ext4_nojournal_sops = {
+  .dirty_inode = ext4_dirty_inode,
+  .drop_inode = ext4_drop_inode,
+  .evict_inode = ext4_evict_inode,
++ .sync_fs = ext4_sync_fs_nojournal,
+  .put_super = ext4_put_super,
+  .statfs  = ext4_statfs,
+  .remount_fs = ext4_remount,
+@@ -4593,6 +4595,7 @@ static int ext4_sync_fs(struct super_block *sb, int wait)
+ {
+  int ret = 0;
+  tid_t target;
++ bool needs_barrier = false;
+  struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 
+  trace_ext4_sync_fs(sb, wait);
+@@ -4603,10 +4606,41 @@ static int ext4_sync_fs(struct super_block *sb, int wait)
+   * no dirty dquots
+   */
+  dquot_writeback_dquots(sb, -1);
++ /*
++  * Data writeback is possible w/o journal transaction, so barrier must
++  * being sent at the end of the function. But we can skip it if
++  * transaction_commit will do it for us.
++  */
++ target = jbd2_get_latest_transaction(sbi->s_journal);
++ if (wait && sbi->s_journal->j_flags & JBD2_BARRIER &&
++     !jbd2_trans_will_send_data_barrier(sbi->s_journal, target))
++  needs_barrier = true;
++
+  if (jbd2_journal_start_commit(sbi->s_journal, &target)) {
+   if (wait)
+-   jbd2_log_wait_commit(sbi->s_journal, target);
++   ret = jbd2_log_wait_commit(sbi->s_journal, target);
++ }
++ if (needs_barrier) {
++  int err;
++  err = blkdev_issue_flush(sb->s_bdev, GFP_KERNEL, NULL);
++  if (!ret)
++   ret = err;
+  }
++
++ return ret;
++}
++
++static int ext4_sync_fs_nojournal(struct super_block *sb, int wait)
++{
++ int ret = 0;
++
++ trace_ext4_sync_fs(sb, wait);
++ flush_workqueue(EXT4_SB(sb)->rsv_conversion_wq);
++ flush_workqueue(EXT4_SB(sb)->unrsv_conversion_wq);
++ dquot_writeback_dquots(sb, -1);
++ if (wait && test_opt(sb, BARRIER))
++  ret = blkdev_issue_flush(sb->s_bdev, GFP_KERNEL, NULL);
++
+  return ret;
+ }
+ 
+diff --git a/include/linux/jbd2.h b/include/linux/jbd2.h
+index c3645b9..a79783f 100644
+--- a/include/linux/jbd2.h
++++ b/include/linux/jbd2.h
+@@ -1374,6 +1374,19 @@ static inline u32 jbd2_chksum(journal_t *journal, u32 crc,
+  return *(u32 *)desc.ctx;
+ }
+ 
++/* Return most recent uncommitted transaction */
++static inline tid_t  jbd2_get_latest_transaction(journal_t *journal)
++{
++ tid_t tid;
++
++ read_lock(&journal->j_state_lock);
++ tid = journal->j_commit_request;
++ if (journal->j_running_transaction)
++  tid = journal->j_running_transaction->t_tid;
++ read_unlock(&journal->j_state_lock);
++ return tid;
++}
++
+ #ifdef __KERNEL__
+ 
+ #define buffer_trace_init(bh) do {} while (0)
+-- 
+1.7.1

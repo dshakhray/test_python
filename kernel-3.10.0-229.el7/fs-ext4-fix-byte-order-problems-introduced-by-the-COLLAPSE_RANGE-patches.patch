@@ -1,0 +1,106 @@
+From 3731ddf6f4b132c19bec16c313a19ec99005db14 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 10:12:35 -0400
+Subject: [fs] ext4: fix byte order problems introduced by the COLLAPSE_RANGE patches
+
+Message-id: <1414059176-6044-12-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98284
+O-Subject: [RHEL 7.1 PATCH 11/32] ext4: fix byte order problems introduced by the COLLAPSE_RANGE patches
+Bugzilla: 1150171
+
+From: Zheng Liu <wenqing.lz@taobao.com>
+
+BZ 1150171
+https://bugzilla.redhat.com/show_bug.cgi?id=1150171
+
+BREW 8149772
+https://brewweb.devel.redhat.com/taskinfo?taskID=8149772
+
+Upstream commit 847c6c422aa0ae81a5517a9558ec2737806dca48
+
+ This commit tries to fix some byte order issues that is found by sparse
+ check.
+
+ $ make M=fs/ext4 C=2 CF=-D__CHECK_ENDIAN__
+ ...
+   CHECK   fs/ext4/extents.c
+ fs/ext4/extents.c:5232:41: warning: restricted __le32 degrades to integer
+ fs/ext4/extents.c:5236:52: warning: bad assignment (-=) to restricted __le32
+ fs/ext4/extents.c:5258:45: warning: bad assignment (-=) to restricted __le32
+ fs/ext4/extents.c:5303:28: warning: restricted __le32 degrades to integer
+ fs/ext4/extents.c:5318:18: warning: incorrect type in assignment (different base types)
+ fs/ext4/extents.c:5318:18:    expected unsigned int [unsigned] [usertype] ex_start
+ fs/ext4/extents.c:5318:18:    got restricted __le32 [usertype] ee_block
+ fs/ext4/extents.c:5319:24: warning: restricted __le32 degrades to integer
+ fs/ext4/extents.c:5334:31: warning: incorrect type in assignment (different base types)
+ ...
+
+ Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+ Cc: Namjae Jeon <namjae.jeon@samsung.com>
+ Signed-off-by: Zheng Liu <wenqing.lz@taobao.com>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 7da86a1..626ec81 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -5225,11 +5225,11 @@ ext4_ext_shift_path_extents(struct ext4_ext_path *path, ext4_lblk_t shift,
+    if (ex_start == EXT_FIRST_EXTENT(path[depth].p_hdr))
+     update = 1;
+ 
+-   *start = ex_last->ee_block +
++   *start = le32_to_cpu(ex_last->ee_block) +
+     ext4_ext_get_actual_len(ex_last);
+ 
+    while (ex_start <= ex_last) {
+-    ex_start->ee_block -= shift;
++    le32_add_cpu(&ex_start->ee_block, -shift);
+     if (ex_start >
+      EXT_FIRST_EXTENT(path[depth].p_hdr)) {
+      if (ext4_ext_try_to_merge_right(inode,
+@@ -5251,7 +5251,7 @@ ext4_ext_shift_path_extents(struct ext4_ext_path *path, ext4_lblk_t shift,
+   if (err)
+    goto out;
+ 
+-  path[depth].p_idx->ei_block -= shift;
++  le32_add_cpu(&path[depth].p_idx->ei_block, -shift);
+   err = ext4_ext_dirty(handle, inode, path + depth);
+   if (err)
+    goto out;
+@@ -5296,7 +5296,8 @@ ext4_ext_shift_extents(struct inode *inode, handle_t *handle,
+   return ret;
+  }
+ 
+- stop_block = extent->ee_block + ext4_ext_get_actual_len(extent);
++ stop_block = le32_to_cpu(extent->ee_block) +
++   ext4_ext_get_actual_len(extent);
+  ext4_ext_drop_refs(path);
+  kfree(path);
+ 
+@@ -5311,8 +5312,9 @@ ext4_ext_shift_extents(struct inode *inode, handle_t *handle,
+  path = ext4_ext_find_extent(inode, start - 1, NULL, 0);
+  depth = path->p_depth;
+  extent =  path[depth].p_ext;
+- ex_start = extent->ee_block;
+- ex_end = extent->ee_block + ext4_ext_get_actual_len(extent);
++ ex_start = le32_to_cpu(extent->ee_block);
++ ex_end = le32_to_cpu(extent->ee_block) +
++   ext4_ext_get_actual_len(extent);
+  ext4_ext_drop_refs(path);
+  kfree(path);
+ 
+@@ -5327,7 +5329,7 @@ ext4_ext_shift_extents(struct inode *inode, handle_t *handle,
+    return PTR_ERR(path);
+   depth = path->p_depth;
+   extent = path[depth].p_ext;
+-  current_block = extent->ee_block;
++  current_block = le32_to_cpu(extent->ee_block);
+   if (start > current_block) {
+    /* Hole, move to the next extent */
+    ret = mext_next_extent(inode, path, &extent);
+-- 
+1.7.1

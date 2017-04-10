@@ -1,0 +1,103 @@
+From 186122d9d13f6a55d0633cdeaaba7fb15fd4c071 Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Tue, 16 Dec 2014 15:10:00 -0500
+Subject: [powerpc] perf/hv-24x7: Use per-cpu page buffer
+
+Message-id: <1418742601-6870-4-git-send-email-gduarte@redhat.com>
+Patchwork-id: 102102
+O-Subject: [RHEL7.1 PATCH BZ 1171795 3/4] powerpc/perf/hv-24x7: Use per-cpu page buffer
+Bugzilla: 1171795
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+BZ 1171795
+Upstream Status: http://git.kernel.org/cgit/linux/kernel/git/mpe/linux.git/commit/?h=next&id=f34b6c72c3ebaa286d3311a825ef79eccbcca82f
+
+Upstream commit:
+Author: "sukadev@linux.vnet.ibm.com" <sukadev@linux.vnet.ibm.com>
+Date: Wed, 10 Dec 2014 14:29:13 -0800
+
+    powerpc/perf/hv-24x7: Use per-cpu page buffer
+
+    The 24x7 counters are continuously running and not updated on an
+    interrupt. So we record the event counts when stopping the event or
+    deleting it.
+
+    But to "read" a single counter in 24x7, we allocate a page and pass it
+    into the hypervisor (The HV returns the page full of counters from which
+    we extract the specific counter for this event).
+
+    We allocate a page using GFP_USER and when deleting the event, we end up
+    with the following warning because we are blocking in interrupt context.
+
+      [  698.641709] BUG: scheduling while atomic: swapper/0/0/0x10010000
+
+    We could use GFP_ATOMIC but that could result in failures. Pre-allocate
+    a buffer so we don't have to allocate in interrupt context. Further as
+    Michael Ellerman suggested, use Per-CPU buffer so we only need to
+    allocate once per CPU.
+
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Sukadev Bhattiprolu <sukadev@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/perf/hv-24x7.c b/arch/powerpc/perf/hv-24x7.c
+index f7d0368..6dee206 100644
+--- a/arch/powerpc/perf/hv-24x7.c
++++ b/arch/powerpc/perf/hv-24x7.c
+@@ -217,11 +217,14 @@ static bool is_physical_domain(int domain)
+   domain == HV_24X7_PERF_DOMAIN_PHYSICAL_CORE;
+ }
+ 
++DEFINE_PER_CPU(char, hv_24x7_reqb[4096]) __aligned(4096);
++DEFINE_PER_CPU(char, hv_24x7_resb[4096]) __aligned(4096);
++
+ static unsigned long single_24x7_request(u8 domain, u32 offset, u16 ix,
+       u16 lpar, u64 *res,
+       bool success_expected)
+ {
+- unsigned long ret = -ENOMEM;
++ unsigned long ret;
+ 
+  /*
+   * request_buffer and result_buffer are not required to be 4k aligned,
+@@ -243,13 +246,11 @@ static unsigned long single_24x7_request(u8 domain, u32 offset, u16 ix,
+  BUILD_BUG_ON(sizeof(*request_buffer) > 4096);
+  BUILD_BUG_ON(sizeof(*result_buffer) > 4096);
+ 
+- request_buffer = kmem_cache_zalloc(hv_page_cache, GFP_USER);
+- if (!request_buffer)
+-  goto out;
++ request_buffer = (void *)get_cpu_var(hv_24x7_reqb);
++ result_buffer = (void *)get_cpu_var(hv_24x7_resb);
+ 
+- result_buffer = kmem_cache_zalloc(hv_page_cache, GFP_USER);
+- if (!result_buffer)
+-  goto out_free_request_buffer;
++ memset(request_buffer, 0, 4096);
++ memset(result_buffer, 0, 4096);
+ 
+  *request_buffer = (struct reqb) {
+   .buf = {
+@@ -278,15 +279,11 @@ static unsigned long single_24x7_request(u8 domain, u32 offset, u16 ix,
+     domain, offset, ix, lpar, ret, ret,
+     result_buffer->buf.detailed_rc,
+     result_buffer->buf.failing_request_ix);
+-  goto out_free_result_buffer;
++  goto out;
+  }
+ 
+  *res = be64_to_cpu(result_buffer->result);
+ 
+-out_free_result_buffer:
+- kfree(result_buffer);
+-out_free_request_buffer:
+- kfree(request_buffer);
+ out:
+  return ret;
+ }
+-- 
+1.7.1

@@ -1,0 +1,115 @@
+From a15535c3673d40f93edaedd297911f516c870d5b Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 15 Sep 2014 15:45:52 -0400
+Subject: [fs] xfs: add a few more verifier tests
+
+Message-id: <541709B0.3020900@redhat.com>
+Patchwork-id: 94799
+O-Subject: [RHEL7.1 PATCH] xfs: add a few more verifier tests
+Bugzilla: 1059330 1061656
+RH-Acked-by: Brian Foster <bfoster@redhat.com>
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+This is for 2 bugs,
+
+Bug 1059330 - xfs throws OOPs message at 'xlog_pack_data' with fuzz testing
+Bug 1061656 - xfs throws OOPs message at 'xfs_btree_del_cursor' with fuzz testing
+
+and it's a backport of this commit in the xfs for-next tree:
+
+http://oss.sgi.com/cgi-bin/gitweb.cgi?p=xfs/xfs.git;a=commitdiff;h=e1b05723ed834090caab56866adc05bce31c9bdd
+
+Build at https://brewweb.devel.redhat.com/taskinfo?taskID=7953141
+Tested w/ images in original bug on s390 box.
+
+Original commit log below:
+
+These were exposed by fsfuzzer runs; without them we fail
+in various exciting and sometimes convoluted ways when we
+encounter disk corruption.
+
+Without the MAXLEVELS tests we tend to walk off the end of
+an array in a loop like this:
+
+        for (i = 0; i < cur->bc_nlevels; i++) {
+                if (cur->bc_bufs[i])
+
+Without the dirblklog test we try to allocate more memory
+than we could possibly hope for and loop forever:
+
+xfs_dabuf_map()
+ nfsb = mp->m_dir_geo->fsbcount;
+ irecs = kmem_zalloc(sizeof(irec) * nfsb, KM_SLEEP...
+
+As for the logbsize check, that's the convoluted one.
+
+If logbsize is specified at mount time, it's sanitized
+in xfs_parseargs; in particular it makes sure that it's
+not > XLOG_MAX_RECORD_BSIZE.
+
+If not specified at mount time, it comes from the superblock
+via sb_logsunit; this is limited to 256k at mkfs time as well;
+it's copied into m_logbsize in xfs_finish_flags().
+
+However, if for some reason the on-disk value is corrupt and
+too large, nothing catches it.  It's a circuitous path, but
+that size eventually finds its way to places that make the kernel
+very unhappy, leading to oopses in xlog_pack_data() because we
+use the size as an index into iclog->ic_data, but the array
+is not necessarily that big.
+
+Anyway - bounds checking when we read from disk is a good thing!
+
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_alloc.c b/fs/xfs/xfs_alloc.c
+index 1351a24..f33068c 100644
+--- a/fs/xfs/xfs_alloc.c
++++ b/fs/xfs/xfs_alloc.c
+@@ -2210,6 +2210,10 @@ xfs_agf_verify(
+        be32_to_cpu(agf->agf_flcount) <= XFS_AGFL_SIZE(mp)))
+   return false;
+ 
++ if (be32_to_cpu(agf->agf_levels[XFS_BTNUM_BNO]) > XFS_BTREE_MAXLEVELS ||
++     be32_to_cpu(agf->agf_levels[XFS_BTNUM_CNT]) > XFS_BTREE_MAXLEVELS)
++  return false;
++
+  /*
+   * during growfs operations, the perag is not fully initialised,
+   * so we can't use it for any useful checking. growfs ensures we can't
+diff --git a/fs/xfs/xfs_ialloc.c b/fs/xfs/xfs_ialloc.c
+index 8f711db..e5382dc 100644
+--- a/fs/xfs/xfs_ialloc.c
++++ b/fs/xfs/xfs_ialloc.c
+@@ -1562,6 +1562,8 @@ xfs_agi_verify(
+  if (!XFS_AGI_GOOD_VERSION(be32_to_cpu(agi->agi_versionnum)))
+   return false;
+ 
++ if (be32_to_cpu(agi->agi_level) > XFS_BTREE_MAXLEVELS)
++  return false;
+  /*
+   * during growfs operations, the perag is not fully initialised,
+   * so we can't use it for any useful checking. growfs ensures we can't
+diff --git a/fs/xfs/xfs_sb.c b/fs/xfs/xfs_sb.c
+index 258d9b3..b98c21d 100644
+--- a/fs/xfs/xfs_sb.c
++++ b/fs/xfs/xfs_sb.c
+@@ -279,11 +279,13 @@ xfs_mount_validate_sb(
+      sbp->sb_blocklog < XFS_MIN_BLOCKSIZE_LOG   ||
+      sbp->sb_blocklog > XFS_MAX_BLOCKSIZE_LOG   ||
+      sbp->sb_blocksize != (1 << sbp->sb_blocklog)  ||
++     sbp->sb_dirblklog > XFS_MAX_BLOCKSIZE_LOG   ||
+      sbp->sb_inodesize < XFS_DINODE_MIN_SIZE   ||
+      sbp->sb_inodesize > XFS_DINODE_MAX_SIZE   ||
+      sbp->sb_inodelog < XFS_DINODE_MIN_LOG   ||
+      sbp->sb_inodelog > XFS_DINODE_MAX_LOG   ||
+      sbp->sb_inodesize != (1 << sbp->sb_inodelog)  ||
++     sbp->sb_logsunit > XLOG_MAX_RECORD_BSIZE   ||
+      sbp->sb_inopblock != howmany(sbp->sb_blocksize,sbp->sb_inodesize) ||
+      (sbp->sb_blocklog - sbp->sb_inodelog != sbp->sb_inopblog) ||
+      (sbp->sb_rextsize * sbp->sb_blocksize > XFS_MAX_RTEXTSIZE) ||
+-- 
+1.7.1

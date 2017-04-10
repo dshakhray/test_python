@@ -1,0 +1,105 @@
+From 6849cdb417dc3d70662cdb6e58fa6bbbad7ca591 Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 26 Jan 2015 19:26:49 -0500
+Subject: [md] Revert: raid56: Don't perform reads to support writes until stripe is ready
+
+Message-id: <1422300409-394-3-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 103568
+O-Subject: [RHEL7.1 PATCH 2/2] Revert "[md] raid56: Don't perform reads to support writes until stripe is ready"
+Bugzilla: 1153796
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+This reverts commit 70d751cb1aba009264e244c95f9552b5cfe15278.
+
+This is the second temporary commit to this series, while we work to
+resolve the issue upstream.
+
+The reconstruct write optimization in MD raid5, function fetch_block
+causes livelocks in LVM raid4/5 tests.
+
+Test scenarios:
+The tests wait for full initial array resynchronization before making
+a filesystem on the raid4/5 logical volume, mounting it, writing to
+the filesystem and failing one physical volume holding a raiddev.
+
+In short, we're seeing livelocks on fully synchronized raid4/5 arrays
+with a failed device.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index fd8095b..955bd8d 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -296,12 +296,9 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh,
+  BUG_ON(atomic_read(&conf->active_stripes)==0);
+  if (test_bit(STRIPE_HANDLE, &sh->state)) {
+   if (test_bit(STRIPE_DELAYED, &sh->state) &&
+-      !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state)) {
++      !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+    list_add_tail(&sh->lru, &conf->delayed_list);
+-   if (atomic_read(&conf->preread_active_stripes)
+-       < IO_THRESHOLD)
+-    md_wakeup_thread(conf->mddev->thread);
+-  } else if (test_bit(STRIPE_BIT_DELAY, &sh->state) &&
++  else if (test_bit(STRIPE_BIT_DELAY, &sh->state) &&
+       sh->bm_seq - conf->seq_write > 0)
+    list_add_tail(&sh->lru, &conf->bitmap_list);
+   else {
+@@ -2923,11 +2920,8 @@ static int fetch_block(struct stripe_head *sh, struct stripe_head_state *s,
+       (s->failed >= 1 && fdev[0]->toread) ||
+       (s->failed >= 2 && fdev[1]->toread) ||
+       (sh->raid_conf->level <= 5 && s->failed && fdev[0]->towrite &&
+-       (!test_bit(R5_Insync, &dev->flags) || test_bit(STRIPE_PREREAD_ACTIVE, &sh->state)) &&
+        !test_bit(R5_OVERWRITE, &fdev[0]->flags)) ||
+-      (sh->raid_conf->level == 6 && s->failed && s->to_write &&
+-       s->to_write < sh->raid_conf->raid_disks - 2 &&
+-       (!test_bit(R5_Insync, &dev->flags) || test_bit(STRIPE_PREREAD_ACTIVE, &sh->state))))) {
++      (sh->raid_conf->level == 6 && s->failed && s->to_write))) {
+   /* we would like to get this block, possibly by computing it,
+    * otherwise read it if the backing disk is insync
+    */
+@@ -3133,8 +3127,7 @@ static void handle_stripe_dirtying(struct r5conf *conf,
+       !test_bit(R5_LOCKED, &dev->flags) &&
+       !(test_bit(R5_UPTODATE, &dev->flags) ||
+       test_bit(R5_Wantcompute, &dev->flags))) {
+-   if (test_bit(R5_Insync, &dev->flags))
+-    rcw++;
++   if (test_bit(R5_Insync, &dev->flags)) rcw++;
+    else
+     rcw += 2*disks;
+   }
+@@ -3155,10 +3148,10 @@ static void handle_stripe_dirtying(struct r5conf *conf,
+        !(test_bit(R5_UPTODATE, &dev->flags) ||
+        test_bit(R5_Wantcompute, &dev->flags)) &&
+        test_bit(R5_Insync, &dev->flags)) {
+-    if (test_bit(STRIPE_PREREAD_ACTIVE,
+-          &sh->state)) {
+-     pr_debug("Read_old block %d for r-m-w\n",
+-       i);
++    if (
++      test_bit(STRIPE_PREREAD_ACTIVE, &sh->state)) {
++     pr_debug("Read_old block "
++       "%d for r-m-w\n", i);
+      set_bit(R5_LOCKED, &dev->flags);
+      set_bit(R5_Wantread, &dev->flags);
+      s->locked++;
+@@ -3181,9 +3174,10 @@ static void handle_stripe_dirtying(struct r5conf *conf,
+        !(test_bit(R5_UPTODATE, &dev->flags) ||
+          test_bit(R5_Wantcompute, &dev->flags))) {
+     rcw++;
+-    if (test_bit(R5_Insync, &dev->flags) &&
+-        test_bit(STRIPE_PREREAD_ACTIVE,
+-          &sh->state)) {
++    if (!test_bit(R5_Insync, &dev->flags))
++     continue; /* it's a failed drive */
++    if (
++      test_bit(STRIPE_PREREAD_ACTIVE, &sh->state)) {
+      pr_debug("Read_old block "
+       "%d for Reconstruct\n", i);
+      set_bit(R5_LOCKED, &dev->flags);
+-- 
+1.7.1

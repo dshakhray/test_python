@@ -1,0 +1,100 @@
+From 10a349dd16ccf4152d81ff6d68b9c0537af8bcfc Mon Sep 17 00:00:00 2001
+From: Daniel Borkmann <dborkman@redhat.com>
+Date: Thu, 13 Nov 2014 17:38:26 -0500
+Subject: [net] sctp: fix NULL pointer dereference in af->from_addr_param on malformed packet
+
+Message-id: <30bb74275fc5f9dc41a5e88fc552c768288ff29a.1415898829.git.dborkman@redhat.com>
+Patchwork-id: 99956
+O-Subject: [RHEL7.1 PATCH net] net: sctp: fix NULL pointer dereference in af->from_addr_param on malformed packet
+Bugzilla: 1154002
+CVE: CVE-2014-7841
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1154002
+Upstream Status: e40607cbe270a9e8360907cb1e62ddf0736e4864 (net)
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8238446
+Tested: verified on beaker w/ test case
+CVE-2014-7841
+
+Upstream Commit:
+commit e40607cbe270a9e8360907cb1e62ddf0736e4864
+Author: Daniel Borkmann <dborkman@redhat.com>
+Date:   Mon Nov 10 17:54:26 2014 +0100
+
+    net: sctp: fix NULL pointer dereference in af->from_addr_param on malformed packet
+
+    An SCTP server doing ASCONF will panic on malformed INIT ping-of-death
+    in the form of:
+
+      ------------ INIT[PARAM: SET_PRIMARY_IP] ------------>
+
+    While the INIT chunk parameter verification dissects through many things
+    in order to detect malformed input, it misses to actually check parameters
+    inside of parameters. E.g. RFC5061, section 4.2.4 proposes a 'set primary
+    IP address' parameter in ASCONF, which has as a subparameter an address
+    parameter.
+
+    So an attacker may send a parameter type other than SCTP_PARAM_IPV4_ADDRESS
+    or SCTP_PARAM_IPV6_ADDRESS, param_type2af() will subsequently return 0
+    and thus sctp_get_af_specific() returns NULL, too, which we then happily
+    dereference unconditionally through af->from_addr_param().
+
+    The trace for the log:
+
+    BUG: unable to handle kernel NULL pointer dereference at 0000000000000078
+    IP: [<ffffffffa01e9c62>] sctp_process_init+0x492/0x990 [sctp]
+    PGD 0
+    Oops: 0000 [#1] SMP
+    [...]
+    Pid: 0, comm: swapper Not tainted 2.6.32-504.el6.x86_64 #1 Bochs Bochs
+    RIP: 0010:[<ffffffffa01e9c62>]  [<ffffffffa01e9c62>] sctp_process_init+0x492/0x990 [sctp]
+    [...]
+    Call Trace:
+     <IRQ>
+     [<ffffffffa01f2add>] ? sctp_bind_addr_copy+0x5d/0xe0 [sctp]
+     [<ffffffffa01e1fcb>] sctp_sf_do_5_1B_init+0x21b/0x340 [sctp]
+     [<ffffffffa01e3751>] sctp_do_sm+0x71/0x1210 [sctp]
+     [<ffffffffa01e5c09>] ? sctp_endpoint_lookup_assoc+0xc9/0xf0 [sctp]
+     [<ffffffffa01e61f6>] sctp_endpoint_bh_rcv+0x116/0x230 [sctp]
+     [<ffffffffa01ee986>] sctp_inq_push+0x56/0x80 [sctp]
+     [<ffffffffa01fcc42>] sctp_rcv+0x982/0xa10 [sctp]
+     [<ffffffffa01d5123>] ? ipt_local_in_hook+0x23/0x28 [iptable_filter]
+     [<ffffffff8148bdc9>] ? nf_iterate+0x69/0xb0
+     [<ffffffff81496d10>] ? ip_local_deliver_finish+0x0/0x2d0
+     [<ffffffff8148bf86>] ? nf_hook_slow+0x76/0x120
+     [<ffffffff81496d10>] ? ip_local_deliver_finish+0x0/0x2d0
+    [...]
+
+    A minimal way to address this is to check for NULL as we do on all
+    other such occasions where we know sctp_get_af_specific() could
+    possibly return with NULL.
+
+    Fixes: d6de3097592b ("[SCTP]: Add the handling of "Set Primary IP Address" parameter to INIT")
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Cc: Vlad Yasevich <vyasevich@gmail.com>
+    Acked-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/sctp/sm_make_chunk.c b/net/sctp/sm_make_chunk.c
+index 4387012..1d29f13 100644
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@ -2596,6 +2596,9 @@ do_addr_param:
+   addr_param = param.v + sizeof(sctp_addip_param_t);
+ 
+   af = sctp_get_af_specific(param_type2af(param.p->type));
++  if (af == NULL)
++   break;
++
+   af->from_addr_param(&addr, addr_param,
+         htons(asoc->peer.port), 0);
+ 
+-- 
+1.7.1

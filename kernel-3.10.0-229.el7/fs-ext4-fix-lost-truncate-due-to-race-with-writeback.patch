@@ -1,0 +1,147 @@
+From 1e241173a64743a6d86b56d8261c966be059e772 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:53:34 -0400
+Subject: [fs] ext4: fix lost truncate due to race with writeback
+
+Message-id: <1414058125-4183-61-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98139
+O-Subject: [RHEL 7.1 PATCH v2 060/171] ext4: fix lost truncate due to race with writeback
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Jan Kara <jack@suse.cz>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit 90e775b71ac4e685898c7995756fe58c135adaa6
+
+ The following race can lead to a loss of i_disksize update from truncate
+ thus resulting in a wrong inode size if the inode size isn't updated
+ again before inode is reclaimed:
+
+ ext4_setattr()    mpage_map_and_submit_extent()
+   EXT4_I(inode)->i_disksize = attr->ia_size;
+   ...       ...
+        disksize = ((loff_t)mpd->first_page) << PAGE_CACHE_SHIFT
+        /* False because i_size isn't
+         * updated yet */
+        if (disksize > i_size_read(inode))
+        /* True, because i_disksize is
+         * already truncated */
+        if (disksize > EXT4_I(inode)->i_disksize)
+          /* Overwrite i_disksize
+           * update from truncate */
+          ext4_update_i_disksize()
+   i_size_write(inode, attr->ia_size);
+
+ For other places updating i_disksize such race cannot happen because
+ i_mutex prevents these races. Writeback is the only place where we do
+ not hold i_mutex and we cannot grab it there because of lock ordering.
+
+ We fix the race by doing both i_disksize and i_size update in truncate
+ atomically under i_data_sem and in mpage_map_and_submit_extent() we move
+ the check against i_size under i_data_sem as well.
+
+ Signed-off-by: Jan Kara <jack@suse.cz>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Cc: stable@vger.kernel.org
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 4419e57..c16f6cc 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2438,16 +2438,32 @@ do {        \
+ #define EXT4_FREECLUSTERS_WATERMARK 0
+ #endif
+ 
++/* Update i_disksize. Requires i_mutex to avoid races with truncate */
+ static inline void ext4_update_i_disksize(struct inode *inode, loff_t newsize)
+ {
+- /*
+-  * XXX: replace with spinlock if seen contended -bzzz
+-  */
++ WARN_ON_ONCE(S_ISREG(inode->i_mode) &&
++       !mutex_is_locked(&inode->i_mutex));
++ down_write(&EXT4_I(inode)->i_data_sem);
++ if (newsize > EXT4_I(inode)->i_disksize)
++  EXT4_I(inode)->i_disksize = newsize;
++ up_write(&EXT4_I(inode)->i_data_sem);
++}
++
++/*
++ * Update i_disksize after writeback has been started. Races with truncate
++ * are avoided by checking i_size under i_data_sem.
++ */
++static inline void ext4_wb_update_i_disksize(struct inode *inode, loff_t newsize)
++{
++ loff_t i_size;
++
+  down_write(&EXT4_I(inode)->i_data_sem);
++ i_size = i_size_read(inode);
++ if (newsize > i_size)
++  newsize = i_size;
+  if (newsize > EXT4_I(inode)->i_disksize)
+   EXT4_I(inode)->i_disksize = newsize;
+  up_write(&EXT4_I(inode)->i_data_sem);
+- return ;
+ }
+ 
+ struct ext4_group_info {
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index d4136d7..f91e0b2 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2238,12 +2238,10 @@ static int mpage_map_and_submit_extent(handle_t *handle,
+ 
+  /* Update on-disk size after IO is submitted */
+  disksize = ((loff_t)mpd->first_page) << PAGE_CACHE_SHIFT;
+- if (disksize > i_size_read(inode))
+-  disksize = i_size_read(inode);
+  if (disksize > EXT4_I(inode)->i_disksize) {
+   int err2;
+ 
+-  ext4_update_i_disksize(inode, disksize);
++  ext4_wb_update_i_disksize(inode, disksize);
+   err2 = ext4_mark_inode_dirty(handle, inode);
+   if (err2)
+    ext4_error(inode->i_sb,
+@@ -4628,18 +4626,27 @@ int ext4_setattr(struct dentry *dentry, struct iattr *attr)
+     error = ext4_orphan_add(handle, inode);
+     orphan = 1;
+    }
++   down_write(&EXT4_I(inode)->i_data_sem);
+    EXT4_I(inode)->i_disksize = attr->ia_size;
+    rc = ext4_mark_inode_dirty(handle, inode);
+    if (!error)
+     error = rc;
++   /*
++    * We have to update i_size under i_data_sem together
++    * with i_disksize to avoid races with writeback code
++    * running ext4_wb_update_i_disksize().
++    */
++   if (!error)
++    i_size_write(inode, attr->ia_size);
++   up_write(&EXT4_I(inode)->i_data_sem);
+    ext4_journal_stop(handle);
+    if (error) {
+     ext4_orphan_del(NULL, inode);
+     goto err_out;
+    }
+-  }
++  } else
++   i_size_write(inode, attr->ia_size);
+ 
+-  i_size_write(inode, attr->ia_size);
+   /*
+    * Blocks are going to be removed from the inode. Wait
+    * for dio in flight.  Temporarily disable
+-- 
+1.7.1

@@ -1,0 +1,103 @@
+From 1b7d7c449618bc854e2ff8c389f9b39548770821 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 12 Sep 2014 14:27:45 -0400
+Subject: [net] netlink: autosize skb lengthes
+
+Message-id: <d1d67df7c7511790f4633cc677d9843ea061d471.1410528971.git.jbenc@redhat.com>
+Patchwork-id: 93973
+O-Subject: [RHEL7.1 net PATCH 02/14] netlink: autosize skb lengthes
+Bugzilla: 1140661
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1140661
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7948291
+
+commit 9063e21fb026c4966fc93261c18322214f9835eb
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri Mar 7 12:02:33 2014 -0800
+
+    netlink: autosize skb lengthes
+
+    One known problem with netlink is the fact that NLMSG_GOODSIZE is
+    really small on PAGE_SIZE==4096 architectures, and it is difficult
+    to know in advance what buffer size is used by the application.
+
+    This patch adds an automatic learning of the size.
+
+    First netlink message will still be limited to ~4K, but if user used
+    bigger buffers, then following messages will be able to use up to 16KB.
+
+    This speedups dump() operations by a large factor and should be safe
+    for legacy applications.
+
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Cc: Thomas Graf <tgraf@suug.ch>
+    Acked-by: Thomas Graf <tgraf@suug.ch>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index a4458d6..022b9f0 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -2399,6 +2399,11 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
+  }
+ #endif
+ 
++ /* Record the max length of recvmsg() calls for future allocations */
++ nlk->max_recvmsg_len = max(nlk->max_recvmsg_len, len);
++ nlk->max_recvmsg_len = min_t(size_t, nlk->max_recvmsg_len,
++         16384);
++
+  copied = data_skb->len;
+  if (len < copied) {
+   msg->msg_flags |= MSG_TRUNC;
+@@ -2656,7 +2661,27 @@ static int netlink_dump(struct sock *sk)
+  if (!netlink_rx_is_mmaped(sk) &&
+      atomic_read(&sk->sk_rmem_alloc) >= sk->sk_rcvbuf)
+   goto errout_skb;
+- skb = netlink_alloc_skb(sk, alloc_size, nlk->portid, GFP_KERNEL);
++
++ /* NLMSG_GOODSIZE is small to avoid high order allocations being
++  * required, but it makes sense to _attempt_ a 16K bytes allocation
++  * to reduce number of system calls on dump operations, if user
++  * ever provided a big enough buffer.
++  */
++ if (alloc_size < nlk->max_recvmsg_len) {
++  skb = netlink_alloc_skb(sk,
++     nlk->max_recvmsg_len,
++     nlk->portid,
++     GFP_KERNEL |
++     __GFP_NOWARN |
++     __GFP_NORETRY);
++  /* available room should be exact amount to avoid MSG_TRUNC */
++  if (skb)
++   skb_reserve(skb, skb_tailroom(skb) -
++      nlk->max_recvmsg_len);
++ }
++ if (!skb)
++  skb = netlink_alloc_skb(sk, alloc_size, nlk->portid,
++     GFP_KERNEL);
+  if (!skb)
+   goto errout_skb;
+  netlink_skb_set_owner_r(skb, sk);
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index 74c16f0..b771d42 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -31,6 +31,7 @@ struct netlink_sock {
+  u32   ngroups;
+  unsigned long  *groups;
+  unsigned long  state;
++ size_t   max_recvmsg_len;
+  wait_queue_head_t wait;
+  bool   cb_running;
+  struct netlink_callback cb;
+-- 
+1.7.1

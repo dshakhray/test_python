@@ -1,0 +1,121 @@
+From 8509cc55b7a8be47967316b9f24b80487a577f24 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 23 Oct 2014 20:01:34 -0400
+Subject: [md] dm-thin: refactor requeue_io to eliminate spinlock bouncing
+
+Message-id: <1414094494-22068-25-git-send-email-snitzer@redhat.com>
+Patchwork-id: 98357
+O-Subject: [RHEL7.2 PATCH 24/24] dm thin: refactor requeue_io to eliminate spinlock bouncing
+Bugzilla: 1156164
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1156164
+
+Upstream linux-dm.git commit 330f26b9734599470354368e019d853a7b591fc5
+Author: Mike Snitzer <snitzer@redhat.com>
+Date:   Sun Oct 19 07:52:44 2014 -0400
+
+    dm thin: refactor requeue_io to eliminate spinlock bouncing
+
+    Also refactor some other bio_list erroring helpers.
+
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index 9035a98..b2087f6 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -457,21 +457,32 @@ struct dm_thin_endio_hook {
+  struct rb_node rb_node;
+ };
+ 
+-static void requeue_bio_list(struct thin_c *tc, struct bio_list *master)
++static void __merge_bio_list(struct bio_list *bios, struct bio_list *master)
++{
++ bio_list_merge(bios, master);
++ bio_list_init(master);
++}
++
++static void error_bio_list(struct bio_list *bios, int error)
+ {
+  struct bio *bio;
++
++ while ((bio = bio_list_pop(bios)))
++  bio_endio(bio, error);
++}
++
++static void error_thin_bio_list(struct thin_c *tc, struct bio_list *master, int error)
++{
+  struct bio_list bios;
+  unsigned long flags;
+ 
+  bio_list_init(&bios);
+ 
+  spin_lock_irqsave(&tc->lock, flags);
+- bio_list_merge(&bios, master);
+- bio_list_init(master);
++ __merge_bio_list(&bios, master);
+  spin_unlock_irqrestore(&tc->lock, flags);
+ 
+- while ((bio = bio_list_pop(&bios)))
+-  bio_endio(bio, DM_ENDIO_REQUEUE);
++ error_bio_list(&bios, error);
+ }
+ 
+ static void requeue_deferred_cells(struct thin_c *tc)
+@@ -493,26 +504,18 @@ static void requeue_deferred_cells(struct thin_c *tc)
+ 
+ static void requeue_io(struct thin_c *tc)
+ {
+- requeue_bio_list(tc, &tc->deferred_bio_list);
+- requeue_bio_list(tc, &tc->retry_on_resume_list);
+- requeue_deferred_cells(tc);
+-}
+-
+-static void error_thin_retry_list(struct thin_c *tc)
+-{
+- struct bio *bio;
+- unsigned long flags;
+  struct bio_list bios;
++ unsigned long flags;
+ 
+  bio_list_init(&bios);
+ 
+  spin_lock_irqsave(&tc->lock, flags);
+- bio_list_merge(&bios, &tc->retry_on_resume_list);
+- bio_list_init(&tc->retry_on_resume_list);
++ __merge_bio_list(&bios, &tc->deferred_bio_list);
++ __merge_bio_list(&bios, &tc->retry_on_resume_list);
+  spin_unlock_irqrestore(&tc->lock, flags);
+ 
+- while ((bio = bio_list_pop(&bios)))
+-  bio_io_error(bio);
++ error_bio_list(&bios, DM_ENDIO_REQUEUE);
++ requeue_deferred_cells(tc);
+ }
+ 
+ static void error_retry_list(struct pool *pool)
+@@ -521,7 +524,7 @@ static void error_retry_list(struct pool *pool)
+ 
+  rcu_read_lock();
+  list_for_each_entry_rcu(tc, &pool->active_thins, list)
+-  error_thin_retry_list(tc);
++  error_thin_bio_list(tc, &tc->retry_on_resume_list, -EIO);
+  rcu_read_unlock();
+ }
+ 
+@@ -1746,7 +1749,7 @@ static void process_thin_deferred_bios(struct thin_c *tc)
+  unsigned count = 0;
+ 
+  if (tc->requeue_mode) {
+-  requeue_bio_list(tc, &tc->deferred_bio_list);
++  error_thin_bio_list(tc, &tc->deferred_bio_list, DM_ENDIO_REQUEUE);
+   return;
+  }
+ 
+-- 
+1.7.1

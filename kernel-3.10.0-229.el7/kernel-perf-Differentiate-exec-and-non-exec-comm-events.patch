@@ -1,0 +1,177 @@
+From 57c471c55d5b4b41445647c4e03768deff7d15d7 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:38 -0400
+Subject: [kernel] perf: Differentiate exec() and non-exec() comm events
+
+Message-id: <1410181752-25631-34-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91723
+O-Subject: [PATCH RHEL7.1 BZ1134356 033/307] perf: Differentiate exec() and non-exec() comm events
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 82b897782d10fcc4930c9d4a15b175348fdd2871
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Wed May 28 11:45:04 2014 +0300
+
+KABI
+=====
+The 'struct perf_event *' pointer is used within 'struct thread_struct',
+making 'struct perf_event' and all its members like 'struct perf_event_attr'
+KABI-broken any time we change it. At the moment we don't have any perf
+related function on KABI list, so masking the change with __GENKSYMS__
+macro.
+
+RHEL7
+=====
+RHEL7 is missing kbasename change for set_task_comm, so keeping
+the (__)set_task_comm) string argument as char *.
+
+description
+===========
+perf tools like 'perf report' can aggregate samples by comm strings,
+which generally works.  However, there are other potential use-cases.
+For example, to pair up 'calls' with 'returns' accurately (from branch
+events like Intel BTS) it is necessary to identify whether the process
+has exec'd.  Although a comm event is generated when an 'exec' happens
+it is also generated whenever the comm string is changed on a whim
+(e.g. by prctl PR_SET_NAME).  This patch adds a flag to the comm event
+to differentiate one case from the other.
+
+In order to determine whether the kernel supports the new flag, a
+selection bit named 'exec' is added to struct perf_event_attr.  The
+bit does nothing but will cause perf_event_open() to fail if the bit
+is set on kernels that do not have it defined.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/exec.c b/fs/exec.c
+index dd300d8..d5973c8 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1035,13 +1035,13 @@ EXPORT_SYMBOL_GPL(get_task_comm);
+  * so that a new one can be started
+  */
+ 
+-void set_task_comm(struct task_struct *tsk, char *buf)
++void __set_task_comm(struct task_struct *tsk, char *buf, bool exec)
+ {
+  task_lock(tsk);
+  trace_task_rename(tsk, buf);
+  strlcpy(tsk->comm, buf, sizeof(tsk->comm));
+  task_unlock(tsk);
+- perf_event_comm(tsk);
++ perf_event_comm(tsk, exec);
+ }
+ 
+ static void filename_to_taskname(char *tcomm, const char *fn, unsigned int len)
+@@ -1117,7 +1117,7 @@ void setup_new_exec(struct linux_binprm * bprm)
+   set_dumpable(current->mm, suid_dumpable);
+ 
+  perf_event_exec();
+- set_task_comm(current, bprm->tcomm);
++ __set_task_comm(current, bprm->tcomm, true);
+ 
+  /* Set the new mm task size. We have to do that late because it may
+   * depend on TIF_32BIT which is only updated in flush_thread() on
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index b4cacdc..3bf1c33 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -730,7 +730,7 @@ extern int perf_register_guest_info_callbacks(struct perf_guest_info_callbacks *
+ extern int perf_unregister_guest_info_callbacks(struct perf_guest_info_callbacks *callbacks);
+ 
+ extern void perf_event_exec(void);
+-extern void perf_event_comm(struct task_struct *tsk);
++extern void perf_event_comm(struct task_struct *tsk, bool exec);
+ extern void perf_event_fork(struct task_struct *tsk);
+ 
+ /* Callchains */
+@@ -838,7 +838,7 @@ static inline int perf_unregister_guest_info_callbacks
+ 
+ static inline void perf_event_mmap(struct vm_area_struct *vma)  { }
+ static inline void perf_event_exec(void)    { }
+-static inline void perf_event_comm(struct task_struct *tsk)  { }
++static inline void perf_event_comm(struct task_struct *tsk, bool exec) { }
+ static inline void perf_event_fork(struct task_struct *tsk)  { }
+ static inline void perf_event_init(void)    { }
+ static inline int  perf_swevent_get_recursion_context(void)  { return -1; }
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 912a5bb..3e391fa 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2248,7 +2248,11 @@ extern long do_fork(unsigned long, unsigned long, unsigned long, int __user *, i
+ struct task_struct *fork_idle(int);
+ extern pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags);
+ 
+-extern void set_task_comm(struct task_struct *tsk, char *from);
++extern void __set_task_comm(struct task_struct *tsk, char *from, bool exec);
++static inline void set_task_comm(struct task_struct *tsk, char *from)
++{
++ __set_task_comm(tsk, from, false);
++}
+ extern char *get_task_comm(char *to, struct task_struct *tsk);
+ 
+ #ifdef CONFIG_SMP
+diff --git a/include/uapi/linux/perf_event.h b/include/uapi/linux/perf_event.h
+index 87f6492..7f96d2b 100644
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@ -303,7 +303,12 @@ struct perf_event_attr {
+     exclude_callchain_user   : 1, /* exclude user callchains */
+     mmap2          :  1, /* include mmap with inode data     */
+ 
++#ifdef __GENKSYMS__
+     __reserved_1   : 40;
++#else
++    comm_exec      :  1, /* flag comm events that are due to an exec */
++    __reserved_1   : 39;
++#endif
+ 
+  union {
+   __u32  wakeup_events;   /* wakeup every n events */
+@@ -502,7 +507,12 @@ struct perf_event_mmap_page {
+ #define PERF_RECORD_MISC_GUEST_KERNEL  (4 << 0)
+ #define PERF_RECORD_MISC_GUEST_USER  (5 << 0)
+ 
++/*
++ * PERF_RECORD_MISC_MMAP_DATA and PERF_RECORD_MISC_COMM_EXEC are used on
++ * different events so can reuse the same bit position.
++ */
+ #define PERF_RECORD_MISC_MMAP_DATA  (1 << 13)
++#define PERF_RECORD_MISC_COMM_EXEC  (1 << 13)
+ /*
+  * Indicates that the content of PERF_SAMPLE_IP points to
+  * the actual instruction that triggered the event. See also
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 99c01f7..3c9ede3 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -5095,7 +5095,7 @@ static void perf_event_comm_event(struct perf_comm_event *comm_event)
+          NULL);
+ }
+ 
+-void perf_event_comm(struct task_struct *task)
++void perf_event_comm(struct task_struct *task, bool exec)
+ {
+  struct perf_comm_event comm_event;
+ 
+@@ -5109,7 +5109,7 @@ void perf_event_comm(struct task_struct *task)
+   .event_id  = {
+    .header = {
+     .type = PERF_RECORD_COMM,
+-    .misc = 0,
++    .misc = exec ? PERF_RECORD_MISC_COMM_EXEC : 0,
+     /* .size */
+    },
+    /* .pid */
+-- 
+1.7.1

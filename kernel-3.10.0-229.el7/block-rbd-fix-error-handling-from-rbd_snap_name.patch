@@ -1,0 +1,75 @@
+From 84ae0e4515e6a127a4951331586c4febead133c6 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:22:54 -0400
+Subject: [block] rbd: fix error handling from rbd_snap_name()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-68-git-send-email-sweil@redhat.com>
+Patchwork-id: 89672
+O-Subject: [PATCH 067/303] rbd: fix error handling from rbd_snap_name()
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Josh Durgin <josh.durgin@inktank.com>
+
+rbd_snap_name() calls rbd_dev_v{1,2}_snap_name() depending on the
+format of the image. The format 1 version returns NULL on error, which
+is handled by the caller. The format 2 version returns an ERR_PTR,
+which the caller of rbd_snap_name() does not expect.
+
+Fortunately this is unlikely to occur in practice because
+rbd_snap_id_by_name() is called before rbd_snap_name(). This would hit
+similar errors to rbd_snap_name() (like the snapshot not existing) and
+return early, so rbd_snap_name() would not hit an error unless the
+snapshot was removed between the two calls or memory was exhausted.
+
+Use an ERR_PTR in rbd_dev_v1_snap_name() so that the specific error
+can be propagated, and it is consistent with rbd_dev_v2_snap_name().
+Handle the ERR_PTR in the only rbd_snap_name() caller.
+
+Suggested-by: Alex Elder <alex.elder@linaro.org>
+Signed-off-by: Josh Durgin <josh.durgin@inktank.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+(cherry picked from commit da6a6b63978d45f9ae582d1f362f182012da3a22)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 626a713..2f00778 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -927,12 +927,14 @@ static const char *rbd_dev_v1_snap_name(struct rbd_device *rbd_dev,
+      u64 snap_id)
+ {
+  u32 which;
++ const char *snap_name;
+ 
+  which = rbd_dev_snap_index(rbd_dev, snap_id);
+  if (which == BAD_SNAP_INDEX)
+-  return NULL;
++  return ERR_PTR(-ENOENT);
+ 
+- return _rbd_dev_v1_snap_name(rbd_dev, which);
++ snap_name = _rbd_dev_v1_snap_name(rbd_dev, which);
++ return snap_name ? snap_name : ERR_PTR(-ENOMEM);
+ }
+ 
+ static const char *rbd_snap_name(struct rbd_device *rbd_dev, u64 snap_id)
+@@ -4163,8 +4165,8 @@ static int rbd_dev_spec_update(struct rbd_device *rbd_dev)
+  /* Look up the snapshot name, and make a copy */
+ 
+  snap_name = rbd_snap_name(rbd_dev, spec->snap_id);
+- if (!snap_name) {
+-  ret = -ENOMEM;
++ if (IS_ERR(snap_name)) {
++  ret = PTR_ERR(snap_name);
+   goto out_err;
+  }
+ 
+-- 
+1.7.1

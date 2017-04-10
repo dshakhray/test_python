@@ -1,0 +1,141 @@
+From 3be268542d6082b75f5590f9767363e01b83131b Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Tue, 16 Dec 2014 14:23:35 -0500
+Subject: [net] bridge: Add a default_pvid sysfs attribute
+
+Message-id: <1418739817-22923-6-git-send-email-vyasevic@redhat.com>
+Patchwork-id: 102097
+O-Subject: [RHEL7 PATCH 5/7] bridge: Add a default_pvid sysfs attribute
+Bugzilla: 1164653
+RH-Acked-by: Michael S. Tsirkin <mst@redhat.com>
+RH-Acked-by: Marcelo Leitner <mleitner@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1164653
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8371670
+
+Upstream commit 96a20d9d7fff7068a2233b00379f0778a150bf86
+Author: Vlad Yasevich <vyasevich@gmail.com>
+Date:   Fri Oct 3 11:29:16 2014 -0400
+
+    bridge: Add a default_pvid sysfs attribute
+
+    This patch allows the user to set and retrieve default_pvid
+    value.  A new value can only be stored when vlan filtering
+    is disabled.
+
+    Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ net/bridge/br_private.h
+ net/bridge/br_sysfs_br.c
+ net/bridge/br_vlan.c
+ - Conflicts related to missing support for 802.1AD filtering.
+
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 670b9e0..397b4ed 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -306,6 +306,7 @@ struct net_bridge
+ #ifdef CONFIG_BRIDGE_VLAN_FILTERING
+  u8    vlan_enabled;
+  __be16    vlan_proto;
++ u16    default_pvid;
+  struct net_port_vlans __rcu *vlan_info;
+ #endif
+ };
+@@ -619,6 +620,7 @@ void br_vlan_flush(struct net_bridge *br);
+ bool br_vlan_find(struct net_bridge *br, u16 vid);
+ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val);
+ void br_vlan_init(struct net_bridge *br);
++int br_vlan_set_default_pvid(struct net_bridge *br, unsigned long val);
+ int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags);
+ int nbp_vlan_delete(struct net_bridge_port *port, u16 vid);
+ void nbp_vlan_flush(struct net_bridge_port *port);
+diff --git a/net/bridge/br_sysfs_br.c b/net/bridge/br_sysfs_br.c
+index 8baa9c0..d74c3ed 100644
+--- a/net/bridge/br_sysfs_br.c
++++ b/net/bridge/br_sysfs_br.c
+@@ -708,6 +708,22 @@ static ssize_t store_vlan_filtering(struct device *d,
+ }
+ static DEVICE_ATTR(vlan_filtering, S_IRUGO | S_IWUSR,
+      show_vlan_filtering, store_vlan_filtering);
++
++static ssize_t default_pvid_show(struct device *d,
++     struct device_attribute *attr,
++     char *buf)
++{
++ struct net_bridge *br = to_bridge(d);
++ return sprintf(buf, "%d\n", br->default_pvid);
++}
++
++static ssize_t default_pvid_store(struct device *d,
++      struct device_attribute *attr,
++      const char *buf, size_t len)
++{
++ return store_bridge_parm(d, buf, len, br_vlan_set_default_pvid);
++}
++static DEVICE_ATTR_RW(default_pvid);
+ #endif
+ 
+ static struct attribute *bridge_attrs[] = {
+@@ -752,6 +768,7 @@ static struct attribute *bridge_attrs[] = {
+ #endif
+ #ifdef CONFIG_BRIDGE_VLAN_FILTERING
+  &dev_attr_vlan_filtering.attr,
++ &dev_attr_default_pvid.attr,
+ #endif
+  NULL
+ };
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index fac3377..4181e48 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -399,8 +399,38 @@ unlock:
+ void br_vlan_init(struct net_bridge *br)
+ {
+  br->vlan_proto = htons(ETH_P_8021Q);
++ br->default_pvid = 1;
+ }
+ 
++int br_vlan_set_default_pvid(struct net_bridge *br, unsigned long val)
++{
++ u16 pvid = val;
++ int err = 0;
++
++ if (!val || val >= VLAN_VID_MASK)
++  return -EINVAL;
++
++ if (!rtnl_trylock())
++  return restart_syscall();
++
++ if (pvid == br->default_pvid)
++  goto unlock;
++
++ /* Only allow default pvid change when filtering is disabled */
++ if (br->vlan_enabled) {
++  pr_info_once("Please disable vlan filtering to change default_pvid\n");
++  err = -EPERM;
++  goto unlock;
++ }
++
++ br->default_pvid = pvid;
++
++unlock:
++ rtnl_unlock();
++ return err;
++}
++
++
+ /* Must be protected by RTNL.
+  * Must be called with vid in range from 1 to 4094 inclusive.
+  */
+-- 
+1.7.1

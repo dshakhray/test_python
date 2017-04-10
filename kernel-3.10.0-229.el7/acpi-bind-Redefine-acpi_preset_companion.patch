@@ -1,0 +1,179 @@
+From a937332aa1c6f8996b0f333ed82eac44106fdc83 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 19 Sep 2014 12:28:46 -0400
+Subject: [acpi] bind: Redefine acpi_preset_companion()
+
+Message-id: <1411129776-21656-12-git-send-email-prarit@redhat.com>
+Patchwork-id: 96379
+O-Subject: [RHEL7.1 PATCH BZ 1141846 11/61] ACPI / bind: Redefine acpi_preset_companion()
+Bugzilla: 1141846
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1141846
+
+commit 9c5ad36d987a1b06f6b0b9dc7bc61a45d277455d
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Thu Nov 28 23:58:28 2013 +0100
+
+    ACPI / bind: Redefine acpi_preset_companion()
+
+    Modify acpi_preset_companion() to take a struct acpi_device pointer
+    instead of an ACPI handle as its second argument and redefine it as
+    a static inline wrapper around ACPI_COMPANION_SET() passing the
+    return value of acpi_find_child_device() directly as the second
+    argument to it.  Update its users to pass struct acpi_device
+    pointers instead of ACPI handles to it.
+
+    This allows some unnecessary acpi_bus_get_device() calls to be
+    avoided.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Reviewed-by: Aaron Lu <aaron.lu@intel.com>
+    Tested-by: Aaron Lu <aaron.lu@intel.com> # for ATA binding
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+Cc: Stefan Assmann <sassmann@redhat.com>
+Cc: David Milburn <dmilburn@redhat.com>
+Cc: Jeff Garzik <jgarzik@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Cc: Dean Nelson <dnelson@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/glue.c b/drivers/acpi/glue.c
+index 29a3fb1..543c2c5 100644
+--- a/drivers/acpi/glue.c
++++ b/drivers/acpi/glue.c
+@@ -149,6 +149,7 @@ struct acpi_device *acpi_find_child_device(struct acpi_device *parent,
+  }
+  return ret;
+ }
++EXPORT_SYMBOL_GPL(acpi_find_child_device);
+ 
+ acpi_handle acpi_get_child(acpi_handle handle, u64 addr)
+ {
+@@ -294,15 +295,6 @@ int acpi_unbind_one(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(acpi_unbind_one);
+ 
+-void acpi_preset_companion(struct device *dev, acpi_handle parent, u64 addr)
+-{
+- struct acpi_device *adev;
+-
+- if (!acpi_bus_get_device(acpi_get_child(parent, addr), &adev))
+-  ACPI_COMPANION_SET(dev, adev);
+-}
+-EXPORT_SYMBOL_GPL(acpi_preset_companion);
+-
+ static int acpi_platform_notify(struct device *dev)
+ {
+  struct acpi_bus_type *type = acpi_get_bus_type(dev);
+diff --git a/drivers/ata/libata-acpi.c b/drivers/ata/libata-acpi.c
+index 4372cfa..150a641 100644
+--- a/drivers/ata/libata-acpi.c
++++ b/drivers/ata/libata-acpi.c
+@@ -180,12 +180,12 @@ static const struct acpi_dock_ops ata_acpi_ap_dock_ops = {
+ /* bind acpi handle to pata port */
+ void ata_acpi_bind_port(struct ata_port *ap)
+ {
+- acpi_handle host_handle = ACPI_HANDLE(ap->host->dev);
++ struct acpi_device *host_companion = ACPI_COMPANION(ap->host->dev);
+ 
+- if (libata_noacpi || ap->flags & ATA_FLAG_ACPI_SATA || !host_handle)
++ if (libata_noacpi || ap->flags & ATA_FLAG_ACPI_SATA || !host_companion)
+   return;
+ 
+- acpi_preset_companion(&ap->tdev, host_handle, ap->port_no);
++ acpi_preset_companion(&ap->tdev, host_companion, ap->port_no);
+ 
+  if (ata_acpi_gtm(ap, &ap->__acpi_init_gtm) == 0)
+   ap->pflags |= ATA_PFLAG_INIT_GTM_VALID;
+@@ -198,17 +198,17 @@ void ata_acpi_bind_port(struct ata_port *ap)
+ void ata_acpi_bind_dev(struct ata_device *dev)
+ {
+  struct ata_port *ap = dev->link->ap;
+- acpi_handle port_handle = ACPI_HANDLE(&ap->tdev);
+- acpi_handle host_handle = ACPI_HANDLE(ap->host->dev);
+- acpi_handle parent_handle;
++ struct acpi_device *port_companion = ACPI_COMPANION(&ap->tdev);
++ struct acpi_device *host_companion = ACPI_COMPANION(ap->host->dev);
++ struct acpi_device *parent;
+  u64 adr;
+ 
+  /*
+-  * For both sata/pata devices, host handle is required.
+-  * For pata device, port handle is also required.
++  * For both sata/pata devices, host companion device is required.
++  * For pata device, port companion device is also required.
+   */
+- if (libata_noacpi || !host_handle ||
+-   (!(ap->flags & ATA_FLAG_ACPI_SATA) && !port_handle))
++ if (libata_noacpi || !host_companion ||
++   (!(ap->flags & ATA_FLAG_ACPI_SATA) && !port_companion))
+   return;
+ 
+  if (ap->flags & ATA_FLAG_ACPI_SATA) {
+@@ -216,13 +216,13 @@ void ata_acpi_bind_dev(struct ata_device *dev)
+    adr = SATA_ADR(ap->port_no, NO_PORT_MULT);
+   else
+    adr = SATA_ADR(ap->port_no, dev->link->pmp);
+-  parent_handle = host_handle;
++  parent = host_companion;
+  } else {
+   adr = dev->devno;
+-  parent_handle = port_handle;
++  parent = port_companion;
+  }
+ 
+- acpi_preset_companion(&dev->tdev, parent_handle, adr);
++ acpi_preset_companion(&dev->tdev, parent, adr);
+ 
+  register_hotplug_dock_device(ata_dev_acpi_handle(dev),
+          &ata_acpi_dev_dock_ops, dev, NULL, NULL);
+diff --git a/drivers/mmc/core/sdio_bus.c b/drivers/mmc/core/sdio_bus.c
+index 66d914a..e3e897d 100644
+--- a/drivers/mmc/core/sdio_bus.c
++++ b/drivers/mmc/core/sdio_bus.c
+@@ -305,7 +305,7 @@ static void sdio_acpi_set_handle(struct sdio_func *func)
+  struct mmc_host *host = func->card->host;
+  u64 addr = (host->slotno << 16) | func->num;
+ 
+- acpi_preset_companion(&func->dev, ACPI_HANDLE(host->parent), addr);
++ acpi_preset_companion(&func->dev, ACPI_COMPANION(host->parent), addr);
+ }
+ #else
+ static inline void sdio_acpi_set_handle(struct sdio_func *func) {}
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index 3e3d716..a7fada9 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -444,7 +444,6 @@ struct acpi_pci_root {
+ struct acpi_device *acpi_find_child_device(struct acpi_device *parent,
+         u64 address, bool check_children);
+ acpi_handle acpi_get_child(acpi_handle handle, u64 addr);
+-void acpi_preset_companion(struct device *dev, acpi_handle parent, u64 addr);
+ int acpi_is_root_bridge(acpi_handle);
+ struct acpi_pci_root *acpi_pci_find_root(acpi_handle handle);
+ 
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+index dab21a7..3ebc82e 100644
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -53,6 +53,12 @@ static inline acpi_handle acpi_device_handle(struct acpi_device *adev)
+ #define ACPI_COMPANION_SET(dev, adev) ACPI_COMPANION(dev) = (adev)
+ #define ACPI_HANDLE(dev)  acpi_device_handle(ACPI_COMPANION(dev))
+ 
++static inline void acpi_preset_companion(struct device *dev,
++      struct acpi_device *parent, u64 addr)
++{
++ ACPI_COMPANION_SET(dev, acpi_find_child_device(parent, addr, NULL));
++}
++
+ enum acpi_irq_model_id {
+  ACPI_IRQ_MODEL_PIC = 0,
+  ACPI_IRQ_MODEL_IOAPIC,
+-- 
+1.7.1

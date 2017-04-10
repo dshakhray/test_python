@@ -1,0 +1,72 @@
+From 36a43ac6a8a9ca4cb341a2403c5fa6cb679a4ceb Mon Sep 17 00:00:00 2001
+From: Radim Krcmar <rkrcmar@redhat.com>
+Date: Wed, 12 Nov 2014 17:20:44 -0500
+Subject: [virt] kvm: recalculate_apic_map after enabling apic
+
+Message-id: <1415812845-12372-2-git-send-email-rkrcmar@redhat.com>
+Patchwork-id: 99851
+O-Subject: [RHEL7.1 kernel PATCH 1/2] KVM: x86: recalculate_apic_map after enabling apic
+Bugzilla: 1151174
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Andrew Jones <drjones@redhat.com>
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+
+From: Nadav Amit <namit@cs.technion.ac.il>
+
+Currently, recalculate_apic_map ignores vcpus whose lapic is software disabled
+through the spurious interrupt vector. However, once it is re-enabled, the map
+is not recalculated. Therefore, if the guest OS configured DFR while lapic is
+software-disabled, the map may be incorrect. This patch recalculates apic map
+after software enabling the lapic.
+
+Signed-off-by: Nadav Amit <namit@cs.technion.ac.il>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1e1b6c26443547b05925ae4a4494884c92eb7d95)
+Signed-off-by: Radim Krcmar <rkrcmar@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 0069118..089f3f8 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -112,17 +112,6 @@ static inline int __apic_test_and_clear_vector(int vec, void *bitmap)
+ struct static_key_deferred apic_hw_disabled __read_mostly;
+ struct static_key_deferred apic_sw_disabled __read_mostly;
+ 
+-static inline void apic_set_spiv(struct kvm_lapic *apic, u32 val)
+-{
+- if ((kvm_apic_get_reg(apic, APIC_SPIV) ^ val) & APIC_SPIV_APIC_ENABLED) {
+-  if (val & APIC_SPIV_APIC_ENABLED)
+-   static_key_slow_dec_deferred(&apic_sw_disabled);
+-  else
+-   static_key_slow_inc(&apic_sw_disabled.key);
+- }
+- apic_set_reg(apic, APIC_SPIV, val);
+-}
+-
+ static inline int apic_enabled(struct kvm_lapic *apic)
+ {
+  return kvm_apic_sw_enabled(apic) && kvm_apic_hw_enabled(apic);
+@@ -210,6 +199,20 @@ out:
+  kvm_vcpu_request_scan_ioapic(kvm);
+ }
+ 
++static inline void apic_set_spiv(struct kvm_lapic *apic, u32 val)
++{
++ u32 prev = kvm_apic_get_reg(apic, APIC_SPIV);
++
++ apic_set_reg(apic, APIC_SPIV, val);
++ if ((prev ^ val) & APIC_SPIV_APIC_ENABLED) {
++  if (val & APIC_SPIV_APIC_ENABLED) {
++   static_key_slow_dec_deferred(&apic_sw_disabled);
++   recalculate_apic_map(apic->vcpu->kvm);
++  } else
++   static_key_slow_inc(&apic_sw_disabled.key);
++ }
++}
++
+ static inline void kvm_apic_set_id(struct kvm_lapic *apic, u8 id)
+ {
+  apic_set_reg(apic, APIC_ID, id << 24);
+-- 
+1.7.1

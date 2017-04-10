@@ -1,0 +1,179 @@
+From 9639a35f1f61b5fa8c379cede15f24a9f1c1573b Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:15:13 -0400
+Subject: [net] Allow GRO to use and set levels of checksum unnecessary
+
+Message-id: <1409652920-431-51-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90158
+O-Subject: [PATCH 50/57] [RHEL7.1 net] net: Allow GRO to use and set levels of checksum unnecessary
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+commit 662880f4420340aad4f9a62a349c6c9d4faa1a5d
+Author: Tom Herbert <therbert@google.com>
+Date:   Wed Aug 27 21:26:56 2014 -0700
+
+    net: Allow GRO to use and set levels of checksum unnecessary
+
+    Allow GRO path to "consume" checksums provided in CHECKSUM_UNNECESSARY
+    and to report new checksums verfied for use in fallback to normal
+    path.
+
+    Change GRO checksum path to track csum_level using a csum_cnt field
+    in NAPI_GRO_CB. On GRO initialization, if ip_summed is
+    CHECKSUM_UNNECESSARY set NAPI_GRO_CB(skb)->csum_cnt to
+    skb->csum_level + 1. For each checksum verified, decrement
+    NAPI_GRO_CB(skb)->csum_cnt while its greater than zero. If a checksum
+    is verfied and NAPI_GRO_CB(skb)->csum_cnt == 0, we have verified a
+    deeper checksum than originally indicated in skbuf so increment
+    csum_level (or initialize to CHECKSUM_UNNECESSARY if ip_summed is
+    CHECKSUM_NONE or CHECKSUM_COMPLETE).
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 161ed86..21195ad 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1661,8 +1661,8 @@ struct napi_gro_cb {
+  /* GRO checksum is valid */
+  u8 csum_valid:1;
+ 
+- /* Number encapsulation layers crossed */
+- u8 encapsulation;
++ /* Number of checksums via CHECKSUM_UNNECESSARY */
++ u8 csum_cnt:3;
+ 
+  /* used to support CHECKSUM_COMPLETE for tunneling protocols */
+  __wsum csum;
+@@ -1909,8 +1909,7 @@ static inline bool __skb_gro_checksum_validate_needed(struct sk_buff *skb,
+             __sum16 check)
+ {
+  return (skb->ip_summed != CHECKSUM_PARTIAL &&
+-  (skb->ip_summed != CHECKSUM_UNNECESSARY ||
+-   (NAPI_GRO_CB(skb)->encapsulation > skb->encapsulation)) &&
++  NAPI_GRO_CB(skb)->csum_cnt == 0 &&
+   (!zero_okay || check));
+ }
+ 
+@@ -1926,18 +1925,17 @@ static inline __sum16 __skb_gro_checksum_validate_complete(struct sk_buff *skb,
+  return __skb_gro_checksum_complete(skb);
+ }
+ 
+-/* Update skb for CHECKSUM_UNNECESSARY when we verified a top level
+- * checksum or an encapsulated one during GRO. This saves work
+- * if we fallback to normal path with the packet.
+- */
+ static inline void skb_gro_incr_csum_unnecessary(struct sk_buff *skb)
+ {
+- if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
+-  if (NAPI_GRO_CB(skb)->encapsulation)
+-   skb->encapsulation = 1;
+- } else if (skb->ip_summed != CHECKSUM_PARTIAL) {
+-  skb->ip_summed = CHECKSUM_UNNECESSARY;
+-  skb->encapsulation = 0;
++ if (NAPI_GRO_CB(skb)->csum_cnt > 0) {
++  /* Consume a checksum from CHECKSUM_UNNECESSARY */
++  NAPI_GRO_CB(skb)->csum_cnt--;
++ } else {
++  /* Update skb for CHECKSUM_UNNECESSARY and csum_level when we
++   * verified a new top level checksum or an encapsulated one
++   * during GRO. This saves work if we fallback to normal path.
++   */
++  __skb_incr_checksum_unnecessary(skb);
+  }
+ }
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 2071641..aa616cf 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3788,13 +3788,6 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff
+ 
+  gro_list_prepare(napi, skb);
+ 
+- if (skb->ip_summed == CHECKSUM_COMPLETE) {
+-  NAPI_GRO_CB(skb)->csum = skb->csum;
+-  NAPI_GRO_CB(skb)->csum_valid = 1;
+- } else {
+-  NAPI_GRO_CB(skb)->csum_valid = 0;
+- }
+-
+  rcu_read_lock();
+  list_for_each_entry_rcu(ptype, head, list) {
+   if (ptype->type != type || !ptype->callbacks.gro_receive)
+@@ -3806,7 +3799,22 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff
+   NAPI_GRO_CB(skb)->flush = 0;
+   NAPI_GRO_CB(skb)->free = 0;
+   NAPI_GRO_CB(skb)->udp_mark = 0;
+-  NAPI_GRO_CB(skb)->encapsulation = 0;
++
++  /* Setup for GRO checksum validation */
++  switch (skb->ip_summed) {
++  case CHECKSUM_COMPLETE:
++   NAPI_GRO_CB(skb)->csum = skb->csum;
++   NAPI_GRO_CB(skb)->csum_valid = 1;
++   NAPI_GRO_CB(skb)->csum_cnt = 0;
++   break;
++  case CHECKSUM_UNNECESSARY:
++   NAPI_GRO_CB(skb)->csum_cnt = skb->csum_level + 1;
++   NAPI_GRO_CB(skb)->csum_valid = 0;
++   break;
++  default:
++   NAPI_GRO_CB(skb)->csum_cnt = 0;
++   NAPI_GRO_CB(skb)->csum_valid = 0;
++  }
+ 
+   pp = ptype->callbacks.gro_receive(&napi->gro_list, skb);
+   break;
+diff --git a/net/ipv4/gre_offload.c b/net/ipv4/gre_offload.c
+index b1dd73d..f4e4eec 100644
+--- a/net/ipv4/gre_offload.c
++++ b/net/ipv4/gre_offload.c
+@@ -172,12 +172,9 @@ static struct sk_buff **gre_gro_receive(struct sk_buff **head,
+  }
+ 
+  /* Don't bother verifying checksum if we're going to flush anyway. */
+- if (greh->flags & GRE_CSUM) {
+-  if (!NAPI_GRO_CB(skb)->flush &&
+-      skb_gro_checksum_simple_validate(skb))
++ if ((greh->flags & GRE_CSUM) && !NAPI_GRO_CB(skb)->flush &&
++     skb_gro_checksum_simple_validate(skb))
+    goto out_unlock;
+-  NAPI_GRO_CB(skb)->encapsulation++;
+- }
+ 
+  flush = 0;
+ 
+diff --git a/net/ipv4/udp_offload.c b/net/ipv4/udp_offload.c
+index 1d2f12f..689dc82 100644
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -162,12 +162,13 @@ struct sk_buff **udp_gro_receive(struct sk_buff **head, struct sk_buff *skb,
+  int flush = 1;
+ 
+  if (NAPI_GRO_CB(skb)->udp_mark ||
+-     (!skb->encapsulation && !NAPI_GRO_CB(skb)->csum_valid))
++     (skb->ip_summed != CHECKSUM_PARTIAL &&
++      NAPI_GRO_CB(skb)->csum_cnt == 0 &&
++      !NAPI_GRO_CB(skb)->csum_valid))
+   goto out;
+ 
+  /* mark that this skb passed once through the udp gro layer */
+  NAPI_GRO_CB(skb)->udp_mark = 1;
+- NAPI_GRO_CB(skb)->encapsulation++;
+ 
+  rcu_read_lock();
+  uo_priv = rcu_dereference(udp_offload_base);
+-- 
+1.7.1

@@ -1,0 +1,62 @@
+From 54ffbb365d824c7b3a34293da401be989eb73b30 Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:25:24 -0400
+Subject: [md] raid5: Retry R5_ReadNoMerge flag when hit a read error
+
+Message-id: <1409563584-9000-23-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 89983
+O-Subject: [RHEL7.1 PATCH 22/82] raid5: Retry R5_ReadNoMerge flag when hit a read error.
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: Bian Yu <bianyu@kedacom.com>
+
+Because of block layer merge, one bio fails will cause other bios
+which belongs to the same request fails, so raid5_end_read_request
+will record all these bios as badblocks.
+If retry request with R5_ReadNoMerge flag to avoid bios merge,
+badblocks can only record sector which is bad exactly.
+
+test:
+hdparm --yes-i-know-what-i-am-doing --make-bad-sector 300000 /dev/sdb
+mdadm -C /dev/md0 -l5 -n3 /dev/sd[bcd] --assume-clean
+mdadm /dev/md0 -f /dev/sdd
+mdadm /dev/md0 -r /dev/sdd
+mdadm --zero-superblock /dev/sdd
+mdadm /dev/md0 -a /dev/sdd
+
+1. Without this patch:
+cat /sys/block/md0/md/rd*/bad_blocks
+299776 256
+299776 256
+
+2. With this patch:
+cat /sys/block/md0/md/rd*/bad_blocks
+300000 8
+300000 8
+
+Signed-off-by: Bian Yu <bianyu@kedacom.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit edfa1f651e93261eecb034d02284ece103dd691a)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 5606cef..21b97ee 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -2042,6 +2042,9 @@ static void raid5_end_read_request(struct bio * bi, int error)
+           mdname(conf->mddev), bdn);
+   else
+    retry = 1;
++  if (set_bad && test_bit(In_sync, &rdev->flags)
++      && !test_bit(R5_ReadNoMerge, &sh->dev[i].flags))
++   retry = 1;
+   if (retry)
+    if (test_bit(R5_ReadNoMerge, &sh->dev[i].flags)) {
+     set_bit(R5_ReadError, &sh->dev[i].flags);
+-- 
+1.7.1

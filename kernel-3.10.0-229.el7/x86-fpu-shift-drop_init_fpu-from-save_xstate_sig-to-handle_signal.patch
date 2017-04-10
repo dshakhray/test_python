@@ -1,0 +1,129 @@
+From 837835030503999f4f0208682d418e1596b4a777 Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Wed, 15 Oct 2014 16:57:18 -0400
+Subject: [x86] fpu: shift drop_init_fpu() from save_xstate_sig() to handle_signal()
+
+Message-id: <20141015165718.GA29829@redhat.com>
+Patchwork-id: 97577
+O-Subject: [PATCH RHEL7 BZ 1121784 1/2] x86, fpu: shift drop_init_fpu() from save_xstate_sig() to handle_signal()
+Bugzilla: 1121784
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+RHBZ: 1121784
+
+Upstream commit 7604790e2a7c7936de115e268d1c1219c42f07e9
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Tue Sep 2 19:57:13 2014 +0200
+
+save_xstate_sig()->drop_init_fpu() doesn't look right. setup_rt_frame()
+can fail after that, in this case the next setup_rt_frame() triggered
+by SIGSEGV won't save fpu simply because the old state was lost. This
+obviously mean that fpu won't be restored after sys_rt_sigreturn() from
+SIGSEGV handler.
+
+Shift drop_init_fpu() into !failed branch in handle_signal().
+
+Test-case (needs -O2):
+
+ #include <stdio.h>
+ #include <signal.h>
+ #include <unistd.h>
+ #include <sys/syscall.h>
+ #include <sys/mman.h>
+ #include <pthread.h>
+ #include <assert.h>
+
+ volatile double D;
+
+ void test(double d)
+ {
+  int pid = getpid();
+
+  for (D = d; D == d; ) {
+   /* sys_tkill(pid, SIGHUP); asm to avoid save/reload
+    * fp regs around "C" call */
+   asm ("" : : "a"(200), "D"(pid), "S"(1));
+   asm ("syscall" : : : "ax");
+  }
+
+  printf("ERR!!\n");
+ }
+
+ void sigh(int sig)
+ {
+ }
+
+ char altstack[4096 * 10] __attribute__((aligned(4096)));
+
+ void *tfunc(void *arg)
+ {
+  for (;;) {
+   mprotect(altstack, sizeof(altstack), PROT_READ);
+   mprotect(altstack, sizeof(altstack), PROT_READ|PROT_WRITE);
+  }
+ }
+
+ int main(void)
+ {
+  stack_t st = {
+   .ss_sp = altstack,
+   .ss_size = sizeof(altstack),
+   .ss_flags = SS_ONSTACK,
+  };
+
+  struct sigaction sa = {
+   .sa_handler = sigh,
+  };
+
+  pthread_t pt;
+
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaltstack(&st, NULL);
+  sa.sa_flags = SA_ONSTACK;
+  sigaction(SIGHUP, &sa, NULL);
+
+  pthread_create(&pt, NULL, tfunc, NULL);
+
+  test(123.456);
+  return 0;
+ }
+
+Reported-by: Bean Anderson <bean@azulsystems.com>
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Link: http://lkml.kernel.org/r/20140902175713.GA21646@redhat.com
+Cc: <stable@kernel.org> # v3.7+
+Signed-off-by: H. Peter Anvin <hpa@linux.intel.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/signal.c b/arch/x86/kernel/signal.c
+index d859eea..e74ab49 100644
+--- a/arch/x86/kernel/signal.c
++++ b/arch/x86/kernel/signal.c
+@@ -673,6 +673,11 @@ handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+    * handler too.
+    */
+   regs->flags &= ~(X86_EFLAGS_DF|X86_EFLAGS_RF|X86_EFLAGS_TF);
++  /*
++   * Ensure the signal handler starts with the new fpu state.
++   */
++  if (used_math())
++   drop_init_fpu(current);
+  }
+  signal_setup_done(failed, ksig, test_thread_flag(TIF_SINGLESTEP));
+ }
+diff --git a/arch/x86/kernel/xsave.c b/arch/x86/kernel/xsave.c
+index 64bfa44..3a1acc9 100644
+--- a/arch/x86/kernel/xsave.c
++++ b/arch/x86/kernel/xsave.c
+@@ -268,8 +268,6 @@ int save_xstate_sig(void __user *buf, void __user *buf_fx, int size)
+  if (use_fxsr() && save_xstate_epilog(buf_fx, ia32_fxstate))
+   return -1;
+ 
+- drop_init_fpu(tsk); /* trigger finit */
+-
+  return 0;
+ }
+ 
+-- 
+1.7.1

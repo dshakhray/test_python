@@ -1,0 +1,384 @@
+From 2dcf9ba9a3a99df0c9904d8cdc6e88ed1d235b06 Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:13:12 -0400
+Subject: [virt] kvm/ppc: book3s/pr - Handle Facility interrupt and FSCR
+
+Message-id: <1410765214-16377-57-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94768
+O-Subject: [PATCH 56/78] KVM: PPC: Book3S PR: Handle Facility interrupt and FSCR
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit 616dff86028298dbc91174fb3d12b8ed8cd74955
+Author: Alexander Graf <agraf@suse.de>
+Date:   Tue Apr 29 16:48:44 2014 +0200
+
+    KVM: PPC: Book3S PR: Handle Facility interrupt and FSCR
+
+    POWER8 introduced a new interrupt type called "Facility unavailable interrupt"
+    which contains its status message in a new register called FSCR.
+
+    Handle these exits and try to emulate instructions for unhandled facilities.
+    Follow-on patches enable KVM to expose specific facilities into the guest.
+
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_asm.h b/arch/powerpc/include/asm/kvm_asm.h
+index 8337c33..c1c5e85 100644
+--- a/arch/powerpc/include/asm/kvm_asm.h
++++ b/arch/powerpc/include/asm/kvm_asm.h
+@@ -101,6 +101,7 @@
+ #define BOOK3S_INTERRUPT_PERFMON 0xf00
+ #define BOOK3S_INTERRUPT_ALTIVEC 0xf20
+ #define BOOK3S_INTERRUPT_VSX  0xf40
++#define BOOK3S_INTERRUPT_FAC_UNAVAIL 0xf60
+ #define BOOK3S_INTERRUPT_H_FAC_UNAVAIL 0xf80
+ 
+ #define BOOK3S_IRQPRIO_SYSTEM_RESET  0
+@@ -113,14 +114,15 @@
+ #define BOOK3S_IRQPRIO_FP_UNAVAIL  7
+ #define BOOK3S_IRQPRIO_ALTIVEC   8
+ #define BOOK3S_IRQPRIO_VSX   9
+-#define BOOK3S_IRQPRIO_SYSCALL   10
+-#define BOOK3S_IRQPRIO_MACHINE_CHECK  11
+-#define BOOK3S_IRQPRIO_DEBUG   12
+-#define BOOK3S_IRQPRIO_EXTERNAL   13
+-#define BOOK3S_IRQPRIO_DECREMENTER  14
+-#define BOOK3S_IRQPRIO_PERFORMANCE_MONITOR 15
+-#define BOOK3S_IRQPRIO_EXTERNAL_LEVEL  16
+-#define BOOK3S_IRQPRIO_MAX   17
++#define BOOK3S_IRQPRIO_FAC_UNAVAIL  10
++#define BOOK3S_IRQPRIO_SYSCALL   11
++#define BOOK3S_IRQPRIO_MACHINE_CHECK  12
++#define BOOK3S_IRQPRIO_DEBUG   13
++#define BOOK3S_IRQPRIO_EXTERNAL   14
++#define BOOK3S_IRQPRIO_DECREMENTER  15
++#define BOOK3S_IRQPRIO_PERFORMANCE_MONITOR 16
++#define BOOK3S_IRQPRIO_EXTERNAL_LEVEL  17
++#define BOOK3S_IRQPRIO_MAX   18
+ 
+ #define BOOK3S_HFLAG_DCBZ32   0x1
+ #define BOOK3S_HFLAG_SLB   0x2
+diff --git a/arch/powerpc/include/asm/kvm_book3s_asm.h b/arch/powerpc/include/asm/kvm_book3s_asm.h
+index 821725c..5bdfb5d 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_asm.h
++++ b/arch/powerpc/include/asm/kvm_book3s_asm.h
+@@ -104,6 +104,7 @@ struct kvmppc_host_state {
+ #ifdef CONFIG_PPC_BOOK3S_64
+  u64 cfar;
+  u64 ppr;
++ u64 host_fscr;
+ #endif
+ };
+ 
+@@ -133,6 +134,7 @@ struct kvmppc_book3s_shadow_vcpu {
+   u64     esid;
+   u64     vsid;
+  } slb[64];   /* guest SLB */
++ u64 shadow_fscr;
+ #endif
+ };
+ 
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index c3b4871..b957575 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -491,6 +491,7 @@ struct kvm_vcpu_arch {
+  ulong ppr;
+  ulong pspb;
+  ulong fscr;
++ ulong shadow_fscr;
+  ulong ebbhr;
+  ulong ebbrr;
+  ulong bescr;
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 71ef537..5bb4ff1 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -530,6 +530,7 @@ int main(void)
+  DEFINE(VCPU_CFAR, offsetof(struct kvm_vcpu, arch.cfar));
+  DEFINE(VCPU_PPR, offsetof(struct kvm_vcpu, arch.ppr));
+  DEFINE(VCPU_FSCR, offsetof(struct kvm_vcpu, arch.fscr));
++ DEFINE(VCPU_SHADOW_FSCR, offsetof(struct kvm_vcpu, arch.shadow_fscr));
+  DEFINE(VCPU_PSPB, offsetof(struct kvm_vcpu, arch.pspb));
+  DEFINE(VCPU_EBBHR, offsetof(struct kvm_vcpu, arch.ebbhr));
+  DEFINE(VCPU_EBBRR, offsetof(struct kvm_vcpu, arch.ebbrr));
+@@ -611,6 +612,7 @@ int main(void)
+ #ifdef CONFIG_PPC64
+  SVCPU_FIELD(SVCPU_SLB, slb);
+  SVCPU_FIELD(SVCPU_SLB_MAX, slb_max);
++ SVCPU_FIELD(SVCPU_SHADOW_FSCR, shadow_fscr);
+ #endif
+ 
+  HSTATE_FIELD(HSTATE_HOST_R1, host_r1);
+@@ -646,6 +648,7 @@ int main(void)
+ #ifdef CONFIG_PPC_BOOK3S_64
+  HSTATE_FIELD(HSTATE_CFAR, cfar);
+  HSTATE_FIELD(HSTATE_PPR, ppr);
++ HSTATE_FIELD(HSTATE_HOST_FSCR, host_fscr);
+ #endif /* CONFIG_PPC_BOOK3S_64 */
+ 
+ #else /* CONFIG_PPC_BOOK3S */
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index 2ccd2f0..dfe4dd2 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -145,6 +145,7 @@ static int kvmppc_book3s_vec2irqprio(unsigned int vec)
+  case 0xd00: prio = BOOK3S_IRQPRIO_DEBUG;  break;
+  case 0xf20: prio = BOOK3S_IRQPRIO_ALTIVEC;  break;
+  case 0xf40: prio = BOOK3S_IRQPRIO_VSX;   break;
++ case 0xf60: prio = BOOK3S_IRQPRIO_FAC_UNAVAIL;  break;
+  default:    prio = BOOK3S_IRQPRIO_MAX;   break;
+  }
+ 
+@@ -275,6 +276,9 @@ int kvmppc_book3s_irqprio_deliver(struct kvm_vcpu *vcpu, unsigned int priority)
+  case BOOK3S_IRQPRIO_PERFORMANCE_MONITOR:
+   vec = BOOK3S_INTERRUPT_PERFMON;
+   break;
++ case BOOK3S_IRQPRIO_FAC_UNAVAIL:
++  vec = BOOK3S_INTERRUPT_FAC_UNAVAIL;
++  break;
+  default:
+   deliver = 0;
+   printk(KERN_ERR "KVM: Unknown interrupt: 0x%x\n", priority);
+@@ -627,6 +631,9 @@ int kvm_vcpu_ioctl_get_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+    val = get_reg_val(reg->id, kvmppc_xics_get_icp(vcpu));
+    break;
+ #endif /* CONFIG_KVM_XICS */
++  case KVM_REG_PPC_FSCR:
++   val = get_reg_val(reg->id, vcpu->arch.fscr);
++   break;
+   default:
+    r = -EINVAL;
+    break;
+@@ -716,6 +723,9 @@ int kvm_vcpu_ioctl_set_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
+       set_reg_val(reg->id, val));
+    break;
+ #endif /* CONFIG_KVM_XICS */
++  case KVM_REG_PPC_FSCR:
++   vcpu->arch.fscr = set_reg_val(reg->id, val);
++   break;
+   default:
+    r = -EINVAL;
+    break;
+diff --git a/arch/powerpc/kvm/book3s_emulate.c b/arch/powerpc/kvm/book3s_emulate.c
+index 0a1de29..e8133e5 100644
+--- a/arch/powerpc/kvm/book3s_emulate.c
++++ b/arch/powerpc/kvm/book3s_emulate.c
+@@ -438,6 +438,9 @@ int kvmppc_core_emulate_mtspr_pr(struct kvm_vcpu *vcpu, int sprn, ulong spr_val)
+  case SPRN_GQR7:
+   to_book3s(vcpu)->gqr[sprn - SPRN_GQR0] = spr_val;
+   break;
++ case SPRN_FSCR:
++  vcpu->arch.fscr = spr_val;
++  break;
+  case SPRN_ICTC:
+  case SPRN_THRM1:
+  case SPRN_THRM2:
+@@ -545,6 +548,9 @@ int kvmppc_core_emulate_mfspr_pr(struct kvm_vcpu *vcpu, int sprn, ulong *spr_val
+  case SPRN_GQR7:
+   *spr_val = to_book3s(vcpu)->gqr[sprn - SPRN_GQR0];
+   break;
++ case SPRN_FSCR:
++  *spr_val = vcpu->arch.fscr;
++  break;
+  case SPRN_THRM1:
+  case SPRN_THRM2:
+  case SPRN_THRM3:
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index e620660..8ba468f 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -957,9 +957,6 @@ static int kvmppc_get_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+  case KVM_REG_PPC_IAMR:
+   *val = get_reg_val(id, vcpu->arch.iamr);
+   break;
+- case KVM_REG_PPC_FSCR:
+-  *val = get_reg_val(id, vcpu->arch.fscr);
+-  break;
+  case KVM_REG_PPC_PSPB:
+   *val = get_reg_val(id, vcpu->arch.pspb);
+   break;
+@@ -1169,9 +1166,6 @@ static int kvmppc_set_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+  case KVM_REG_PPC_IAMR:
+   vcpu->arch.iamr = set_reg_val(id, *val);
+   break;
+- case KVM_REG_PPC_FSCR:
+-  vcpu->arch.fscr = set_reg_val(id, *val);
+-  break;
+  case KVM_REG_PPC_PSPB:
+   vcpu->arch.pspb = set_reg_val(id, *val);
+   break;
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 28ab0fe..6f48479 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -53,6 +53,7 @@
+ 
+ static int kvmppc_handle_ext(struct kvm_vcpu *vcpu, unsigned int exit_nr,
+         ulong msr);
++static void kvmppc_giveup_fac(struct kvm_vcpu *vcpu, ulong fac);
+ 
+ /* Some compatibility defines */
+ #ifdef CONFIG_PPC_BOOK3S_32
+@@ -115,6 +116,9 @@ void kvmppc_copy_to_svcpu(struct kvmppc_book3s_shadow_vcpu *svcpu,
+  svcpu->ctr = vcpu->arch.ctr;
+  svcpu->lr  = vcpu->arch.lr;
+  svcpu->pc  = vcpu->arch.pc;
++#ifdef CONFIG_PPC_BOOK3S_64
++ svcpu->shadow_fscr = vcpu->arch.shadow_fscr;
++#endif
+  svcpu->in_use = true;
+ }
+ 
+@@ -158,6 +162,9 @@ void kvmppc_copy_from_svcpu(struct kvm_vcpu *vcpu,
+  vcpu->arch.fault_dar   = svcpu->fault_dar;
+  vcpu->arch.fault_dsisr = svcpu->fault_dsisr;
+  vcpu->arch.last_inst   = svcpu->last_inst;
++#ifdef CONFIG_PPC_BOOK3S_64
++ vcpu->arch.shadow_fscr = svcpu->shadow_fscr;
++#endif
+  svcpu->in_use = false;
+ 
+ out:
+@@ -610,6 +617,17 @@ void kvmppc_giveup_ext(struct kvm_vcpu *vcpu, ulong msr)
+  kvmppc_recalc_shadow_msr(vcpu);
+ }
+ 
++/* Give up facility (TAR / EBB / DSCR) */
++static void kvmppc_giveup_fac(struct kvm_vcpu *vcpu, ulong fac)
++{
++#ifdef CONFIG_PPC_BOOK3S_64
++ if (!(vcpu->arch.shadow_fscr & (1ULL << fac))) {
++  /* Facility not available to the guest, ignore giveup request*/
++  return;
++ }
++#endif
++}
++
+ static int kvmppc_read_inst(struct kvm_vcpu *vcpu)
+ {
+  ulong srr0 = kvmppc_get_pc(vcpu);
+@@ -741,6 +759,50 @@ static void kvmppc_handle_lost_ext(struct kvm_vcpu *vcpu)
+  current->thread.regs->msr |= lost_ext;
+ }
+ 
++#ifdef CONFIG_PPC_BOOK3S_64
++
++static void kvmppc_trigger_fac_interrupt(struct kvm_vcpu *vcpu, ulong fac)
++{
++ /* Inject the Interrupt Cause field and trigger a guest interrupt */
++ vcpu->arch.fscr &= ~(0xffULL << 56);
++ vcpu->arch.fscr |= (fac << 56);
++ kvmppc_book3s_queue_irqprio(vcpu, BOOK3S_INTERRUPT_FAC_UNAVAIL);
++}
++
++static void kvmppc_emulate_fac(struct kvm_vcpu *vcpu, ulong fac)
++{
++ enum emulation_result er = EMULATE_FAIL;
++
++ if (!(kvmppc_get_msr(vcpu) & MSR_PR))
++  er = kvmppc_emulate_instruction(vcpu->run, vcpu);
++
++ if ((er != EMULATE_DONE) && (er != EMULATE_AGAIN)) {
++  /* Couldn't emulate, trigger interrupt in guest */
++  kvmppc_trigger_fac_interrupt(vcpu, fac);
++ }
++}
++
++/* Enable facilities (TAR, EBB, DSCR) for the guest */
++static int kvmppc_handle_fac(struct kvm_vcpu *vcpu, ulong fac)
++{
++ BUG_ON(!cpu_has_feature(CPU_FTR_ARCH_207S));
++
++ if (!(vcpu->arch.fscr & (1ULL << fac))) {
++  /* Facility not enabled by the guest */
++  kvmppc_trigger_fac_interrupt(vcpu, fac);
++  return RESUME_GUEST;
++ }
++
++ switch (fac) {
++ default:
++  kvmppc_emulate_fac(vcpu, fac);
++  break;
++ }
++
++ return RESUME_GUEST;
++}
++#endif
++
+ int kvmppc_handle_exit_pr(struct kvm_run *run, struct kvm_vcpu *vcpu,
+      unsigned int exit_nr)
+ {
+@@ -1015,6 +1077,12 @@ program_interrupt:
+   }
+   r = RESUME_GUEST;
+   break;
++#ifdef CONFIG_PPC_BOOK3S_64
++ case BOOK3S_INTERRUPT_FAC_UNAVAIL:
++  kvmppc_handle_fac(vcpu, vcpu->arch.shadow_fscr >> 56);
++  r = RESUME_GUEST;
++  break;
++#endif
+  case BOOK3S_INTERRUPT_MACHINE_CHECK:
+  case BOOK3S_INTERRUPT_TRACE:
+   kvmppc_book3s_queue_irqprio(vcpu, exit_nr);
+diff --git a/arch/powerpc/kvm/book3s_segment.S b/arch/powerpc/kvm/book3s_segment.S
+index 1e0cc2a..acee37c 100644
+--- a/arch/powerpc/kvm/book3s_segment.S
++++ b/arch/powerpc/kvm/book3s_segment.S
+@@ -90,6 +90,15 @@ kvmppc_handler_trampoline_enter:
+  LOAD_GUEST_SEGMENTS
+ 
+ #ifdef CONFIG_PPC_BOOK3S_64
++BEGIN_FTR_SECTION
++ /* Save host FSCR */
++ mfspr r8, SPRN_FSCR
++ std r8, HSTATE_HOST_FSCR(r13)
++ /* Set FSCR during guest execution */
++ ld r9, SVCPU_SHADOW_FSCR(r13)
++ mtspr SPRN_FSCR, r9
++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
++
+  /* Some guests may need to have dcbz set to 32 byte length.
+   *
+   * Usually we ensure that by patching the guest's instructions
+@@ -255,6 +264,10 @@ BEGIN_FTR_SECTION
+  cmpwi r12, BOOK3S_INTERRUPT_H_EMUL_ASSIST
+  beq- ld_last_inst
+ END_FTR_SECTION_IFSET(CPU_FTR_HVMODE)
++BEGIN_FTR_SECTION
++ cmpwi r12, BOOK3S_INTERRUPT_FAC_UNAVAIL
++ beq- ld_last_inst
++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ #endif
+ 
+  b no_ld_last_inst
+@@ -311,6 +324,18 @@ no_ld_last_inst:
+ 
+ no_dcbz32_off:
+ 
++BEGIN_FTR_SECTION
++ /* Save guest FSCR on a FAC_UNAVAIL interrupt */
++ cmpwi r12, BOOK3S_INTERRUPT_FAC_UNAVAIL
++ bne+ no_fscr_save
++ mfspr r7, SPRN_FSCR
++ std r7, SVCPU_SHADOW_FSCR(r13)
++no_fscr_save:
++ /* Restore host FSCR */
++ ld r8, HSTATE_HOST_FSCR(r13)
++ mtspr SPRN_FSCR, r8
++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
++
+ #endif /* CONFIG_PPC_BOOK3S_64 */
+ 
+  /*
+-- 
+1.7.1

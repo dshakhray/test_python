@@ -1,0 +1,150 @@
+From aa016da222bb16ae2c69fa24343306a955a7f215 Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:06:54 -0400
+Subject: [ethernet] qlcnic: Pre-allocate DMA buffer used for minidump collection
+
+Message-id: <1408626422-3941-131-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88625
+O-Subject: [PATCH RHEL 7.1 130/138] qlcnic: Pre-allocate DMA buffer used for minidump collection
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Shahed Shaikh <shahed.shaikh@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id 4da005cf1e30897520106114a8ce11a5aa558497
+
+Pre-allocate the physically contiguous DMA buffer used for
+minidump collection at driver load time, rather than at
+run time, to minimize allocation failures. Driver will allocate
+the buffer at load time if PEX DMA support capability is indicated
+by the adapter.
+
+Signed-off-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+index 69fced1..c2eea2a 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+@@ -441,6 +441,8 @@ struct qlcnic_82xx_dump_template_hdr {
+  u32 rsvd1[0];
+ };
+ 
++#define QLC_PEX_DMA_READ_SIZE (PAGE_SIZE * 16)
++
+ struct qlcnic_fw_dump {
+  u8 clr; /* flag to indicate if dump is cleared */
+  bool enable; /* enable/disable dump */
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index 85b1911..95cfeba 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -2084,12 +2084,20 @@ err_out:
+ 
+ static void qlcnic_free_adapter_resources(struct qlcnic_adapter *adapter)
+ {
++ struct qlcnic_fw_dump *fw_dump = &adapter->ahw->fw_dump;
++
+  kfree(adapter->recv_ctx);
+  adapter->recv_ctx = NULL;
+ 
+- if (adapter->ahw->fw_dump.tmpl_hdr) {
+-  vfree(adapter->ahw->fw_dump.tmpl_hdr);
+-  adapter->ahw->fw_dump.tmpl_hdr = NULL;
++ if (fw_dump->tmpl_hdr) {
++  vfree(fw_dump->tmpl_hdr);
++  fw_dump->tmpl_hdr = NULL;
++ }
++
++ if (fw_dump->dma_buffer) {
++  dma_free_coherent(&adapter->pdev->dev, QLC_PEX_DMA_READ_SIZE,
++      fw_dump->dma_buffer, fw_dump->phys_addr);
++  fw_dump->dma_buffer = NULL;
+  }
+ 
+  kfree(adapter->ahw->reset.buff);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_minidump.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_minidump.c
+index f7694da..e46fc39 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_minidump.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_minidump.c
+@@ -660,8 +660,6 @@ out:
+ #define QLC_DMA_CMD_BUFF_ADDR_HI 4
+ #define QLC_DMA_CMD_STATUS_CTRL  8
+ 
+-#define QLC_PEX_DMA_READ_SIZE  (PAGE_SIZE * 16)
+-
+ static int qlcnic_start_pex_dma(struct qlcnic_adapter *adapter,
+     struct __mem *mem)
+ {
+@@ -1155,6 +1153,7 @@ int qlcnic_fw_cmd_get_minidump_temp(struct qlcnic_adapter *adapter)
+  u32 version, csum, *tmp_buf;
+  u8 use_flash_temp = 0;
+  u32 temp_size = 0;
++ void *temp_buffer;
+  int err;
+ 
+  ahw = adapter->ahw;
+@@ -1204,6 +1203,19 @@ flash_temp:
+ 
+  qlcnic_cache_tmpl_hdr_values(adapter, fw_dump);
+ 
++ if (fw_dump->use_pex_dma) {
++  fw_dump->dma_buffer = NULL;
++  temp_buffer = dma_alloc_coherent(&adapter->pdev->dev,
++       QLC_PEX_DMA_READ_SIZE,
++       &fw_dump->phys_addr,
++       GFP_KERNEL);
++  if (!temp_buffer)
++   fw_dump->use_pex_dma = false;
++  else
++   fw_dump->dma_buffer = temp_buffer;
++ }
++
++
+  dev_info(&adapter->pdev->dev,
+    "Default minidump capture mask 0x%x\n",
+    fw_dump->cap_mask);
+@@ -1223,7 +1235,7 @@ int qlcnic_dump_fw(struct qlcnic_adapter *adapter)
+  struct device *dev = &adapter->pdev->dev;
+  struct qlcnic_hardware_context *ahw;
+  struct qlcnic_dump_entry *entry;
+- void *temp_buffer, *tmpl_hdr;
++ void *tmpl_hdr;
+  u32 ocm_window;
+  __le32 *buffer;
+  char mesg[64];
+@@ -1267,16 +1279,6 @@ int qlcnic_dump_fw(struct qlcnic_adapter *adapter)
+  qlcnic_set_sys_info(adapter, tmpl_hdr, 0, QLCNIC_DRIVER_VERSION);
+  qlcnic_set_sys_info(adapter, tmpl_hdr, 1, adapter->fw_version);
+ 
+- if (fw_dump->use_pex_dma) {
+-  temp_buffer = dma_alloc_coherent(dev, QLC_PEX_DMA_READ_SIZE,
+-       &fw_dump->phys_addr,
+-       GFP_KERNEL);
+-  if (!temp_buffer)
+-   fw_dump->use_pex_dma = false;
+-  else
+-   fw_dump->dma_buffer = temp_buffer;
+- }
+-
+  if (qlcnic_82xx_check(adapter)) {
+   ops_cnt = ARRAY_SIZE(qlcnic_fw_dump_ops);
+   fw_dump_ops = qlcnic_fw_dump_ops;
+@@ -1334,10 +1336,6 @@ int qlcnic_dump_fw(struct qlcnic_adapter *adapter)
+  /* Send a udev event to notify availability of FW dump */
+  kobject_uevent_env(&dev->kobj, KOBJ_CHANGE, msg);
+ 
+- if (fw_dump->use_pex_dma)
+-  dma_free_coherent(dev, QLC_PEX_DMA_READ_SIZE,
+-      fw_dump->dma_buffer, fw_dump->phys_addr);
+-
+  return 0;
+ }
+ 
+-- 
+1.7.1

@@ -1,0 +1,203 @@
+From cfc7790e7f40a0b039b10d5610c8f3b1151dac67 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:52:42 -0400
+Subject: [fs] jbd2: cleanup needed free block estimates when starting a transaction
+
+Message-id: <1414058125-4183-9-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98119
+O-Subject: [RHEL 7.1 PATCH v2 008/171] jbd2: cleanup needed free block estimates when starting a transaction
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Jan Kara <jack@suse.cz>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit 76c39904561004ac8675f858a290129e439d5168
+
+ __jbd2_log_space_left() and jbd_space_needed() were kind of odd.
+ jbd_space_needed() accounted also credits needed for currently
+ committing transaction while it didn't account for credits needed for
+ control blocks.  __jbd2_log_space_left() then accounted for control
+ blocks as a fraction of free space.  Since results of these two
+ functions are always only compared against each other, this works
+ correct but is somewhat strange.  Move the estimates so that
+ jbd_space_needed() returns number of blocks needed for a transaction
+ including control blocks and __jbd2_log_space_left() returns free
+ space in the journal (with the committing transaction already
+ subtracted).  Rename functions to jbd2_log_space_left() and
+ jbd2_space_needed() while we are changing them.
+
+ Reviewed-by: Zheng Liu <wenqing.lz@taobao.com>
+ Signed-off-by: Jan Kara <jack@suse.cz>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/jbd2/checkpoint.c b/fs/jbd2/checkpoint.c
+index 23d3d64..7f34f47 100644
+--- a/fs/jbd2/checkpoint.c
++++ b/fs/jbd2/checkpoint.c
+@@ -120,8 +120,8 @@ void __jbd2_log_wait_for_space(journal_t *journal)
+  int nblocks, space_left;
+  /* assert_spin_locked(&journal->j_state_lock); */
+ 
+- nblocks = jbd_space_needed(journal);
+- while (__jbd2_log_space_left(journal) < nblocks) {
++ nblocks = jbd2_space_needed(journal);
++ while (jbd2_log_space_left(journal) < nblocks) {
+   if (journal->j_flags & JBD2_ABORT)
+    return;
+   write_unlock(&journal->j_state_lock);
+@@ -140,8 +140,8 @@ void __jbd2_log_wait_for_space(journal_t *journal)
+    */
+   write_lock(&journal->j_state_lock);
+   spin_lock(&journal->j_list_lock);
+-  nblocks = jbd_space_needed(journal);
+-  space_left = __jbd2_log_space_left(journal);
++  nblocks = jbd2_space_needed(journal);
++  space_left = jbd2_log_space_left(journal);
+   if (space_left < nblocks) {
+    int chkpt = journal->j_checkpoint_transactions != NULL;
+    tid_t tid = 0;
+diff --git a/fs/jbd2/journal.c b/fs/jbd2/journal.c
+index 926b7ff..7fd74b6 100644
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@ -478,35 +478,6 @@ repeat:
+  */
+ 
+ /*
+- * __jbd2_log_space_left: Return the number of free blocks left in the journal.
+- *
+- * Called with the journal already locked.
+- *
+- * Called under j_state_lock
+- */
+-
+-int __jbd2_log_space_left(journal_t *journal)
+-{
+- int left = journal->j_free;
+-
+- /* assert_spin_locked(&journal->j_state_lock); */
+-
+- /*
+-  * Be pessimistic here about the number of those free blocks which
+-  * might be required for log descriptor control blocks.
+-  */
+-
+-#define MIN_LOG_RESERVED_BLOCKS 32 /* Allow for rounding errors */
+-
+- left -= MIN_LOG_RESERVED_BLOCKS;
+-
+- if (left <= 0)
+-  return 0;
+- left -= (left >> 3);
+- return left;
+-}
+-
+-/*
+  * Called with j_state_lock locked for writing.
+  * Returns true if a transaction commit was started.
+  */
+diff --git a/fs/jbd2/transaction.c b/fs/jbd2/transaction.c
+index 0cd8c35..e10caa6 100644
+--- a/fs/jbd2/transaction.c
++++ b/fs/jbd2/transaction.c
+@@ -283,12 +283,12 @@ repeat:
+   * reduce the free space arbitrarily.  Be careful to account for
+   * those buffers when checkpointing.
+   */
+- if (__jbd2_log_space_left(journal) < jbd_space_needed(journal)) {
++ if (jbd2_log_space_left(journal) < jbd2_space_needed(journal)) {
+   jbd_debug(2, "Handle %p waiting for checkpoint...\n", handle);
+   atomic_sub(nblocks, &transaction->t_outstanding_credits);
+   read_unlock(&journal->j_state_lock);
+   write_lock(&journal->j_state_lock);
+-  if (__jbd2_log_space_left(journal) < jbd_space_needed(journal))
++  if (jbd2_log_space_left(journal) < jbd2_space_needed(journal))
+    __jbd2_log_wait_for_space(journal);
+   write_unlock(&journal->j_state_lock);
+   goto repeat;
+@@ -306,7 +306,7 @@ repeat:
+  jbd_debug(4, "Handle %p given %d credits (total %d, free %d)\n",
+     handle, nblocks,
+     atomic_read(&transaction->t_outstanding_credits),
+-    __jbd2_log_space_left(journal));
++    jbd2_log_space_left(journal));
+  read_unlock(&journal->j_state_lock);
+ 
+  lock_map_acquire(&handle->h_lockdep_map);
+@@ -443,7 +443,8 @@ int jbd2_journal_extend(handle_t *handle, int nblocks)
+   goto unlock;
+  }
+ 
+- if (wanted > __jbd2_log_space_left(journal)) {
++ if (wanted + (wanted >> JBD2_CONTROL_BLOCKS_SHIFT) >
++     jbd2_log_space_left(journal)) {
+   jbd_debug(3, "denied handle %p %d blocks: "
+      "insufficient log space\n", handle, nblocks);
+   atomic_sub(nblocks, &transaction->t_outstanding_credits);
+diff --git a/include/linux/jbd2.h b/include/linux/jbd2.h
+index 20e9161..8028dd5 100644
+--- a/include/linux/jbd2.h
++++ b/include/linux/jbd2.h
+@@ -1212,7 +1212,6 @@ extern void jbd2_clear_buffer_revoked_flags(journal_t *journal);
+  * transitions on demand.
+  */
+ 
+-int __jbd2_log_space_left(journal_t *); /* Called with journal locked */
+ int jbd2_log_start_commit(journal_t *journal, tid_t tid);
+ int __jbd2_log_start_commit(journal_t *journal, tid_t tid);
+ int jbd2_journal_start_commit(journal_t *journal, tid_t *tid);
+@@ -1283,16 +1282,37 @@ extern int jbd2_journal_blocks_per_page(struct inode *inode);
+ extern size_t journal_tag_bytes(journal_t *journal);
+ 
+ /*
++ * We reserve t_outstanding_credits >> JBD2_CONTROL_BLOCKS_SHIFT for
++ * transaction control blocks.
++ */
++#define JBD2_CONTROL_BLOCKS_SHIFT 5
++
++/*
+  * Return the minimum number of blocks which must be free in the journal
+  * before a new transaction may be started.  Must be called under j_state_lock.
+  */
+-static inline int jbd_space_needed(journal_t *journal)
++static inline int jbd2_space_needed(journal_t *journal)
+ {
+  int nblocks = journal->j_max_transaction_buffers;
+- if (journal->j_committing_transaction)
+-  nblocks += atomic_read(&journal->j_committing_transaction->
+-           t_outstanding_credits);
+- return nblocks;
++ return nblocks + (nblocks >> JBD2_CONTROL_BLOCKS_SHIFT);
++}
++
++/*
++ * Return number of free blocks in the log. Must be called under j_state_lock.
++ */
++static inline unsigned long jbd2_log_space_left(journal_t *journal)
++{
++ /* Allow for rounding errors */
++ unsigned long free = journal->j_free - 32;
++
++ if (journal->j_committing_transaction) {
++  unsigned long committing = atomic_read(&journal->
++   j_committing_transaction->t_outstanding_credits);
++
++  /* Transaction + control blocks */
++  free -= committing + (committing >> JBD2_CONTROL_BLOCKS_SHIFT);
++ }
++ return free;
+ }
+ 
+ /*
+-- 
+1.7.1

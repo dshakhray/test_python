@@ -1,0 +1,177 @@
+From 0c72205f764e27ca1c7f1775419fe66a1d98ff1a Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:07:59 -0400
+Subject: [usb] xhci: Add a global command queue
+
+Message-id: <1410887463-20674-408-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95341
+O-Subject: [RHEL7 PATCH 407/591] xhci: Add a global command queue
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit c9aa1a2de4cbf7d0db6012fbf86b6ee0c3719470
+Author: Mathias Nyman <mathias.nyman@linux.intel.com>
+Date:   Thu May 8 19:26:01 2014 +0300
+
+    xhci: Add a global command queue
+
+    Create a list to store command structures, add a structure to it every time
+    a command is submitted, and remove it from the list once we get a
+    command completion event matching the command.
+
+    Callers that wait for completion will free their command structures themselves.
+    The other command structures are freed in the command completion event handler.
+
+    Also add a check that prevents queuing commands if host is dying
+
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index 3c266f1..4975f0a 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -1821,6 +1821,7 @@ void xhci_mem_cleanup(struct xhci_hcd *xhci)
+   list_del(&cur_cd->cancel_cmd_list);
+   kfree(cur_cd);
+  }
++ xhci_cleanup_command_queue(xhci);
+ 
+  for (i = 1; i < MAX_HC_SLOTS; ++i)
+   xhci_free_virt_device(xhci, i);
+@@ -2324,6 +2325,7 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+  int i;
+ 
+  INIT_LIST_HEAD(&xhci->cancel_cmd_list);
++ INIT_LIST_HEAD(&xhci->cmd_list);
+ 
+  page_size = readl(&xhci->op_regs->page_size);
+  xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 377704b..9093769 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1519,6 +1519,20 @@ static void xhci_handle_cmd_nec_get_fw(struct xhci_hcd *xhci,
+    NEC_FW_MINOR(le32_to_cpu(event->status)));
+ }
+ 
++static void xhci_del_and_free_cmd(struct xhci_command *cmd)
++{
++ list_del(&cmd->cmd_list);
++ if (!cmd->completion)
++  kfree(cmd);
++}
++
++void xhci_cleanup_command_queue(struct xhci_hcd *xhci)
++{
++ struct xhci_command *cur_cmd, *tmp_cmd;
++ list_for_each_entry_safe(cur_cmd, tmp_cmd, &xhci->cmd_list, cmd_list)
++  xhci_del_and_free_cmd(cur_cmd);
++}
++
+ static void handle_cmd_completion(struct xhci_hcd *xhci,
+   struct xhci_event_cmd *event)
+ {
+@@ -1527,6 +1541,7 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
+  dma_addr_t cmd_dequeue_dma;
+  u32 cmd_comp_code;
+  union xhci_trb *cmd_trb;
++ struct xhci_command *cmd;
+  u32 cmd_type;
+ 
+  cmd_dma = le64_to_cpu(event->cmd_trb);
+@@ -1544,6 +1559,13 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
+   return;
+  }
+ 
++ cmd = list_entry(xhci->cmd_list.next, struct xhci_command, cmd_list);
++
++ if (cmd->command_trb != xhci->cmd_ring->dequeue) {
++  xhci_err(xhci,
++    "Command completion event does not match command\n");
++  return;
++ }
+  trace_xhci_cmd_completion(cmd_trb, (struct xhci_generic_trb *) event);
+ 
+  cmd_comp_code = GET_COMP_CODE(le32_to_cpu(event->status));
+@@ -1613,6 +1635,9 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
+   xhci->error_bitmask |= 1 << 6;
+   break;
+  }
++
++ xhci_del_and_free_cmd(cmd);
++
+  inc_deq(xhci, xhci->cmd_ring);
+ }
+ 
+@@ -3996,6 +4021,8 @@ static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
+ {
+  int reserved_trbs = xhci->cmd_ring_reserved_trbs;
+  int ret;
++ if (xhci->xhc_state & XHCI_STATE_DYING)
++  return -ESHUTDOWN;
+ 
+  if (!command_must_succeed)
+   reserved_trbs++;
+@@ -4009,10 +4036,9 @@ static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
+      "unfailable commands failed.\n");
+   return ret;
+  }
+- if (cmd->completion)
+-  cmd->command_trb = xhci->cmd_ring->enqueue;
+- else
+-  kfree(cmd);
++
++ cmd->command_trb = xhci->cmd_ring->enqueue;
++ list_add_tail(&cmd->cmd_list, &xhci->cmd_list);
+ 
+  queue_trb(xhci, xhci->cmd_ring, false, field1, field2, field3,
+    field4 | xhci->cmd_ring->cycle_state);
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index a34196d..d3afbc5 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -3732,7 +3732,6 @@ int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev)
+     timeleft == 0 ? "Timeout" : "Signal");
+   /* cancel the enable slot request */
+   ret = xhci_cancel_cmd(xhci, NULL, command->command_trb);
+-  kfree(command);
+   return ret;
+  }
+ 
+@@ -3891,7 +3890,6 @@ static int xhci_setup_device(struct usb_hcd *hcd, struct usb_device *udev,
+      timeleft == 0 ? "Timeout" : "Signal", act);
+   /* cancel the address device command */
+   ret = xhci_cancel_cmd(xhci, NULL, command->command_trb);
+-  kfree(command);
+   if (ret < 0)
+    return ret;
+   return -ETIME;
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 1e737f7..ee51724 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1495,6 +1495,7 @@ struct xhci_hcd {
+ #define CMD_RING_STATE_ABORTED         (1 << 1)
+ #define CMD_RING_STATE_STOPPED         (1 << 2)
+  struct list_head        cancel_cmd_list;
++ struct list_head        cmd_list;
+  unsigned int  cmd_ring_reserved_trbs;
+  struct xhci_ring *event_ring;
+  struct xhci_erst erst;
+@@ -1834,6 +1835,7 @@ int xhci_cancel_cmd(struct xhci_hcd *xhci, struct xhci_command *command,
+   union xhci_trb *cmd_trb);
+ void xhci_ring_ep_doorbell(struct xhci_hcd *xhci, unsigned int slot_id,
+   unsigned int ep_index, unsigned int stream_id);
++void xhci_cleanup_command_queue(struct xhci_hcd *xhci);
+ 
+ /* xHCI roothub code */
+ void xhci_set_link_state(struct xhci_hcd *xhci, __le32 __iomem **port_array,
+-- 
+1.7.1

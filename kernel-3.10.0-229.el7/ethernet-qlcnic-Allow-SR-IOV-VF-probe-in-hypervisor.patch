@@ -1,0 +1,144 @@
+From d5bbbab527e77a883329c5e24065743adf257bb4 Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:06:44 -0400
+Subject: [ethernet] qlcnic: Allow SR-IOV VF probe in hypervisor
+
+Message-id: <1408626422-3941-121-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88623
+O-Subject: [PATCH RHEL 7.1 120/138] qlcnic: Allow SR-IOV VF probe in hypervisor.
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Rajesh Borundia <rajesh.borundia@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id 132a3f2bee7600366244097658c4c89ac99a8981
+
+o Add support for SR-IOV VF probe in hypervisor to enable
+  assignment of VFs within hypervisor.
+o SR-IOV VF can be uplinked to bridge/macvtap device with this change.
+o Refactor SR-IOV enable/disable code. We cannot take rtnl lock
+  while enabling/disabling SR-IOV as VF probe will take an rtnl
+  lock.
+o Disable spoofchk by default.
+
+Signed-off-by: Rajesh Borundia <rajesh.borundia@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index 4e5e6f1..a3ba77c 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -2429,9 +2429,6 @@ qlcnic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+  int err, pci_using_dac = -1;
+  char board_name[QLCNIC_MAX_BOARD_NAME_LEN + 19]; /* MAC + ": " + name */
+ 
+- if (pdev->is_virtfn)
+-  return -ENODEV;
+-
+  err = pci_enable_device(pdev);
+  if (err)
+   return err;
+@@ -2712,9 +2709,9 @@ static void qlcnic_remove(struct pci_dev *pdev)
+   return;
+ 
+  netdev = adapter->netdev;
+- qlcnic_sriov_pf_disable(adapter);
+ 
+  qlcnic_cancel_idc_work(adapter);
++ qlcnic_sriov_pf_disable(adapter);
+  ahw = adapter->ahw;
+ 
+  unregister_netdev(netdev);
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+index 6afe9c1..3406898 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+@@ -198,7 +198,7 @@ int qlcnic_sriov_init(struct qlcnic_adapter *adapter, int num_vfs)
+    }
+    sriov->vf_info[i].vp = vp;
+    vp->max_tx_bw = MAX_BW;
+-   vp->spoofchk = true;
++   vp->spoofchk = false;
+    random_ether_addr(vp->mac);
+    dev_info(&adapter->pdev->dev,
+      "MAC Address %pM is configured for VF %d\n",
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+index 1cf0c2b..b470520 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_pf.c
+@@ -465,12 +465,12 @@ static int qlcnic_pci_sriov_disable(struct qlcnic_adapter *adapter)
+   return -EPERM;
+  }
+ 
++ qlcnic_sriov_pf_disable(adapter);
++
+  rtnl_lock();
+  if (netif_running(netdev))
+   __qlcnic_down(adapter, netdev);
+ 
+- qlcnic_sriov_pf_disable(adapter);
+-
+  qlcnic_sriov_free_vlans(adapter);
+ 
+  qlcnic_sriov_pf_cleanup(adapter);
+@@ -589,7 +589,6 @@ static int __qlcnic_pci_sriov_enable(struct qlcnic_adapter *adapter,
+ 
+  qlcnic_sriov_alloc_vlans(adapter);
+ 
+- err = qlcnic_sriov_pf_enable(adapter, num_vfs);
+  return err;
+ 
+ del_flr_queue:
+@@ -620,25 +619,36 @@ static int qlcnic_pci_sriov_enable(struct qlcnic_adapter *adapter, int num_vfs)
+   __qlcnic_down(adapter, netdev);
+ 
+  err = __qlcnic_pci_sriov_enable(adapter, num_vfs);
+- if (err) {
+-  netdev_info(netdev, "Failed to enable SR-IOV on port %d\n",
+-       adapter->portnum);
++ if (err)
++  goto error;
+ 
+-  err = -EIO;
+-  if (qlcnic_83xx_configure_opmode(adapter))
+-   goto error;
+- } else {
++ if (netif_running(netdev))
++  __qlcnic_up(adapter, netdev);
++
++ rtnl_unlock();
++ err = qlcnic_sriov_pf_enable(adapter, num_vfs);
++ if (!err) {
+   netdev_info(netdev,
+        "SR-IOV is enabled successfully on port %d\n",
+        adapter->portnum);
+   /* Return number of vfs enabled */
+-  err = num_vfs;
++  return num_vfs;
+  }
++
++ rtnl_lock();
+  if (netif_running(netdev))
+-  __qlcnic_up(adapter, netdev);
++  __qlcnic_down(adapter, netdev);
+ 
+ error:
++ if (!qlcnic_83xx_configure_opmode(adapter)) {
++  if (netif_running(netdev))
++   __qlcnic_up(adapter, netdev);
++ }
++
+  rtnl_unlock();
++ netdev_info(netdev, "Failed to enable SR-IOV on port %d\n",
++      adapter->portnum);
++
+  return err;
+ }
+ 
+-- 
+1.7.1

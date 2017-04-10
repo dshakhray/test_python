@@ -1,0 +1,176 @@
+From f008d31b1c680230d934a18207a6909c97337af4 Mon Sep 17 00:00:00 2001
+From: John Snow <jsnow@redhat.com>
+Date: Fri, 14 Nov 2014 23:32:36 -0500
+Subject: [virt] kvm/ioapic: conditionally delay irq delivery duringeoi broadcast
+
+Message-id: <1416007956-11018-2-git-send-email-jsnow@redhat.com>
+Patchwork-id: 100058
+O-Subject: [RHEL-7.1 kernel PATCH] kvm: ioapic: conditionally delay irq delivery duringeoi broadcast
+Bugzilla: 921526
+RH-Acked-by: Alex Williamson <alex.williamson@redhat.com>
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+RH-Acked-by: Jason Wang <jasowang@redhat.com>
+
+From: Zhang Haoyu <zhanghy@sangfor.com>
+
+Currently, we call ioapic_service() immediately when we find the irq is still
+active during eoi broadcast. But for real hardware, there's some delay between
+the EOI writing and irq delivery.  If we do not emulate this behavior, and
+re-inject the interrupt immediately after the guest sends an EOI and re-enables
+interrupts, a guest might spend all its time in the ISR if it has a broken
+handler for a level-triggered interrupt.
+
+Such livelock actually happens with Windows guests when resuming from
+hibernation.
+
+As there's no way to recognize the broken handle from new raised ones, this patch
+delays an interrupt if 10.000 consecutive EOIs found that the interrupt was
+still high.  The guest can then make a little forward progress, until a proper
+IRQ handler is set or until some detection routine in the guest (such as
+Linux's note_interrupt()) recognizes the situation.
+
+Cc: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Jason Wang <jasowang@redhat.com>
+Signed-off-by: Zhang Haoyu <zhanghy@sangfor.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 184564efae4d775225c8fe3b762a56956fb1f827)
+Signed-off-by: John Snow <jsnow@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/trace/events/kvm.h b/include/trace/events/kvm.h
+index 908925a..ab679c3 100644
+--- a/include/trace/events/kvm.h
++++ b/include/trace/events/kvm.h
+@@ -95,6 +95,26 @@ TRACE_EVENT(kvm_ioapic_set_irq,
+     __entry->coalesced ? " (coalesced)" : "")
+ );
+ 
++TRACE_EVENT(kvm_ioapic_delayed_eoi_inj,
++     TP_PROTO(__u64 e),
++     TP_ARGS(e),
++
++ TP_STRUCT__entry(
++  __field( __u64,  e  )
++ ),
++
++ TP_fast_assign(
++  __entry->e  = e;
++ ),
++
++ TP_printk("dst %x vec=%u (%s|%s|%s%s)",
++    (u8)(__entry->e >> 56), (u8)__entry->e,
++    __print_symbolic((__entry->e >> 8 & 0x7), kvm_deliver_mode),
++    (__entry->e & (1<<11)) ? "logical" : "physical",
++    (__entry->e & (1<<15)) ? "level" : "edge",
++    (__entry->e & (1<<16)) ? "|masked" : "")
++);
++
+ TRACE_EVENT(kvm_msi_set_irq,
+      TP_PROTO(__u64 address, __u64 data),
+      TP_ARGS(address, data),
+diff --git a/virt/kvm/ioapic.c b/virt/kvm/ioapic.c
+index e8ce34c..0ba4057 100644
+--- a/virt/kvm/ioapic.c
++++ b/virt/kvm/ioapic.c
+@@ -405,6 +405,26 @@ void kvm_ioapic_clear_all(struct kvm_ioapic *ioapic, int irq_source_id)
+  spin_unlock(&ioapic->lock);
+ }
+ 
++static void kvm_ioapic_eoi_inject_work(struct work_struct *work)
++{
++ int i;
++ struct kvm_ioapic *ioapic = container_of(work, struct kvm_ioapic,
++       eoi_inject.work);
++ spin_lock(&ioapic->lock);
++ for (i = 0; i < IOAPIC_NUM_PINS; i++) {
++  union kvm_ioapic_redirect_entry *ent = &ioapic->redirtbl[i];
++
++  if (ent->fields.trig_mode != IOAPIC_LEVEL_TRIG)
++   continue;
++
++  if (ioapic->irr & (1 << i) && !ent->fields.remote_irr)
++   ioapic_service(ioapic, i, false);
++ }
++ spin_unlock(&ioapic->lock);
++}
++
++#define IOAPIC_SUCCESSIVE_IRQ_MAX_COUNT 10000
++
+ static void __kvm_ioapic_update_eoi(struct kvm_vcpu *vcpu,
+    struct kvm_ioapic *ioapic, int vector, int trigger_mode)
+ {
+@@ -435,8 +455,26 @@ static void __kvm_ioapic_update_eoi(struct kvm_vcpu *vcpu,
+ 
+   ASSERT(ent->fields.trig_mode == IOAPIC_LEVEL_TRIG);
+   ent->fields.remote_irr = 0;
+-  if (ioapic->irr & (1 << i))
+-   ioapic_service(ioapic, i, false);
++  if (!ent->fields.mask && (ioapic->irr & (1 << i))) {
++   ++ioapic->irq_eoi[i];
++   if (ioapic->irq_eoi[i] == IOAPIC_SUCCESSIVE_IRQ_MAX_COUNT) {
++    /*
++     * Real hardware does not deliver the interrupt
++     * immediately during eoi broadcast, and this
++     * lets a buggy guest make slow progress
++     * even if it does not correctly handle a
++     * level-triggered interrupt.  Emulate this
++     * behavior if we detect an interrupt storm.
++     */
++    schedule_delayed_work(&ioapic->eoi_inject, HZ / 100);
++    ioapic->irq_eoi[i] = 0;
++    trace_kvm_ioapic_delayed_eoi_inj(ent->bits);
++   } else {
++    ioapic_service(ioapic, i, false);
++   }
++  } else {
++   ioapic->irq_eoi[i] = 0;
++  }
+  }
+ }
+ 
+@@ -565,12 +603,14 @@ static void kvm_ioapic_reset(struct kvm_ioapic *ioapic)
+ {
+  int i;
+ 
++ cancel_delayed_work_sync(&ioapic->eoi_inject);
+  for (i = 0; i < IOAPIC_NUM_PINS; i++)
+   ioapic->redirtbl[i].fields.mask = 1;
+  ioapic->base_address = IOAPIC_DEFAULT_BASE_ADDRESS;
+  ioapic->ioregsel = 0;
+  ioapic->irr = 0;
+  ioapic->id = 0;
++ memset(ioapic->irq_eoi, 0x00, IOAPIC_NUM_PINS);
+  rtc_irq_eoi_tracking_reset(ioapic);
+  update_handled_vectors(ioapic);
+ }
+@@ -589,6 +629,7 @@ int kvm_ioapic_init(struct kvm *kvm)
+  if (!ioapic)
+   return -ENOMEM;
+  spin_lock_init(&ioapic->lock);
++ INIT_DELAYED_WORK(&ioapic->eoi_inject, kvm_ioapic_eoi_inject_work);
+  kvm->arch.vioapic = ioapic;
+  kvm_ioapic_reset(ioapic);
+  kvm_iodevice_init(&ioapic->dev, &ioapic_mmio_ops);
+@@ -609,6 +650,7 @@ void kvm_ioapic_destroy(struct kvm *kvm)
+ {
+  struct kvm_ioapic *ioapic = kvm->arch.vioapic;
+ 
++ cancel_delayed_work_sync(&ioapic->eoi_inject);
+  if (ioapic) {
+   kvm_io_bus_unregister_dev(kvm, KVM_MMIO_BUS, &ioapic->dev);
+   kvm->arch.vioapic = NULL;
+diff --git a/virt/kvm/ioapic.h b/virt/kvm/ioapic.h
+index 90d43e9..e23b706 100644
+--- a/virt/kvm/ioapic.h
++++ b/virt/kvm/ioapic.h
+@@ -59,6 +59,8 @@ struct kvm_ioapic {
+  spinlock_t lock;
+  DECLARE_BITMAP(handled_vectors, 256);
+  struct rtc_status rtc_status;
++ struct delayed_work eoi_inject;
++ u32 irq_eoi[IOAPIC_NUM_PINS];
+ };
+ 
+ #ifdef DEBUG
+-- 
+1.7.1

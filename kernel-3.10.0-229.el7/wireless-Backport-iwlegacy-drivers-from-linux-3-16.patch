@@ -1,0 +1,1090 @@
+From 65eaa5bd5381f13e01e003d86da766fd0dc026a4 Mon Sep 17 00:00:00 2001
+From: Stanislaw Gruszka <sgruszka@redhat.com>
+Date: Fri, 5 Sep 2014 11:23:45 -0400
+Subject: [wireless] Backport iwlegacy drivers from linux 3.16
+
+Message-id: <1409916232-5882-9-git-send-email-sgruszka@redhat.com>
+Patchwork-id: 91437
+O-Subject: [RHEL7 PATCH 08/15] Backport iwlegacy drivers from linux 3.16
+Bugzilla: 1136324
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: John Greene <jogreene@redhat.com>
+
+BZ#1136324
+
+Decription:
+Sync iwlegacy driver to code from linux 3.16 (up to commit
+19583ca584d6f574384e17fe7613dfaeadcdc4a6).
+
+Brew:
+https://brewweb.devel.redhat.com/taskinfo?taskID=7918052
+
+Testing:
+Not tested.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/wireless/iwlegacy/3945-debug.c b/drivers/net/wireless/iwlegacy/3945-debug.c
+index f767dd1..c1b4441 100644
+--- a/drivers/net/wireless/iwlegacy/3945-debug.c
++++ b/drivers/net/wireless/iwlegacy/3945-debug.c
+@@ -48,7 +48,7 @@ il3945_stats_flag(struct il_priv *il, char *buf, int bufsz)
+  return p;
+ }
+ 
+-ssize_t
++static ssize_t
+ il3945_ucode_rx_stats_read(struct file *file, char __user *user_buf,
+       size_t count, loff_t *ppos)
+ {
+@@ -313,7 +313,7 @@ il3945_ucode_rx_stats_read(struct file *file, char __user *user_buf,
+  return ret;
+ }
+ 
+-ssize_t
++static ssize_t
+ il3945_ucode_tx_stats_read(struct file *file, char __user *user_buf,
+       size_t count, loff_t *ppos)
+ {
+@@ -403,7 +403,7 @@ il3945_ucode_tx_stats_read(struct file *file, char __user *user_buf,
+  return ret;
+ }
+ 
+-ssize_t
++static ssize_t
+ il3945_ucode_general_stats_read(struct file *file, char __user *user_buf,
+     size_t count, loff_t *ppos)
+ {
+diff --git a/drivers/net/wireless/iwlegacy/3945-mac.c b/drivers/net/wireless/iwlegacy/3945-mac.c
+index b37a582..dc1d20c 100644
+--- a/drivers/net/wireless/iwlegacy/3945-mac.c
++++ b/drivers/net/wireless/iwlegacy/3945-mac.c
+@@ -1248,14 +1248,7 @@ il3945_rx_handle(struct il_priv *il)
+   len = le32_to_cpu(pkt->len_n_flags) & IL_RX_FRAME_SIZE_MSK;
+   len += sizeof(u32); /* account for status word */
+ 
+-  /* Reclaim a command buffer only if this packet is a response
+-   *   to a (driver-originated) command.
+-   * If the packet (e.g. Rx frame) originated from uCode,
+-   *   there is no command buffer to reclaim.
+-   * Ucode should set SEQ_RX_FRAME bit if ucode-originated,
+-   *   but apparently a few don't get set; catch them here. */
+-  reclaim = !(pkt->hdr.sequence & SEQ_RX_FRAME) &&
+-      pkt->hdr.cmd != N_STATS && pkt->hdr.cmd != C_TX;
++  reclaim = il_need_reclaim(il, pkt);
+ 
+   /* Based on type of command response or notification,
+    *   handle those that need handling via function in
+@@ -1495,12 +1488,14 @@ il3945_irq_tasklet(struct il_priv *il)
+  if (inta & CSR_INT_BIT_WAKEUP) {
+   D_ISR("Wakeup interrupt\n");
+   il_rx_queue_update_write_ptr(il, &il->rxq);
++
++  spin_lock_irqsave(&il->lock, flags);
+   il_txq_update_write_ptr(il, &il->txq[0]);
+   il_txq_update_write_ptr(il, &il->txq[1]);
+   il_txq_update_write_ptr(il, &il->txq[2]);
+   il_txq_update_write_ptr(il, &il->txq[3]);
+   il_txq_update_write_ptr(il, &il->txq[4]);
+-  il_txq_update_write_ptr(il, &il->txq[5]);
++  spin_unlock_irqrestore(&il->lock, flags);
+ 
+   il->isr_stats.wakeup++;
+   handled |= CSR_INT_BIT_WAKEUP;
+@@ -1595,7 +1590,7 @@ il3945_get_channels_for_scan(struct il_priv *il, enum ieee80211_band band,
+    *  and use long active_dwell time.
+    */
+   if (!is_active || il_is_channel_passive(ch_info) ||
+-      (chan->flags & IEEE80211_CHAN_PASSIVE_SCAN)) {
++      (chan->flags & IEEE80211_CHAN_NO_IR)) {
+    scan_ch->type = 0; /* passive */
+    if (IL_UCODE_API(il->ucode_ver) == 1)
+     scan_ch->active_dwell =
+@@ -2396,8 +2391,7 @@ __il3945_up(struct il_priv *il)
+   clear_bit(S_RFKILL, &il->status);
+  else {
+   set_bit(S_RFKILL, &il->status);
+-  IL_WARN("Radio disabled by HW RF Kill switch\n");
+-  return -ENODEV;
++  return -ERFKILL;
+  }
+ 
+  _il_wr(il, CSR_INT, 0xFFFFFFFF);
+@@ -3119,7 +3113,7 @@ il3945_store_debug_level(struct device *d, struct device_attribute *attr,
+  unsigned long val;
+  int ret;
+ 
+- ret = strict_strtoul(buf, 0, &val);
++ ret = kstrtoul(buf, 0, &val);
+  if (ret)
+   IL_INFO("%s is not in hex or decimal form.\n", buf);
+  else
+@@ -3575,9 +3569,9 @@ il3945_setup_mac(struct il_priv *il)
+  hw->wiphy->interface_modes =
+      BIT(NL80211_IFTYPE_STATION) | BIT(NL80211_IFTYPE_ADHOC);
+ 
+- hw->wiphy->flags |=
+-     WIPHY_FLAG_CUSTOM_REGULATORY | WIPHY_FLAG_DISABLE_BEACON_HINTS |
+-     WIPHY_FLAG_IBSS_RSN;
++ hw->wiphy->flags |= WIPHY_FLAG_IBSS_RSN;
++ hw->wiphy->regulatory_flags |= REGULATORY_CUSTOM_REG |
++           REGULATORY_DISABLE_BEACON_HINTS;
+ 
+  hw->wiphy->flags &= ~WIPHY_FLAG_PS_ON_BY_DEFAULT;
+ 
+@@ -3727,7 +3721,8 @@ il3945_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+   * 5. Setup HW Constants
+   * ********************/
+  /* Device-specific setup */
+- if (il3945_hw_set_hw_params(il)) {
++ err = il3945_hw_set_hw_params(il);
++ if (err) {
+   IL_ERR("failed to set hw settings\n");
+   goto out_eeprom_free;
+  }
+@@ -3810,7 +3805,6 @@ out_iounmap:
+ out_pci_release_regions:
+  pci_release_regions(pdev);
+ out_pci_disable_device:
+- pci_set_drvdata(pdev, NULL);
+  pci_disable_device(pdev);
+ out_ieee80211_free_hw:
+  ieee80211_free_hw(il->hw);
+@@ -3887,7 +3881,6 @@ il3945_pci_remove(struct pci_dev *pdev)
+  iounmap(il->hw_base);
+  pci_release_regions(pdev);
+  pci_disable_device(pdev);
+- pci_set_drvdata(pdev, NULL);
+ 
+  il_free_channel_map(il);
+  il_free_geos(il);
+diff --git a/drivers/net/wireless/iwlegacy/3945-rs.c b/drivers/net/wireless/iwlegacy/3945-rs.c
+index fe31590..76b0729 100644
+--- a/drivers/net/wireless/iwlegacy/3945-rs.c
++++ b/drivers/net/wireless/iwlegacy/3945-rs.c
+@@ -25,7 +25,6 @@
+  *****************************************************************************/
+ 
+ #include <linux/kernel.h>
+-#include <linux/init.h>
+ #include <linux/skbuff.h>
+ #include <linux/slab.h>
+ #include <net/mac80211.h>
+@@ -887,12 +886,12 @@ il3945_remove_debugfs(void *il, void *il_sta)
+  */
+ static void
+ il3945_rs_rate_init_stub(void *il_r, struct ieee80211_supported_band *sband,
++    struct cfg80211_chan_def *chandef,
+     struct ieee80211_sta *sta, void *il_sta)
+ {
+ }
+ 
+-static struct rate_control_ops rs_ops = {
+- .module = NULL,
++static const struct rate_control_ops rs_ops = {
+  .name = RS_NAME,
+  .tx_status = il3945_rs_tx_status,
+  .get_rate = il3945_rs_get_rate,
+diff --git a/drivers/net/wireless/iwlegacy/3945.c b/drivers/net/wireless/iwlegacy/3945.c
+index 9a5f36e..b598e28 100644
+--- a/drivers/net/wireless/iwlegacy/3945.c
++++ b/drivers/net/wireless/iwlegacy/3945.c
+@@ -26,7 +26,6 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+-#include <linux/init.h>
+ #include <linux/slab.h>
+ #include <linux/pci.h>
+ #include <linux/dma-mapping.h>
+@@ -331,6 +330,19 @@ il3945_hdl_tx(struct il_priv *il, struct il_rx_buf *rxb)
+   return;
+  }
+ 
++ /*
++  * Firmware will not transmit frame on passive channel, if it not yet
++  * received some valid frame on that channel. When this error happen
++  * we have to wait until firmware will unblock itself i.e. when we
++  * note received beacon or other frame. We unblock queues in
++  * il3945_pass_packet_to_mac80211 or in il_mac_bss_info_changed.
++  */
++ if (unlikely((status & TX_STATUS_MSK) == TX_STATUS_FAIL_PASSIVE_NO_RX) &&
++     il->iw_mode == NL80211_IFTYPE_STATION) {
++  il_stop_queues_by_reason(il, IL_STOP_REASON_PASSIVE);
++  D_INFO("Stopped queues - RX waiting on passive channel\n");
++ }
++
+  txq->time_stamp = jiffies;
+  info = IEEE80211_SKB_CB(txq->skbs[txq->q.read_ptr]);
+  ieee80211_tx_info_clear_status(info);
+@@ -453,10 +465,10 @@ il3945_is_network_packet(struct il_priv *il, struct ieee80211_hdr *header)
+  switch (il->iw_mode) {
+  case NL80211_IFTYPE_ADHOC: /* Header: Dest. | Source    | BSSID */
+   /* packets to our IBSS update information */
+-  return ether_addr_equal(header->addr3, il->bssid);
++  return ether_addr_equal_64bits(header->addr3, il->bssid);
+  case NL80211_IFTYPE_STATION: /* Header: Dest. | AP{BSSID} | Source */
+   /* packets to our IBSS update information */
+-  return ether_addr_equal(header->addr2, il->bssid);
++  return ether_addr_equal_64bits(header->addr2, il->bssid);
+  default:
+   return 1;
+  }
+@@ -489,6 +501,11 @@ il3945_pass_packet_to_mac80211(struct il_priv *il, struct il_rx_buf *rxb,
+   return;
+  }
+ 
++ if (unlikely(test_bit(IL_STOP_REASON_PASSIVE, &il->stop_reason))) {
++  il_wake_queues_by_reason(il, IL_STOP_REASON_PASSIVE);
++  D_INFO("Woke queues - frame received on passive channel\n");
++ }
++
+  skb = dev_alloc_skb(SMALL_PACKET_SIZE);
+  if (!skb) {
+   IL_ERR("dev_alloc_skb failed\n");
+@@ -556,7 +573,7 @@ il3945_hdl_rx(struct il_priv *il, struct il_rx_buf *rxb)
+   rx_status.flag |= RX_FLAG_SHORTPRE;
+ 
+  if ((unlikely(rx_stats->phy_count > 20))) {
+-  D_DROP("dsp size out of range [0,20]: %d/n",
++  D_DROP("dsp size out of range [0,20]: %d\n",
+          rx_stats->phy_count);
+   return;
+  }
+diff --git a/drivers/net/wireless/iwlegacy/3945.h b/drivers/net/wireless/iwlegacy/3945.h
+index 9a8703d..00030d4 100644
+--- a/drivers/net/wireless/iwlegacy/3945.h
++++ b/drivers/net/wireless/iwlegacy/3945.h
+@@ -189,15 +189,14 @@ struct il3945_ibss_seq {
+  * for use by iwl-*.c
+  *
+  *****************************************************************************/
+-extern int il3945_calc_db_from_ratio(int sig_ratio);
+-extern void il3945_rx_replenish(void *data);
+-extern void il3945_rx_queue_reset(struct il_priv *il, struct il_rx_queue *rxq);
+-extern unsigned int il3945_fill_beacon_frame(struct il_priv *il,
+-          struct ieee80211_hdr *hdr,
+-          int left);
+-extern int il3945_dump_nic_event_log(struct il_priv *il, bool full_log,
+-         char **buf, bool display);
+-extern void il3945_dump_nic_error_log(struct il_priv *il);
++int il3945_calc_db_from_ratio(int sig_ratio);
++void il3945_rx_replenish(void *data);
++void il3945_rx_queue_reset(struct il_priv *il, struct il_rx_queue *rxq);
++unsigned int il3945_fill_beacon_frame(struct il_priv *il,
++          struct ieee80211_hdr *hdr, int left);
++int il3945_dump_nic_event_log(struct il_priv *il, bool full_log, char **buf,
++         bool display);
++void il3945_dump_nic_error_log(struct il_priv *il);
+ 
+ /******************************************************************************
+  *
+@@ -215,39 +214,36 @@ extern void il3945_dump_nic_error_log(struct il_priv *il);
+  * il3945_mac_     <-- mac80211 callback
+  *
+  ****************************************************************************/
+-extern void il3945_hw_handler_setup(struct il_priv *il);
+-extern void il3945_hw_setup_deferred_work(struct il_priv *il);
+-extern void il3945_hw_cancel_deferred_work(struct il_priv *il);
+-extern int il3945_hw_rxq_stop(struct il_priv *il);
+-extern int il3945_hw_set_hw_params(struct il_priv *il);
+-extern int il3945_hw_nic_init(struct il_priv *il);
+-extern int il3945_hw_nic_stop_master(struct il_priv *il);
+-extern void il3945_hw_txq_ctx_free(struct il_priv *il);
+-extern void il3945_hw_txq_ctx_stop(struct il_priv *il);
+-extern int il3945_hw_nic_reset(struct il_priv *il);
+-extern int il3945_hw_txq_attach_buf_to_tfd(struct il_priv *il,
+-        struct il_tx_queue *txq,
+-        dma_addr_t addr, u16 len, u8 reset,
+-        u8 pad);
+-extern void il3945_hw_txq_free_tfd(struct il_priv *il, struct il_tx_queue *txq);
+-extern int il3945_hw_get_temperature(struct il_priv *il);
+-extern int il3945_hw_tx_queue_init(struct il_priv *il, struct il_tx_queue *txq);
+-extern unsigned int il3945_hw_get_beacon_cmd(struct il_priv *il,
+-          struct il3945_frame *frame,
+-          u8 rate);
++void il3945_hw_handler_setup(struct il_priv *il);
++void il3945_hw_setup_deferred_work(struct il_priv *il);
++void il3945_hw_cancel_deferred_work(struct il_priv *il);
++int il3945_hw_rxq_stop(struct il_priv *il);
++int il3945_hw_set_hw_params(struct il_priv *il);
++int il3945_hw_nic_init(struct il_priv *il);
++int il3945_hw_nic_stop_master(struct il_priv *il);
++void il3945_hw_txq_ctx_free(struct il_priv *il);
++void il3945_hw_txq_ctx_stop(struct il_priv *il);
++int il3945_hw_nic_reset(struct il_priv *il);
++int il3945_hw_txq_attach_buf_to_tfd(struct il_priv *il, struct il_tx_queue *txq,
++        dma_addr_t addr, u16 len, u8 reset, u8 pad);
++void il3945_hw_txq_free_tfd(struct il_priv *il, struct il_tx_queue *txq);
++int il3945_hw_get_temperature(struct il_priv *il);
++int il3945_hw_tx_queue_init(struct il_priv *il, struct il_tx_queue *txq);
++unsigned int il3945_hw_get_beacon_cmd(struct il_priv *il,
++          struct il3945_frame *frame, u8 rate);
+ void il3945_hw_build_tx_cmd_rate(struct il_priv *il, struct il_device_cmd *cmd,
+      struct ieee80211_tx_info *info,
+      struct ieee80211_hdr *hdr, int sta_id);
+-extern int il3945_hw_reg_send_txpower(struct il_priv *il);
+-extern int il3945_hw_reg_set_txpower(struct il_priv *il, s8 power);
+-extern void il3945_hdl_stats(struct il_priv *il, struct il_rx_buf *rxb);
++int il3945_hw_reg_send_txpower(struct il_priv *il);
++int il3945_hw_reg_set_txpower(struct il_priv *il, s8 power);
++void il3945_hdl_stats(struct il_priv *il, struct il_rx_buf *rxb);
+ void il3945_hdl_c_stats(struct il_priv *il, struct il_rx_buf *rxb);
+-extern void il3945_disable_events(struct il_priv *il);
+-extern int il4965_get_temperature(const struct il_priv *il);
+-extern void il3945_post_associate(struct il_priv *il);
+-extern void il3945_config_ap(struct il_priv *il);
++void il3945_disable_events(struct il_priv *il);
++int il4965_get_temperature(const struct il_priv *il);
++void il3945_post_associate(struct il_priv *il);
++void il3945_config_ap(struct il_priv *il);
+ 
+-extern int il3945_commit_rxon(struct il_priv *il);
++int il3945_commit_rxon(struct il_priv *il);
+ 
+ /**
+  * il3945_hw_find_station - Find station id for a given BSSID
+@@ -257,14 +253,14 @@ extern int il3945_commit_rxon(struct il_priv *il);
+  * not yet been merged into a single common layer for managing the
+  * station tables.
+  */
+-extern u8 il3945_hw_find_station(struct il_priv *il, const u8 * bssid);
++u8 il3945_hw_find_station(struct il_priv *il, const u8 *bssid);
+ 
+-extern __le32 il3945_get_antenna_flags(const struct il_priv *il);
+-extern int il3945_init_hw_rate_table(struct il_priv *il);
+-extern void il3945_reg_txpower_periodic(struct il_priv *il);
+-extern int il3945_txpower_set_from_eeprom(struct il_priv *il);
++__le32 il3945_get_antenna_flags(const struct il_priv *il);
++int il3945_init_hw_rate_table(struct il_priv *il);
++void il3945_reg_txpower_periodic(struct il_priv *il);
++int il3945_txpower_set_from_eeprom(struct il_priv *il);
+ 
+-extern int il3945_rs_next_rate(struct il_priv *il, int rate);
++int il3945_rs_next_rate(struct il_priv *il, int rate);
+ 
+ /* scanning */
+ int il3945_request_scan(struct il_priv *il, struct ieee80211_vif *vif);
+diff --git a/drivers/net/wireless/iwlegacy/4965-debug.c b/drivers/net/wireless/iwlegacy/4965-debug.c
+index c8153fc..e0597bf 100644
+--- a/drivers/net/wireless/iwlegacy/4965-debug.c
++++ b/drivers/net/wireless/iwlegacy/4965-debug.c
+@@ -55,7 +55,7 @@ il4965_stats_flag(struct il_priv *il, char *buf, int bufsz)
+  return p;
+ }
+ 
+-ssize_t
++static ssize_t
+ il4965_ucode_rx_stats_read(struct file *file, char __user *user_buf,
+       size_t count, loff_t *ppos)
+ {
+@@ -467,7 +467,7 @@ il4965_ucode_rx_stats_read(struct file *file, char __user *user_buf,
+  return ret;
+ }
+ 
+-ssize_t
++static ssize_t
+ il4965_ucode_tx_stats_read(struct file *file, char __user *user_buf,
+       size_t count, loff_t *ppos)
+ {
+@@ -633,7 +633,7 @@ il4965_ucode_tx_stats_read(struct file *file, char __user *user_buf,
+  return ret;
+ }
+ 
+-ssize_t
++static ssize_t
+ il4965_ucode_general_stats_read(struct file *file, char __user *user_buf,
+     size_t count, loff_t *ppos)
+ {
+diff --git a/drivers/net/wireless/iwlegacy/4965-mac.c b/drivers/net/wireless/iwlegacy/4965-mac.c
+index d2586f0..c159c05 100644
+--- a/drivers/net/wireless/iwlegacy/4965-mac.c
++++ b/drivers/net/wireless/iwlegacy/4965-mac.c
+@@ -92,7 +92,6 @@ il4965_check_abort_status(struct il_priv *il, u8 frame_count, u32 status)
+  * EEPROM
+  */
+ struct il_mod_params il4965_mod_params = {
+- .amsdu_size_8K = 1,
+  .restart_fw = 1,
+  /* the rest are 0 by default */
+ };
+@@ -590,6 +589,11 @@ il4965_pass_packet_to_mac80211(struct il_priv *il, struct ieee80211_hdr *hdr,
+   return;
+  }
+ 
++ if (unlikely(test_bit(IL_STOP_REASON_PASSIVE, &il->stop_reason))) {
++  il_wake_queues_by_reason(il, IL_STOP_REASON_PASSIVE);
++  D_INFO("Woke queues - frame received on passive channel\n");
++ }
++
+  /* In case of HW accelerated crypto and bad decryption, drop */
+  if (!il->cfg->mod_params->sw_crypto &&
+      il_set_decrypted_flag(il, hdr, ampdu_status, stats))
+@@ -666,7 +670,7 @@ il4965_hdl_rx(struct il_priv *il, struct il_rx_buf *rxb)
+  }
+ 
+  if ((unlikely(phy_res->cfg_phy_cnt > 20))) {
+-  D_DROP("dsp size out of range [0,20]: %d/n",
++  D_DROP("dsp size out of range [0,20]: %d\n",
+          phy_res->cfg_phy_cnt);
+   return;
+  }
+@@ -800,7 +804,7 @@ il4965_get_channels_for_scan(struct il_priv *il, struct ieee80211_vif *vif,
+   }
+ 
+   if (!is_active || il_is_channel_passive(ch_info) ||
+-      (chan->flags & IEEE80211_CHAN_PASSIVE_SCAN))
++      (chan->flags & IEEE80211_CHAN_NO_IR))
+    scan_ch->type = SCAN_CHANNEL_TYPE_PASSIVE;
+   else
+    scan_ch->type = SCAN_CHANNEL_TYPE_ACTIVE;
+@@ -2812,6 +2816,19 @@ il4965_hdl_tx(struct il_priv *il, struct il_rx_buf *rxb)
+   return;
+  }
+ 
++ /*
++  * Firmware will not transmit frame on passive channel, if it not yet
++  * received some valid frame on that channel. When this error happen
++  * we have to wait until firmware will unblock itself i.e. when we
++  * note received beacon or other frame. We unblock queues in
++  * il4965_pass_packet_to_mac80211 or in il_mac_bss_info_changed.
++  */
++ if (unlikely((status & TX_STATUS_MSK) == TX_STATUS_FAIL_PASSIVE_NO_RX) &&
++     il->iw_mode == NL80211_IFTYPE_STATION) {
++  il_stop_queues_by_reason(il, IL_STOP_REASON_PASSIVE);
++  D_INFO("Stopped queues - RX waiting on passive channel\n");
++ }
++
+  spin_lock_irqsave(&il->sta_lock, flags);
+  if (txq->sched_retry) {
+   const u32 scd_ssn = il4965_get_scd_ssn(tx_resp);
+@@ -4256,17 +4273,7 @@ il4965_rx_handle(struct il_priv *il)
+   len = le32_to_cpu(pkt->len_n_flags) & IL_RX_FRAME_SIZE_MSK;
+   len += sizeof(u32); /* account for status word */
+ 
+-  /* Reclaim a command buffer only if this packet is a response
+-   *   to a (driver-originated) command.
+-   * If the packet (e.g. Rx frame) originated from uCode,
+-   *   there is no command buffer to reclaim.
+-   * Ucode should set SEQ_RX_FRAME bit if ucode-originated,
+-   *   but apparently a few don't get set; catch them here. */
+-  reclaim = !(pkt->hdr.sequence & SEQ_RX_FRAME) &&
+-      (pkt->hdr.cmd != N_RX_PHY) && (pkt->hdr.cmd != N_RX) &&
+-      (pkt->hdr.cmd != N_RX_MPDU) &&
+-      (pkt->hdr.cmd != N_COMPRESSED_BA) &&
+-      (pkt->hdr.cmd != N_STATS) && (pkt->hdr.cmd != C_TX);
++  reclaim = il_need_reclaim(il, pkt);
+ 
+   /* Based on type of command response or notification,
+    *   handle those that need handling via function in
+@@ -4573,7 +4580,7 @@ il4965_store_debug_level(struct device *d, struct device_attribute *attr,
+  unsigned long val;
+  int ret;
+ 
+- ret = strict_strtoul(buf, 0, &val);
++ ret = kstrtoul(buf, 0, &val);
+  if (ret)
+   IL_ERR("%s is not in hex or decimal form.\n", buf);
+  else
+@@ -4620,7 +4627,7 @@ il4965_store_tx_power(struct device *d, struct device_attribute *attr,
+  unsigned long val;
+  int ret;
+ 
+- ret = strict_strtoul(buf, 10, &val);
++ ret = kstrtoul(buf, 10, &val);
+  if (ret)
+   IL_INFO("%s is not in decimal form.\n", buf);
+  else {
+@@ -5747,7 +5754,8 @@ il4965_mac_setup_register(struct il_priv *il, u32 max_probe_length)
+  hw->flags =
+      IEEE80211_HW_SIGNAL_DBM | IEEE80211_HW_AMPDU_AGGREGATION |
+      IEEE80211_HW_NEED_DTIM_BEFORE_ASSOC | IEEE80211_HW_SPECTRUM_MGMT |
+-     IEEE80211_HW_SUPPORTS_PS | IEEE80211_HW_SUPPORTS_DYNAMIC_PS;
++     IEEE80211_HW_REPORTS_TX_ACK_STATUS | IEEE80211_HW_SUPPORTS_PS |
++     IEEE80211_HW_SUPPORTS_DYNAMIC_PS;
+  if (il->cfg->sku & IL_SKU_N)
+   hw->flags |=
+       IEEE80211_HW_SUPPORTS_DYNAMIC_SMPS |
+@@ -5759,9 +5767,9 @@ il4965_mac_setup_register(struct il_priv *il, u32 max_probe_length)
+  hw->wiphy->interface_modes =
+      BIT(NL80211_IFTYPE_STATION) | BIT(NL80211_IFTYPE_ADHOC);
+ 
+- hw->wiphy->flags |=
+-     WIPHY_FLAG_CUSTOM_REGULATORY | WIPHY_FLAG_DISABLE_BEACON_HINTS |
+-     WIPHY_FLAG_IBSS_RSN;
++ hw->wiphy->flags |= WIPHY_FLAG_IBSS_RSN;
++ hw->wiphy->regulatory_flags |= REGULATORY_CUSTOM_REG |
++           REGULATORY_DISABLE_BEACON_HINTS;
+ 
+  /*
+   * For now, disable PS by default because it affects
+@@ -6687,7 +6695,6 @@ out_free_eeprom:
+ out_iounmap:
+  iounmap(il->hw_base);
+ out_pci_release_regions:
+- pci_set_drvdata(pdev, NULL);
+  pci_release_regions(pdev);
+ out_pci_disable_device:
+  pci_disable_device(pdev);
+@@ -6768,7 +6775,6 @@ il4965_pci_remove(struct pci_dev *pdev)
+  iounmap(il->hw_base);
+  pci_release_regions(pdev);
+  pci_disable_device(pdev);
+- pci_set_drvdata(pdev, NULL);
+ 
+  il4965_uninit_drv(il);
+ 
+@@ -6859,6 +6865,6 @@ module_param_named(11n_disable, il4965_mod_params.disable_11n, int, S_IRUGO);
+ MODULE_PARM_DESC(11n_disable, "disable 11n functionality");
+ module_param_named(amsdu_size_8K, il4965_mod_params.amsdu_size_8K, int,
+      S_IRUGO);
+-MODULE_PARM_DESC(amsdu_size_8K, "enable 8K amsdu size");
++MODULE_PARM_DESC(amsdu_size_8K, "enable 8K amsdu size (default 0 [disabled])");
+ module_param_named(fw_restart, il4965_mod_params.restart_fw, int, S_IRUGO);
+ MODULE_PARM_DESC(fw_restart, "restart firmware in case of error");
+diff --git a/drivers/net/wireless/iwlegacy/4965-rs.c b/drivers/net/wireless/iwlegacy/4965-rs.c
+index ed3c42a..eaaeea1 100644
+--- a/drivers/net/wireless/iwlegacy/4965-rs.c
++++ b/drivers/net/wireless/iwlegacy/4965-rs.c
+@@ -24,7 +24,6 @@
+  *
+  *****************************************************************************/
+ #include <linux/kernel.h>
+-#include <linux/init.h>
+ #include <linux/skbuff.h>
+ #include <linux/slab.h>
+ #include <net/mac80211.h>
+@@ -2803,12 +2802,12 @@ il4965_rs_remove_debugfs(void *il, void *il_sta)
+  */
+ static void
+ il4965_rs_rate_init_stub(void *il_r, struct ieee80211_supported_band *sband,
++    struct cfg80211_chan_def *chandef,
+     struct ieee80211_sta *sta, void *il_sta)
+ {
+ }
+ 
+-static struct rate_control_ops rs_4965_ops = {
+- .module = NULL,
++static const struct rate_control_ops rs_4965_ops = {
+  .name = IL4965_RS_NAME,
+  .tx_status = il4965_rs_tx_status,
+  .get_rate = il4965_rs_get_rate,
+diff --git a/drivers/net/wireless/iwlegacy/4965.c b/drivers/net/wireless/iwlegacy/4965.c
+index 777a578..fe47db9 100644
+--- a/drivers/net/wireless/iwlegacy/4965.c
++++ b/drivers/net/wireless/iwlegacy/4965.c
+@@ -26,7 +26,6 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+-#include <linux/init.h>
+ #include <linux/pci.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/delay.h>
+diff --git a/drivers/net/wireless/iwlegacy/4965.h b/drivers/net/wireless/iwlegacy/4965.h
+index 1b15b0b..337dfcf 100644
+--- a/drivers/net/wireless/iwlegacy/4965.h
++++ b/drivers/net/wireless/iwlegacy/4965.h
+@@ -272,7 +272,7 @@ il4965_hw_valid_rtc_data_addr(u32 addr)
+  ((t) < IL_TX_POWER_TEMPERATURE_MIN || \
+   (t) > IL_TX_POWER_TEMPERATURE_MAX)
+ 
+-extern void il4965_temperature_calib(struct il_priv *il);
++void il4965_temperature_calib(struct il_priv *il);
+ /********************* END TEMPERATURE ***************************************/
+ 
+ /********************* START TXPOWER *****************************************/
+diff --git a/drivers/net/wireless/iwlegacy/commands.h b/drivers/net/wireless/iwlegacy/commands.h
+index 3b6c994..dd74413 100644
+--- a/drivers/net/wireless/iwlegacy/commands.h
++++ b/drivers/net/wireless/iwlegacy/commands.h
+@@ -1348,14 +1348,6 @@ struct il_rx_mpdu_res_start {
+ #define TX_CMD_SEC_KEY128 0x08
+ 
+ /*
+- * security overhead sizes
+- */
+-#define WEP_IV_LEN 4
+-#define WEP_ICV_LEN 4
+-#define CCMP_MIC_LEN 8
+-#define TKIP_ICV_LEN 4
+-
+-/*
+  * C_TX = 0x1c (command)
+  */
+ 
+@@ -2278,7 +2270,8 @@ struct il_spectrum_notification {
+  */
+ #define IL_POWER_VEC_SIZE 5
+ 
+-#define IL_POWER_DRIVER_ALLOW_SLEEP_MSK cpu_to_le16(BIT(0))
++#define IL_POWER_DRIVER_ALLOW_SLEEP_MSK  cpu_to_le16(BIT(0))
++#define IL_POWER_SLEEP_OVER_DTIM_MSK  cpu_to_le16(BIT(2))
+ #define IL_POWER_PCI_PM_MSK   cpu_to_le16(BIT(3))
+ 
+ struct il3945_powertable_cmd {
+diff --git a/drivers/net/wireless/iwlegacy/common.c b/drivers/net/wireless/iwlegacy/common.c
+index 9c9ebad..ecc6746 100644
+--- a/drivers/net/wireless/iwlegacy/common.c
++++ b/drivers/net/wireless/iwlegacy/common.c
+@@ -33,7 +33,6 @@
+ #include <linux/slab.h>
+ #include <linux/types.h>
+ #include <linux/lockdep.h>
+-#include <linux/init.h>
+ #include <linux/pci.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/delay.h>
+@@ -1079,29 +1078,82 @@ EXPORT_SYMBOL(il_get_channel_info);
+  * Setting power level allows the card to go to sleep when not busy.
+  *
+  * We calculate a sleep command based on the required latency, which
+- * we get from mac80211. In order to handle thermal throttling, we can
+- * also use pre-defined power levels.
++ * we get from mac80211.
+  */
+ 
+-/*
+- * This defines the old power levels. They are still used by default
+- * (level 1) and for thermal throttle (levels 3 through 5)
+- */
+-
+-struct il_power_vec_entry {
+- struct il_powertable_cmd cmd;
+- u8 no_dtim;  /* number of skip dtim */
+-};
++#define SLP_VEC(X0, X1, X2, X3, X4) { \
++  cpu_to_le32(X0), \
++  cpu_to_le32(X1), \
++  cpu_to_le32(X2), \
++  cpu_to_le32(X3), \
++  cpu_to_le32(X4)  \
++}
+ 
+ static void
+-il_power_sleep_cam_cmd(struct il_priv *il, struct il_powertable_cmd *cmd)
++il_build_powertable_cmd(struct il_priv *il, struct il_powertable_cmd *cmd)
+ {
++ const __le32 interval[3][IL_POWER_VEC_SIZE] = {
++  SLP_VEC(2, 2, 4, 6, 0xFF),
++  SLP_VEC(2, 4, 7, 10, 10),
++  SLP_VEC(4, 7, 10, 10, 0xFF)
++ };
++ int i, dtim_period, no_dtim;
++ u32 max_sleep;
++ bool skip;
++
+  memset(cmd, 0, sizeof(*cmd));
+ 
+  if (il->power_data.pci_pm)
+   cmd->flags |= IL_POWER_PCI_PM_MSK;
+ 
+- D_POWER("Sleep command for CAM\n");
++ /* if no Power Save, we are done */
++ if (il->power_data.ps_disabled)
++  return;
++
++ cmd->flags = IL_POWER_DRIVER_ALLOW_SLEEP_MSK;
++ cmd->keep_alive_seconds = 0;
++ cmd->debug_flags = 0;
++ cmd->rx_data_timeout = cpu_to_le32(25 * 1024);
++ cmd->tx_data_timeout = cpu_to_le32(25 * 1024);
++ cmd->keep_alive_beacons = 0;
++
++ dtim_period = il->vif ? il->vif->bss_conf.dtim_period : 0;
++
++ if (dtim_period <= 2) {
++  memcpy(cmd->sleep_interval, interval[0], sizeof(interval[0]));
++  no_dtim = 2;
++ } else if (dtim_period <= 10) {
++  memcpy(cmd->sleep_interval, interval[1], sizeof(interval[1]));
++  no_dtim = 2;
++ } else {
++  memcpy(cmd->sleep_interval, interval[2], sizeof(interval[2]));
++  no_dtim = 0;
++ }
++
++ if (dtim_period == 0) {
++  dtim_period = 1;
++  skip = false;
++ } else {
++  skip = !!no_dtim;
++ }
++
++ if (skip) {
++  __le32 tmp = cmd->sleep_interval[IL_POWER_VEC_SIZE - 1];
++
++  max_sleep = le32_to_cpu(tmp);
++  if (max_sleep == 0xFF)
++   max_sleep = dtim_period * (skip + 1);
++  else if (max_sleep >  dtim_period)
++   max_sleep = (max_sleep / dtim_period) * dtim_period;
++  cmd->flags |= IL_POWER_SLEEP_OVER_DTIM_MSK;
++ } else {
++  max_sleep = dtim_period;
++  cmd->flags &= ~IL_POWER_SLEEP_OVER_DTIM_MSK;
++ }
++
++ for (i = 0; i < IL_POWER_VEC_SIZE; i++)
++  if (le32_to_cpu(cmd->sleep_interval[i]) > max_sleep)
++   cmd->sleep_interval[i] = cpu_to_le32(max_sleep);
+ }
+ 
+ static int
+@@ -1174,7 +1226,8 @@ il_power_update_mode(struct il_priv *il, bool force)
+ {
+  struct il_powertable_cmd cmd;
+ 
+- il_power_sleep_cam_cmd(il, &cmd);
++ il_build_powertable_cmd(il, &cmd);
++
+  return il_power_set_mode(il, &cmd, force);
+ }
+ EXPORT_SYMBOL(il_power_update_mode);
+@@ -3445,10 +3498,10 @@ il_init_geos(struct il_priv *il)
+ 
+   if (il_is_channel_valid(ch)) {
+    if (!(ch->flags & EEPROM_CHANNEL_IBSS))
+-    geo_ch->flags |= IEEE80211_CHAN_NO_IBSS;
++    geo_ch->flags |= IEEE80211_CHAN_NO_IR;
+ 
+    if (!(ch->flags & EEPROM_CHANNEL_ACTIVE))
+-    geo_ch->flags |= IEEE80211_CHAN_PASSIVE_SCAN;
++    geo_ch->flags |= IEEE80211_CHAN_NO_IR;
+ 
+    if (ch->flags & EEPROM_CHANNEL_RADAR)
+     geo_ch->flags |= IEEE80211_CHAN_RADAR;
+@@ -3746,10 +3799,10 @@ il_full_rxon_required(struct il_priv *il)
+ 
+  /* These items are only settable from the full RXON command */
+  CHK(!il_is_associated(il));
+- CHK(!ether_addr_equal(staging->bssid_addr, active->bssid_addr));
+- CHK(!ether_addr_equal(staging->node_addr, active->node_addr));
+- CHK(!ether_addr_equal(staging->wlap_bssid_addr,
+-         active->wlap_bssid_addr));
++ CHK(!ether_addr_equal_64bits(staging->bssid_addr, active->bssid_addr));
++ CHK(!ether_addr_equal_64bits(staging->node_addr, active->node_addr));
++ CHK(!ether_addr_equal_64bits(staging->wlap_bssid_addr,
++         active->wlap_bssid_addr));
+  CHK_NEQ(staging->dev_type, active->dev_type);
+  CHK_NEQ(staging->channel, active->channel);
+  CHK_NEQ(staging->air_propagation, active->air_propagation);
+@@ -4702,7 +4755,8 @@ out:
+ }
+ EXPORT_SYMBOL(il_mac_change_interface);
+ 
+-void il_mac_flush(struct ieee80211_hw *hw, u32 queues, bool drop)
++void il_mac_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++    u32 queues, bool drop)
+ {
+  struct il_priv *il = hw->priv;
+  unsigned long timeout = jiffies + msecs_to_jiffies(500);
+@@ -5082,6 +5136,7 @@ set_ch_out:
+  }
+ 
+  if (changed & (IEEE80211_CONF_CHANGE_PS | IEEE80211_CONF_CHANGE_IDLE)) {
++  il->power_data.ps_disabled = !(conf->flags & IEEE80211_CONF_PS);
+   ret = il_power_update_mode(il, false);
+   if (ret)
+    D_MAC80211("Error setting sleep level\n");
+@@ -5308,6 +5363,17 @@ il_mac_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+   D_MAC80211("BSSID %pM\n", bss_conf->bssid);
+ 
+   /*
++   * On passive channel we wait with blocked queues to see if
++   * there is traffic on that channel. If no frame will be
++   * received (what is very unlikely since scan detects AP on
++   * that channel, but theoretically possible), mac80211 associate
++   * procedure will time out and mac80211 will call us with NULL
++   * bssid. We have to unblock queues on such condition.
++   */
++  if (is_zero_ether_addr(bss_conf->bssid))
++   il_wake_queues_by_reason(il, IL_STOP_REASON_PASSIVE);
++
++  /*
+    * If there is currently a HW scan going on in the background,
+    * then we need to cancel it, otherwise sometimes we are not
+    * able to authenticate (FIXME: why ?)
+diff --git a/drivers/net/wireless/iwlegacy/common.h b/drivers/net/wireless/iwlegacy/common.h
+index 4caaf52..ea5c0f8 100644
+--- a/drivers/net/wireless/iwlegacy/common.h
++++ b/drivers/net/wireless/iwlegacy/common.h
+@@ -858,9 +858,9 @@ struct il_hw_params {
+  * il4965_mac_     <-- mac80211 callback
+  *
+  ****************************************************************************/
+-extern void il4965_update_chain_flags(struct il_priv *il);
++void il4965_update_chain_flags(struct il_priv *il);
+ extern const u8 il_bcast_addr[ETH_ALEN];
+-extern int il_queue_space(const struct il_queue *q);
++int il_queue_space(const struct il_queue *q);
+ static inline int
+ il_queue_used(const struct il_queue *q, int i)
+ {
+@@ -1123,6 +1123,7 @@ struct il_power_mgr {
+  struct il_powertable_cmd sleep_cmd_next;
+  int debug_sleep_level_override;
+  bool pci_pm;
++ bool ps_disabled;
+ };
+ 
+ struct il_priv {
+@@ -1299,6 +1300,8 @@ struct il_priv {
+  /* queue refcounts */
+ #define IL_MAX_HW_QUEUES 32
+  unsigned long queue_stopped[BITS_TO_LONGS(IL_MAX_HW_QUEUES)];
++#define IL_STOP_REASON_PASSIVE 0
++ unsigned long stop_reason;
+  /* for each AC */
+  atomic_t queue_stop_count[4];
+ 
+@@ -1595,7 +1598,7 @@ struct il_mod_params {
+  int disable_hw_scan; /* def: 0 = use h/w scan */
+  int num_of_queues; /* def: HW dependent */
+  int disable_11n; /* def: 0 = 11n capabilities enabled */
+- int amsdu_size_8K; /* def: 1 = enable 8K amsdu size */
++ int amsdu_size_8K; /* def: 0 = disable 8K amsdu size */
+  int antenna;  /* def: 0 = both antennas (use diversity) */
+  int restart_fw;  /* def: 1 = restart firmware */
+ };
+@@ -1720,12 +1723,13 @@ void il_mac_remove_interface(struct ieee80211_hw *hw,
+         struct ieee80211_vif *vif);
+ int il_mac_change_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+        enum nl80211_iftype newtype, bool newp2p);
+-void il_mac_flush(struct ieee80211_hw *hw, u32 queues, bool drop);
++void il_mac_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++    u32 queues, bool drop);
+ int il_alloc_txq_mem(struct il_priv *il);
+ void il_free_txq_mem(struct il_priv *il);
+ 
+ #ifdef CONFIG_IWLEGACY_DEBUGFS
+-extern void il_update_stats(struct il_priv *il, bool is_tx, __le16 fc, u16 len);
++void il_update_stats(struct il_priv *il, bool is_tx, __le16 fc, u16 len);
+ #else
+ static inline void
+ il_update_stats(struct il_priv *il, bool is_tx, __le16 fc, u16 len)
+@@ -1758,12 +1762,12 @@ void il_chswitch_done(struct il_priv *il, bool is_success);
+ /*****************************************************
+ * TX
+ ******************************************************/
+-extern void il_txq_update_write_ptr(struct il_priv *il, struct il_tx_queue *txq);
+-extern int il_tx_queue_init(struct il_priv *il, u32 txq_id);
+-extern void il_tx_queue_reset(struct il_priv *il, u32 txq_id);
+-extern void il_tx_queue_unmap(struct il_priv *il, int txq_id);
+-extern void il_tx_queue_free(struct il_priv *il, int txq_id);
+-extern void il_setup_watchdog(struct il_priv *il);
++void il_txq_update_write_ptr(struct il_priv *il, struct il_tx_queue *txq);
++int il_tx_queue_init(struct il_priv *il, u32 txq_id);
++void il_tx_queue_reset(struct il_priv *il, u32 txq_id);
++void il_tx_queue_unmap(struct il_priv *il, int txq_id);
++void il_tx_queue_free(struct il_priv *il, int txq_id);
++void il_setup_watchdog(struct il_priv *il);
+ /*****************************************************
+  * TX power
+  ****************************************************/
+@@ -1929,10 +1933,10 @@ il_is_ready_rf(struct il_priv *il)
+  return il_is_ready(il);
+ }
+ 
+-extern void il_send_bt_config(struct il_priv *il);
+-extern int il_send_stats_request(struct il_priv *il, u8 flags, bool clear);
+-extern void il_apm_stop(struct il_priv *il);
+-extern void _il_apm_stop(struct il_priv *il);
++void il_send_bt_config(struct il_priv *il);
++int il_send_stats_request(struct il_priv *il, u8 flags, bool clear);
++void il_apm_stop(struct il_priv *il);
++void _il_apm_stop(struct il_priv *il);
+ 
+ int il_apm_init(struct il_priv *il);
+ 
+@@ -1966,15 +1970,29 @@ void il_tx_cmd_protection(struct il_priv *il, struct ieee80211_tx_info *info,
+ 
+ irqreturn_t il_isr(int irq, void *data);
+ 
+-extern void il_set_bit(struct il_priv *p, u32 r, u32 m);
+-extern void il_clear_bit(struct il_priv *p, u32 r, u32 m);
+-extern bool _il_grab_nic_access(struct il_priv *il);
+-extern int _il_poll_bit(struct il_priv *il, u32 addr, u32 bits, u32 mask, int timeout);
+-extern int il_poll_bit(struct il_priv *il, u32 addr, u32 mask, int timeout);
+-extern u32 il_rd_prph(struct il_priv *il, u32 reg);
+-extern void il_wr_prph(struct il_priv *il, u32 addr, u32 val);
+-extern u32 il_read_targ_mem(struct il_priv *il, u32 addr);
+-extern void il_write_targ_mem(struct il_priv *il, u32 addr, u32 val);
++void il_set_bit(struct il_priv *p, u32 r, u32 m);
++void il_clear_bit(struct il_priv *p, u32 r, u32 m);
++bool _il_grab_nic_access(struct il_priv *il);
++int _il_poll_bit(struct il_priv *il, u32 addr, u32 bits, u32 mask, int timeout);
++int il_poll_bit(struct il_priv *il, u32 addr, u32 mask, int timeout);
++u32 il_rd_prph(struct il_priv *il, u32 reg);
++void il_wr_prph(struct il_priv *il, u32 addr, u32 val);
++u32 il_read_targ_mem(struct il_priv *il, u32 addr);
++void il_write_targ_mem(struct il_priv *il, u32 addr, u32 val);
++
++static inline bool il_need_reclaim(struct il_priv *il, struct il_rx_pkt *pkt)
++{
++ /* Reclaim a command buffer only if this packet is a response
++  * to a (driver-originated) command. If the packet (e.g. Rx frame)
++  * originated from uCode, there is no command buffer to reclaim.
++  * Ucode should set SEQ_RX_FRAME bit if ucode-originated, but
++  * apparently a few don't get set; catch them here.
++  */
++ return !(pkt->hdr.sequence & SEQ_RX_FRAME) &&
++        pkt->hdr.cmd != N_STATS && pkt->hdr.cmd != C_TX &&
++        pkt->hdr.cmd != N_RX_PHY && pkt->hdr.cmd != N_RX &&
++        pkt->hdr.cmd != N_RX_MPDU && pkt->hdr.cmd != N_COMPRESSED_BA;
++}
+ 
+ static inline void
+ _il_write8(struct il_priv *il, u32 ofs, u8 val)
+@@ -2257,6 +2275,19 @@ il_set_swq_id(struct il_tx_queue *txq, u8 ac, u8 hwq)
+ }
+ 
+ static inline void
++_il_wake_queue(struct il_priv *il, u8 ac)
++{
++ if (atomic_dec_return(&il->queue_stop_count[ac]) <= 0)
++  ieee80211_wake_queue(il->hw, ac);
++}
++
++static inline void
++_il_stop_queue(struct il_priv *il, u8 ac)
++{
++ if (atomic_inc_return(&il->queue_stop_count[ac]) > 0)
++  ieee80211_stop_queue(il->hw, ac);
++}
++static inline void
+ il_wake_queue(struct il_priv *il, struct il_tx_queue *txq)
+ {
+  u8 queue = txq->swq_id;
+@@ -2264,8 +2295,7 @@ il_wake_queue(struct il_priv *il, struct il_tx_queue *txq)
+  u8 hwq = (queue >> 2) & 0x1f;
+ 
+  if (test_and_clear_bit(hwq, il->queue_stopped))
+-  if (atomic_dec_return(&il->queue_stop_count[ac]) <= 0)
+-   ieee80211_wake_queue(il->hw, ac);
++  _il_wake_queue(il, ac);
+ }
+ 
+ static inline void
+@@ -2276,8 +2306,27 @@ il_stop_queue(struct il_priv *il, struct il_tx_queue *txq)
+  u8 hwq = (queue >> 2) & 0x1f;
+ 
+  if (!test_and_set_bit(hwq, il->queue_stopped))
+-  if (atomic_inc_return(&il->queue_stop_count[ac]) > 0)
+-   ieee80211_stop_queue(il->hw, ac);
++  _il_stop_queue(il, ac);
++}
++
++static inline void
++il_wake_queues_by_reason(struct il_priv *il, int reason)
++{
++ u8 ac;
++
++ if (test_and_clear_bit(reason, &il->stop_reason))
++  for (ac = 0; ac < 4; ac++)
++   _il_wake_queue(il, ac);
++}
++
++static inline void
++il_stop_queues_by_reason(struct il_priv *il, int reason)
++{
++ u8 ac;
++
++ if (!test_and_set_bit(reason, &il->stop_reason))
++  for (ac = 0; ac < 4; ac++)
++   _il_stop_queue(il, ac);
+ }
+ 
+ #ifdef ieee80211_stop_queue
+@@ -2835,13 +2884,13 @@ il4965_first_antenna(u8 mask)
+  * The specific throughput table used is based on the type of network
+  * the associated with, including A, B, G, and G w/ TGG protection
+  */
+-extern void il3945_rate_scale_init(struct ieee80211_hw *hw, s32 sta_id);
++void il3945_rate_scale_init(struct ieee80211_hw *hw, s32 sta_id);
+ 
+ /* Initialize station's rate scaling information after adding station */
+-extern void il4965_rs_rate_init(struct il_priv *il, struct ieee80211_sta *sta,
+-    u8 sta_id);
+-extern void il3945_rs_rate_init(struct il_priv *il, struct ieee80211_sta *sta,
+-    u8 sta_id);
++void il4965_rs_rate_init(struct il_priv *il, struct ieee80211_sta *sta,
++    u8 sta_id);
++void il3945_rs_rate_init(struct il_priv *il, struct ieee80211_sta *sta,
++    u8 sta_id);
+ 
+ /**
+  * il_rate_control_register - Register the rate control algorithm callbacks
+@@ -2853,8 +2902,8 @@ extern void il3945_rs_rate_init(struct il_priv *il, struct ieee80211_sta *sta,
+  * ieee80211_register_hw
+  *
+  */
+-extern int il4965_rate_control_register(void);
+-extern int il3945_rate_control_register(void);
++int il4965_rate_control_register(void);
++int il3945_rate_control_register(void);
+ 
+ /**
+  * il_rate_control_unregister - Unregister the rate control callbacks
+@@ -2862,11 +2911,11 @@ extern int il3945_rate_control_register(void);
+  * This should be called after calling ieee80211_unregister_hw, but before
+  * the driver is unloaded.
+  */
+-extern void il4965_rate_control_unregister(void);
+-extern void il3945_rate_control_unregister(void);
++void il4965_rate_control_unregister(void);
++void il3945_rate_control_unregister(void);
+ 
+-extern int il_power_update_mode(struct il_priv *il, bool force);
+-extern void il_power_initialize(struct il_priv *il);
++int il_power_update_mode(struct il_priv *il, bool force);
++void il_power_initialize(struct il_priv *il);
+ 
+ extern u32 il_debug_level;
+ 
+diff --git a/drivers/net/wireless/iwlegacy/debug.c b/drivers/net/wireless/iwlegacy/debug.c
+index eff2650..3440101 100644
+--- a/drivers/net/wireless/iwlegacy/debug.c
++++ b/drivers/net/wireless/iwlegacy/debug.c
+@@ -31,7 +31,7 @@
+ 
+ #include "common.h"
+ 
+-void
++static void
+ il_clear_traffic_stats(struct il_priv *il)
+ {
+  memset(&il->tx_stats, 0, sizeof(struct traffic_stats));
+@@ -567,12 +567,12 @@ il_dbgfs_channels_read(struct file *file, char __user *user_buf, size_t count,
+           flags & IEEE80211_CHAN_RADAR ?
+           " (IEEE 802.11h required)" : "",
+           ((channels[i].
+-     flags & IEEE80211_CHAN_NO_IBSS) ||
++     flags & IEEE80211_CHAN_NO_IR) ||
+            (channels[i].
+      flags & IEEE80211_CHAN_RADAR)) ? "" :
+           ", IBSS",
+           channels[i].
+-          flags & IEEE80211_CHAN_PASSIVE_SCAN ?
++          flags & IEEE80211_CHAN_NO_IR ?
+           "passive only" : "active/passive");
+  }
+  supp_band = il_get_hw_mode(il, IEEE80211_BAND_5GHZ);
+@@ -594,12 +594,12 @@ il_dbgfs_channels_read(struct file *file, char __user *user_buf, size_t count,
+           flags & IEEE80211_CHAN_RADAR ?
+           " (IEEE 802.11h required)" : "",
+           ((channels[i].
+-     flags & IEEE80211_CHAN_NO_IBSS) ||
++     flags & IEEE80211_CHAN_NO_IR) ||
+            (channels[i].
+      flags & IEEE80211_CHAN_RADAR)) ? "" :
+           ", IBSS",
+           channels[i].
+-          flags & IEEE80211_CHAN_PASSIVE_SCAN ?
++          flags & IEEE80211_CHAN_NO_IR ?
+           "passive only" : "active/passive");
+  }
+  ret = simple_read_from_buffer(user_buf, count, ppos, buf, pos);
+-- 
+1.7.1

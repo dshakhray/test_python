@@ -1,0 +1,97 @@
+From 4fc3bb6ec13a767d4ab06cd4bf04664b6ca721d5 Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Mon, 8 Sep 2014 20:11:48 -0400
+Subject: [block] cfq-iosched: Fix wrong children_weight calculation
+
+Message-id: <1410207109-30525-2-git-send-email-vgoyal@redhat.com>
+Patchwork-id: 92482
+O-Subject: [RHEL7.1 PATCH 1/2] cfq-iosched: Fix wrong children_weight calculation
+Bugzilla: 1116126
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ:1116126
+
+commit e15693ef18e13e3e6bffe891fe140f18b8ff6d07
+Author: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+Date: Tue, 26 Aug 2014 20:56:36 +0900
+
+cfq_group_service_tree_add() is applying new_weight at the beginning of
+the function via cfq_update_group_weight().
+This actually allows weight to change between adding it to and subtracting
+it from children_weight, and triggers WARN_ON_ONCE() in
+cfq_group_service_tree_del(), or even causes oops by divide error during
+vfr calculation in cfq_group_service_tree_add().
+
+The detailed scenario is as follows:
+1. Create blkio cgroups X and Y as a child of X.
+   Set X's weight to 500 and perform some I/O to apply new_weight.
+   This X's I/O completes before starting Y's I/O.
+2. Y starts I/O and cfq_group_service_tree_add() is called with Y.
+3. cfq_group_service_tree_add() walks up the tree during children_weight
+   calculation and adds parent X's weight (500) to children_weight of root.
+   children_weight becomes 500.
+4. Set X's weight to 1000.
+5. X starts I/O and cfq_group_service_tree_add() is called with X.
+6. cfq_group_service_tree_add() applies its new_weight (1000).
+7. I/O of Y completes and cfq_group_service_tree_del() is called with Y.
+8. I/O of X completes and cfq_group_service_tree_del() is called with X.
+9. cfq_group_service_tree_del() subtracts X's weight (1000) from
+   children_weight of root. children_weight becomes -500.
+   This triggers WARN_ON_ONCE().
+10. Set X's weight to 500.
+11. X starts I/O and cfq_group_service_tree_add() is called with X.
+12. cfq_group_service_tree_add() applies its new_weight (500) and adds it
+    to children_weight of root. children_weight becomes 0. Calcularion of
+    vfr triggers oops by divide error.
+
+weight should be updated right before adding it to children_weight.
+
+Reported-by: Ruki Sekiya <sekiya.ruki@lab.ntt.co.jp>
+Signed-off-by: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+Acked-by: Tejun Heo <tj@kernel.org>
+Cc: stable@vger.kernel.org
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/cfq-iosched.c b/block/cfq-iosched.c
+index 8c294b7..0d208a9 100644
+--- a/block/cfq-iosched.c
++++ b/block/cfq-iosched.c
+@@ -1275,12 +1275,16 @@ __cfq_group_service_tree_add(struct cfq_rb_root *st, struct cfq_group *cfqg)
+ static void
+ cfq_update_group_weight(struct cfq_group *cfqg)
+ {
+- BUG_ON(!RB_EMPTY_NODE(&cfqg->rb_node));
+-
+  if (cfqg->new_weight) {
+   cfqg->weight = cfqg->new_weight;
+   cfqg->new_weight = 0;
+  }
++}
++
++static void
++cfq_update_group_leaf_weight(struct cfq_group *cfqg)
++{
++ BUG_ON(!RB_EMPTY_NODE(&cfqg->rb_node));
+ 
+  if (cfqg->new_leaf_weight) {
+   cfqg->leaf_weight = cfqg->new_leaf_weight;
+@@ -1299,7 +1303,7 @@ cfq_group_service_tree_add(struct cfq_rb_root *st, struct cfq_group *cfqg)
+  /* add to the service tree */
+  BUG_ON(!RB_EMPTY_NODE(&cfqg->rb_node));
+ 
+- cfq_update_group_weight(cfqg);
++ cfq_update_group_leaf_weight(cfqg);
+  __cfq_group_service_tree_add(st, cfqg);
+ 
+  /*
+@@ -1323,6 +1327,7 @@ cfq_group_service_tree_add(struct cfq_rb_root *st, struct cfq_group *cfqg)
+   */
+  while ((parent = cfqg_parent(pos))) {
+   if (propagate) {
++   cfq_update_group_weight(pos);
+    propagate = !parent->nr_active++;
+    parent->children_weight += pos->weight;
+   }
+-- 
+1.7.1

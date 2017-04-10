@@ -1,0 +1,107 @@
+From e436fd154d102315bc14372064dbcadf161ec24a Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@redhat.com>
+Date: Tue, 21 Oct 2014 17:05:40 -0400
+Subject: [net] ipv4: fix a race in update_or_create_fnhe()
+
+Message-id: <9b0e89c918b61a33eda9cc163201d2b3ae8d2b34.1413910820.git.hannes@redhat.com>
+Patchwork-id: 98026
+O-Subject: [RHEL7.1 net PATCH 4/4] ipv4: fix a race in update_or_create_fnhe()
+Bugzilla: 1155155
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1155155
+Upstream Status: caa415270c732505240bb60171c44a7838c555e8
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8142603
+
+Upstream Commit:
+commit caa415270c732505240bb60171c44a7838c555e8
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Wed Sep 3 22:21:56 2014 -0700
+
+    ipv4: fix a race in update_or_create_fnhe()
+
+    nh_exceptions is effectively used under rcu, but lacks proper
+    barriers. Between kzalloc() and setting of nh->nh_exceptions(),
+    we need a proper memory barrier.
+
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Fixes: 4895c771c7f00 ("ipv4: Add FIB nexthop exceptions.")
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Hannes Frederic Sowa <hannes@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index 44424e9..a6cb00a 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -86,7 +86,7 @@ struct fib_nh {
+  int   nh_saddr_genid;
+  struct rtable __rcu * __percpu *nh_pcpu_rth_output;
+  struct rtable __rcu *nh_rth_input;
+- struct fnhe_hash_bucket *nh_exceptions;
++ struct fnhe_hash_bucket __rcu *nh_exceptions;
+ };
+ 
+ /*
+diff --git a/net/ipv4/fib_semantics.c b/net/ipv4/fib_semantics.c
+index 07a9a4f..b6c8c98 100644
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@ -157,9 +157,12 @@ static void rt_fibinfo_free(struct rtable __rcu **rtp)
+ 
+ static void free_nh_exceptions(struct fib_nh *nh)
+ {
+- struct fnhe_hash_bucket *hash = nh->nh_exceptions;
++ struct fnhe_hash_bucket *hash;
+  int i;
+ 
++ hash = rcu_dereference_protected(nh->nh_exceptions, 1);
++ if (!hash)
++  return;
+  for (i = 0; i < FNHE_HASH_SIZE; i++) {
+   struct fib_nh_exception *fnhe;
+ 
+@@ -204,8 +207,7 @@ static void free_fib_info_rcu(struct rcu_head *head)
+  change_nexthops(fi) {
+   if (nexthop_nh->nh_dev)
+    dev_put(nexthop_nh->nh_dev);
+-  if (nexthop_nh->nh_exceptions)
+-   free_nh_exceptions(nexthop_nh);
++  free_nh_exceptions(nexthop_nh);
+   rt_fibinfo_free_cpus(nexthop_nh->nh_pcpu_rth_output);
+   rt_fibinfo_free(&nexthop_nh->nh_rth_input);
+  } endfor_nexthops(fi);
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index c81528f..ba33bd9 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -618,12 +618,12 @@ static void update_or_create_fnhe(struct fib_nh *nh, __be32 daddr, __be32 gw,
+ 
+  spin_lock_bh(&fnhe_lock);
+ 
+- hash = nh->nh_exceptions;
++ hash = rcu_dereference(nh->nh_exceptions);
+  if (!hash) {
+   hash = kzalloc(FNHE_HASH_SIZE * sizeof(*hash), GFP_ATOMIC);
+   if (!hash)
+    goto out_unlock;
+-  nh->nh_exceptions = hash;
++  rcu_assign_pointer(nh->nh_exceptions, hash);
+  }
+ 
+  hash += hval;
+@@ -1214,7 +1214,7 @@ static unsigned int ipv4_mtu(const struct dst_entry *dst)
+ 
+ static struct fib_nh_exception *find_exception(struct fib_nh *nh, __be32 daddr)
+ {
+- struct fnhe_hash_bucket *hash = nh->nh_exceptions;
++ struct fnhe_hash_bucket *hash = rcu_dereference(nh->nh_exceptions);
+  struct fib_nh_exception *fnhe;
+  u32 hval;
+ 
+-- 
+1.7.1

@@ -1,0 +1,141 @@
+From da5285d74e3f5a633a6df9fe6e73a9af5c0fe77f Mon Sep 17 00:00:00 2001
+From: Steve Best <sbest@redhat.com>
+Date: Fri, 3 Oct 2014 21:26:06 -0400
+Subject: [powerpc] powernv: Interface to register/unregister opal dump region
+
+Message-id: <20141003212605.20407.62826.sendpatchset@ibm-p7r2-01.lab.bos.redhat.com>
+Patchwork-id: 96896
+O-Subject: [PATCH RHEL7.1 BZ1142244 2/4] powerpc/powernv: Interface to register/unregister opal dump region
+Bugzilla: 1142244
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+RHBZ#:
+------
+https://bugzilla.redhat.com/show_bug.cgi?id=1142244
+
+Description:
+------------
+PowerNV platform is capable of capturing host memory region when system
+crashes (because of host/firmware). We have new OPAL API to register/
+unregister memory region to be captured when system crashes.
+
+This patch adds support for new API. Also during boot time we register
+kernel log buffer and unregister before doing kexec.
+
+Signed-off-by: Vasant Hegde <hegdevasant@linux.vnet.ibm.com>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+RHEL Version Found:
+-------------------
+7.0
+
+Upstream Status:
+----------------
+https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=b09c2ec4082c63584491f35df2cb530ee8ca312d
+
+----------------
+Steve Best
+
+Proposed Patch:
+---------------
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 0da1dbd..e795ae1 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -147,6 +147,8 @@ struct opal_sg_list {
+ #define OPAL_SET_PARAM    90
+ #define OPAL_DUMP_RESEND   91
+ #define OPAL_DUMP_INFO2    94
++#define OPAL_REGISTER_DUMP_REGION  101
++#define OPAL_UNREGISTER_DUMP_REGION  102
+ 
+ #ifndef __ASSEMBLY__
+ 
+@@ -860,6 +862,8 @@ int64_t opal_get_param(uint64_t token, uint32_t param_id, uint64_t buffer,
+ int64_t opal_set_param(uint64_t token, uint32_t param_id, uint64_t buffer,
+   uint64_t length);
+ int64_t opal_sensor_read(uint32_t sensor_hndl, int token, __be32 *sensor_data);
++int64_t opal_register_dump_region(uint32_t id, uint64_t start, uint64_t end);
++int64_t opal_unregister_dump_region(uint32_t id);
+ 
+ /* Internal functions */
+ extern int early_init_dt_scan_opal(unsigned long node, const char *uname,
+@@ -912,6 +916,13 @@ struct opal_sg_list *opal_vmalloc_to_sg_list(void *vmalloc_addr,
+           unsigned long vmalloc_size);
+ void opal_free_sg_list(struct opal_sg_list *sg);
+ 
++/*
++ * Dump region ID range usable by the OS
++ */
++#define OPAL_DUMP_REGION_HOST_START  0x80
++#define OPAL_DUMP_REGION_LOG_BUF  0x80
++#define OPAL_DUMP_REGION_HOST_END  0xFF
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* __OPAL_H */
+diff --git a/arch/powerpc/platforms/powernv/opal-wrappers.S b/arch/powerpc/platforms/powernv/opal-wrappers.S
+index 4abbff2..0f016cb 100644
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@ -146,3 +146,5 @@ OPAL_CALL(opal_sync_host_reboot,  OPAL_SYNC_HOST_REBOOT);
+ OPAL_CALL(opal_sensor_read,   OPAL_SENSOR_READ);
+ OPAL_CALL(opal_get_param,   OPAL_GET_PARAM);
+ OPAL_CALL(opal_set_param,   OPAL_SET_PARAM);
++OPAL_CALL(opal_register_dump_region,  OPAL_REGISTER_DUMP_REGION);
++OPAL_CALL(opal_unregister_dump_region,  OPAL_UNREGISTER_DUMP_REGION);
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index 539243e..07dee0c 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -567,6 +567,24 @@ static int opal_sysfs_init(void)
+  return 0;
+ }
+ 
++static void __init opal_dump_region_init(void)
++{
++ void *addr;
++ uint64_t size;
++ int rc;
++
++ /* Register kernel log buffer */
++ addr = log_buf_addr_get();
++ size = log_buf_len_get();
++ rc = opal_register_dump_region(OPAL_DUMP_REGION_LOG_BUF,
++           __pa(addr), size);
++ /* Don't warn if this is just an older OPAL that doesn't
++  * know about that call
++  */
++ if (rc && rc != OPAL_UNSUPPORTED)
++  pr_warn("DUMP: Failed to register kernel log buffer. "
++   "rc = %d\n", rc);
++}
+ static int __init opal_init(void)
+ {
+  struct device_node *np, *consoles;
+@@ -616,6 +634,8 @@ static int __init opal_init(void)
+  /* Create "opal" kobject under /sys/firmware */
+  rc = opal_sysfs_init();
+  if (rc == 0) {
++  /* Setup dump region interface */
++  opal_dump_region_init();
+   /* Setup error log interface */
+   rc = opal_elog_init();
+   /* Setup code update interface */
+@@ -656,6 +676,9 @@ void opal_shutdown(void)
+   else
+    mdelay(10);
+  }
++
++ /* Unregister memory dump region */
++ opal_unregister_dump_region(OPAL_DUMP_REGION_LOG_BUF);
+ }
+ 
+ /* Export this so that test modules can use it */
+-- 
+1.7.1

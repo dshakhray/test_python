@@ -1,0 +1,70 @@
+From e286fe04baf3a3842c22dd87741aa0ff6d15cdef Mon Sep 17 00:00:00 2001
+From: Jacob Tanenbaum <jtanenba@redhat.com>
+Date: Thu, 25 Sep 2014 13:10:59 -0400
+Subject: [usb] serial/whiteheat: fix memory corruption flaw
+
+Message-id: <1411650659-12215-1-git-send-email-jtanenba@redhat.com>
+Patchwork-id: 96719
+O-Subject: [RHEL7 PATCH BZ1141404 CVE-2014-3185] Kernel: USB serial: memory corruption flaw
+Bugzilla: 1141404
+CVE: CVE-2014-3185
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+Linux kernel built with the USB Serial Converter support(USB_SERIAL) along with
+a USB ConnectTech WhiteHEAT Serial Driver(CONFIG_USB_SERIAL_WHITEHEAT) is
+vulnerable to a memory corruption flaw. It could occur when reading completion
+commands via USB Request Blocks buffers.
+
+A local user with physical access to the system could use this flaw to corrupt
+kernel memory area or crash the system kernel resulting in DoS.
+
+Backport of the following:
+commit 6817ae225cd650fb1c3295d769298c38b1eba818
+Author: James Forshaw <forshaw@google.com>
+Date:   Sat Aug 23 14:39:48 2014 -0700
+
+USB: whiteheat: Added bounds checking for bulk command response
+
+This patch fixes a potential security issue in the whiteheat USB driver
+which might allow a local attacker to cause kernel memory corrpution.
+This is due to an unchecked memcpy into a fixed size buffer (of 64
+bytes). On EHCI and XHCI busses it's possible to craft responses greater
+than 64 bytes leading a buffer overflow.
+
+BUGZILLA: https://bugzilla.redhat.com/show_bug.cgi?id=1141404
+BREW: https://brewweb.devel.redhat.com/taskinfo?taskID=8004887
+BEAKER: https://beaker.engineering.redhat.com/jobs/758213
+
+No issues seen in Brew build or Beaker tests. It is a known issue that
+test case "/kernel/RHEL7/perf/sanity/test" fails sporadically.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/serial/whiteheat.c b/drivers/usb/serial/whiteheat.c
+index e62f2df..6c3734d 100644
+--- a/drivers/usb/serial/whiteheat.c
++++ b/drivers/usb/serial/whiteheat.c
+@@ -514,6 +514,10 @@ static void command_port_read_callback(struct urb *urb)
+   dev_dbg(&urb->dev->dev, "%s - command_info is NULL, exiting.\n", __func__);
+   return;
+  }
++ if (!urb->actual_length) {
++  dev_dbg(&urb->dev->dev, "%s - empty response, exiting.\n", __func__);
++  return;
++ }
+  if (status) {
+   dev_dbg(&urb->dev->dev, "%s - nonzero urb status: %d\n", __func__, status);
+   if (status != -ENOENT)
+@@ -534,7 +538,8 @@ static void command_port_read_callback(struct urb *urb)
+   /* These are unsolicited reports from the firmware, hence no
+      waiting command to wakeup */
+   dev_dbg(&urb->dev->dev, "%s - event received\n", __func__);
+- } else if (data[0] == WHITEHEAT_GET_DTR_RTS) {
++ } else if ((data[0] == WHITEHEAT_GET_DTR_RTS) &&
++  (urb->actual_length - 1 <= sizeof(command_info->result_buffer))) {
+   memcpy(command_info->result_buffer, &data[1],
+       urb->actual_length - 1);
+   command_info->command_finished = WHITEHEAT_CMD_COMPLETE;
+-- 
+1.7.1

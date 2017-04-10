@@ -1,0 +1,87 @@
+From 87268238e8842e4492ac92477140007e835f5278 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:22:19 -0400
+Subject: [fs] ceph: fix race between cap issue and revoke
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-33-git-send-email-sweil@redhat.com>
+Patchwork-id: 89779
+O-Subject: [PATCH 032/303] ceph: fix race between cap issue and revoke
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: "Yan, Zheng" <zheng.z.yan@intel.com>
+
+If we receive new caps from the auth MDS and the non-auth MDS is
+revoking the newly issued caps, we should release the caps from
+the non-auth MDS. The scenario is filelock's state changes from
+SYNC to LOCK. Non-auth MDS revokes Fc cap, the client gets Fc cap
+from the auth MDS at the same time.
+
+Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit 6ee6b95373dfa1d0a4c9bc76689ec10a60c1d6f2)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index 7045a8d..25442b4 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -806,22 +806,28 @@ int __ceph_caps_issued_mask(struct ceph_inode_info *ci, int mask, int touch)
+ /*
+  * Return true if mask caps are currently being revoked by an MDS.
+  */
+-int ceph_caps_revoking(struct ceph_inode_info *ci, int mask)
++int __ceph_caps_revoking_other(struct ceph_inode_info *ci,
++          struct ceph_cap *ocap, int mask)
+ {
+- struct inode *inode = &ci->vfs_inode;
+  struct ceph_cap *cap;
+  struct rb_node *p;
+- int ret = 0;
+ 
+- spin_lock(&ci->i_ceph_lock);
+  for (p = rb_first(&ci->i_caps); p; p = rb_next(p)) {
+   cap = rb_entry(p, struct ceph_cap, ci_node);
+-  if (__cap_is_valid(cap) &&
+-      (cap->implemented & ~cap->issued & mask)) {
+-   ret = 1;
+-   break;
+-  }
++  if (cap != ocap && __cap_is_valid(cap) &&
++      (cap->implemented & ~cap->issued & mask))
++   return 1;
+  }
++ return 0;
++}
++
++int ceph_caps_revoking(struct ceph_inode_info *ci, int mask)
++{
++ struct inode *inode = &ci->vfs_inode;
++ int ret;
++
++ spin_lock(&ci->i_ceph_lock);
++ ret = __ceph_caps_revoking_other(ci, NULL, mask);
+  spin_unlock(&ci->i_ceph_lock);
+  dout("ceph_caps_revoking %p %s = %d\n", inode,
+       ceph_cap_string(mask), ret);
+@@ -2488,6 +2494,11 @@ static void handle_cap_grant(struct inode *inode, struct ceph_mds_caps *grant,
+  } else {
+   dout("grant: %s -> %s\n", ceph_cap_string(cap->issued),
+        ceph_cap_string(newcaps));
++  /* non-auth MDS is revoking the newly grant caps ? */
++  if (cap == ci->i_auth_cap &&
++      __ceph_caps_revoking_other(ci, cap, newcaps))
++      check_caps = 2;
++
+   cap->issued = newcaps;
+   cap->implemented |= newcaps; /* add bits only, to
+            * avoid stepping on a
+-- 
+1.7.1

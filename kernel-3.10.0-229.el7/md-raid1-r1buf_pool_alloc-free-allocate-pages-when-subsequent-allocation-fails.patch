@@ -1,0 +1,86 @@
+From 32a96635958d2362d7172880c18ee0b68e6d6a31 Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:25:56 -0400
+Subject: [md] raid1: r1buf_pool_alloc, free allocate pages when subsequent allocation fails
+
+Message-id: <1409563584-9000-55-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 90004
+O-Subject: [RHEL7.1 PATCH 54/82] md/raid1: r1buf_pool_alloc: free allocate pages when subsequent allocation fails.
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: NeilBrown <neilb@suse.de>
+
+When performing a user-request check/repair (MD_RECOVERY_REQUEST is set)
+on a raid1, we allocate multiple bios each with their own set of pages.
+
+If the page allocations for one bio fails, we currently do *not* free
+the pages allocated for the previous bios, nor do we free the bio itself.
+
+This patch frees all the already-allocate pages, and makes sure that
+all the bios are freed as well.
+
+This bug can cause a memory leak which can ultimately OOM a machine.
+It was introduced in 3.10-rc1.
+
+Fixes: a07876064a0b73ab5ef1ebcf14b1cf0231c07858
+Cc: Kent Overstreet <koverstreet@google.com>
+Cc: stable@vger.kernel.org (3.10+)
+Reported-by: Russell King - ARM Linux <linux@arm.linux.org.uk>
+Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit da1aab3dca9aa88ae34ca392470b8943159e25fe)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index b799048..d0d13af 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -96,6 +96,7 @@ static void * r1buf_pool_alloc(gfp_t gfp_flags, void *data)
+  struct pool_info *pi = data;
+  struct r1bio *r1_bio;
+  struct bio *bio;
++ int need_pages;
+  int i, j;
+ 
+  r1_bio = r1bio_pool_alloc(gfp_flags, pi);
+@@ -118,15 +119,15 @@ static void * r1buf_pool_alloc(gfp_t gfp_flags, void *data)
+   * RESYNC_PAGES for each bio.
+   */
+  if (test_bit(MD_RECOVERY_REQUESTED, &pi->mddev->recovery))
+-  j = pi->raid_disks;
++  need_pages = pi->raid_disks;
+  else
+-  j = 1;
+- while(j--) {
++  need_pages = 1;
++ for (j = 0; j < need_pages; j++) {
+   bio = r1_bio->bios[j];
+   bio->bi_vcnt = RESYNC_PAGES;
+ 
+   if (bio_alloc_pages(bio, gfp_flags))
+-   goto out_free_bio;
++   goto out_free_pages;
+  }
+  /* If not user-requests, copy the page pointers to all bios */
+  if (!test_bit(MD_RECOVERY_REQUESTED, &pi->mddev->recovery)) {
+@@ -140,6 +141,14 @@ static void * r1buf_pool_alloc(gfp_t gfp_flags, void *data)
+ 
+  return r1_bio;
+ 
++out_free_pages:
++ while (--j >= 0) {
++  struct bio_vec *bv;
++
++  bio_for_each_segment_all(bv, r1_bio->bios[j], i)
++   __free_page(bv->bv_page);
++ }
++
+ out_free_bio:
+  while (++j < pi->raid_disks)
+   bio_put(r1_bio->bios[j]);
+-- 
+1.7.1

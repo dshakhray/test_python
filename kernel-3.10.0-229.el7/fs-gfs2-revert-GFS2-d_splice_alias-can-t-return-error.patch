@@ -1,0 +1,69 @@
+From cfcbd84cf9d4588464b46d9c7fb78d3f7e02b3f9 Mon Sep 17 00:00:00 2001
+From: Robert S Peterson <rpeterso@redhat.com>
+Date: Wed, 17 Sep 2014 16:51:30 -0400
+Subject: [fs] gfs2: revert "GFS2: d_splice_alias() can't return error"
+
+Message-id: <601537171.24388338.1410972690895.JavaMail.zimbra@redhat.com>
+Patchwork-id: 96139
+O-Subject: [RHEL7.1 PATCH][bz1141899] GFS2: revert "GFS2: d_splice_alias() can't return error"
+Bugzilla: 1141899
+RH-Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+RH-Acked-by: Abhijith Das <adas@redhat.com>
+
+Hi,
+
+This patch is for bz#1141899. GFS2 in the RHEL7 kernel doesn't check
+the return code from d_splice_alias, which is wrong. This patch combines
+two upstream patches listed below, so that it's fixed properly.
+
+This was tested on the "AFC East" cluster from the performance group
+using SAS Calibration. A kernel build with the patch may be found here:
+https://brewweb.devel.redhat.com/taskinfo?taskID=7973601
+
+Patch description:
+
+0d0d110720d7960b77c03c9f2597faaff4b484ae asserts that "d_splice_alias()
+can't return error unless it was given an IS_ERR(inode)".
+
+That was true of the implementation of d_splice_alias, but this is
+really a problem with d_splice_alias: at a minimum it should be able to
+return -ELOOP in the case where inserting the given dentry would cause a
+directory loop.
+
+This is a combination of these two upstream patches:
+d57b9c9a999a8f4475fe73fba629c964245800ca and
+cfb2f9d5c921e38b0f12bb26fed10b877664444d
+
+rhbz#1141899
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/gfs2/inode.c b/fs/gfs2/inode.c
+index 0acd355..7b03d30 100644
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@ -585,6 +585,11 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
+  error = PTR_ERR(inode);
+  if (!IS_ERR(inode)) {
+   d = d_splice_alias(inode, dentry);
++  error = PTR_ERR(d);
++  if (IS_ERR(d)) {
++   inode = ERR_CAST(d);
++   goto fail_gunlock;
++  }
+   error = 0;
+   if (file) {
+    if (S_ISREG(inode->i_mode)) {
+@@ -780,6 +785,10 @@ static struct dentry *__gfs2_lookup(struct inode *dir, struct dentry *dentry,
+  }
+ 
+  d = d_splice_alias(inode, dentry);
++ if (IS_ERR(d)) {
++  gfs2_glock_dq_uninit(&gh);
++  return d;
++ }
+  if (file && S_ISREG(inode->i_mode))
+   error = finish_open(file, dentry, gfs2_open_common, opened);
+ 
+-- 
+1.7.1

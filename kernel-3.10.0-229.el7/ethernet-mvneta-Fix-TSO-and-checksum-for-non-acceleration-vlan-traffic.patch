@@ -1,0 +1,82 @@
+From 7ce6591f2fd79d1b2adacee514f8962566c459cb Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Fri, 29 Aug 2014 21:23:22 -0400
+Subject: [ethernet] mvneta: Fix TSO and checksum for non-acceleration vlan traffic
+
+Message-id: <1409347403-2401-12-git-send-email-vyasevic@redhat.com>
+Patchwork-id: 89929
+O-Subject: [RHEL7 PATCH 11/12] mvneta: Fix TSO and checksum for non-acceleration vlan traffic
+Bugzilla: 1135619
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+
+From: Vlad Yasevich <vyasevich@gmail.com>
+
+This driver doesn't appear to support vlan acceleration at
+all.  However, it does claim to support TSO and IP checksums
+for vlan devices.  Thus any configured vlan device would
+end up passing down partial checksums or TSO frames.
+
+The driver also uses the value from skb->protocol to
+determine TSO and checksum offload information, but assumes
+that skb->protocol holds the l3 protocol information.
+As a result, vlan traffic with partial checksums or TSO
+will fail those checks and TSO will not happen.
+
+Fix this by using vlan_get_protocol() helper.
+
+CC: Thomas Petazzoni <thomas.petazzoni@free-electrons.com>
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 817dbfa5d1bc276a72c1a577310382008e8aca0a)
+
+Also squashed in
+  commit 2d39d120781a5770573dc6ed672a5a562f541aea
+      mvneta: Add missing if_vlan.h include.
+so as not to break bisect builds.
+
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/marvell/mvneta.c b/drivers/net/ethernet/marvell/mvneta.c
+index 254f255..a7290ea 100644
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -20,6 +20,7 @@
+ #include <linux/mbus.h>
+ #include <linux/module.h>
+ #include <linux/interrupt.h>
++#include <linux/if_vlan.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+ #include <linux/of.h>
+@@ -1292,15 +1293,16 @@ static u32 mvneta_skb_tx_csum(struct mvneta_port *pp, struct sk_buff *skb)
+ {
+  if (skb->ip_summed == CHECKSUM_PARTIAL) {
+   int ip_hdr_len = 0;
++  __be16 l3_proto = vlan_get_protocol(skb);
+   u8 l4_proto;
+ 
+-  if (skb->protocol == htons(ETH_P_IP)) {
++  if (l3_proto == htons(ETH_P_IP)) {
+    struct iphdr *ip4h = ip_hdr(skb);
+ 
+    /* Calculate IPv4 checksum and L4 checksum */
+    ip_hdr_len = ip4h->ihl;
+    l4_proto = ip4h->protocol;
+-  } else if (skb->protocol == htons(ETH_P_IPV6)) {
++  } else if (l3_proto == htons(ETH_P_IPV6)) {
+    struct ipv6hdr *ip6h = ipv6_hdr(skb);
+ 
+    /* Read l4_protocol from one of IPv6 extra headers */
+@@ -1311,7 +1313,7 @@ static u32 mvneta_skb_tx_csum(struct mvneta_port *pp, struct sk_buff *skb)
+    return MVNETA_TX_L4_CSUM_NOT;
+ 
+   return mvneta_txq_desc_csum(skb_network_offset(skb),
+-    skb->protocol, ip_hdr_len, l4_proto);
++         l3_proto, ip_hdr_len, l4_proto);
+  }
+ 
+  return MVNETA_TX_L4_CSUM_NOT;
+-- 
+1.7.1

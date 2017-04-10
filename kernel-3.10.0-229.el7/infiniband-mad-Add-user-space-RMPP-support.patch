@@ -1,0 +1,282 @@
+From 4373c50d9ec5ef33bc7f59d854b5fea6cb5443af Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 11:59:32 -0400
+Subject: [infiniband] mad: Add user space RMPP support
+
+Message-id: <753d9459d880306a68f8d8cee21fc62c4b72790b.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93589
+O-Subject: [Patch RHEL7.1 V1 036/197] IB/mad: Add user space RMPP support
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Ira Weiny <ira.weiny@intel.com>
+
+Using the new registration mechanism, define a flag that indicates the
+user wishes to process RMPP messages in user space rather than have
+the kernel process them.
+
+Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 1471cb6ca67990a306500e69e52ffb28c93ccbbc)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/core/mad.c b/drivers/infiniband/core/mad.c
+index 988bbda..74c30f4 100644
+--- a/drivers/infiniband/core/mad.c
++++ b/drivers/infiniband/core/mad.c
+@@ -283,6 +283,7 @@ struct ib_mad_agent *ib_register_mad_agent(struct ib_device *device,
+     goto error1;
+    }
+   }
++
+   /* Make sure class supplied is consistent with QP type */
+   if (qp_type == IB_QPT_SMI) {
+    if ((mad_reg_req->mgmt_class !=
+@@ -309,6 +310,8 @@ struct ib_mad_agent *ib_register_mad_agent(struct ib_device *device,
+   /* No registration request supplied */
+   if (!send_handler)
+    goto error1;
++  if (registration_flags & IB_MAD_USER_RMPP)
++   goto error1;
+  }
+ 
+  /* Validate device and port */
+@@ -907,6 +910,12 @@ static int alloc_send_rmpp_list(struct ib_mad_send_wr_private *send_wr,
+  return 0;
+ }
+ 
++int ib_mad_kernel_rmpp_agent(struct ib_mad_agent *agent)
++{
++ return agent->rmpp_version && !(agent->flags & IB_MAD_USER_RMPP);
++}
++EXPORT_SYMBOL(ib_mad_kernel_rmpp_agent);
++
+ struct ib_mad_send_buf * ib_create_send_mad(struct ib_mad_agent *mad_agent,
+          u32 remote_qpn, u16 pkey_index,
+          int rmpp_active,
+@@ -923,10 +932,12 @@ struct ib_mad_send_buf * ib_create_send_mad(struct ib_mad_agent *mad_agent,
+  pad = get_pad_size(hdr_len, data_len);
+  message_size = hdr_len + data_len + pad;
+ 
+- if ((!mad_agent->rmpp_version &&
+-      (rmpp_active || message_size > sizeof(struct ib_mad))) ||
+-     (!rmpp_active && message_size > sizeof(struct ib_mad)))
+-  return ERR_PTR(-EINVAL);
++ if (ib_mad_kernel_rmpp_agent(mad_agent)) {
++  if (!rmpp_active && message_size > sizeof(struct ib_mad))
++   return ERR_PTR(-EINVAL);
++ } else
++  if (rmpp_active || message_size > sizeof(struct ib_mad))
++   return ERR_PTR(-EINVAL);
+ 
+  size = rmpp_active ? hdr_len : sizeof(struct ib_mad);
+  buf = kzalloc(sizeof *mad_send_wr + size, gfp_mask);
+@@ -1180,7 +1191,7 @@ int ib_post_send_mad(struct ib_mad_send_buf *send_buf,
+          &mad_agent_priv->send_list);
+   spin_unlock_irqrestore(&mad_agent_priv->lock, flags);
+ 
+-  if (mad_agent_priv->agent.rmpp_version) {
++  if (ib_mad_kernel_rmpp_agent(&mad_agent_priv->agent)) {
+    ret = ib_send_rmpp_mad(mad_send_wr);
+    if (ret >= 0 && ret != IB_RMPP_RESULT_CONSUMED)
+     ret = ib_send_mad(mad_send_wr);
+@@ -1730,6 +1741,7 @@ static int is_data_mad(struct ib_mad_agent_private *mad_agent_priv,
+ 
+  rmpp_mad = (struct ib_rmpp_mad *)mad_hdr;
+  return !mad_agent_priv->agent.rmpp_version ||
++  !ib_mad_kernel_rmpp_agent(&mad_agent_priv->agent) ||
+   !(ib_get_rmpp_flags(&rmpp_mad->rmpp_hdr) &
+         IB_MGMT_RMPP_FLAG_ACTIVE) ||
+   (rmpp_mad->rmpp_hdr.rmpp_type == IB_MGMT_RMPP_TYPE_DATA);
+@@ -1857,7 +1869,7 @@ static void ib_mad_complete_recv(struct ib_mad_agent_private *mad_agent_priv,
+ 
+  INIT_LIST_HEAD(&mad_recv_wc->rmpp_list);
+  list_add(&mad_recv_wc->recv_buf.list, &mad_recv_wc->rmpp_list);
+- if (mad_agent_priv->agent.rmpp_version) {
++ if (ib_mad_kernel_rmpp_agent(&mad_agent_priv->agent)) {
+   mad_recv_wc = ib_process_rmpp_recv_wc(mad_agent_priv,
+             mad_recv_wc);
+   if (!mad_recv_wc) {
+@@ -1872,23 +1884,39 @@ static void ib_mad_complete_recv(struct ib_mad_agent_private *mad_agent_priv,
+   mad_send_wr = ib_find_send_mad(mad_agent_priv, mad_recv_wc);
+   if (!mad_send_wr) {
+    spin_unlock_irqrestore(&mad_agent_priv->lock, flags);
+-   ib_free_recv_mad(mad_recv_wc);
+-   deref_mad_agent(mad_agent_priv);
+-   return;
+-  }
+-  ib_mark_mad_done(mad_send_wr);
+-  spin_unlock_irqrestore(&mad_agent_priv->lock, flags);
++   if (!ib_mad_kernel_rmpp_agent(&mad_agent_priv->agent)
++      && ib_is_mad_class_rmpp(mad_recv_wc->recv_buf.mad->mad_hdr.mgmt_class)
++      && (ib_get_rmpp_flags(&((struct ib_rmpp_mad *)mad_recv_wc->recv_buf.mad)->rmpp_hdr)
++     & IB_MGMT_RMPP_FLAG_ACTIVE)) {
++    /* user rmpp is in effect
++     * and this is an active RMPP MAD
++     */
++    mad_recv_wc->wc->wr_id = 0;
++    mad_agent_priv->agent.recv_handler(&mad_agent_priv->agent,
++           mad_recv_wc);
++    atomic_dec(&mad_agent_priv->refcount);
++   } else {
++    /* not user rmpp, revert to normal behavior and
++     * drop the mad */
++    ib_free_recv_mad(mad_recv_wc);
++    deref_mad_agent(mad_agent_priv);
++    return;
++   }
++  } else {
++   ib_mark_mad_done(mad_send_wr);
++   spin_unlock_irqrestore(&mad_agent_priv->lock, flags);
+ 
+-  /* Defined behavior is to complete response before request */
+-  mad_recv_wc->wc->wr_id = (unsigned long) &mad_send_wr->send_buf;
+-  mad_agent_priv->agent.recv_handler(&mad_agent_priv->agent,
+-         mad_recv_wc);
+-  atomic_dec(&mad_agent_priv->refcount);
++   /* Defined behavior is to complete response before request */
++   mad_recv_wc->wc->wr_id = (unsigned long) &mad_send_wr->send_buf;
++   mad_agent_priv->agent.recv_handler(&mad_agent_priv->agent,
++          mad_recv_wc);
++   atomic_dec(&mad_agent_priv->refcount);
+ 
+-  mad_send_wc.status = IB_WC_SUCCESS;
+-  mad_send_wc.vendor_err = 0;
+-  mad_send_wc.send_buf = &mad_send_wr->send_buf;
+-  ib_mad_complete_send_wr(mad_send_wr, &mad_send_wc);
++   mad_send_wc.status = IB_WC_SUCCESS;
++   mad_send_wc.vendor_err = 0;
++   mad_send_wc.send_buf = &mad_send_wr->send_buf;
++   ib_mad_complete_send_wr(mad_send_wr, &mad_send_wc);
++  }
+  } else {
+   mad_agent_priv->agent.recv_handler(&mad_agent_priv->agent,
+          mad_recv_wc);
+@@ -2128,7 +2156,7 @@ void ib_mad_complete_send_wr(struct ib_mad_send_wr_private *mad_send_wr,
+ 
+  mad_agent_priv = mad_send_wr->mad_agent_priv;
+  spin_lock_irqsave(&mad_agent_priv->lock, flags);
+- if (mad_agent_priv->agent.rmpp_version) {
++ if (ib_mad_kernel_rmpp_agent(&mad_agent_priv->agent)) {
+   ret = ib_process_rmpp_send_wc(mad_send_wr, mad_send_wc);
+   if (ret == IB_RMPP_RESULT_CONSUMED)
+    goto done;
+@@ -2524,7 +2552,7 @@ static int retry_send(struct ib_mad_send_wr_private *mad_send_wr)
+ 
+  mad_send_wr->timeout = msecs_to_jiffies(mad_send_wr->send_buf.timeout_ms);
+ 
+- if (mad_send_wr->mad_agent_priv->agent.rmpp_version) {
++ if (ib_mad_kernel_rmpp_agent(&mad_send_wr->mad_agent_priv->agent)) {
+   ret = ib_retry_rmpp(mad_send_wr);
+   switch (ret) {
+   case IB_RMPP_RESULT_UNHANDLED:
+diff --git a/drivers/infiniband/core/user_mad.c b/drivers/infiniband/core/user_mad.c
+index 11af1c6..928cdd2 100644
+--- a/drivers/infiniband/core/user_mad.c
++++ b/drivers/infiniband/core/user_mad.c
+@@ -506,13 +506,15 @@ static ssize_t ib_umad_write(struct file *filp, const char __user *buf,
+ 
+  rmpp_mad = (struct ib_rmpp_mad *) packet->mad.data;
+  hdr_len = ib_get_mad_data_offset(rmpp_mad->mad_hdr.mgmt_class);
+- if (!ib_is_mad_class_rmpp(rmpp_mad->mad_hdr.mgmt_class)) {
+-  copy_offset = IB_MGMT_MAD_HDR;
+-  rmpp_active = 0;
+- } else {
++
++ if (ib_is_mad_class_rmpp(rmpp_mad->mad_hdr.mgmt_class)
++     && ib_mad_kernel_rmpp_agent(agent)) {
+   copy_offset = IB_MGMT_RMPP_HDR;
+   rmpp_active = ib_get_rmpp_flags(&rmpp_mad->rmpp_hdr) &
+-         IB_MGMT_RMPP_FLAG_ACTIVE;
++      IB_MGMT_RMPP_FLAG_ACTIVE;
++ } else {
++  copy_offset = IB_MGMT_MAD_HDR;
++  rmpp_active = 0;
+  }
+ 
+  data_len = count - hdr_size(file) - hdr_len;
+@@ -558,14 +560,22 @@ static ssize_t ib_umad_write(struct file *filp, const char __user *buf,
+   rmpp_mad->mad_hdr.tid = *tid;
+  }
+ 
+- spin_lock_irq(&file->send_lock);
+- ret = is_duplicate(file, packet);
+- if (!ret)
++ if (!ib_mad_kernel_rmpp_agent(agent)
++    && ib_is_mad_class_rmpp(rmpp_mad->mad_hdr.mgmt_class)
++    && (ib_get_rmpp_flags(&rmpp_mad->rmpp_hdr) & IB_MGMT_RMPP_FLAG_ACTIVE)) {
++  spin_lock_irq(&file->send_lock);
+   list_add_tail(&packet->list, &file->send_list);
+- spin_unlock_irq(&file->send_lock);
+- if (ret) {
+-  ret = -EINVAL;
+-  goto err_msg;
++  spin_unlock_irq(&file->send_lock);
++ } else {
++  spin_lock_irq(&file->send_lock);
++  ret = is_duplicate(file, packet);
++  if (!ret)
++   list_add_tail(&packet->list, &file->send_list);
++  spin_unlock_irq(&file->send_lock);
++  if (ret) {
++   ret = -EINVAL;
++   goto err_msg;
++  }
+  }
+ 
+  ret = ib_post_send_mad(packet->msg, NULL);
+diff --git a/include/rdma/ib_mad.h b/include/rdma/ib_mad.h
+index 876f497..9bb99e9 100644
+--- a/include/rdma/ib_mad.h
++++ b/include/rdma/ib_mad.h
+@@ -40,6 +40,7 @@
+ #include <linux/list.h>
+ 
+ #include <rdma/ib_verbs.h>
++#include <uapi/rdma/ib_user_mad.h>
+ 
+ /* Management base version */
+ #define IB_MGMT_BASE_VERSION   1
+@@ -359,6 +360,9 @@ typedef void (*ib_mad_recv_handler)(struct ib_mad_agent *mad_agent,
+  * @port_num: Port number on which QP is registered
+  * @rmpp_version: If set, indicates the RMPP version used by this agent.
+  */
++enum {
++ IB_MAD_USER_RMPP = IB_USER_MAD_USER_RMPP,
++};
+ struct ib_mad_agent {
+  struct ib_device *device;
+  struct ib_qp  *qp;
+@@ -666,4 +670,11 @@ void *ib_get_rmpp_segment(struct ib_mad_send_buf *send_buf, int seg_num);
+  */
+ void ib_free_send_mad(struct ib_mad_send_buf *send_buf);
+ 
++/**
++ * ib_mad_kernel_rmpp_agent - Returns if the agent is performing RMPP.
++ * @agent: the agent in question
++ * @return: true if agent is performing rmpp, false otherwise.
++ */
++int ib_mad_kernel_rmpp_agent(struct ib_mad_agent *agent);
++
+ #endif /* IB_MAD_H */
+diff --git a/include/uapi/rdma/ib_user_mad.h b/include/uapi/rdma/ib_user_mad.h
+index c00b081..09f809f 100644
+--- a/include/uapi/rdma/ib_user_mad.h
++++ b/include/uapi/rdma/ib_user_mad.h
+@@ -213,7 +213,10 @@ struct ib_user_mad_reg_req {
+  *                       used.
+  * @rmpp_version       - If set, indicates the RMPP version to use.
+  */
+-#define IB_USER_MAD_REG_FLAGS_CAP (0)
++enum {
++ IB_USER_MAD_USER_RMPP = (1 << 0),
++};
++#define IB_USER_MAD_REG_FLAGS_CAP (IB_USER_MAD_USER_RMPP)
+ struct ib_user_mad_reg_req2 {
+  __u32 id;
+  __u32 qpn;
+-- 
+1.7.1

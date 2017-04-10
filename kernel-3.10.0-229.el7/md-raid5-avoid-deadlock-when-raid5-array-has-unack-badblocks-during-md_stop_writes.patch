@@ -1,0 +1,150 @@
+From d00eee4a612db646cdf9c611454c0e9d5e57706b Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:25:27 -0400
+Subject: [md] raid5: avoid deadlock when raid5 array has unack badblocks during md_stop_writes
+
+Message-id: <1409563584-9000-26-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 89959
+O-Subject: [RHEL7.1 PATCH 25/82] md/raid5: avoid deadlock when raid5 array has unack badblocks during md_stop_writes.
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: NeilBrown <neilb@suse.de>
+
+When raid5 recovery hits a fresh badblock, this badblock will flagged as unack
+badblock until md_update_sb() is called.
+But md_stop will take reconfig lock which means raid5d can't call
+md_update_sb() in md_check_recovery(), the badblock will always
+be unack, so raid5d thread enters an infinite loop and md_stop_write()
+can never stop sync_thread. This causes deadlock.
+
+To solve this, when STOP_ARRAY ioctl is issued and sync_thread is
+running, we need set md->recovery FROZEN and INTR flags and wait for
+sync_thread to stop before we (re)take reconfig lock.
+
+This requires that raid5 reshape_request notices MD_RECOVERY_INTR
+(which it probably should have noticed anyway) and stops waiting for a
+metadata update in that case.
+
+Reported-by: Jianpeng Ma <majianpeng@gmail.com>
+Reported-by: Bian Yu <bianyu@kedacom.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit 30b8feb730f9b9b3c5de02580897da03f59b6b16)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 1cc1a31..f8c56ab 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -5312,20 +5312,35 @@ EXPORT_SYMBOL_GPL(md_stop);
+ static int md_set_readonly(struct mddev *mddev, struct block_device *bdev)
+ {
+  int err = 0;
++ int did_freeze = 0;
++
++ if (!test_bit(MD_RECOVERY_FROZEN, &mddev->recovery)) {
++  did_freeze = 1;
++  set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
++  md_wakeup_thread(mddev->thread);
++ }
++ if (mddev->sync_thread) {
++  set_bit(MD_RECOVERY_INTR, &mddev->recovery);
++  /* Thread might be blocked waiting for metadata update
++   * which will now never happen */
++  wake_up_process(mddev->sync_thread->tsk);
++ }
++ mddev_unlock(mddev);
++ wait_event(resync_wait, mddev->sync_thread == NULL);
++ mddev_lock_nointr(mddev);
++
+  mutex_lock(&mddev->open_mutex);
+- if (atomic_read(&mddev->openers) > !!bdev) {
++ if (atomic_read(&mddev->openers) > !!bdev ||
++     mddev->sync_thread ||
++     (bdev && !test_bit(MD_STILL_CLOSED, &mddev->flags))) {
+   printk("md: %s still in use.\n",mdname(mddev));
++  if (did_freeze) {
++   clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
++   md_wakeup_thread(mddev->thread);
++  }
+   err = -EBUSY;
+   goto out;
+  }
+- if (bdev && !test_bit(MD_STILL_CLOSED, &mddev->flags)) {
+-  /* Someone opened the device since we flushed it
+-   * so page cache could be dirty and it is too late
+-   * to flush.  So abort
+-   */
+-  mutex_unlock(&mddev->open_mutex);
+-  return -EBUSY;
+- }
+  if (mddev->pers) {
+   __md_stop_writes(mddev);
+ 
+@@ -5336,7 +5351,7 @@ static int md_set_readonly(struct mddev *mddev, struct block_device *bdev)
+   set_disk_ro(mddev->gendisk, 1);
+   clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+   sysfs_notify_dirent_safe(mddev->sysfs_state);
+-  err = 0; 
++  err = 0;
+  }
+ out:
+  mutex_unlock(&mddev->open_mutex);
+@@ -5352,20 +5367,34 @@ static int do_md_stop(struct mddev * mddev, int mode,
+ {
+  struct gendisk *disk = mddev->gendisk;
+  struct md_rdev *rdev;
++ int did_freeze = 0;
++
++ if (!test_bit(MD_RECOVERY_FROZEN, &mddev->recovery)) {
++  did_freeze = 1;
++  set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
++  md_wakeup_thread(mddev->thread);
++ }
++ if (mddev->sync_thread) {
++  set_bit(MD_RECOVERY_INTR, &mddev->recovery);
++  /* Thread might be blocked waiting for metadata update
++   * which will now never happen */
++  wake_up_process(mddev->sync_thread->tsk);
++ }
++ mddev_unlock(mddev);
++ wait_event(resync_wait, mddev->sync_thread == NULL);
++ mddev_lock_nointr(mddev);
+ 
+  mutex_lock(&mddev->open_mutex);
+  if (atomic_read(&mddev->openers) > !!bdev ||
+-     mddev->sysfs_active) {
++     mddev->sysfs_active ||
++     mddev->sync_thread ||
++     (bdev && !test_bit(MD_STILL_CLOSED, &mddev->flags))) {
+   printk("md: %s still in use.\n",mdname(mddev));
+   mutex_unlock(&mddev->open_mutex);
+-  return -EBUSY;
+- }
+- if (bdev && !test_bit(MD_STILL_CLOSED, &mddev->flags)) {
+-  /* Someone opened the device since we flushed it
+-   * so page cache could be dirty and it is too late
+-   * to flush.  So abort
+-   */
+-  mutex_unlock(&mddev->open_mutex);
++  if (did_freeze) {
++   clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
++   md_wakeup_thread(mddev->thread);
++  }
+   return -EBUSY;
+  }
+  if (mddev->pers) {
+@@ -7899,6 +7928,7 @@ void md_reap_sync_thread(struct mddev *mddev)
+ 
+  /* resync has finished, collect result */
+  md_unregister_thread(&mddev->sync_thread);
++ wake_up(&resync_wait);
+  if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
+      !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
+   /* success...*/
+-- 
+1.7.1

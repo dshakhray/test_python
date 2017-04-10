@@ -1,0 +1,64 @@
+From af3302a449748e2e89ca1e130ad6bfdefa62d365 Mon Sep 17 00:00:00 2001
+From: Andrea Arcangeli <aarcange@redhat.com>
+Date: Tue, 9 Sep 2014 01:16:39 -0400
+Subject: [mm] fix the theoretical compound_lock() vs prep_new_page() race
+
+Message-id: <1410225399-8094-23-git-send-email-aarcange@redhat.com>
+Patchwork-id: 93371
+O-Subject: [RHEL7.1 PATCH 22/22] mm: fix the theoretical compound_lock() vs prep_new_page() race
+Bugzilla: 1135506
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+From: Oleg Nesterov <oleg@redhat.com>
+
+get/put_page(thp_tail) paths do get_page_unless_zero(page_head) +
+compound_lock(). In theory this page_head can be already freed and
+reallocated as alloc_pages(__GFP_COMP, smaller_order). In this case
+get_page_unless_zero() can succeed right after set_page_refcounted(),
+and compound_lock() can race with the non-atomic __SetPageHead().
+
+Perhaps we should rework the thp locking (under discussion), but
+until then this patch moves set_page_refcounted() and adds wmb()
+to ensure that page->_count != 0 comes as a last change.
+
+I am not sure about other callers of set_page_refcounted(), but at
+first glance they look fine to me.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 471c261..58c1763 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -894,8 +894,6 @@ static int prep_new_page(struct page *page, int order, gfp_t gfp_flags)
+  }
+ 
+  set_page_private(page, 0);
+- set_page_refcounted(page);
+-
+  arch_alloc_page(page, order);
+  kernel_map_pages(page, 1 << order, 1);
+ 
+@@ -905,6 +903,14 @@ static int prep_new_page(struct page *page, int order, gfp_t gfp_flags)
+  if (order && (gfp_flags & __GFP_COMP))
+   prep_compound_page(page, order);
+ 
++ /*
++  * Make sure the caller of get_page_unless_zero() will see the
++  * fully initialized page. Say, to ensure that compound_lock()
++  * can't race with the non-atomic __SetPage*() above.
++  */
++ smp_wmb();
++ set_page_refcounted(page);
++
+  return 0;
+ }
+ 
+-- 
+1.7.1

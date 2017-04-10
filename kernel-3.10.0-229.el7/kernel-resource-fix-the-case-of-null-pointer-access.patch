@@ -1,0 +1,100 @@
+From 68f518027935de103722a33ca808ca3f917cd387 Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Fri, 5 Sep 2014 18:56:07 -0400
+Subject: [kernel] resource: fix the case of null pointer access
+
+Message-id: <1409943373-12669-33-git-send-email-vgoyal@redhat.com>
+Patchwork-id: 91513
+O-Subject: [RHEL7.1 PATCH 32/38] resource: fix the case of null pointer access
+Bugzilla: 852066
+RH-Acked-by: Dave Anderson <anderson@redhat.com>
+RH-Acked-by: Baoquan He <bhe@redhat.com>
+RH-Acked-by: Dave Young <dyoung@redhat.com>
+RH-Acked-by: Chao WANG <chaowang@redhat.com>
+
+BZ:852066
+
+commit 800df627e2eabaf4a921d342a1d5162c843b7fc2
+Author: Vivek Goyal <vgoyal@redhat.com>
+Date: Fri, 29 Aug 2014 15:18:29 -0700
+
+Richard and Daniel reported that UML is broken due to changes to
+resource traversal functions.  Problem is that iomem_resource.child can
+be null and new code does not consider that possibility.  Old code used
+a for loop and that loop will not even execute if p was null.
+
+Revert back to for() loop logic and bail out if p is null.
+
+I also moved sibling_only check out of resource_lock. There is no
+reason to keep it inside the lock.
+
+Following is backtrace of the UML crash.
+
+RIP: 0033:[<0000000060039b9f>]
+RSP: 0000000081459da0  EFLAGS: 00010202
+RAX: 0000000000000000 RBX: 00000000219b3fff RCX: 000000006010d1d9
+RDX: 0000000000000001 RSI: 00000000602dfb94 RDI: 0000000081459df8
+RBP: 0000000081459de0 R08: 00000000601b59f4 R09: ffffffff0000ff00
+R10: ffffffff0000ff00 R11: 0000000081459e88 R12: 0000000081459df8
+R13: 00000000219b3fff R14: 00000000602dfb94 R15: 0000000000000000
+Kernel panic - not syncing: Segfault with no mm
+CPU: 0 PID: 1 Comm: swapper Not tainted 3.16.0-10454-g58d08e3 #13
+Stack:
+ 00000000 000080d0 81459df0 219b3fff
+ 81459e70 6010d1d9 ffffffff 6033e010
+ 81459e50 6003a269 81459e30 00000000
+Call Trace:
+ [<6010d1d9>] ? kclist_add_private+0x0/0xe7
+ [<6003a269>] walk_system_ram_range+0x61/0xb7
+ [<6000e859>] ? proc_kcore_init+0x0/0xf1
+ [<6010d574>] kcore_update_ram+0x4c/0x168
+ [<6010d72e>] ? kclist_add+0x0/0x2e
+ [<6000e943>] proc_kcore_init+0xea/0xf1
+ [<6000e859>] ? proc_kcore_init+0x0/0xf1
+ [<6000e859>] ? proc_kcore_init+0x0/0xf1
+ [<600189f0>] do_one_initcall+0x13c/0x204
+ [<6004ca46>] ? parse_args+0x1df/0x2e0
+ [<6004c82d>] ? parameq+0x0/0x3a
+ [<601b5990>] ? strcpy+0x0/0x18
+ [<60001e1a>] kernel_init_freeable+0x240/0x31e
+ [<6026f1c0>] kernel_init+0x12/0x148
+ [<60019fad>] new_thread_handler+0x81/0xa3
+
+Fixes 8c86e70acead629aacb4a ("resource: provide new functions to walk
+through resources").
+
+Reported-by: Daniel Walter <sahne@0x90.at>
+Tested-by: Richard Weinberger <richard@nod.at>
+Tested-by: Toralf Foerster <toralf.foerster@gmx.de>
+Tested-by: Daniel Walter <sahne@0x90.at>
+Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/resource.c b/kernel/resource.c
+index 20eecc9..7db94d2 100644
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@ -351,15 +351,12 @@ static int find_next_iomem_res(struct resource *res, char *name,
+  end = res->end;
+  BUG_ON(start >= end);
+ 
+- read_lock(&resource_lock);
+-
+- if (first_level_children_only) {
+-  p = iomem_resource.child;
++ if (first_level_children_only)
+   sibling_only = true;
+- } else
+-  p = &iomem_resource;
+ 
+- while ((p = next_resource(p, sibling_only))) {
++ read_lock(&resource_lock);
++
++ for (p = iomem_resource.child; p; p = next_resource(p, sibling_only)) {
+   if (p->flags != res->flags)
+    continue;
+   if (name && strcmp(p->name, name))
+-- 
+1.7.1

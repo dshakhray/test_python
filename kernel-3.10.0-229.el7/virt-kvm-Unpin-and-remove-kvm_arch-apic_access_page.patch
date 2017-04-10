@@ -1,0 +1,119 @@
+From 50f064a7d6bdc07b696182c842613948113f95bf Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Mon, 10 Nov 2014 14:17:33 -0500
+Subject: [virt] kvm: Unpin and remove kvm_arch->apic_access_page
+
+Message-id: <1415629055-7922-8-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 99806
+O-Subject: [RHEL7 PATCH v2 7/9] kvm: x86: Unpin and remove kvm_arch->apic_access_page
+Bugzilla: 1140974
+
+From: Tang Chen <tangchen@cn.fujitsu.com>
+
+In order to make the APIC access page migratable, stop pinning it in
+memory.
+
+And because the APIC access page is not pinned in memory, we can
+remove kvm_arch->apic_access_page.  When we need to write its
+physical address into vmcs, we use gfn_to_page() to get its page
+struct, which is needed to call page_to_phys(); the page is then
+immediately unpinned.
+
+Suggested-by: Gleb Natapov <gleb@kernel.org>
+Signed-off-by: Tang Chen <tangchen@cn.fujitsu.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from upstream commit c24ae0dcd3e8695efa43e71704d1fc4bc7e29e9b)
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 1f2866b..e8a3030 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -574,7 +574,7 @@ struct kvm_arch {
+  struct kvm_apic_map *apic_map;
+ 
+  unsigned int tss_addr;
+- struct page *apic_access_page;
++ bool apic_access_page_done;
+ 
+  gpa_t wall_clock;
+ 
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 8bd7bd9..e288126 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -3995,7 +3995,7 @@ static int alloc_apic_access_page(struct kvm *kvm)
+  int r = 0;
+ 
+  mutex_lock(&kvm->slots_lock);
+- if (kvm->arch.apic_access_page)
++ if (kvm->arch.apic_access_page_done)
+   goto out;
+  kvm_userspace_mem.slot = APIC_ACCESS_PAGE_PRIVATE_MEMSLOT;
+  kvm_userspace_mem.flags = 0;
+@@ -4011,7 +4011,12 @@ static int alloc_apic_access_page(struct kvm *kvm)
+   goto out;
+  }
+ 
+- kvm->arch.apic_access_page = page;
++ /*
++  * Do not pin the page in memory, so that memory hot-unplug
++  * is able to migrate it.
++  */
++ put_page(page);
++ kvm->arch.apic_access_page_done = true;
+ out:
+  mutex_unlock(&kvm->slots_lock);
+  return r;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 5911409..47ca84f 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5939,19 +5939,31 @@ static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
+ 
+ void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu)
+ {
++ struct page *page = NULL;
++
+  if (!kvm_x86_ops->set_apic_access_page_addr)
+   return;
+ 
+- vcpu->kvm->arch.apic_access_page = gfn_to_page(vcpu->kvm,
+-   APIC_DEFAULT_PHYS_BASE >> PAGE_SHIFT);
+- kvm_x86_ops->set_apic_access_page_addr(vcpu,
+-   page_to_phys(vcpu->kvm->arch.apic_access_page));
++ page = gfn_to_page(vcpu->kvm, APIC_DEFAULT_PHYS_BASE >> PAGE_SHIFT);
++ kvm_x86_ops->set_apic_access_page_addr(vcpu, page_to_phys(page));
++
++ /*
++  * Do not pin apic access page in memory, the MMU notifier
++  * will call us again if it is migrated or swapped out.
++  */
++ put_page(page);
+ }
+ EXPORT_SYMBOL_GPL(kvm_vcpu_reload_apic_access_page);
+ 
+ void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
+         unsigned long address)
+ {
++ /*
++  * The physical address of apic access page is stored in the VMCS.
++  * Update it when it becomes invalid.
++  */
++ if (address == gfn_to_hva(kvm, APIC_DEFAULT_PHYS_BASE >> PAGE_SHIFT))
++  kvm_make_all_cpus_request(kvm, KVM_REQ_APIC_PAGE_RELOAD);
+ }
+ 
+ /*
+@@ -7201,8 +7213,6 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+  kfree(kvm->arch.vpic);
+  kfree(kvm->arch.vioapic);
+  kvm_free_vcpus(kvm);
+- if (kvm->arch.apic_access_page)
+-  put_page(kvm->arch.apic_access_page);
+  kfree(rcu_dereference_check(kvm->arch.apic_map, 1));
+ }
+ 
+-- 
+1.7.1

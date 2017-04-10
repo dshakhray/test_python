@@ -7,6 +7,7 @@
 import git
 import logging
 import os
+import selenium
 import sys
 import time
 
@@ -15,7 +16,7 @@ from selenium import webdriver
 KERNEL_VER = sys.argv[1]
 URL_PATCHES = 'https://access.redhat.com/labs/psb/versions/{}/patches/%s?raw=true'.format(KERNEL_VER)
 URL_PATCHES_LIST = 'https://access.redhat.com/labs/psb/versions/{}/patches'.format(KERNEL_VER)
-REMOTE_URL = 'git@github.com:dshakhray/test_python.git'
+REMOTE_URL = 'ssh://dmalyavkina@gerrit.cloudlinux.com:29418/patches-downloader'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
@@ -36,7 +37,7 @@ def log_in():
 def get_list_of_patches_names():
     driver = log_in()
     driver.get(URL_PATCHES_LIST)
-    time.sleep(10)
+    time.sleep(5)
     patches_list = []
 
     try:
@@ -45,11 +46,14 @@ def get_list_of_patches_names():
         count_rows = rows[1].find_element_by_class_name("num").text
         count_click = int(count_rows) / 50
 
+        logger.info('Available %s patches' % count_rows)
+        logger.info('Get a complete list of patch names')
+
         for i in range(count_click):
             driver.find_element_by_id("psb-load-more-patches").click()
-            time.sleep(3)
+            time.sleep(2)
     except Exception:
-        pass
+        logger.error('A non-existent version of the kernel is specified')
 
     logger.info('A full list of patches has opened')
 

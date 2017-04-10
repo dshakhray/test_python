@@ -1,0 +1,181 @@
+From 3de1aecc5a1220c615b2c64fff54a261b2843e3a Mon Sep 17 00:00:00 2001
+From: Michal Schmidt <mschmidt@redhat.com>
+Date: Fri, 5 Sep 2014 19:49:08 -0400
+Subject: [ethernet] bnx2x: prevent WARN during driver unload
+
+Message-id: <1409946615-5862-4-git-send-email-mschmidt@redhat.com>
+Patchwork-id: 91547
+O-Subject: [RHEL7.1 PATCH 03/70] bnx2x: prevent WARN during driver unload
+Bugzilla: 1089402
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+BZ: https://bugzilla.redhat.com/show_bug.cgi?id=1089402
+
+Upstream commit:
+commit 9a2620c877454bb4b5c19f73d4d1d7b375da3632
+Author: Yuval Mintz <yuvalmin@broadcom.com>
+Date:   Tue Jan 7 12:07:41 2014 +0200
+
+    bnx2x: prevent WARN during driver unload
+
+    Starting with commit 80c33dd "net: add might_sleep() call to napi_disable"
+    bnx2x fails the might_sleep tests causing a stack trace to appear whenever
+    the driver is unloaded, as local_bh_disable() is being called before
+    napi_disable().
+
+    This changes the locking schematics related to CONFIG_NET_RX_BUSY_POLL,
+    preventing the need for calling local_bh_disable() and thus eliminating
+    the issue.
+
+    Signed-off-by: Yuval Mintz <yuvalmin@broadcom.com>
+    Signed-off-by: Dmitry Kravkov <dmitry@broadcom.com>
+    Signed-off-by: Ariel Elior <ariele@broadcom.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
+index 3692e8b..8107f26 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x.h
+@@ -521,10 +521,12 @@ struct bnx2x_fastpath {
+ #define BNX2X_FP_STATE_IDLE        0
+ #define BNX2X_FP_STATE_NAPI  (1 << 0)    /* NAPI owns this FP */
+ #define BNX2X_FP_STATE_POLL  (1 << 1)    /* poll owns this FP */
+-#define BNX2X_FP_STATE_NAPI_YIELD (1 << 2)    /* NAPI yielded this FP */
+-#define BNX2X_FP_STATE_POLL_YIELD (1 << 3)    /* poll yielded this FP */
++#define BNX2X_FP_STATE_DISABLED  (1 << 2)
++#define BNX2X_FP_STATE_NAPI_YIELD (1 << 3)    /* NAPI yielded this FP */
++#define BNX2X_FP_STATE_POLL_YIELD (1 << 4)    /* poll yielded this FP */
++#define BNX2X_FP_OWNED (BNX2X_FP_STATE_NAPI | BNX2X_FP_STATE_POLL)
+ #define BNX2X_FP_YIELD (BNX2X_FP_STATE_NAPI_YIELD | BNX2X_FP_STATE_POLL_YIELD)
+-#define BNX2X_FP_LOCKED (BNX2X_FP_STATE_NAPI | BNX2X_FP_STATE_POLL)
++#define BNX2X_FP_LOCKED (BNX2X_FP_OWNED | BNX2X_FP_STATE_DISABLED)
+ #define BNX2X_FP_USER_PEND (BNX2X_FP_STATE_POLL | BNX2X_FP_STATE_POLL_YIELD)
+  /* protect state */
+  spinlock_t lock;
+@@ -614,7 +616,7 @@ static inline bool bnx2x_fp_lock_napi(struct bnx2x_fastpath *fp)
+ {
+  bool rc = true;
+ 
+- spin_lock(&fp->lock);
++ spin_lock_bh(&fp->lock);
+  if (fp->state & BNX2X_FP_LOCKED) {
+   WARN_ON(fp->state & BNX2X_FP_STATE_NAPI);
+   fp->state |= BNX2X_FP_STATE_NAPI_YIELD;
+@@ -623,7 +625,7 @@ static inline bool bnx2x_fp_lock_napi(struct bnx2x_fastpath *fp)
+   /* we don't care if someone yielded */
+   fp->state = BNX2X_FP_STATE_NAPI;
+  }
+- spin_unlock(&fp->lock);
++ spin_unlock_bh(&fp->lock);
+  return rc;
+ }
+ 
+@@ -632,14 +634,16 @@ static inline bool bnx2x_fp_unlock_napi(struct bnx2x_fastpath *fp)
+ {
+  bool rc = false;
+ 
+- spin_lock(&fp->lock);
++ spin_lock_bh(&fp->lock);
+  WARN_ON(fp->state &
+   (BNX2X_FP_STATE_POLL | BNX2X_FP_STATE_NAPI_YIELD));
+ 
+  if (fp->state & BNX2X_FP_STATE_POLL_YIELD)
+   rc = true;
+- fp->state = BNX2X_FP_STATE_IDLE;
+- spin_unlock(&fp->lock);
++
++ /* state ==> idle, unless currently disabled */
++ fp->state &= BNX2X_FP_STATE_DISABLED;
++ spin_unlock_bh(&fp->lock);
+  return rc;
+ }
+ 
+@@ -670,7 +674,9 @@ static inline bool bnx2x_fp_unlock_poll(struct bnx2x_fastpath *fp)
+ 
+  if (fp->state & BNX2X_FP_STATE_POLL_YIELD)
+   rc = true;
+- fp->state = BNX2X_FP_STATE_IDLE;
++
++ /* state ==> idle, unless currently disabled */
++ fp->state &= BNX2X_FP_STATE_DISABLED;
+  spin_unlock_bh(&fp->lock);
+  return rc;
+ }
+@@ -678,9 +684,23 @@ static inline bool bnx2x_fp_unlock_poll(struct bnx2x_fastpath *fp)
+ /* true if a socket is polling, even if it did not get the lock */
+ static inline bool bnx2x_fp_ll_polling(struct bnx2x_fastpath *fp)
+ {
+- WARN_ON(!(fp->state & BNX2X_FP_LOCKED));
++ WARN_ON(!(fp->state & BNX2X_FP_OWNED));
+  return fp->state & BNX2X_FP_USER_PEND;
+ }
++
++/* false if fp is currently owned */
++static inline bool bnx2x_fp_ll_disable(struct bnx2x_fastpath *fp)
++{
++ int rc = true;
++
++ spin_lock_bh(&fp->lock);
++ if (fp->state & BNX2X_FP_OWNED)
++  rc = false;
++ fp->state |= BNX2X_FP_STATE_DISABLED;
++ spin_unlock_bh(&fp->lock);
++
++ return rc;
++}
+ #else
+ static inline void bnx2x_fp_init_lock(struct bnx2x_fastpath *fp)
+ {
+@@ -710,6 +730,10 @@ static inline bool bnx2x_fp_ll_polling(struct bnx2x_fastpath *fp)
+ {
+  return false;
+ }
++static inline bool bnx2x_fp_ll_disable(struct bnx2x_fastpath *fp)
++{
++ return true;
++}
+ #endif /* CONFIG_NET_RX_BUSY_POLL */
+ 
+ /* Use 2500 as a mini-jumbo MTU for FCoE */
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+index 1fbd794..6a557d2 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
+@@ -1852,26 +1852,22 @@ static void bnx2x_napi_disable_cnic(struct bnx2x *bp)
+ {
+  int i;
+ 
+- local_bh_disable();
+  for_each_rx_queue_cnic(bp, i) {
+   napi_disable(&bnx2x_fp(bp, i, napi));
+-  while (!bnx2x_fp_lock_napi(&bp->fp[i]))
+-   mdelay(1);
++  while (!bnx2x_fp_ll_disable(&bp->fp[i]))
++   usleep_range(1000, 2000);
+  }
+- local_bh_enable();
+ }
+ 
+ static void bnx2x_napi_disable(struct bnx2x *bp)
+ {
+  int i;
+ 
+- local_bh_disable();
+  for_each_eth_queue(bp, i) {
+   napi_disable(&bnx2x_fp(bp, i, napi));
+-  while (!bnx2x_fp_lock_napi(&bp->fp[i]))
+-   mdelay(1);
++  while (!bnx2x_fp_ll_disable(&bp->fp[i]))
++   usleep_range(1000, 2000);
+  }
+- local_bh_enable();
+ }
+ 
+ void bnx2x_netif_start(struct bnx2x *bp)
+-- 
+1.7.1

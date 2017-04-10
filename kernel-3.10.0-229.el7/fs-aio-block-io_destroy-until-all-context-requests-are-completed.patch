@@ -1,0 +1,157 @@
+From 4b4311f82281e6a093ea50de960c0251b20562c0 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Mon, 8 Sep 2014 22:52:53 -0400
+Subject: [fs] aio: block io_destroy() until all context requests are completed
+
+Message-id: <1410216777-18522-5-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 93348
+O-Subject: [RHEL7 PATCH 4/8] aio: block io_destroy() until all context requests are completed
+Bugzilla: 1122092
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+This is a backport of the following commit.  Differences from the
+upstream patch are mostly related to context.  This was tested using
+the libaio test harness, aio-stress, and xfstests aio tests.
+
+This patch addresses bug 1122092.
+
+  commit e02ba72aabfade4c9cd6e3263e9b57bf890ad25c
+  Author: Anatol Pomozov <anatol.pomozov@gmail.com>
+  Date:   Tue Apr 15 11:31:33 2014 -0700
+
+    aio: block io_destroy() until all context requests are completed
+
+    deletes aio context and all resources related to. It makes sense that
+    no IO operations connected to the context should be running after the context
+    is destroyed. As we removed io_context we have no chance to
+    get requests status or call io_getevents().
+
+    man page for io_destroy says that this function may block until
+    all context's requests are completed. Before kernel 3.11 io_destroy()
+    blocked indeed, but since aio refactoring in 3.11 it is not true anymore.
+
+    Here is a pseudo-code that shows a testcase for a race condition discovered
+    in 3.11:
+
+      initialize io_context
+      io_submit(read to buffer)
+      io_destroy()
+
+      // context is destroyed so we can free the resources
+      free(buffers);
+
+      // if the buffer is allocated by some other user he'll be surprised
+      // to learn that the buffer still filled by an outstanding operation
+      // from the destroyed io_context
+
+    The fix is straight-forward - add a completion struct and wait on it
+    in io_destroy, complete() should be called when number of in-fligh requests
+    reaches zero.
+
+    If two or more io_destroy() called for the same context simultaneously then
+    only the first one waits for IO completion, other calls behaviour is undefined.
+
+    Tested: ran http://pastebin.com/LrPsQ4RL testcase for several hours and
+      do not see the race condition anymore.
+
+    Signed-off-by: Anatol Pomozov <anatol.pomozov@gmail.com>
+    Signed-off-by: Benjamin LaHaise <bcrl@kvack.org>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/aio.c b/fs/aio.c
+index 7dc7565..12e2987 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -106,6 +106,11 @@ struct kioctx {
+   wait_queue_head_t wait;
+  } ____cacheline_aligned_in_smp;
+ 
++ /*
++  * signals when all in-flight requests are done
++  */
++ struct completion *requests_done;
++
+  struct {
+   unsigned tail;
+   spinlock_t completion_lock;
+@@ -521,6 +526,10 @@ static void free_ioctx(struct kioctx *ctx)
+ 
+  aio_free_ring(ctx);
+ 
++ /* At this point we know that there are no any in-flight requests */
++ if (ctx->requests_done)
++  complete(ctx->requests_done);
++
+  pr_debug("freeing %p\n", ctx);
+ 
+  /*
+@@ -636,7 +645,8 @@ static void kill_ioctx_rcu(struct rcu_head *head)
+  * when the processes owning a context have all exited to encourage
+  * the rapid destruction of the kioctx.
+  */
+-static void kill_ioctx(struct mm_struct *mm, struct kioctx *ctx)
++static void kill_ioctx(struct mm_struct *mm, struct kioctx *ctx,
++  struct completion *requests_done)
+ {
+  if (!atomic_xchg(&ctx->dead, 1)) {
+   spin_lock(&mm->ioctx_lock);
+@@ -658,8 +668,13 @@ static void kill_ioctx(struct mm_struct *mm, struct kioctx *ctx)
+   if (ctx->mmap_size)
+    vm_munmap(ctx->mmap_base, ctx->mmap_size);
+ 
++  ctx->requests_done = requests_done;
++
+   /* Between hlist_del_rcu() and dropping the initial ref */
+   call_rcu(&ctx->rcu_head, kill_ioctx_rcu);
++ } else {
++  if (requests_done)
++   complete(requests_done);
+  }
+ }
+ 
+@@ -709,7 +724,7 @@ void exit_aio(struct mm_struct *mm)
+    */
+   ctx->mmap_size = 0;
+ 
+-  kill_ioctx(mm, ctx);
++  kill_ioctx(mm, ctx, NULL);
+  }
+ }
+ 
+@@ -1081,7 +1096,7 @@ SYSCALL_DEFINE2(io_setup, unsigned, nr_events, aio_context_t __user *, ctxp)
+  if (!IS_ERR(ioctx)) {
+   ret = put_user(ioctx->user_id, ctxp);
+   if (ret)
+-   kill_ioctx(current->mm, ioctx);
++   kill_ioctx(current->mm, ioctx, NULL);
+   put_ioctx(ioctx);
+  }
+ 
+@@ -1099,8 +1114,22 @@ SYSCALL_DEFINE1(io_destroy, aio_context_t, ctx)
+ {
+  struct kioctx *ioctx = lookup_ioctx(ctx);
+  if (likely(NULL != ioctx)) {
+-  kill_ioctx(current->mm, ioctx);
++  struct completion requests_done =
++   COMPLETION_INITIALIZER_ONSTACK(requests_done);
++
++  /* Pass requests_done to kill_ioctx() where it can be set
++   * in a thread-safe way. If we try to set it here then we have
++   * a race condition if two io_destroy() called simultaneously.
++   */
++  kill_ioctx(current->mm, ioctx, &requests_done);
+   put_ioctx(ioctx);
++
++  /* Wait until all IO for the context are done. Otherwise kernel
++   * keep using user-space buffers even if user thinks the context
++   * is destroyed.
++   */
++  wait_for_completion(&requests_done);
++
+   return 0;
+  }
+  pr_debug("EINVAL: io_destroy: invalid context id\n");
+-- 
+1.7.1

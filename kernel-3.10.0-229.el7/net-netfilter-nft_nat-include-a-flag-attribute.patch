@@ -1,0 +1,136 @@
+From 7654a7c6f83fe3f696a7f7f1fc93f7799c88061f Mon Sep 17 00:00:00 2001
+From: Marcelo Leitner <mleitner@redhat.com>
+Date: Tue, 21 Oct 2014 16:20:38 -0400
+Subject: [net] netfilter: nft_nat: include a flag attribute
+
+Message-id: <20141021162038.22888.12161.stgit@localhost.localdomain>
+Patchwork-id: 98003
+O-Subject: [RHEL7 net PATCH 106/124] netfilter: nft_nat: include a flag attribute
+Bugzilla: 1148041 1155088
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Backport of upstream commit: e42eff8a32f8b7bde88ea3c5a56391407cbe84f3
+
+ commit e42eff8a32f8b7bde88ea3c5a56391407cbe84f3
+ Author: Arturo Borrero <arturo.borrero.glez@gmail.com>
+ Date:   Thu Sep 4 14:06:14 2014 +0200
+
+    netfilter: nft_nat: include a flag attribute
+
+    Both SNAT and DNAT (and the upcoming masquerade) can have additional
+    configuration parameters, such as port randomization and NAT addressing
+    persistence. We can cover these scenarios by simply adding a flag
+    attribute for userspace to fill when needed.
+
+    The flags to use are defined in include/uapi/linux/netfilter/nf_nat.h:
+
+     NF_NAT_RANGE_MAP_IPS
+     NF_NAT_RANGE_PROTO_SPECIFIED
+     NF_NAT_RANGE_PROTO_RANDOM
+     NF_NAT_RANGE_PERSISTENT
+     NF_NAT_RANGE_PROTO_RANDOM_FULLY
+     NF_NAT_RANGE_PROTO_RANDOM_ALL
+
+    The caller must take care of not messing up with the flags, as they are
+    added unconditionally to the final resulting nf_nat_range.
+
+    Signed-off-by: Arturo Borrero Gonzalez <arturo.borrero.glez@gmail.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/uapi/linux/netfilter/nf_nat.h b/include/uapi/linux/netfilter/nf_nat.h
+index 1ad3659..0880781 100644
+--- a/include/uapi/linux/netfilter/nf_nat.h
++++ b/include/uapi/linux/netfilter/nf_nat.h
+@@ -13,6 +13,11 @@
+ #define NF_NAT_RANGE_PROTO_RANDOM_ALL  \
+  (NF_NAT_RANGE_PROTO_RANDOM | NF_NAT_RANGE_PROTO_RANDOM_FULLY)
+ 
++#define NF_NAT_RANGE_MASK     \
++ (NF_NAT_RANGE_MAP_IPS | NF_NAT_RANGE_PROTO_SPECIFIED | \
++  NF_NAT_RANGE_PROTO_RANDOM | NF_NAT_RANGE_PERSISTENT | \
++  NF_NAT_RANGE_PROTO_RANDOM_FULLY)
++
+ struct nf_nat_ipv4_range {
+  unsigned int   flags;
+  __be32    min_ip;
+diff --git a/include/uapi/linux/netfilter/nf_tables.h b/include/uapi/linux/netfilter/nf_tables.h
+index c000947..6022c6e 100644
+--- a/include/uapi/linux/netfilter/nf_tables.h
++++ b/include/uapi/linux/netfilter/nf_tables.h
+@@ -785,6 +785,7 @@ enum nft_nat_types {
+  * @NFTA_NAT_REG_ADDR_MAX: source register of address range end (NLA_U32: nft_registers)
+  * @NFTA_NAT_REG_PROTO_MIN: source register of proto range start (NLA_U32: nft_registers)
+  * @NFTA_NAT_REG_PROTO_MAX: source register of proto range end (NLA_U32: nft_registers)
++ * @NFTA_NAT_FLAGS: NAT flags (see NF_NAT_RANGE_* in linux/netfilter/nf_nat.h) (NLA_U32)
+  */
+ enum nft_nat_attributes {
+  NFTA_NAT_UNSPEC,
+@@ -794,6 +795,7 @@ enum nft_nat_attributes {
+  NFTA_NAT_REG_ADDR_MAX,
+  NFTA_NAT_REG_PROTO_MIN,
+  NFTA_NAT_REG_PROTO_MAX,
++ NFTA_NAT_FLAGS,
+  __NFTA_NAT_MAX
+ };
+ #define NFTA_NAT_MAX  (__NFTA_NAT_MAX - 1)
+diff --git a/net/netfilter/nft_nat.c b/net/netfilter/nft_nat.c
+index 79ff58c..799550b 100644
+--- a/net/netfilter/nft_nat.c
++++ b/net/netfilter/nft_nat.c
+@@ -33,6 +33,7 @@ struct nft_nat {
+  enum nft_registers      sreg_proto_max:8;
+  enum nf_nat_manip_type  type:8;
+  u8   family;
++ u16   flags;
+ };
+ 
+ static void nft_nat_eval(const struct nft_expr *expr,
+@@ -71,6 +72,8 @@ static void nft_nat_eval(const struct nft_expr *expr,
+   range.flags |= NF_NAT_RANGE_PROTO_SPECIFIED;
+  }
+ 
++ range.flags |= priv->flags;
++
+  data[NFT_REG_VERDICT].verdict =
+   nf_nat_setup_info(ct, &range, priv->type);
+ }
+@@ -82,6 +85,7 @@ static const struct nla_policy nft_nat_policy[NFTA_NAT_MAX + 1] = {
+  [NFTA_NAT_REG_ADDR_MAX]  = { .type = NLA_U32 },
+  [NFTA_NAT_REG_PROTO_MIN] = { .type = NLA_U32 },
+  [NFTA_NAT_REG_PROTO_MAX] = { .type = NLA_U32 },
++ [NFTA_NAT_FLAGS]  = { .type = NLA_U32 },
+ };
+ 
+ static int nft_nat_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
+@@ -149,6 +153,12 @@ static int nft_nat_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
+  } else
+   priv->sreg_proto_max = priv->sreg_proto_min;
+ 
++ if (tb[NFTA_NAT_FLAGS]) {
++  priv->flags = ntohl(nla_get_be32(tb[NFTA_NAT_FLAGS]));
++  if (priv->flags & ~NF_NAT_RANGE_MASK)
++   return -EINVAL;
++ }
++
+  return 0;
+ }
+ 
+@@ -183,6 +193,12 @@ static int nft_nat_dump(struct sk_buff *skb, const struct nft_expr *expr)
+      htonl(priv->sreg_proto_max)))
+    goto nla_put_failure;
+  }
++
++ if (priv->flags != 0) {
++  if (nla_put_be32(skb, NFTA_NAT_FLAGS, htonl(priv->flags)))
++   goto nla_put_failure;
++ }
++
+  return 0;
+ 
+ nla_put_failure:
+-- 
+1.7.1

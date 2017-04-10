@@ -1,0 +1,91 @@
+From 27468c1cf64cb04fe59f1ee45642ad706c192b64 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Mon, 8 Sep 2014 22:52:54 -0400
+Subject: [fs] aio: report error from io_destroy() when threads race in io_destroy()
+
+Message-id: <1410216777-18522-6-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 93346
+O-Subject: [RHEL7 PATCH 5/8] aio: report error from io_destroy() when threads race in io_destroy()
+Bugzilla: 1122092
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+This is a straight-forward backport of the following commit.  This was
+tested using the libaio test harness, aio-stress, and xfstests aio
+tests.
+
+This patch addresses bug 1122092.
+
+  commit fb2d44838320b78e6e3b5eb2e35b70f62f262e4c
+  Author: Benjamin LaHaise <bcrl@kvack.org>
+  Date:   Tue Apr 29 12:45:17 2014 -0400
+
+    aio: report error from io_destroy() when threads race in io_destroy()
+
+    As reported by Anatol Pomozov, io_destroy() fails to report an error when
+    it loses the race to destroy a given ioctx.  Since there is a difference in
+    behaviour between the thread that wins the race (which blocks on outstanding
+    io requests) versus lthe thread that loses (which returns immediately), wire
+    up a return code from kill_ioctx() to the io_destroy() syscall.
+
+    Signed-off-by: Benjamin LaHaise <bcrl@kvack.org>
+    Cc: Anatol Pomozov <anatol.pomozov@gmail.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/aio.c b/fs/aio.c
+index 12e2987..b779f3b 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -645,7 +645,7 @@ static void kill_ioctx_rcu(struct rcu_head *head)
+  * when the processes owning a context have all exited to encourage
+  * the rapid destruction of the kioctx.
+  */
+-static void kill_ioctx(struct mm_struct *mm, struct kioctx *ctx,
++static int kill_ioctx(struct mm_struct *mm, struct kioctx *ctx,
+   struct completion *requests_done)
+ {
+  if (!atomic_xchg(&ctx->dead, 1)) {
+@@ -672,10 +672,10 @@ static void kill_ioctx(struct mm_struct *mm, struct kioctx *ctx,
+ 
+   /* Between hlist_del_rcu() and dropping the initial ref */
+   call_rcu(&ctx->rcu_head, kill_ioctx_rcu);
+- } else {
+-  if (requests_done)
+-   complete(requests_done);
++  return 0;
+  }
++
++ return -EINVAL;
+ }
+ 
+ /* wait_on_sync_kiocb:
+@@ -1116,21 +1116,23 @@ SYSCALL_DEFINE1(io_destroy, aio_context_t, ctx)
+  if (likely(NULL != ioctx)) {
+   struct completion requests_done =
+    COMPLETION_INITIALIZER_ONSTACK(requests_done);
++  int ret;
+ 
+   /* Pass requests_done to kill_ioctx() where it can be set
+    * in a thread-safe way. If we try to set it here then we have
+    * a race condition if two io_destroy() called simultaneously.
+    */
+-  kill_ioctx(current->mm, ioctx, &requests_done);
++  ret = kill_ioctx(current->mm, ioctx, &requests_done);
+   put_ioctx(ioctx);
+ 
+   /* Wait until all IO for the context are done. Otherwise kernel
+    * keep using user-space buffers even if user thinks the context
+    * is destroyed.
+    */
+-  wait_for_completion(&requests_done);
++  if (!ret)
++   wait_for_completion(&requests_done);
+ 
+-  return 0;
++  return ret;
+  }
+  pr_debug("EINVAL: io_destroy: invalid context id\n");
+  return -EINVAL;
+-- 
+1.7.1

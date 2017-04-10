@@ -1,0 +1,364 @@
+From 02c7418f4720a0dce4d89b0003a669993133c311 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:00:13 -0400
+Subject: [infiniband] mlx4: Implement IP based gids support for RoCE/SRIOV
+
+Message-id: <06ab3ad41f593157263977473fbc05d3f8f7c477.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93645
+O-Subject: [Patch RHEL7.1 V1 077/197] mlx4: Implement IP based gids support for RoCE/SRIOV
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Jack Morgenstein <jackm@dev.mellanox.co.il>
+
+Since there is no connection between the MAC/VLAN and the GID
+when using IP-based addressing, the proxy QP1 (running on the
+slave) must pass the source-mac, destination-mac, and vlan_id
+information separately from the GID. Additionally, the Host
+must pass the remote source-mac and vlan_id back to the slave,
+
+This is achieved as follows:
+Outgoing MADs:
+    1. Source MAC: obtained from the CQ completion structure
+       (struct ib_wc, smac field).
+    2. Destination MAC: obtained from the tunnel header
+    3. vlan_id: obtained from the tunnel header.
+Incoming MADs
+    1. The source (i.e., remote) MAC and vlan_id are passed in
+       the tunnel header to the proxy QP1.
+
+VST mode support:
+     For outgoing MADs,  the vlan_id obtained from the header is
+        discarded, and the vlan_id specified by the Hypervisor is used
+        instead.
+     For incoming MADs, the incoming vlan_id (in the wc) is discarded, and the
+        "invalid" vlan (0xffff)  is substituted when forwarding to the slave.
+
+Signed-off-by: Moni Shoua <monis@mellanox.co.il>
+Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5ea8bbfc49291b7e23161fe4de0bf3e4a4e34b18)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cq.c b/drivers/infiniband/hw/mlx4/cq.c
+index cc40f08..5f64081 100644
+--- a/drivers/infiniband/hw/mlx4/cq.c
++++ b/drivers/infiniband/hw/mlx4/cq.c
+@@ -564,7 +564,7 @@ static int mlx4_ib_ipoib_csum_ok(__be16 status, __be16 checksum)
+ }
+ 
+ static int use_tunnel_data(struct mlx4_ib_qp *qp, struct mlx4_ib_cq *cq, struct ib_wc *wc,
+-      unsigned tail, struct mlx4_cqe *cqe)
++      unsigned tail, struct mlx4_cqe *cqe, int is_eth)
+ {
+  struct mlx4_ib_proxy_sqp_hdr *hdr;
+ 
+@@ -574,12 +574,20 @@ static int use_tunnel_data(struct mlx4_ib_qp *qp, struct mlx4_ib_cq *cq, struct
+        DMA_FROM_DEVICE);
+  hdr = (struct mlx4_ib_proxy_sqp_hdr *) (qp->sqp_proxy_rcv[tail].addr);
+  wc->pkey_index = be16_to_cpu(hdr->tun.pkey_index);
+- wc->slid = be16_to_cpu(hdr->tun.slid_mac_47_32);
+- wc->sl  = (u8) (be16_to_cpu(hdr->tun.sl_vid) >> 12);
+  wc->src_qp = be32_to_cpu(hdr->tun.flags_src_qp) & 0xFFFFFF;
+  wc->wc_flags   |= (hdr->tun.g_ml_path & 0x80) ? (IB_WC_GRH) : 0;
+  wc->dlid_path_bits = 0;
+ 
++ if (is_eth) {
++  wc->vlan_id = be16_to_cpu(hdr->tun.sl_vid);
++  memcpy(&(wc->smac[0]), (char *)&hdr->tun.mac_31_0, 4);
++  memcpy(&(wc->smac[4]), (char *)&hdr->tun.slid_mac_47_32, 2);
++  wc->wc_flags |= (IB_WC_WITH_VLAN | IB_WC_WITH_SMAC);
++ } else {
++  wc->slid        = be16_to_cpu(hdr->tun.slid_mac_47_32);
++  wc->sl          = (u8) (be16_to_cpu(hdr->tun.sl_vid) >> 12);
++ }
++
+  return 0;
+ }
+ 
+@@ -594,6 +602,7 @@ static int mlx4_ib_poll_one(struct mlx4_ib_cq *cq,
+  struct mlx4_srq *msrq = NULL;
+  int is_send;
+  int is_error;
++ int is_eth;
+  u32 g_mlpath_rqpn;
+  u16 wqe_ctr;
+  unsigned tail = 0;
+@@ -778,11 +787,15 @@ repoll:
+    break;
+   }
+ 
++  is_eth = (rdma_port_get_link_layer(wc->qp->device,
++        (*cur_qp)->port) ==
++     IB_LINK_LAYER_ETHERNET);
+   if (mlx4_is_mfunc(to_mdev(cq->ibcq.device)->dev)) {
+    if ((*cur_qp)->mlx4_ib_qp_type &
+        (MLX4_IB_QPT_PROXY_SMI_OWNER |
+         MLX4_IB_QPT_PROXY_SMI | MLX4_IB_QPT_PROXY_GSI))
+-    return use_tunnel_data(*cur_qp, cq, wc, tail, cqe);
++    return use_tunnel_data(*cur_qp, cq, wc, tail,
++             cqe, is_eth);
+   }
+ 
+   wc->slid    = be16_to_cpu(cqe->rlid);
+@@ -793,20 +806,21 @@ repoll:
+   wc->pkey_index     = be32_to_cpu(cqe->immed_rss_invalid) & 0x7f;
+   wc->wc_flags   |= mlx4_ib_ipoib_csum_ok(cqe->status,
+      cqe->checksum) ? IB_WC_IP_CSUM_OK : 0;
+-  if (rdma_port_get_link_layer(wc->qp->device,
+-    (*cur_qp)->port) == IB_LINK_LAYER_ETHERNET)
++  if (is_eth) {
+    wc->sl  = be16_to_cpu(cqe->sl_vid) >> 13;
+-  else
+-   wc->sl  = be16_to_cpu(cqe->sl_vid) >> 12;
+-  if (be32_to_cpu(cqe->vlan_my_qpn) & MLX4_CQE_VLAN_PRESENT_MASK) {
+-   wc->vlan_id = be16_to_cpu(cqe->sl_vid) &
+-    MLX4_CQE_VID_MASK;
++   if (be32_to_cpu(cqe->vlan_my_qpn) &
++     MLX4_CQE_VLAN_PRESENT_MASK) {
++    wc->vlan_id = be16_to_cpu(cqe->sl_vid) &
++     MLX4_CQE_VID_MASK;
++   } else {
++    wc->vlan_id = 0xffff;
++   }
++   memcpy(wc->smac, cqe->smac, ETH_ALEN);
++   wc->wc_flags |= (IB_WC_WITH_VLAN | IB_WC_WITH_SMAC);
+   } else {
++   wc->sl  = be16_to_cpu(cqe->sl_vid) >> 12;
+    wc->vlan_id = 0xffff;
+   }
+-  wc->wc_flags |= IB_WC_WITH_VLAN;
+-  memcpy(wc->smac, cqe->smac, ETH_ALEN);
+-  wc->wc_flags |= IB_WC_WITH_SMAC;
+  }
+ 
+  return 0;
+diff --git a/drivers/infiniband/hw/mlx4/mad.c b/drivers/infiniband/hw/mlx4/mad.c
+index 7ff8e1d..426dbbc 100644
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -545,11 +545,36 @@ int mlx4_ib_send_to_slave(struct mlx4_ib_dev *dev, int slave, u8 port,
+ 
+  /* adjust tunnel data */
+  tun_mad->hdr.pkey_index = cpu_to_be16(tun_pkey_ix);
+- tun_mad->hdr.sl_vid = cpu_to_be16(((u16)(wc->sl)) << 12);
+- tun_mad->hdr.slid_mac_47_32 = cpu_to_be16(wc->slid);
+  tun_mad->hdr.flags_src_qp = cpu_to_be32(wc->src_qp & 0xFFFFFF);
+  tun_mad->hdr.g_ml_path = (grh && (wc->wc_flags & IB_WC_GRH)) ? 0x80 : 0;
+ 
++ if (is_eth) {
++  u16 vlan = 0;
++  if (mlx4_get_slave_default_vlan(dev->dev, port, slave, &vlan,
++      NULL)) {
++   /* VST mode */
++   if (vlan != wc->vlan_id)
++    /* Packet vlan is not the VST-assigned vlan.
++     * Drop the packet.
++     */
++    goto out;
++    else
++    /* Remove the vlan tag before forwarding
++     * the packet to the VF.
++     */
++    vlan = 0xffff;
++  } else {
++   vlan = wc->vlan_id;
++  }
++
++  tun_mad->hdr.sl_vid = cpu_to_be16(vlan);
++  memcpy((char *)&tun_mad->hdr.mac_31_0, &(wc->smac[0]), 4);
++  memcpy((char *)&tun_mad->hdr.slid_mac_47_32, &(wc->smac[4]), 2);
++ } else {
++  tun_mad->hdr.sl_vid = cpu_to_be16(((u16)(wc->sl)) << 12);
++  tun_mad->hdr.slid_mac_47_32 = cpu_to_be16(wc->slid);
++ }
++
+  ib_dma_sync_single_for_device(&dev->ib_dev,
+           tun_qp->tx_ring[tun_tx_ix].buf.map,
+           sizeof (struct mlx4_rcv_tunnel_mad),
+@@ -1116,8 +1141,9 @@ static int is_proxy_qp0(struct mlx4_ib_dev *dev, int qpn, int slave)
+ 
+ 
+ int mlx4_ib_send_to_wire(struct mlx4_ib_dev *dev, int slave, u8 port,
+-    enum ib_qp_type dest_qpt, u16 pkey_index, u32 remote_qpn,
+-    u32 qkey, struct ib_ah_attr *attr, struct ib_mad *mad)
++    enum ib_qp_type dest_qpt, u16 pkey_index,
++    u32 remote_qpn, u32 qkey, struct ib_ah_attr *attr,
++    u8 *s_mac, struct ib_mad *mad)
+ {
+  struct ib_sge list;
+  struct ib_send_wr wr, *bad_wr;
+@@ -1206,6 +1232,9 @@ int mlx4_ib_send_to_wire(struct mlx4_ib_dev *dev, int slave, u8 port,
+  wr.num_sge = 1;
+  wr.opcode = IB_WR_SEND;
+  wr.send_flags = IB_SEND_SIGNALED;
++ if (s_mac)
++  memcpy(to_mah(ah)->av.eth.s_mac, s_mac, 6);
++
+ 
+  ret = ib_post_send(send_qp, &wr, &bad_wr);
+ out:
+@@ -1331,13 +1360,19 @@ static void mlx4_ib_multiplex_mad(struct mlx4_ib_demux_pv_ctx *ctx, struct ib_wc
+  if (ah_attr.ah_flags & IB_AH_GRH)
+   fill_in_real_sgid_index(dev, slave, ctx->port, &ah_attr);
+ 
++ memcpy(ah_attr.dmac, tunnel->hdr.mac, 6);
++ ah_attr.vlan_id = be16_to_cpu(tunnel->hdr.vlan);
++ /* if slave have default vlan use it */
++ mlx4_get_slave_default_vlan(dev->dev, ctx->port, slave,
++        &ah_attr.vlan_id, &ah_attr.sl);
++
+  mlx4_ib_send_to_wire(dev, slave, ctx->port,
+         is_proxy_qp0(dev, wc->src_qp, slave) ?
+         IB_QPT_SMI : IB_QPT_GSI,
+         be16_to_cpu(tunnel->hdr.pkey_index),
+         be32_to_cpu(tunnel->hdr.remote_qpn),
+         be32_to_cpu(tunnel->hdr.qkey),
+-        &ah_attr, &tunnel->mad);
++        &ah_attr, wc->smac, &tunnel->mad);
+ }
+ 
+ static int mlx4_ib_alloc_pv_bufs(struct mlx4_ib_demux_pv_ctx *ctx,
+diff --git a/drivers/infiniband/hw/mlx4/mcg.c b/drivers/infiniband/hw/mlx4/mcg.c
+index 25b2cdf..ed327e6 100644
+--- a/drivers/infiniband/hw/mlx4/mcg.c
++++ b/drivers/infiniband/hw/mlx4/mcg.c
+@@ -215,8 +215,9 @@ static int send_mad_to_wire(struct mlx4_ib_demux_ctx *ctx, struct ib_mad *mad)
+  }
+  mlx4_ib_query_ah(dev->sm_ah[ctx->port - 1], &ah_attr);
+  spin_unlock(&dev->sm_lock);
+- return mlx4_ib_send_to_wire(dev, mlx4_master_func_num(dev->dev), ctx->port,
+-        IB_QPT_GSI, 0, 1, IB_QP1_QKEY, &ah_attr, mad);
++ return mlx4_ib_send_to_wire(dev, mlx4_master_func_num(dev->dev),
++        ctx->port, IB_QPT_GSI, 0, 1, IB_QP1_QKEY,
++        &ah_attr, NULL, mad);
+ }
+ 
+ static int send_mad_to_slave(int slave, struct mlx4_ib_demux_ctx *ctx,
+diff --git a/drivers/infiniband/hw/mlx4/mlx4_ib.h b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+index febc8f9..f589522 100644
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@ -737,9 +737,12 @@ void mlx4_ib_tunnels_update_work(struct work_struct *work);
+ int mlx4_ib_send_to_slave(struct mlx4_ib_dev *dev, int slave, u8 port,
+      enum ib_qp_type qpt, struct ib_wc *wc,
+      struct ib_grh *grh, struct ib_mad *mad);
++
+ int mlx4_ib_send_to_wire(struct mlx4_ib_dev *dev, int slave, u8 port,
+     enum ib_qp_type dest_qpt, u16 pkey_index, u32 remote_qpn,
+-    u32 qkey, struct ib_ah_attr *attr, struct ib_mad *mad);
++    u32 qkey, struct ib_ah_attr *attr, u8 *s_mac,
++    struct ib_mad *mad);
++
+ __be64 mlx4_ib_get_new_demux_tid(struct mlx4_ib_demux_ctx *ctx);
+ 
+ int mlx4_ib_demux_cm_handler(struct ib_device *ibdev, int port, int *slave,
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index 11332f0..aadf7f8 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -2152,7 +2152,7 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
+  }
+ 
+  if (is_eth) {
+-  u8 smac[6];
++  u8 *smac;
+   struct in6_addr in6;
+ 
+   u16 pcp = (be32_to_cpu(ah->av.ib.sl_tclass_flowlabel) >> 29) << 13;
+@@ -2164,7 +2164,12 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
+   memcpy(&ctrl->srcrb_flags16[0], ah->av.eth.mac, 2);
+   memcpy(&ctrl->imm, ah->av.eth.mac + 2, 4);
+   memcpy(&in6, sgid.raw, sizeof(in6));
+-  rdma_get_ll_mac(&in6, smac);
++
++  if (!mlx4_is_mfunc(to_mdev(ib_dev)->dev))
++   smac = to_mdev(sqp->qp.ibqp.device)->
++    iboe.netdevs[sqp->qp.port - 1]->dev_addr;
++  else /* use the src mac of the tunnel */
++   smac = ah->av.eth.s_mac;
+   memcpy(sqp->ud_header.eth.smac_h, smac, 6);
+   if (!memcmp(sqp->ud_header.eth.smac_h, sqp->ud_header.eth.dmac_h, 6))
+    mlx->flags |= cpu_to_be32(MLX4_WQE_CTRL_FORCE_LOOPBACK);
+@@ -2396,6 +2401,8 @@ static void build_tunnel_header(struct ib_send_wr *wr, void *wqe, unsigned *mlx_
+  hdr.remote_qpn = cpu_to_be32(wr->wr.ud.remote_qpn);
+  hdr.pkey_index = cpu_to_be16(wr->wr.ud.pkey_index);
+  hdr.qkey = cpu_to_be32(wr->wr.ud.remote_qkey);
++ memcpy(hdr.mac, ah->av.eth.mac, 6);
++ hdr.vlan = ah->av.eth.vlan;
+ 
+  spc = MLX4_INLINE_ALIGN -
+   ((unsigned long) (inl + 1) & (MLX4_INLINE_ALIGN - 1));
+diff --git a/drivers/net/ethernet/mellanox/mlx4/cmd.c b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+index 0d02fba..2b0b45e 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+@@ -2289,6 +2289,30 @@ int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos)
+ }
+ EXPORT_SYMBOL_GPL(mlx4_set_vf_vlan);
+ 
++ /* mlx4_get_slave_default_vlan -
++ * return true if VST ( default vlan)
++ * if VST, will return vlan & qos (if not NULL)
++ */
++bool mlx4_get_slave_default_vlan(struct mlx4_dev *dev, int port, int slave,
++     u16 *vlan, u8 *qos)
++{
++ struct mlx4_vport_oper_state *vp_oper;
++ struct mlx4_priv *priv;
++
++ priv = mlx4_priv(dev);
++ vp_oper = &priv->mfunc.master.vf_oper[slave].vport[port];
++
++ if (MLX4_VGT != vp_oper->state.default_vlan) {
++  if (vlan)
++   *vlan = vp_oper->state.default_vlan;
++  if (qos)
++   *qos = vp_oper->state.default_qos;
++  return true;
++ }
++ return false;
++}
++EXPORT_SYMBOL_GPL(mlx4_get_slave_default_vlan);
++
+ int mlx4_set_vf_spoofchk(struct mlx4_dev *dev, int port, int vf, bool setting)
+ {
+  struct mlx4_priv *priv = mlx4_priv(dev);
+diff --git a/include/linux/mlx4/cmd.h b/include/linux/mlx4/cmd.h
+index 79a3472..0099856 100644
+--- a/include/linux/mlx4/cmd.h
++++ b/include/linux/mlx4/cmd.h
+@@ -240,6 +240,13 @@ int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos);
+ int mlx4_set_vf_spoofchk(struct mlx4_dev *dev, int port, int vf, bool setting);
+ int mlx4_get_vf_config(struct mlx4_dev *dev, int port, int vf, struct ifla_vf_info *ivf);
+ int mlx4_set_vf_link_state(struct mlx4_dev *dev, int port, int vf, int link_state);
++/*
++ * mlx4_get_slave_default_vlan -
++ * return true if VST ( default vlan)
++ * if VST, will return vlan & qos (if not NULL)
++ */
++bool mlx4_get_slave_default_vlan(struct mlx4_dev *dev, int port, int slave,
++     u16 *vlan, u8 *qos);
+ 
+ #define MLX4_COMM_GET_IF_REV(cmd_chan_ver) (u8)((cmd_chan_ver) >> 8)
+ 
+diff --git a/include/linux/mlx4/device.h b/include/linux/mlx4/device.h
+index a29c7e4..2511aed 100644
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@ -632,7 +632,8 @@ struct mlx4_eth_av {
+  u8  hop_limit;
+  __be32  sl_tclass_flowlabel;
+  u8  dgid[16];
+- u32  reserved4[2];
++ u8  s_mac[6];
++ u8  reserved4[2];
+  __be16  vlan;
+  u8  mac[ETH_ALEN];
+ };
+-- 
+1.7.1

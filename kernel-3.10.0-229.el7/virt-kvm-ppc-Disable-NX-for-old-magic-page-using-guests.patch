@@ -1,0 +1,137 @@
+From abaafc152374dcaa90f6b3a4e9885e5bd1115abf Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:13:16 -0400
+Subject: [virt] kvm/ppc: Disable NX for old magic page using guests
+
+Message-id: <1410765214-16377-61-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94759
+O-Subject: [PATCH 60/78] KVM: PPC: Disable NX for old magic page using guests
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit f3383cf80e417e86fcc84a2eb4c96bc52842d8d9
+Author: Alexander Graf <agraf@suse.de>
+Date:   Mon May 12 01:08:32 2014 +0200
+
+    KVM: PPC: Disable NX for old magic page using guests
+
+    Old guests try to use the magic page, but map their trampoline code inside
+    of an NX region.
+
+    Since we can't fix those old kernels, try to detect whether the guest is sane
+    or not. If not, just disable NX functionality in KVM so that old guests at
+    least work at all. For newer guests, add a bit that we can set to keep NX
+    functionality available.
+
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/virtual/kvm/ppc-pv.txt b/Documentation/virtual/kvm/ppc-pv.txt
+index 4643cde..3195606 100644
+--- a/Documentation/virtual/kvm/ppc-pv.txt
++++ b/Documentation/virtual/kvm/ppc-pv.txt
+@@ -94,10 +94,24 @@ a bitmap of available features inside the magic page.
+ The following enhancements to the magic page are currently available:
+ 
+   KVM_MAGIC_FEAT_SR  Maps SR registers r/w in the magic page
++  KVM_MAGIC_FEAT_MAS0_TO_SPRG7 Maps MASn, ESR, PIR and high SPRGs
+ 
+ For enhanced features in the magic page, please check for the existence of the
+ feature before using them!
+ 
++Magic page flags
++================
++
++In addition to features that indicate whether a host is capable of a particular
++feature we also have a channel for a guest to tell the guest whether it's capable
++of something. This is what we call "flags".
++
++Flags are passed to the host in the low 12 bits of the Effective Address.
++
++The following flags are currently available for a guest to expose:
++
++  MAGIC_PAGE_FLAG_NOT_MAPPED_NX Guest handles NX bits correclty wrt magic page
++
+ MSR bits
+ ========
+ 
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 18b1bab..86dc975 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -643,6 +643,7 @@ struct kvm_vcpu_arch {
+ #endif
+  unsigned long magic_page_pa; /* phys addr to map the magic page to */
+  unsigned long magic_page_ea; /* effect. addr to map the magic page to */
++ bool disable_kernel_nx;
+ 
+  int irq_type;  /* one of KVM_IRQ_* */
+  int irq_cpu_id;
+diff --git a/arch/powerpc/include/uapi/asm/kvm_para.h b/arch/powerpc/include/uapi/asm/kvm_para.h
+index e3af328..91e42f0 100644
+--- a/arch/powerpc/include/uapi/asm/kvm_para.h
++++ b/arch/powerpc/include/uapi/asm/kvm_para.h
+@@ -82,10 +82,16 @@ struct kvm_vcpu_arch_shared {
+ 
+ #define KVM_FEATURE_MAGIC_PAGE 1
+ 
++/* Magic page flags from host to guest */
++
+ #define KVM_MAGIC_FEAT_SR  (1 << 0)
+ 
+ /* MASn, ESR, PIR, and high SPRGs */
+ #define KVM_MAGIC_FEAT_MAS0_TO_SPRG7 (1 << 1)
+ 
++/* Magic page flags from guest to host */
++
++#define MAGIC_PAGE_FLAG_NOT_MAPPED_NX (1 << 0)
++
+ 
+ #endif /* _UAPI__POWERPC_KVM_PARA_H__ */
+diff --git a/arch/powerpc/kvm/book3s_64_mmu.c b/arch/powerpc/kvm/book3s_64_mmu.c
+index 5b8465f..385702e 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu.c
++++ b/arch/powerpc/kvm/book3s_64_mmu.c
+@@ -310,6 +310,9 @@ do_second:
+  gpte->raddr = (r & HPTE_R_RPN & ~eaddr_mask) | (eaddr & eaddr_mask);
+  gpte->page_size = pgsize;
+  gpte->may_execute = ((r & HPTE_R_N) ? false : true);
++ if (unlikely(vcpu->arch.disable_kernel_nx) &&
++     !(kvmppc_get_msr(vcpu) & MSR_PR))
++  gpte->may_execute = true;
+  gpte->may_read = false;
+  gpte->may_write = false;
+ 
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index b85d412..caa8188 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -177,8 +177,18 @@ int kvmppc_kvm_pv(struct kvm_vcpu *vcpu)
+   vcpu->arch.shared_big_endian = shared_big_endian;
+ #endif
+ 
+-  vcpu->arch.magic_page_pa = param1;
+-  vcpu->arch.magic_page_ea = param2;
++  if (!(param2 & MAGIC_PAGE_FLAG_NOT_MAPPED_NX)) {
++   /*
++    * Older versions of the Linux magic page code had
++    * a bug where they would map their trampoline code
++    * NX. If that's the case, remove !PR NX capability.
++    */
++   vcpu->arch.disable_kernel_nx = true;
++   kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
++  }
++
++  vcpu->arch.magic_page_pa = param1 & ~0xfffULL;
++  vcpu->arch.magic_page_ea = param2 & ~0xfffULL;
+ 
+   r2 = KVM_MAGIC_FEAT_SR | KVM_MAGIC_FEAT_MAS0_TO_SPRG7;
+ 
+-- 
+1.7.1

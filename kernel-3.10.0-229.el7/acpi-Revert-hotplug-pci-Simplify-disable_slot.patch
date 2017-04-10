@@ -1,0 +1,97 @@
+From d60614eff2abe759f2d1fe2c769a1c3dbdfa554f Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 4 Dec 2014 13:54:49 -0500
+Subject: [acpi] Revert: hotplug/pci: Simplify disable_slot()
+
+Message-id: <1417701289-14757-1-git-send-email-prarit@redhat.com>
+Patchwork-id: 101148
+O-Subject: [RHEL7.1 PATCH BZ 1158720] Revert "[acpi] hotplug/pci: Simplify disable_slot()"
+Bugzilla: 1158720
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+... i don't like posting patches and then going on pto.  this is important
+ enough to break that rule.
+
+ P.
+----8<----
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1158720
+
+Build info:
+Date: Thu Dec  4 08:29:58 EST 2014
+Build OS: Red Hat Enterprise Linux Server release 7.1 Beta (Maipo)
+System name: intel-brickland-05.khw.lab.eng.bos.redhat.com with -j72
+Built on: kernel-3.10.0-210.el7
+Arch built: ppc64 s390x x86_64
+
+This reverts commit b7d2a92ff908ff3cce5d289474440ca24e30b63c.
+
+The changes in this patch require additional pci_bus_sem changes.  Given where
+we are in 7.1 development, I think it is safer to revert this cleanup patch.
+
+Successfully tested by me on a system setup by pbonzini.
+
+Cc: pbonzini@redhat.com
+Cc: knoel@redhat.com
+Cc: Myron Stowe <mstowe@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index c55c570..59dc41d 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -538,15 +538,32 @@ static void __ref enable_slot(struct acpiphp_slot *slot)
+  }
+ }
+ 
++/* return first device in slot, acquiring a reference on it */
++static struct pci_dev *dev_in_slot(struct acpiphp_slot *slot)
++{
++ struct pci_bus *bus = slot->bus;
++ struct pci_dev *dev;
++ struct pci_dev *ret = NULL;
++
++ down_read(&pci_bus_sem);
++ list_for_each_entry(dev, &bus->devices, bus_list)
++  if (PCI_SLOT(dev->devfn) == slot->device) {
++   ret = pci_dev_get(dev);
++   break;
++  }
++ up_read(&pci_bus_sem);
++
++ return ret;
++}
++
+ /**
+  * disable_slot - disable a slot
+  * @slot: ACPI PHP slot
+  */
+ static void disable_slot(struct acpiphp_slot *slot)
+ {
+- struct pci_bus *bus = slot->bus;
+- struct pci_dev *dev, *prev;
+  struct acpiphp_func *func;
++ struct pci_dev *pdev;
+ 
+  /*
+   * enable_slot() enumerates all functions in this device via
+@@ -554,9 +571,10 @@ static void disable_slot(struct acpiphp_slot *slot)
+   * methods (_EJ0, etc.) or not.  Therefore, we remove all functions
+   * here.
+   */
+- list_for_each_entry_safe_reverse(dev, prev, &bus->devices, bus_list)
+-  if (PCI_SLOT(dev->devfn) == slot->device)
+-   pci_stop_and_remove_bus_device(dev);
++ while ((pdev = dev_in_slot(slot))) {
++  pci_stop_and_remove_bus_device(pdev);
++  pci_dev_put(pdev);
++ }
+ 
+  list_for_each_entry(func, &slot->funcs, sibling)
+   acpi_bus_trim(func_to_acpi_device(func));
+-- 
+1.7.1

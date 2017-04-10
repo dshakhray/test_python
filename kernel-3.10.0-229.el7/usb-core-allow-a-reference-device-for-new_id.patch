@@ -1,0 +1,141 @@
+From 7e4924dec33261c655915c128d9ca5dd632d6b07 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:10:21 -0400
+Subject: [usb] core: allow a reference device for new_id
+
+Message-id: <1410887463-20674-550-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95600
+O-Subject: [RHEL7 PATCH 549/591] usb: core: allow a reference device for new_id
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 2fc82c2de604deabb86b0558be0a301bb2209a19
+Author: Wolfram Sang <wsa@the-dreams.de>
+Date:   Fri Jan 10 19:36:42 2014 +0100
+
+    usb: core: allow a reference device for new_id
+
+    Often, usb drivers need some driver_info to get a device to work. To
+    have access to driver_info when using new_id, allow to pass a reference
+    vendor:product tuple from which new_id will inherit driver_info.
+
+    Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-usb b/Documentation/ABI/testing/sysfs-bus-usb
+index 9759b8c..c24beb8 100644
+--- a/Documentation/ABI/testing/sysfs-bus-usb
++++ b/Documentation/ABI/testing/sysfs-bus-usb
+@@ -128,13 +128,19 @@ Description:
+   This may allow the driver to support more hardware than
+   was included in the driver's static device ID support
+   table at compile time. The format for the device ID is:
+-  idVendor idProduct bInterfaceClass.
++  idVendor idProduct bInterfaceClass RefIdVendor RefIdProduct
+   The vendor ID and device ID fields are required, the
+-  interface class is optional.
++  rest is optional. The Ref* tuple can be used to tell the
++  driver to use the same driver_data for the new device as
++  it is used for the reference device.
+   Upon successfully adding an ID, the driver will probe
+   for the device and attempt to bind to it.  For example:
+   # echo "8086 10f5" > /sys/bus/usb/drivers/foo/new_id
+ 
++  Here add a new device (0458:7045) using driver_data from
++  an already supported device (0458:704c):
++  # echo "0458 7045 0 0458 704c" > /sys/bus/usb/drivers/foo/new_id
++
+   Reading from this file will list all dynamically added
+   device IDs in the same format, with one entry per
+   line. For example:
+diff --git a/drivers/usb/core/driver.c b/drivers/usb/core/driver.c
+index 3f82f1d..a988806 100644
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -37,6 +37,7 @@
+  * and cause the driver to probe for all devices again.
+  */
+ ssize_t usb_store_new_id(struct usb_dynids *dynids,
++    const struct usb_device_id *id_table,
+     struct device_driver *driver,
+     const char *buf, size_t count)
+ {
+@@ -44,11 +45,12 @@ ssize_t usb_store_new_id(struct usb_dynids *dynids,
+  u32 idVendor = 0;
+  u32 idProduct = 0;
+  unsigned int bInterfaceClass = 0;
++ u32 refVendor, refProduct;
+  int fields = 0;
+  int retval = 0;
+ 
+- fields = sscanf(buf, "%x %x %x", &idVendor, &idProduct,
+-     &bInterfaceClass);
++ fields = sscanf(buf, "%x %x %x %x %x", &idVendor, &idProduct,
++   &bInterfaceClass, &refVendor, &refProduct);
+  if (fields < 2)
+   return -EINVAL;
+ 
+@@ -65,6 +67,16 @@ ssize_t usb_store_new_id(struct usb_dynids *dynids,
+   dynid->id.match_flags |= USB_DEVICE_ID_MATCH_INT_CLASS;
+  }
+ 
++ if (fields > 4) {
++  const struct usb_device_id *id = id_table;
++
++  for (; id->match_flags; id++)
++   if (id->idVendor == refVendor && id->idProduct == refProduct) {
++    dynid->id.driver_info = id->driver_info;
++    break;
++   }
++ }
++
+  spin_lock(&dynids->lock);
+  list_add_tail(&dynid->node, &dynids->list);
+  spin_unlock(&dynids->lock);
+@@ -106,7 +118,7 @@ static ssize_t new_id_store(struct device_driver *driver,
+ {
+  struct usb_driver *usb_drv = to_usb_driver(driver);
+ 
+- return usb_store_new_id(&usb_drv->dynids, driver, buf, count);
++ return usb_store_new_id(&usb_drv->dynids, usb_drv->id_table, driver, buf, count);
+ }
+ static DRIVER_ATTR_RW(new_id);
+ 
+diff --git a/drivers/usb/serial/bus.c b/drivers/usb/serial/bus.c
+index e7d85ca..757ce2c 100644
+--- a/drivers/usb/serial/bus.c
++++ b/drivers/usb/serial/bus.c
+@@ -133,10 +133,12 @@ static ssize_t store_new_id(struct device_driver *driver,
+        const char *buf, size_t count)
+ {
+  struct usb_serial_driver *usb_drv = to_usb_serial_driver(driver);
+- ssize_t retval = usb_store_new_id(&usb_drv->dynids, driver, buf, count);
++ ssize_t retval = usb_store_new_id(&usb_drv->dynids, usb_drv->id_table,
++      driver, buf, count);
+ 
+  if (retval >= 0 && usb_drv->usb_driver != NULL)
+   retval = usb_store_new_id(&usb_drv->usb_driver->dynids,
++       usb_drv->usb_driver->id_table,
+        &usb_drv->usb_driver->drvwrap.driver,
+        buf, count);
+  return retval;
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index ccadbb9..84f4c44 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -971,6 +971,7 @@ struct usb_dynid {
+ };
+ 
+ extern ssize_t usb_store_new_id(struct usb_dynids *dynids,
++    const struct usb_device_id *id_table,
+     struct device_driver *driver,
+     const char *buf, size_t count);
+ 
+-- 
+1.7.1

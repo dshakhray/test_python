@@ -1,0 +1,220 @@
+From 4ad003f1ddefb9fdf6ee41569f2c50508bd6e241 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 24 Jul 2014 18:16:06 -0400
+Subject: [fs] nfsv4: test SECINFO RPC_AUTH_GSS pseudoflavors for support
+
+Message-id: <1406225773-16395-4-git-send-email-steved@redhat.com>
+Patchwork-id: 86632
+O-Subject: [RHEL7.1 PATCH 03/10] NFSv4: test SECINFO RPC_AUTH_GSS pseudoflavors for support
+Bugzilla: 1120728
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Andy Adamson <andros@netapp.com>
+
+Fix nfs4_negotiate_security to create an rpc_clnt used to test each SECINFO
+returned pseudoflavor. Check credential creation  (and gss_context creation)
+which is important for RPC_AUTH_GSS pseudoflavors which can fail for multiple
+reasons including mis-configuration.
+
+Don't call nfs4_negotiate in nfs4_submount as it was just called by
+nfs4_proc_lookup_mountpoint (nfs4_proc_lookup_common)
+
+Signed-off-by: Andy Adamson <andros@netapp.com>
+[Trond: fix corrupt return value from nfs_find_best_sec()]
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 66b068604903849c5dee3842eb72564064c64c72
+Bugzilla: 1120728
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
+index 5178b0f..a8b855a 100644
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -219,7 +219,7 @@ int nfs_atomic_open(struct inode *, struct dentry *, struct file *,
+ extern struct file_system_type nfs4_fs_type;
+ 
+ /* nfs4namespace.c */
+-struct rpc_clnt *nfs4_create_sec_client(struct rpc_clnt *, struct inode *, struct qstr *);
++struct rpc_clnt *nfs4_negotiate_security(struct rpc_clnt *, struct inode *, struct qstr *);
+ struct vfsmount *nfs4_submount(struct nfs_server *, struct dentry *,
+           struct nfs_fh *, struct nfs_fattr *);
+ int nfs4_replace_transport(struct nfs_server *server,
+diff --git a/fs/nfs/nfs4namespace.c b/fs/nfs/nfs4namespace.c
+index fd4dcb6..3d83cb1 100644
+--- a/fs/nfs/nfs4namespace.c
++++ b/fs/nfs/nfs4namespace.c
+@@ -139,17 +139,22 @@ static size_t nfs_parse_server_name(char *string, size_t len,
+  * @server: NFS server struct
+  * @flavors: List of security tuples returned by SECINFO procedure
+  *
+- * Return the pseudoflavor of the first security mechanism in
+- * "flavors" that is locally supported. The "flavors" array
++ * Return an rpc client that uses the first security mechanism in
++ * "flavors" that is locally supported.  The "flavors" array
+  * is searched in the order returned from the server, per RFC 3530
+- * recommendation.
++ * recommendation and each flavor is checked for membership in the
++ * sec= mount option list if it exists.
+  *
+  * Return -EPERM if no matching flavor is found in the array.
++ *
++ * Please call rpc_shutdown_client() when you are done with this rpc client.
++ *
+  */
+-static rpc_authflavor_t nfs_find_best_sec(struct nfs_server *server,
++static struct rpc_clnt *nfs_find_best_sec(struct rpc_clnt *clnt,
++       struct nfs_server *server,
+        struct nfs4_secinfo_flavors *flavors)
+ {
+- rpc_authflavor_t pseudoflavor;
++ rpc_authflavor_t pflavor;
+  struct nfs4_secinfo4 *secinfo;
+  unsigned int i;
+ 
+@@ -160,58 +165,73 @@ static rpc_authflavor_t nfs_find_best_sec(struct nfs_server *server,
+   case RPC_AUTH_NULL:
+   case RPC_AUTH_UNIX:
+   case RPC_AUTH_GSS:
+-   pseudoflavor = rpcauth_get_pseudoflavor(secinfo->flavor,
++   pflavor = rpcauth_get_pseudoflavor(secinfo->flavor,
+        &secinfo->flavor_info);
+-   /* make sure pseudoflavor matches sec= mount opt */
+-   if (pseudoflavor != RPC_AUTH_MAXFLAVOR &&
+-       nfs_auth_info_match(&server->auth_info,
+-      pseudoflavor))
+-    return pseudoflavor;
+-   break;
++   /* does the pseudoflavor match a sec= mount opt? */
++   if (pflavor != RPC_AUTH_MAXFLAVOR &&
++       nfs_auth_info_match(&server->auth_info, pflavor)) {
++    struct rpc_clnt *new;
++    struct rpc_cred *cred;
++
++    /* Cloning creates an rpc_auth for the flavor */
++    new = rpc_clone_client_set_auth(clnt, pflavor);
++    if (IS_ERR(new))
++     continue;
++    /**
++    * Check that the user actually can use the
++    * flavor. This is mostly for RPC_AUTH_GSS
++    * where cr_init obtains a gss context
++    */
++    cred = rpcauth_lookupcred(new->cl_auth, 0);
++    if (IS_ERR(cred)) {
++     rpc_shutdown_client(new);
++     continue;
++    }
++    put_rpccred(cred);
++    return new;
++   }
+   }
+  }
+-
+- return -EPERM;
++ return ERR_PTR(-EPERM);
+ }
+ 
+-static rpc_authflavor_t nfs4_negotiate_security(struct inode *inode, struct qstr *name)
++/**
++ * nfs4_negotiate_security - in response to an NFS4ERR_WRONGSEC on lookup,
++ * return an rpc_clnt that uses the best available security flavor with
++ * respect to the secinfo flavor list and the sec= mount options.
++ *
++ * @clnt: RPC client to clone
++ * @inode: directory inode
++ * @name: lookup name
++ *
++ * Please call rpc_shutdown_client() when you are done with this rpc client.
++ */
++struct rpc_clnt *
++nfs4_negotiate_security(struct rpc_clnt *clnt, struct inode *inode,
++     struct qstr *name)
+ {
+  struct page *page;
+  struct nfs4_secinfo_flavors *flavors;
+- rpc_authflavor_t flavor;
++ struct rpc_clnt *new;
+  int err;
+ 
+  page = alloc_page(GFP_KERNEL);
+  if (!page)
+-  return -ENOMEM;
++  return ERR_PTR(-ENOMEM);
++
+  flavors = page_address(page);
+ 
+  err = nfs4_proc_secinfo(inode, name, flavors);
+  if (err < 0) {
+-  flavor = err;
++  new = ERR_PTR(err);
+   goto out;
+  }
+ 
+- flavor = nfs_find_best_sec(NFS_SERVER(inode), flavors);
++ new = nfs_find_best_sec(clnt, NFS_SERVER(inode), flavors);
+ 
+ out:
+  put_page(page);
+- return flavor;
+-}
+-
+-/*
+- * Please call rpc_shutdown_client() when you are done with this client.
+- */
+-struct rpc_clnt *nfs4_create_sec_client(struct rpc_clnt *clnt, struct inode *inode,
+-     struct qstr *name)
+-{
+- rpc_authflavor_t flavor;
+-
+- flavor = nfs4_negotiate_security(inode, name);
+- if ((int)flavor < 0)
+-  return ERR_PTR((int)flavor);
+-
+- return rpc_clone_client_set_auth(clnt, flavor);
++ return new;
+ }
+ 
+ static struct vfsmount *try_location(struct nfs_clone_mount *mountdata,
+@@ -394,14 +414,6 @@ struct vfsmount *nfs4_submount(struct nfs_server *server, struct dentry *dentry,
+ 
+  if (client->cl_auth->au_flavor != flavor)
+   flavor = client->cl_auth->au_flavor;
+- else {
+-  rpc_authflavor_t new = nfs4_negotiate_security(dir, name);
+-  if ((int)new < 0) {
+-   mnt = ERR_PTR((int)new);
+-   goto out;
+-  }
+-  flavor = new;
+- }
+  mnt = nfs_do_submount(dentry, fh, fattr, flavor);
+ out:
+  rpc_shutdown_client(client);
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index c8b5e09..201f16c 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -3316,7 +3316,7 @@ static int nfs4_proc_lookup_common(struct rpc_clnt **clnt, struct inode *dir,
+    err = -EPERM;
+    if (client != *clnt)
+     goto out;
+-   client = nfs4_create_sec_client(client, dir, name);
++   client = nfs4_negotiate_security(client, dir, name);
+    if (IS_ERR(client))
+     return PTR_ERR(client);
+ 
+diff --git a/net/sunrpc/auth.c b/net/sunrpc/auth.c
+index 7eb6f00..6809fa9 100644
+--- a/net/sunrpc/auth.c
++++ b/net/sunrpc/auth.c
+@@ -596,6 +596,7 @@ rpcauth_lookupcred(struct rpc_auth *auth, int flags)
+  ret = auth->au_ops->lookup_cred(auth, &acred, flags);
+  return ret;
+ }
++EXPORT_SYMBOL_GPL(rpcauth_lookupcred);
+ 
+ void
+ rpcauth_init_cred(struct rpc_cred *cred, const struct auth_cred *acred,
+-- 
+1.7.1

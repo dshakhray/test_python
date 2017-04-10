@@ -1,0 +1,85 @@
+From 6938cb809a000ffc91a849cb904be4b37155d2a7 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Thu, 11 Sep 2014 12:02:01 -0400
+Subject: [infiniband] mlx4: Reorder steps in RoCE GID table initialization
+
+Message-id: <22c4ec7a6aa61622b470e48847eb53c7c26914e7.1410425016.git.avadai@redhat.com>
+Patchwork-id: 93740
+O-Subject: [Patch RHEL7.1 V1 185/197] IB/mlx4: Reorder steps in RoCE GID table initialization
+Bugzilla: 1107617 1107618 1107619 1107620
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Moni Shoua <monis@mellanox.com>
+
+There's no need to reset the gid table twice and we need to do it only
+for Ethernet ports. Also, no need to actively scan ndetdevs since it's being
+done immediatly after we register netdev notifiers.
+
+Signed-off-by: Moni Shoua <monis@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+
+Upstream: 655b2aaefc353604f9975c31960d9722e6eda449
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index c962394..54c2b3a 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -1727,24 +1727,33 @@ static int mlx4_ib_init_gid_table(struct mlx4_ib_dev *ibdev)
+  struct net_device *dev;
+  struct mlx4_ib_iboe *iboe = &ibdev->iboe;
+  int i;
++ int err = 0;
+ 
+- for (i = 1; i <= ibdev->num_ports; ++i)
+-  if (reset_gid_table(ibdev, i))
+-   return -1;
++ for (i = 1; i <= ibdev->num_ports; ++i) {
++  if (rdma_port_get_link_layer(&ibdev->ib_dev, i) ==
++      IB_LINK_LAYER_ETHERNET) {
++   err = reset_gid_table(ibdev, i);
++   if (err)
++    goto out;
++  }
++ }
+ 
+  read_lock(&dev_base_lock);
+  spin_lock(&iboe->lock);
+ 
+  for_each_netdev(&init_net, dev) {
+   u8 port = mlx4_ib_get_dev_port(dev, ibdev);
+-  if (port)
++  /* port will be non-zero only for ETH ports */
++  if (port) {
++   mlx4_ib_set_default_gid(ibdev, dev, port);
+    mlx4_ib_get_dev_addr(dev, ibdev, port);
++  }
+  }
+ 
+  spin_unlock(&iboe->lock);
+  read_unlock(&dev_base_lock);
+-
+- return 0;
++out:
++ return err;
+ }
+ 
+ static void mlx4_ib_scan_netdevs(struct mlx4_ib_dev *ibdev,
+@@ -2199,12 +2208,8 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
+    }
+   }
+ #endif
+-  for (i = 1 ; i <= ibdev->num_ports ; ++i)
+-   reset_gid_table(ibdev, i);
+-  rtnl_lock();
+-  mlx4_ib_scan_netdevs(ibdev, NULL, 0);
+-  rtnl_unlock();
+-  mlx4_ib_init_gid_table(ibdev);
++  if (mlx4_ib_init_gid_table(ibdev))
++   goto err_notif;
+  }
+ 
+  for (j = 0; j < ARRAY_SIZE(mlx4_class_attributes); ++j) {
+-- 
+1.7.1

@@ -1,0 +1,145 @@
+From a9b93b3c430479d910dbe86a30e9eddab540586e Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:24:10 -0400
+Subject: [net] libceph: follow {read, write}_tier fields on osd request submission
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-144-git-send-email-sweil@redhat.com>
+Patchwork-id: 89726
+O-Subject: [PATCH 143/303] libceph: follow {read, write}_tier fields on osd request submission
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+Overwrite ceph_osd_request::r_oloc.pool with read_tier for read ops and
+write_tier for write and read+write ops (aka basic tiering support).
+{read,write}_tier are part of pg_pool_t since v9.  This commit bumps
+our pg_pool_t decode compat version from v7 to v9, all new fields
+except for {read,write}_tier are ignored.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit 17a13e4028e6ad7ded079cf32370c47bd0e0fc07)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index 7f894a6..49ff69f 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -35,6 +35,8 @@ struct ceph_pg_pool_info {
+  u8 object_hash;
+  u32 pg_num, pgp_num;
+  int pg_num_mask, pgp_num_mask;
++ s64 read_tier;
++ s64 write_tier; /* wins for read+write ops */
+  u64 flags;
+  char *name;
+ };
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 10360de..0eb009e 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -1250,6 +1250,32 @@ static bool __req_should_be_paused(struct ceph_osd_client *osdc,
+ }
+ 
+ /*
++ * Calculate mapping of a request to a PG.  Takes tiering into account.
++ */
++static int __calc_request_pg(struct ceph_osdmap *osdmap,
++        struct ceph_osd_request *req,
++        struct ceph_pg *pg_out)
++{
++ if ((req->r_flags & CEPH_OSD_FLAG_IGNORE_OVERLAY) == 0) {
++  struct ceph_pg_pool_info *pi;
++
++  pi = ceph_pg_pool_by_id(osdmap, req->r_oloc.pool);
++  if (pi) {
++   if ((req->r_flags & CEPH_OSD_FLAG_READ) &&
++       pi->read_tier >= 0)
++    req->r_oloc.pool = pi->read_tier;
++   if ((req->r_flags & CEPH_OSD_FLAG_WRITE) &&
++       pi->write_tier >= 0)
++    req->r_oloc.pool = pi->write_tier;
++  }
++  /* !pi is caught in ceph_oloc_oid_to_pg() */
++ }
++
++ return ceph_oloc_oid_to_pg(osdmap, &req->r_oloc,
++       &req->r_oid, pg_out);
++}
++
++/*
+  * Pick an osd (the first 'up' osd in the pg), allocate the osd struct
+  * (as needed), and set the request r_osd appropriately.  If there is
+  * no up osd, set r_osd to NULL.  Move the request to the appropriate list
+@@ -1269,8 +1295,8 @@ static int __map_request(struct ceph_osd_client *osdc,
+  bool was_paused;
+ 
+  dout("map_request %p tid %lld\n", req, req->r_tid);
+- err = ceph_oloc_oid_to_pg(osdc->osdmap, &req->r_oloc, &req->r_oid,
+-      &pgid);
++
++ err = __calc_request_pg(osdc->osdmap, req, &pgid);
+  if (err) {
+   list_move(&req->r_req_lru_item, &osdc->req_notarget);
+   return err;
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index d69d235..aade4a5 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -519,8 +519,8 @@ static int __decode_pool(void **p, void *end, struct ceph_pg_pool_info *pi)
+   pr_warning("got v %d < 5 cv %d of ceph_pg_pool\n", ev, cv);
+   return -EINVAL;
+  }
+- if (cv > 7) {
+-  pr_warning("got v %d cv %d > 7 of ceph_pg_pool\n", ev, cv);
++ if (cv > 9) {
++  pr_warning("got v %d cv %d > 9 of ceph_pg_pool\n", ev, cv);
+   return -EINVAL;
+  }
+  len = ceph_decode_32(p);
+@@ -548,12 +548,34 @@ static int __decode_pool(void **p, void *end, struct ceph_pg_pool_info *pi)
+   *p += len;
+  }
+ 
+- /* skip removed snaps */
++ /* skip removed_snaps */
+  num = ceph_decode_32(p);
+  *p += num * (8 + 8);
+ 
+  *p += 8;  /* skip auid */
+  pi->flags = ceph_decode_64(p);
++ *p += 4;  /* skip crash_replay_interval */
++
++ if (ev >= 7)
++  *p += 1;  /* skip min_size */
++
++ if (ev >= 8)
++  *p += 8 + 8;  /* skip quota_max_* */
++
++ if (ev >= 9) {
++  /* skip tiers */
++  num = ceph_decode_32(p);
++  *p += num * 8;
++
++  *p += 8;  /* skip tier_of */
++  *p += 1;  /* skip cache_mode */
++
++  pi->read_tier = ceph_decode_64(p);
++  pi->write_tier = ceph_decode_64(p);
++ } else {
++  pi->read_tier = -1;
++  pi->write_tier = -1;
++ }
+ 
+  /* ignore the rest */
+ 
+-- 
+1.7.1

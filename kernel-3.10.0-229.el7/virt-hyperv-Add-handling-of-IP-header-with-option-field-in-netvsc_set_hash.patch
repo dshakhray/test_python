@@ -1,0 +1,86 @@
+From 214e58b498651fd6af6f48d860f2f44de67d16d4 Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Fri, 24 Oct 2014 10:57:39 -0400
+Subject: [virt] hyperv: Add handling of IP header with option field in netvsc_set_hash()
+
+Message-id: <1414148260-34692-4-git-send-email-jasowang@redhat.com>
+Patchwork-id: 98427
+O-Subject: [RHEL7.1 PATCH 3/4] hyperv: Add handling of IP header with option field in netvsc_set_hash()
+Bugzilla: 1156305
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+From: Haiyang Zhang <haiyangz@microsoft.com>
+
+Bugzilla: 1156305
+
+In case that the IP header has optional field at the end, this patch will
+get the port numbers after that field, and compute the hash. The general
+parser skb_flow_dissect() is used here.
+
+Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f88e67149f97d73c704d6fe6f492edde97463025)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index 35d57f1..ef0bbd7 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -163,7 +163,7 @@ union sub_key {
+  * data: network byte order
+  * return: host byte order
+  */
+-static u32 comp_hash(u8 *key, int klen, u8 *data, int dlen)
++static u32 comp_hash(u8 *key, int klen, void *data, int dlen)
+ {
+  union sub_key subk;
+  int k_next = 4;
+@@ -177,7 +177,7 @@ static u32 comp_hash(u8 *key, int klen, u8 *data, int dlen)
+  for (i = 0; i < dlen; i++) {
+   subk.kb = key[k_next];
+   k_next = (k_next + 1) % klen;
+-  dt = data[i];
++  dt = ((u8 *)data)[i];
+   for (j = 0; j < 8; j++) {
+    if (dt & 0x80)
+     ret ^= subk.ka;
+@@ -191,26 +191,20 @@ static u32 comp_hash(u8 *key, int klen, u8 *data, int dlen)
+ 
+ static bool netvsc_set_hash(u32 *hash, struct sk_buff *skb)
+ {
+- struct iphdr *iphdr;
++ struct flow_keys flow;
+  int data_len;
+- bool ret = false;
+ 
+- if (eth_hdr(skb)->h_proto != htons(ETH_P_IP))
++ if (!skb_flow_dissect(skb, &flow) || flow.n_proto != htons(ETH_P_IP))
+   return false;
+ 
+- iphdr = ip_hdr(skb);
++ if (flow.ip_proto == IPPROTO_TCP)
++  data_len = 12;
++ else
++  data_len = 8;
+ 
+- if (iphdr->version == 4) {
+-  if (iphdr->protocol == IPPROTO_TCP)
+-   data_len = 12;
+-  else
+-   data_len = 8;
+-  *hash = comp_hash(netvsc_hash_key, HASH_KEYLEN,
+-      (u8 *)&iphdr->saddr, data_len);
+-  ret = true;
+- }
++ *hash = comp_hash(netvsc_hash_key, HASH_KEYLEN, &flow, data_len);
+ 
+- return ret;
++ return true;
+ }
+ 
+ static u16 netvsc_select_queue(struct net_device *ndev, struct sk_buff *skb)
+-- 
+1.7.1

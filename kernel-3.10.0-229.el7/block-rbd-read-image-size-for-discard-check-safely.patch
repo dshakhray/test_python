@@ -1,0 +1,70 @@
+From ca5b9debc55efe46a6f39a2035af1bbfc9a47a8e Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+Date: Tue, 18 Nov 2014 15:49:33 -0500
+Subject: [block] rbd: read image size for discard check safely
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1416325805-26490-19-git-send-email-idryomov@redhat.com>
+Patchwork-id: 100210
+O-Subject: [RHEL7.1 PATCH 18/50] rbd: read image size for discard check safely
+Bugzilla: 1165232
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Sage Weil <sweil@redhat.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+
+From: Josh Durgin <josh.durgin@inktank.com>
+
+In rbd_img_request_fill() the image size is only checked to determine
+whether we can truncate an object instead of zeroing it for discard
+requests. Take rbd_dev->header_rwsem while reading the image size, and
+move this read into the discard check, so that non-discard ops don't
+need to take the semaphore in this function.
+
+Signed-off-by: Josh Durgin <josh.durgin@inktank.com>
+(cherry picked from commit 3c5df89367761d09d76454a2c4301a73bf2d46ce)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 79a9694..5c71172 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -2376,7 +2376,6 @@ static int rbd_img_request_fill(struct rbd_img_request *img_request,
+   (int)type, data_desc);
+ 
+  img_offset = img_request->offset;
+- img_end = rbd_dev->header.image_size;
+  resid = img_request->length;
+  rbd_assert(resid > 0);
+ 
+@@ -2440,13 +2439,20 @@ static int rbd_img_request_fill(struct rbd_img_request *img_request,
+    if (!offset && (length == object_size)
+     && (!img_request_layered_test(img_request) ||
+      (rbd_dev->parent_overlap <=
+-      obj_request->img_offset)))
++      obj_request->img_offset))) {
+     opcode = CEPH_OSD_OP_DELETE;
+-   else if ((offset + length == object_size) ||
+-    (obj_request->img_offset + length == img_end))
++   } else if ((offset + length == object_size)) {
+     opcode = CEPH_OSD_OP_TRUNCATE;
+-   else
+-    opcode = CEPH_OSD_OP_ZERO;
++   } else {
++    down_read(&rbd_dev->header_rwsem);
++    img_end = rbd_dev->header.image_size;
++    up_read(&rbd_dev->header_rwsem);
++
++    if (obj_request->img_offset + length == img_end)
++     opcode = CEPH_OSD_OP_TRUNCATE;
++    else
++     opcode = CEPH_OSD_OP_ZERO;
++   }
+   } else if (img_request_write_test(img_request)) {
+    op_type = OBJ_OP_WRITE;
+    opcode = CEPH_OSD_OP_WRITE;
+-- 
+1.7.1

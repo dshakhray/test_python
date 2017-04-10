@@ -1,0 +1,157 @@
+From a232eadf475f4e59326461b6048fd19042a327c3 Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:05:25 -0400
+Subject: [ethernet] qlcnic: Enable multiple Tx queue support for 83xx/84xx Series adapters
+
+Message-id: <1408626422-3941-42-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88641
+O-Subject: [PATCH RHEL 7.1 041/138] qlcnic: Enable multiple Tx queue support for 83xx/84xx Series adapters.
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Himanshu Madhani <himanshu.madhani@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id 18afc102fdcb95d6c7d57f2967a06f2f8fe3ba4c
+
+o 83xx and 84xx firmware is capable of multiple Tx queues.
+  This patch will enable multiple Tx queues for 83xx/84xx
+  series adapters. Max number of Tx queues supported will be 8.
+
+Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+index b97eb3a..0c32e20 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_hw.c
+@@ -1654,6 +1654,7 @@ int qlcnic_83xx_loopback_test(struct net_device *netdev, u8 mode)
+  struct qlcnic_adapter *adapter = netdev_priv(netdev);
+  struct qlcnic_hardware_context *ahw = adapter->ahw;
+  u8 drv_sds_rings = adapter->drv_sds_rings;
++ u8 drv_tx_rings = adapter->drv_tx_rings;
+  int ret = 0, loop = 0;
+ 
+  if (ahw->op_mode == QLCNIC_NON_PRIV_FUNC) {
+@@ -1718,6 +1719,7 @@ free_diag_res:
+ 
+ fail_diag_alloc:
+  adapter->drv_sds_rings = drv_sds_rings;
++ adapter->drv_tx_rings = drv_tx_rings;
+  qlcnic_release_diag_lock(adapter);
+  return ret;
+ }
+@@ -3303,6 +3305,7 @@ int qlcnic_83xx_interrupt_test(struct net_device *netdev)
+  struct qlcnic_hardware_context *ahw = adapter->ahw;
+  struct qlcnic_cmd_args cmd;
+  u8 val, drv_sds_rings = adapter->drv_sds_rings;
++ u8 drv_tx_rings = adapter->drv_tx_rings;
+  u32 data;
+  u16 intrpt_id, id;
+  int ret;
+@@ -3359,6 +3362,7 @@ done:
+ 
+ fail_diag_irq:
+  adapter->drv_sds_rings = drv_sds_rings;
++ adapter->drv_tx_rings = drv_tx_rings;
+  qlcnic_release_diag_lock(adapter);
+  return ret;
+ }
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+index 5682a40..89208e5 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_83xx_init.c
+@@ -2068,13 +2068,13 @@ int qlcnic_83xx_configure_opmode(struct qlcnic_adapter *adapter)
+    return -EIO;
+ 
+   adapter->max_sds_rings = QLCNIC_MAX_VNIC_SDS_RINGS;
+-  adapter->max_tx_rings = QLCNIC_SINGLE_RING;
++  adapter->max_tx_rings = QLCNIC_MAX_VNIC_TX_RINGS;
+  } else if (ret == QLC_83XX_DEFAULT_OPMODE) {
+   ahw->nic_mode = QLCNIC_DEFAULT_MODE;
+   adapter->nic_ops->init_driver = qlcnic_83xx_init_default_driver;
+   ahw->idc.state_entry = qlcnic_83xx_idc_ready_state_entry;
+   adapter->max_sds_rings = ahw->max_rx_ques;
+-  adapter->max_tx_rings = QLCNIC_SINGLE_RING;
++  adapter->max_tx_rings = ahw->max_tx_ques;
+  } else {
+   return -EIO;
+  }
+@@ -2179,16 +2179,20 @@ static int qlcnic_83xx_get_fw_info(struct qlcnic_adapter *adapter)
+ 
+ static void qlcnic_83xx_init_rings(struct qlcnic_adapter *adapter)
+ {
++ u8 rx_cnt = QLCNIC_DEF_SDS_RINGS;
++ u8 tx_cnt = QLCNIC_DEF_TX_RINGS;
++
+  adapter->max_tx_rings = QLCNIC_MAX_TX_RINGS;
+  adapter->max_sds_rings = QLCNIC_MAX_SDS_RINGS;
+ 
+- qlcnic_set_tx_ring_count(adapter, QLCNIC_SINGLE_RING);
++ if (!adapter->ahw->msix_supported) {
++  rx_cnt = QLCNIC_SINGLE_RING;
++  tx_cnt = QLCNIC_SINGLE_RING;
++ }
+ 
+  /* compute and set drv sds rings */
+- if (adapter->ahw->msix_supported)
+-  qlcnic_set_sds_ring_count(adapter, QLCNIC_DEF_SDS_RINGS);
+- else
+-  qlcnic_set_sds_ring_count(adapter, QLCNIC_SINGLE_RING);
++ qlcnic_set_tx_ring_count(adapter, tx_cnt);
++ qlcnic_set_sds_ring_count(adapter, rx_cnt);
+ }
+ 
+ int qlcnic_83xx_init(struct qlcnic_adapter *adapter, int pci_using_dac)
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+index 8cda046..6d3edf6 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+@@ -731,7 +731,7 @@ static int qlcnic_set_channels(struct net_device *dev,
+   }
+  }
+ 
+- if (qlcnic_82xx_check(adapter) && channel->tx_count) {
++ if (channel->tx_count) {
+   err = qlcnic_validate_rings(adapter, channel->tx_count,
+          QLCNIC_TX_QUEUE);
+   if (err) {
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+index dfdb0f9..301cf2b 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_io.c
+@@ -581,10 +581,7 @@ netdev_tx_t qlcnic_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
+    goto drop_packet;
+  }
+ 
+- if (qlcnic_check_multi_tx(adapter))
+-  tx_ring = &adapter->tx_ring[skb_get_queue_mapping(skb)];
+- else
+-  tx_ring = &adapter->tx_ring[0];
++ tx_ring = &adapter->tx_ring[skb_get_queue_mapping(skb)];
+  num_txd = tx_ring->num_desc;
+ 
+  frag_count = skb_shinfo(skb)->nr_frags + 1;
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index 2f97e8f..d08f0c0 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -3702,11 +3702,7 @@ int qlcnic_validate_rings(struct qlcnic_adapter *adapter, __u32 ring_cnt,
+   cur_rings = adapter->drv_sds_rings;
+   strcpy(buf, "SDS");
+  } else if (queue_type == QLCNIC_TX_QUEUE) {
+-  if (qlcnic_83xx_check(adapter))
+-   max_hw_rings = QLCNIC_SINGLE_RING;
+-  else
+-   max_hw_rings = adapter->max_tx_rings;
+-
++  max_hw_rings = adapter->max_tx_rings;
+   cur_rings = adapter->drv_tx_rings;
+   strcpy(buf, "Tx");
+  }
+-- 
+1.7.1

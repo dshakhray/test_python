@@ -1,0 +1,109 @@
+From a255e240a1d590b80f81f979db3566ff8d7e5861 Mon Sep 17 00:00:00 2001
+From: Jiri Pirko <jpirko@redhat.com>
+Date: Mon, 19 Jan 2015 15:48:32 -0500
+Subject: [net] team: avoid possible underflow of count_pending value for notify_peers and mcast_rejoin
+
+Message-id: <1421682512-19565-1-git-send-email-jpirko@redhat.com>
+Patchwork-id: 103157
+O-Subject: [patch rhel7.1] team: avoid possible underflow of count_pending value for notify_peers and mcast_rejoin
+Bugzilla: 1176697
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+RH-Acked-by: Marcelo Leitner <mleitner@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+BZ1176697
+https://brewweb.devel.redhat.com/taskinfo?taskID=8540359
+Tested by customer (not able to reproduce in-house)
+
+upstream commit b0d11b42785b70e19bc6a3122eead3f7969a7589
+Author: Jiri Pirko <jiri@resnulli.us>
+Date:   Wed Jan 14 18:15:30 2015 +0100
+
+    team: avoid possible underflow of count_pending value for notify_peers and mcast_rejoin
+
+    This patch is fixing a race condition that may cause setting
+    count_pending to -1, which results in unwanted big bulk of arp messages
+    (in case of "notify peers").
+
+    Consider following scenario:
+
+    count_pending == 2
+       CPU0                                           CPU1
+         team_notify_peers_work
+           atomic_dec_and_test (dec count_pending to 1)
+           schedule_delayed_work
+     team_notify_peers
+       atomic_add (adding 1 to count_pending)
+         team_notify_peers_work
+           atomic_dec_and_test (dec count_pending to 1)
+           schedule_delayed_work
+         team_notify_peers_work
+           atomic_dec_and_test (dec count_pending to 0)
+       schedule_delayed_work
+         team_notify_peers_work
+           atomic_dec_and_test (dec count_pending to -1)
+
+    Fix this race by using atomic_dec_if_positive - that will prevent
+    count_pending running under 0.
+
+Signed-off-by: Jiri Pirko <jpirko@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 49c17f1..3fc3f06 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -629,6 +629,7 @@ static int team_change_mode(struct team *team, const char *kind)
+ static void team_notify_peers_work(struct work_struct *work)
+ {
+  struct team *team;
++ int val;
+ 
+  team = container_of(work, struct team, notify_peers.dw.work);
+ 
+@@ -636,9 +637,14 @@ static void team_notify_peers_work(struct work_struct *work)
+   schedule_delayed_work(&team->notify_peers.dw, 0);
+   return;
+  }
++ val = atomic_dec_if_positive(&team->notify_peers.count_pending);
++ if (val < 0) {
++  rtnl_unlock();
++  return;
++ }
+  call_netdevice_notifiers(NETDEV_NOTIFY_PEERS, team->dev);
+  rtnl_unlock();
+- if (!atomic_dec_and_test(&team->notify_peers.count_pending))
++ if (val)
+   schedule_delayed_work(&team->notify_peers.dw,
+           msecs_to_jiffies(team->notify_peers.interval));
+ }
+@@ -669,6 +675,7 @@ static void team_notify_peers_fini(struct team *team)
+ static void team_mcast_rejoin_work(struct work_struct *work)
+ {
+  struct team *team;
++ int val;
+ 
+  team = container_of(work, struct team, mcast_rejoin.dw.work);
+ 
+@@ -676,9 +683,14 @@ static void team_mcast_rejoin_work(struct work_struct *work)
+   schedule_delayed_work(&team->mcast_rejoin.dw, 0);
+   return;
+  }
++ val = atomic_dec_if_positive(&team->mcast_rejoin.count_pending);
++ if (val < 0) {
++  rtnl_unlock();
++  return;
++ }
+  call_netdevice_notifiers(NETDEV_RESEND_IGMP, team->dev);
+  rtnl_unlock();
+- if (!atomic_dec_and_test(&team->mcast_rejoin.count_pending))
++ if (val)
+   schedule_delayed_work(&team->mcast_rejoin.dw,
+           msecs_to_jiffies(team->mcast_rejoin.interval));
+ }
+-- 
+1.7.1

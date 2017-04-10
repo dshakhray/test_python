@@ -1,0 +1,291 @@
+From 469c4ea37da983f027ced65a2928420da2962803 Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 24 Sep 2014 17:32:59 -0400
+Subject: [infiniband] qib: Add percpu counter replacing qib_devdata int_counter
+
+Message-id: <0d68401072647a27a63a53ab9f2962e438040353.1411579814.git.dledford@redhat.com>
+Patchwork-id: 96688
+O-Subject: [Patch RHEL7 06/19] IB/qib: Add percpu counter replacing qib_devdata int_counter
+Bugzilla: 1085961
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: Mike Marciniszyn <mike.marciniszyn@intel.com>
+
+This patch replaces the dd->int_counter with a percpu counter.
+
+The maintanance of qib_stats.sps_ints and int_counter are
+combined into the new counter.
+
+There are two new functions added to read the counter:
+- qib_int_counter (for a particular qib_devdata)
+- qib_sps_ints (for all HCAs)
+
+A z_int_counter is added to allow the interrupt detection logic
+to determine if interrupts have occured since z_int_counter
+was "reset".
+
+Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 1ed88dd7d0b361e677b2690f573e5c274bb25c87)
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/qib/qib.h b/drivers/infiniband/hw/qib/qib.h
+index 1946101..f044430 100644
+--- a/drivers/infiniband/hw/qib/qib.h
++++ b/drivers/infiniband/hw/qib/qib.h
+@@ -868,8 +868,10 @@ struct qib_devdata {
+  /* last buffer for user use */
+  u32 lastctxt_piobuf;
+ 
+- /* saturating counter of (non-port-specific) device interrupts */
+- u32 int_counter;
++ /* reset value */
++ u64 z_int_counter;
++ /* percpu intcounter */
++ u64 __percpu *int_counter;
+ 
+  /* pio bufs allocated per ctxt */
+  u32 pbufsctxt;
+@@ -1449,6 +1451,10 @@ void qib_nomsi(struct qib_devdata *);
+ void qib_nomsix(struct qib_devdata *);
+ void qib_pcie_getcmd(struct qib_devdata *, u16 *, u8 *, u8 *);
+ void qib_pcie_reenable(struct qib_devdata *, u16, u8, u8);
++/* interrupts for device */
++u64 qib_int_counter(struct qib_devdata *);
++/* interrupt for all devices */
++u64 qib_sps_ints(void);
+ 
+ /*
+  * dma_addr wrappers - all 0's invalid for hw
+diff --git a/drivers/infiniband/hw/qib/qib_fs.c b/drivers/infiniband/hw/qib/qib_fs.c
+index c61e2a9..cab610c 100644
+--- a/drivers/infiniband/hw/qib/qib_fs.c
++++ b/drivers/infiniband/hw/qib/qib_fs.c
+@@ -105,6 +105,7 @@ static int create_file(const char *name, umode_t mode,
+ static ssize_t driver_stats_read(struct file *file, char __user *buf,
+      size_t count, loff_t *ppos)
+ {
++ qib_stats.sps_ints = qib_sps_ints();
+  return simple_read_from_buffer(buf, count, ppos, &qib_stats,
+            sizeof qib_stats);
+ }
+diff --git a/drivers/infiniband/hw/qib/qib_iba6120.c b/drivers/infiniband/hw/qib/qib_iba6120.c
+index 84e593d..b9bea2e 100644
+--- a/drivers/infiniband/hw/qib/qib_iba6120.c
++++ b/drivers/infiniband/hw/qib/qib_iba6120.c
+@@ -1634,9 +1634,7 @@ static irqreturn_t qib_6120intr(int irq, void *data)
+   goto bail;
+  }
+ 
+- qib_stats.sps_ints++;
+- if (dd->int_counter != (u32) -1)
+-  dd->int_counter++;
++ this_cpu_inc(*dd->int_counter);
+ 
+  if (unlikely(istat & (~QLOGIC_IB_I_BITSEXTANT |
+          QLOGIC_IB_I_GPIO | QLOGIC_IB_I_ERROR)))
+@@ -1808,7 +1806,8 @@ static int qib_6120_setup_reset(struct qib_devdata *dd)
+   * isn't set.
+   */
+  dd->flags &= ~(QIB_INITTED | QIB_PRESENT);
+- dd->int_counter = 0; /* so we check interrupts work again */
++ /* so we check interrupts work again */
++ dd->z_int_counter = qib_int_counter(dd);
+  val = dd->control | QLOGIC_IB_C_RESET;
+  writeq(val, &dd->kregbase[kr_control]);
+  mb(); /* prevent compiler re-ordering around actual reset */
+diff --git a/drivers/infiniband/hw/qib/qib_iba7220.c b/drivers/infiniband/hw/qib/qib_iba7220.c
+index 454c2e7..28063d4 100644
+--- a/drivers/infiniband/hw/qib/qib_iba7220.c
++++ b/drivers/infiniband/hw/qib/qib_iba7220.c
+@@ -1962,10 +1962,7 @@ static irqreturn_t qib_7220intr(int irq, void *data)
+   goto bail;
+  }
+ 
+- qib_stats.sps_ints++;
+- if (dd->int_counter != (u32) -1)
+-  dd->int_counter++;
+-
++ this_cpu_inc(*dd->int_counter);
+  if (unlikely(istat & (~QLOGIC_IB_I_BITSEXTANT |
+          QLOGIC_IB_I_GPIO | QLOGIC_IB_I_ERROR)))
+   unlikely_7220_intr(dd, istat);
+@@ -2120,7 +2117,8 @@ static int qib_setup_7220_reset(struct qib_devdata *dd)
+   * isn't set.
+   */
+  dd->flags &= ~(QIB_INITTED | QIB_PRESENT);
+- dd->int_counter = 0; /* so we check interrupts work again */
++ /* so we check interrupts work again */
++ dd->z_int_counter = qib_int_counter(dd);
+  val = dd->control | QLOGIC_IB_C_RESET;
+  writeq(val, &dd->kregbase[kr_control]);
+  mb(); /* prevent compiler reordering around actual reset */
+diff --git a/drivers/infiniband/hw/qib/qib_iba7322.c b/drivers/infiniband/hw/qib/qib_iba7322.c
+index d1bd213..8441579 100644
+--- a/drivers/infiniband/hw/qib/qib_iba7322.c
++++ b/drivers/infiniband/hw/qib/qib_iba7322.c
+@@ -3115,9 +3115,7 @@ static irqreturn_t qib_7322intr(int irq, void *data)
+   goto bail;
+  }
+ 
+- qib_stats.sps_ints++;
+- if (dd->int_counter != (u32) -1)
+-  dd->int_counter++;
++ this_cpu_inc(*dd->int_counter);
+ 
+  /* handle "errors" of various kinds first, device ahead of port */
+  if (unlikely(istat & (~QIB_I_BITSEXTANT | QIB_I_GPIO |
+@@ -3186,9 +3184,7 @@ static irqreturn_t qib_7322pintr(int irq, void *data)
+    */
+   return IRQ_HANDLED;
+ 
+- qib_stats.sps_ints++;
+- if (dd->int_counter != (u32) -1)
+-  dd->int_counter++;
++ this_cpu_inc(*dd->int_counter);
+ 
+  /* Clear the interrupt bit we expect to be set. */
+  qib_write_kreg(dd, kr_intclear, ((1ULL << QIB_I_RCVAVAIL_LSB) |
+@@ -3215,9 +3211,7 @@ static irqreturn_t qib_7322bufavail(int irq, void *data)
+    */
+   return IRQ_HANDLED;
+ 
+- qib_stats.sps_ints++;
+- if (dd->int_counter != (u32) -1)
+-  dd->int_counter++;
++ this_cpu_inc(*dd->int_counter);
+ 
+  /* Clear the interrupt bit we expect to be set. */
+  qib_write_kreg(dd, kr_intclear, QIB_I_SPIOBUFAVAIL);
+@@ -3248,9 +3242,7 @@ static irqreturn_t sdma_intr(int irq, void *data)
+    */
+   return IRQ_HANDLED;
+ 
+- qib_stats.sps_ints++;
+- if (dd->int_counter != (u32) -1)
+-  dd->int_counter++;
++ this_cpu_inc(*dd->int_counter);
+ 
+  /* Clear the interrupt bit we expect to be set. */
+  qib_write_kreg(dd, kr_intclear, ppd->hw_pidx ?
+@@ -3277,9 +3269,7 @@ static irqreturn_t sdma_idle_intr(int irq, void *data)
+    */
+   return IRQ_HANDLED;
+ 
+- qib_stats.sps_ints++;
+- if (dd->int_counter != (u32) -1)
+-  dd->int_counter++;
++ this_cpu_inc(*dd->int_counter);
+ 
+  /* Clear the interrupt bit we expect to be set. */
+  qib_write_kreg(dd, kr_intclear, ppd->hw_pidx ?
+@@ -3306,9 +3296,7 @@ static irqreturn_t sdma_progress_intr(int irq, void *data)
+    */
+   return IRQ_HANDLED;
+ 
+- qib_stats.sps_ints++;
+- if (dd->int_counter != (u32) -1)
+-  dd->int_counter++;
++ this_cpu_inc(*dd->int_counter);
+ 
+  /* Clear the interrupt bit we expect to be set. */
+  qib_write_kreg(dd, kr_intclear, ppd->hw_pidx ?
+@@ -3336,9 +3324,7 @@ static irqreturn_t sdma_cleanup_intr(int irq, void *data)
+    */
+   return IRQ_HANDLED;
+ 
+- qib_stats.sps_ints++;
+- if (dd->int_counter != (u32) -1)
+-  dd->int_counter++;
++ this_cpu_inc(*dd->int_counter);
+ 
+  /* Clear the interrupt bit we expect to be set. */
+  qib_write_kreg(dd, kr_intclear, ppd->hw_pidx ?
+@@ -3723,7 +3709,8 @@ static int qib_do_7322_reset(struct qib_devdata *dd)
+  dd->pport->cpspec->ibsymdelta = 0;
+  dd->pport->cpspec->iblnkerrdelta = 0;
+  dd->pport->cpspec->ibmalfdelta = 0;
+- dd->int_counter = 0; /* so we check interrupts work again */
++ /* so we check interrupts work again */
++ dd->z_int_counter = qib_int_counter(dd);
+ 
+  /*
+   * Keep chip from being accessed until we are ready.  Use
+diff --git a/drivers/infiniband/hw/qib/qib_init.c b/drivers/infiniband/hw/qib/qib_init.c
+index 76c3e17..6d26299 100644
+--- a/drivers/infiniband/hw/qib/qib_init.c
++++ b/drivers/infiniband/hw/qib/qib_init.c
+@@ -525,6 +525,7 @@ static void enable_chip(struct qib_devdata *dd)
+ static void verify_interrupt(unsigned long opaque)
+ {
+  struct qib_devdata *dd = (struct qib_devdata *) opaque;
++ u64 int_counter;
+ 
+  if (!dd)
+   return; /* being torn down */
+@@ -533,7 +534,8 @@ static void verify_interrupt(unsigned long opaque)
+   * If we don't have a lid or any interrupts, let the user know and
+   * don't bother checking again.
+   */
+- if (dd->int_counter == 0) {
++ int_counter = qib_int_counter(dd) - dd->z_int_counter;
++ if (int_counter == 0) {
+   if (!dd->f_intr_fallback(dd))
+    dev_err(&dd->pcidev->dev,
+     "No interrupts detected, not usable.\n");
+@@ -1079,9 +1081,34 @@ void qib_free_devdata(struct qib_devdata *dd)
+ #ifdef CONFIG_DEBUG_FS
+  qib_dbg_ibdev_exit(&dd->verbs_dev);
+ #endif
++ free_percpu(dd->int_counter);
+  ib_dealloc_device(&dd->verbs_dev.ibdev);
+ }
+ 
++u64 qib_int_counter(struct qib_devdata *dd)
++{
++ int cpu;
++ u64 int_counter = 0;
++
++ for_each_possible_cpu(cpu)
++  int_counter += *per_cpu_ptr(dd->int_counter, cpu);
++ return int_counter;
++}
++
++u64 qib_sps_ints(void)
++{
++ unsigned long flags;
++ struct qib_devdata *dd;
++ u64 sps_ints = 0;
++
++ spin_lock_irqsave(&qib_devs_lock, flags);
++ list_for_each_entry(dd, &qib_dev_list, list) {
++  sps_ints += qib_int_counter(dd);
++ }
++ spin_unlock_irqrestore(&qib_devs_lock, flags);
++ return sps_ints;
++}
++
+ /*
+  * Allocate our primary per-unit data structure.  Must be done via verbs
+  * allocator, because the verbs cleanup process both does cleanup and
+@@ -1119,6 +1146,13 @@ struct qib_devdata *qib_alloc_devdata(struct pci_dev *pdev, size_t extra)
+          "Could not allocate unit ID: error %d\n", -ret);
+   goto bail;
+  }
++ dd->int_counter = alloc_percpu(u64);
++ if (!dd->int_counter) {
++  ret = -ENOMEM;
++  qib_early_err(&pdev->dev,
++         "Could not allocate per-cpu int_counter\n");
++  goto bail;
++ }
+ 
+  if (!qib_cpulist_count) {
+   u32 count = num_online_cpus();
+-- 
+1.7.1

@@ -1,0 +1,171 @@
+From e0048c676aea327b020c3c84904bcf13bafea5c6 Mon Sep 17 00:00:00 2001
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Wed, 19 Nov 2014 16:14:34 -0500
+Subject: [ethernet] r8169: adjust __rtl8169_set_features
+
+Message-id: <1416413687-12219-4-git-send-email-ivecera@redhat.com>
+Patchwork-id: 100353
+O-Subject: [RHEL7.1 PATCH 03/16] r8169: adjust __rtl8169_set_features
+Bugzilla: 1165764
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+BZ: #1165764
+
+Upstream commit(s):
+commit 929a031dfd62aae34bf8e728f712e6751e416d1f
+Author: hayeswang <hayeswang@realtek.com>
+Date:   Tue Sep 16 11:40:47 2014 +0800
+
+    r8169: adjust __rtl8169_set_features
+
+    Remove the "changed" test in __rtl8169_set_features(). Instead, do
+    simple test in rtl8169_set_features().
+
+    Set the RxChkSum and RxVlan through __rtl8169_set_features() in
+    rtl_open().
+
+    Signed-off-by: Francois Romieu <romieu@fr.zoreil.com>
+    Signed-off-by: Hayes Wang <hayeswang@realtek.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/realtek/r8169.c b/drivers/net/ethernet/realtek/r8169.c
+index ace4cd2..ff19d2d 100644
+--- a/drivers/net/ethernet/realtek/r8169.c
++++ b/drivers/net/ethernet/realtek/r8169.c
+@@ -1847,33 +1847,31 @@ static void __rtl8169_set_features(struct net_device *dev,
+        netdev_features_t features)
+ {
+  struct rtl8169_private *tp = netdev_priv(dev);
+- netdev_features_t changed = features ^ dev->features;
+  void __iomem *ioaddr = tp->mmio_addr;
++ u32 rx_config;
+ 
+- if (!(changed & (NETIF_F_RXALL | NETIF_F_RXCSUM |
+-    NETIF_F_HW_VLAN_CTAG_RX)))
+-  return;
++ rx_config = RTL_R32(RxConfig);
++ if (features & NETIF_F_RXALL)
++  rx_config |= (AcceptErr | AcceptRunt);
++ else
++  rx_config &= ~(AcceptErr | AcceptRunt);
+ 
+- if (changed & (NETIF_F_RXCSUM | NETIF_F_HW_VLAN_CTAG_RX)) {
+-  if (features & NETIF_F_RXCSUM)
+-   tp->cp_cmd |= RxChkSum;
+-  else
+-   tp->cp_cmd &= ~RxChkSum;
++ RTL_W32(RxConfig, rx_config);
+ 
+-  if (features & NETIF_F_HW_VLAN_CTAG_RX)
+-   tp->cp_cmd |= RxVlan;
+-  else
+-   tp->cp_cmd &= ~RxVlan;
++ if (features & NETIF_F_RXCSUM)
++  tp->cp_cmd |= RxChkSum;
++ else
++  tp->cp_cmd &= ~RxChkSum;
+ 
+-  RTL_W16(CPlusCmd, tp->cp_cmd);
+-  RTL_R16(CPlusCmd);
+- }
+- if (changed & NETIF_F_RXALL) {
+-  int tmp = (RTL_R32(RxConfig) & ~(AcceptErr | AcceptRunt));
+-  if (features & NETIF_F_RXALL)
+-   tmp |= (AcceptErr | AcceptRunt);
+-  RTL_W32(RxConfig, tmp);
+- }
++ if (features & NETIF_F_HW_VLAN_CTAG_RX)
++  tp->cp_cmd |= RxVlan;
++ else
++  tp->cp_cmd &= ~RxVlan;
++
++ tp->cp_cmd |= RTL_R16(CPlusCmd) & ~(RxVlan | RxChkSum);
++
++ RTL_W16(CPlusCmd, tp->cp_cmd);
++ RTL_R16(CPlusCmd);
+ }
+ 
+ static int rtl8169_set_features(struct net_device *dev,
+@@ -1881,8 +1879,11 @@ static int rtl8169_set_features(struct net_device *dev,
+ {
+  struct rtl8169_private *tp = netdev_priv(dev);
+ 
++ features &= NETIF_F_RXALL | NETIF_F_RXCSUM | NETIF_F_HW_VLAN_CTAG_RX;
++
+  rtl_lock_work(tp);
+- __rtl8169_set_features(dev, features);
++ if (features ^ dev->features);
++  __rtl8169_set_features(dev, features);
+  rtl_unlock_work(tp);
+ 
+  return 0;
+@@ -7116,12 +7117,7 @@ static int rtl_open(struct net_device *dev)
+ 
+  rtl8169_init_phy(dev, tp);
+ 
+- if (dev->features & NETIF_F_HW_VLAN_CTAG_RX)
+-  tp->cp_cmd |= RxVlan;
+- else
+-  tp->cp_cmd &= ~RxVlan;
+-
+- RTL_W16(CPlusCmd, tp->cp_cmd);
++ __rtl8169_set_features(dev, dev->features);
+ 
+  rtl_pll_power_up(tp);
+ 
+@@ -7536,8 +7532,7 @@ static void rtl_hw_initialize(struct rtl8169_private *tp)
+  }
+ }
+ 
+-static int
+-rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
++static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ {
+  const struct rtl_cfg_info *cfg = rtl_cfg_infos + ent->driver_data;
+  const unsigned int region = cfg->region;
+@@ -7612,7 +7607,7 @@ rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+   goto err_out_mwi_2;
+  }
+ 
+- tp->cp_cmd = RxChkSum;
++ tp->cp_cmd = 0;
+ 
+  if ((sizeof(dma_addr_t) > 4) &&
+      !pci_set_dma_mask(pdev, DMA_BIT_MASK(64)) && use_dac) {
+@@ -7653,13 +7648,6 @@ rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+  pci_set_master(pdev);
+ 
+- /*
+-  * Pretend we are using VLANs; This bypasses a nasty bug where
+-  * Interrupts stop flowing on high load on 8110SCd controllers.
+-  */
+- if (tp->mac_version == RTL_GIGA_MAC_VER_05)
+-  tp->cp_cmd |= RxVlan;
+-
+  rtl_init_mdio_ops(tp);
+  rtl_init_pll_power_ops(tp);
+  rtl_init_jumbo_ops(tp);
+@@ -7743,8 +7731,14 @@ rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+  dev->vlan_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_TSO |
+   NETIF_F_HIGHDMA;
+ 
++ tp->cp_cmd |= RxChkSum | RxVlan;
++
++ /*
++  * Pretend we are using VLANs; This bypasses a nasty bug where
++  * Interrupts stop flowing on high load on 8110SCd controllers.
++  */
+  if (tp->mac_version == RTL_GIGA_MAC_VER_05)
+-  /* 8110SCd requires hardware Rx VLAN - disallow toggling */
++  /* Disallow toggling */
+   dev->hw_features &= ~NETIF_F_HW_VLAN_CTAG_RX;
+ 
+  if (tp->txd_version == RTL_TD_0)
+-- 
+1.7.1

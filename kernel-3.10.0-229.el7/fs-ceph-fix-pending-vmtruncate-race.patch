@@ -1,0 +1,139 @@
+From da47e2c793a0132de9bca0a52def2835be3c7d4c Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:22:17 -0400
+Subject: [fs] ceph: fix pending vmtruncate race
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-31-git-send-email-sweil@redhat.com>
+Patchwork-id: 89670
+O-Subject: [PATCH 030/303] ceph: fix pending vmtruncate race
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: "Yan, Zheng" <zheng.z.yan@intel.com>
+
+The locking order for pending vmtruncate is wrong, it can lead to
+following race:
+
+        write                  wmtruncate work
+------------------------    ----------------------
+lock i_mutex
+check i_truncate_pending   check i_truncate_pending
+truncate_inode_pages()     lock i_mutex (blocked)
+copy data to page cache
+unlock i_mutex
+                           truncate_inode_pages()
+
+The fix is take i_mutex before calling __ceph_do_pending_vmtruncate()
+
+Fixes: http://tracker.ceph.com/issues/5453
+Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit b415bf4f9fe25f39934f5c464125e4a2dffb6d08)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index 8ec27b1..16266f3 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -2057,7 +2057,11 @@ static int try_get_cap_refs(struct ceph_inode_info *ci, int need, int want,
+  /* finish pending truncate */
+  while (ci->i_truncate_pending) {
+   spin_unlock(&ci->i_ceph_lock);
+-  __ceph_do_pending_vmtruncate(inode, !(need & CEPH_CAP_FILE_WR));
++  if (!(need & CEPH_CAP_FILE_WR))
++   mutex_lock(&inode->i_mutex);
++  __ceph_do_pending_vmtruncate(inode);
++  if (!(need & CEPH_CAP_FILE_WR))
++   mutex_unlock(&inode->i_mutex);
+   spin_lock(&ci->i_ceph_lock);
+  }
+ 
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 7c69f4f..a44d515 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -822,7 +822,7 @@ static loff_t ceph_llseek(struct file *file, loff_t offset, int whence)
+  int ret;
+ 
+  mutex_lock(&inode->i_mutex);
+- __ceph_do_pending_vmtruncate(inode, false);
++ __ceph_do_pending_vmtruncate(inode);
+ 
+  if (whence == SEEK_END || whence == SEEK_DATA || whence == SEEK_HOLE) {
+   ret = ceph_do_getattr(inode, CEPH_STAT_CAP_SIZE);
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index bd2289a..f3a2abf 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -1465,7 +1465,9 @@ static void ceph_vmtruncate_work(struct work_struct *work)
+  struct inode *inode = &ci->vfs_inode;
+ 
+  dout("vmtruncate_work %p\n", inode);
+- __ceph_do_pending_vmtruncate(inode, true);
++ mutex_lock(&inode->i_mutex);
++ __ceph_do_pending_vmtruncate(inode);
++ mutex_unlock(&inode->i_mutex);
+  iput(inode);
+ }
+ 
+@@ -1492,7 +1494,7 @@ void ceph_queue_vmtruncate(struct inode *inode)
+  * Make sure any pending truncation is applied before doing anything
+  * that may depend on it.
+  */
+-void __ceph_do_pending_vmtruncate(struct inode *inode, bool needlock)
++void __ceph_do_pending_vmtruncate(struct inode *inode)
+ {
+  struct ceph_inode_info *ci = ceph_inode(inode);
+  u64 to;
+@@ -1525,11 +1527,7 @@ retry:
+       ci->i_truncate_pending, to);
+  spin_unlock(&ci->i_ceph_lock);
+ 
+- if (needlock)
+-  mutex_lock(&inode->i_mutex);
+  truncate_inode_pages(inode->i_mapping, to);
+- if (needlock)
+-  mutex_unlock(&inode->i_mutex);
+ 
+  spin_lock(&ci->i_ceph_lock);
+  if (to == ci->i_truncate_size) {
+@@ -1588,7 +1586,7 @@ int ceph_setattr(struct dentry *dentry, struct iattr *attr)
+  if (ceph_snap(inode) != CEPH_NOSNAP)
+   return -EROFS;
+ 
+- __ceph_do_pending_vmtruncate(inode, false);
++ __ceph_do_pending_vmtruncate(inode);
+ 
+  err = inode_change_ok(inode, attr);
+  if (err != 0)
+@@ -1770,7 +1768,7 @@ int ceph_setattr(struct dentry *dentry, struct iattr *attr)
+       ceph_cap_string(dirtied), mask);
+ 
+  ceph_mdsc_put_request(req);
+- __ceph_do_pending_vmtruncate(inode, false);
++ __ceph_do_pending_vmtruncate(inode);
+  return err;
+ out:
+  spin_unlock(&ci->i_ceph_lock);
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index dfbb729..cbded57 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -692,7 +692,7 @@ extern int ceph_readdir_prepopulate(struct ceph_mds_request *req,
+ extern int ceph_inode_holds_cap(struct inode *inode, int mask);
+ 
+ extern int ceph_inode_set_size(struct inode *inode, loff_t size);
+-extern void __ceph_do_pending_vmtruncate(struct inode *inode, bool needlock);
++extern void __ceph_do_pending_vmtruncate(struct inode *inode);
+ extern void ceph_queue_vmtruncate(struct inode *inode);
+ 
+ extern void ceph_queue_invalidate(struct inode *inode);
+-- 
+1.7.1

@@ -1,0 +1,201 @@
+From e561a5e111bd96fa1969ac3d24c47e878c7106b2 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 12 Sep 2014 14:27:52 -0400
+Subject: [net] netlink: Add compare function for netlink_table
+
+Message-id: <ab6aaad78a7f8465e1f7efaea356ae3c6c4e0a23.1410528971.git.jbenc@redhat.com>
+Patchwork-id: 93978
+O-Subject: [RHEL7.1 net PATCH 09/14] netlink: Add compare function for netlink_table
+Bugzilla: 1140661
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1140661
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7948291
+
+commit da12c90e099789a63073fc82a19542ce54d4efb9
+Author: Gao feng <gaofeng@cn.fujitsu.com>
+Date:   Thu Jun 6 14:49:11 2013 +0800
+
+    netlink: Add compare function for netlink_table
+
+    As we know, netlink sockets are private resource of
+    net namespace, they can communicate with each other
+    only when they in the same net namespace. this works
+    well until we try to add namespace support for other
+    subsystems which use netlink.
+
+    Don't like ipv4 and route table.., it is not suited to
+    make these subsytems belong to net namespace, Such as
+    audit and crypto subsystems,they are more suitable to
+    user namespace.
+
+    So we must have the ability to make the netlink sockets
+    in same user namespace can communicate with each other.
+
+    This patch adds a new function pointer "compare" for
+    netlink_table, we can decide if the netlink sockets can
+    communicate with each other through this netlink_table
+    self-defined compare function.
+
+    The behavior isn't changed if we don't provide the compare
+    function for netlink_table.
+
+    Signed-off-by: Gao feng <gaofeng@cn.fujitsu.com>
+    Acked-by: Serge E. Hallyn <serge.hallyn@ubuntu.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/netlink.h b/include/linux/netlink.h
+index 4568214..8b50a62 100644
+--- a/include/linux/netlink.h
++++ b/include/linux/netlink.h
+@@ -47,6 +47,7 @@ struct netlink_kernel_cfg {
+  void  (*input)(struct sk_buff *skb);
+  struct mutex *cb_mutex;
+  void  (*bind)(int group);
++ bool  (*compare)(struct net *net, struct sock *sk);
+ };
+ 
+ extern struct sock *__netlink_kernel_create(struct net *net, int unit,
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index 850f727..319967a 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -977,16 +977,23 @@ netlink_unlock_table(void)
+   wake_up(&nl_table_wait);
+ }
+ 
++static bool netlink_compare(struct net *net, struct sock *sk)
++{
++ return net_eq(sock_net(sk), net);
++}
++
+ static struct sock *netlink_lookup(struct net *net, int protocol, u32 portid)
+ {
+- struct nl_portid_hash *hash = &nl_table[protocol].hash;
++ struct netlink_table *table = &nl_table[protocol];
++ struct nl_portid_hash *hash = &table->hash;
+  struct hlist_head *head;
+  struct sock *sk;
+ 
+  read_lock(&nl_table_lock);
+  head = nl_portid_hashfn(hash, portid);
+  sk_for_each(sk, head) {
+-  if (net_eq(sock_net(sk), net) && (nlk_sk(sk)->portid == portid)) {
++  if (table->compare(net, sk) &&
++      (nlk_sk(sk)->portid == portid)) {
+    sock_hold(sk);
+    goto found;
+   }
+@@ -1099,7 +1106,8 @@ netlink_update_listeners(struct sock *sk)
+ 
+ static int netlink_insert(struct sock *sk, struct net *net, u32 portid)
+ {
+- struct nl_portid_hash *hash = &nl_table[sk->sk_protocol].hash;
++ struct netlink_table *table = &nl_table[sk->sk_protocol];
++ struct nl_portid_hash *hash = &table->hash;
+  struct hlist_head *head;
+  int err = -EADDRINUSE;
+  struct sock *osk;
+@@ -1109,7 +1117,8 @@ static int netlink_insert(struct sock *sk, struct net *net, u32 portid)
+  head = nl_portid_hashfn(hash, portid);
+  len = 0;
+  sk_for_each(osk, head) {
+-  if (net_eq(sock_net(osk), net) && (nlk_sk(osk)->portid == portid))
++  if (table->compare(net, osk) &&
++      (nlk_sk(osk)->portid == portid))
+    break;
+   len++;
+  }
+@@ -1284,6 +1293,7 @@ static int netlink_release(struct socket *sock)
+    kfree_rcu(old, rcu);
+    nl_table[sk->sk_protocol].module = NULL;
+    nl_table[sk->sk_protocol].bind = NULL;
++   nl_table[sk->sk_protocol].compare = NULL;
+    nl_table[sk->sk_protocol].flags = 0;
+    nl_table[sk->sk_protocol].registered = 0;
+   }
+@@ -1306,7 +1316,8 @@ static int netlink_autobind(struct socket *sock)
+ {
+  struct sock *sk = sock->sk;
+  struct net *net = sock_net(sk);
+- struct nl_portid_hash *hash = &nl_table[sk->sk_protocol].hash;
++ struct netlink_table *table = &nl_table[sk->sk_protocol];
++ struct nl_portid_hash *hash = &table->hash;
+  struct hlist_head *head;
+  struct sock *osk;
+  s32 portid = task_tgid_vnr(current);
+@@ -1318,7 +1329,7 @@ retry:
+  netlink_table_grab();
+  head = nl_portid_hashfn(hash, portid);
+  sk_for_each(osk, head) {
+-  if (!net_eq(sock_net(osk), net))
++  if (!table->compare(net, osk))
+    continue;
+   if (nlk_sk(osk)->portid == portid) {
+    /* Bind collision, search negative portid values. */
+@@ -2517,9 +2528,12 @@ __netlink_kernel_create(struct net *net, int unit, struct module *module,
+   rcu_assign_pointer(nl_table[unit].listeners, listeners);
+   nl_table[unit].cb_mutex = cb_mutex;
+   nl_table[unit].module = module;
++  nl_table[unit].compare = netlink_compare;
+   if (cfg) {
+    nl_table[unit].bind = cfg->bind;
+    nl_table[unit].flags = cfg->flags;
++   if (cfg->compare)
++    nl_table[unit].compare = cfg->compare;
+   }
+   nl_table[unit].registered = 1;
+  } else {
+@@ -2960,6 +2974,7 @@ static void *netlink_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+ {
+  struct sock *s;
+  struct nl_seq_iter *iter;
++ struct net *net;
+  int i, j;
+ 
+  ++*pos;
+@@ -2967,11 +2982,12 @@ static void *netlink_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+  if (v == SEQ_START_TOKEN)
+   return netlink_seq_socket_idx(seq, 0);
+ 
++ net = seq_file_net(seq);
+  iter = seq->private;
+  s = v;
+  do {
+   s = sk_next(s);
+- } while (s && sock_net(s) != seq_file_net(seq));
++ } while (s && !nl_table[s->sk_protocol].compare(net, s));
+  if (s)
+   return s;
+ 
+@@ -2983,7 +2999,8 @@ static void *netlink_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+ 
+   for (; j <= hash->mask; j++) {
+    s = sk_head(&hash->table[j]);
+-   while (s && sock_net(s) != seq_file_net(seq))
++
++   while (s && !nl_table[s->sk_protocol].compare(net, s))
+     s = sk_next(s);
+    if (s) {
+     iter->link = i;
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index b771d42..ed13a79 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -75,6 +75,7 @@ struct netlink_table {
+  struct mutex  *cb_mutex;
+  struct module  *module;
+  void   (*bind)(int group);
++ bool   (*compare)(struct net *net, struct sock *sock);
+  int   registered;
+ };
+ 
+-- 
+1.7.1

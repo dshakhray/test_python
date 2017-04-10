@@ -1,0 +1,70 @@
+From 1c293cdde127ff786d0a5fc41926d8977261da0e Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:18:47 -0400
+Subject: [fs] nfsd: Fix crash encoding lock reply on 32-bit
+
+Message-id: <1410898849-22126-44-git-send-email-bfields@redhat.com>
+Patchwork-id: 95740
+O-Subject: [Patch RHEL7 043/165] NFSD: Fix crash encoding lock reply on 32-bit
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Kinglong Mee <kinglongmee@gmail.com>
+
+Commit 8c7424cff6 "nfsd4: don't try to encode conflicting owner if low
+on space" forgot to free conf->data in nfsd4_encode_lockt and before
+sign conf->data to NULL in nfsd4_encode_lock_denied, causing a leak.
+
+Worse, kfree() can be called on an uninitialized pointer in the case of
+a succesful lock (or one that fails for a reason other than a conflict).
+
+(Note that lock->lk_denied.ld_owner.data appears it should be zero here,
+until you notice that it's one arm of a union the other arm of which is
+written to in the succesful case by the
+
+ memcpy(&lock->lk_resp_stateid, &lock_stp->st_stid.sc_stateid,
+                                 sizeof(stateid_t));
+
+in nfsd4_lock().  In the 32-bit case this overwrites ld_owner.data.)
+
+Signed-off-by: Kinglong Mee <kinglongmee@gmail.com>
+Fixes: 8c7424cff6 ""nfsd4: don't try to encode conflicting owner if low on space"
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: f98bac5a30b60a2fca854dd5ee7256221d8ccf0a
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c
+index 7abaf6b..f850929 100644
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@ -2874,6 +2874,7 @@ again:
+    * return the conflicting open:
+    */
+   if (conf->len) {
++   kfree(conf->data);
+    conf->len = 0;
+    conf->data = NULL;
+    goto again;
+@@ -2886,6 +2887,7 @@ again:
+  if (conf->len) {
+   p = xdr_encode_opaque_fixed(p, &ld->ld_clientid, 8);
+   p = xdr_encode_opaque(p, conf->data, conf->len);
++  kfree(conf->data);
+  }  else {  /* non - nfsv4 lock in conflict, no clientid nor owner */
+   p = xdr_encode_hyper(p, (u64)0); /* clientid */
+   *p++ = cpu_to_be32(0); /* length of owner name */
+@@ -2902,7 +2904,7 @@ nfsd4_encode_lock(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_lo
+   nfserr = nfsd4_encode_stateid(xdr, &lock->lk_resp_stateid);
+  else if (nfserr == nfserr_denied)
+   nfserr = nfsd4_encode_lock_denied(xdr, &lock->lk_denied);
+- kfree(lock->lk_denied.ld_owner.data);
++
+  return nfserr;
+ }
+ 
+-- 
+1.7.1

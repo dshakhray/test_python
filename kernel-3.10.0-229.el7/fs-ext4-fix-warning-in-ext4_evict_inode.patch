@@ -1,0 +1,115 @@
+From 8db8cb3f288764779c3ea9a6ba2419396ac41125 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:53:18 -0400
+Subject: [fs] ext4: fix warning in ext4_evict_inode()
+
+Message-id: <1414058125-4183-45-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98248
+O-Subject: [RHEL 7.1 PATCH v2 044/171] ext4: fix warning in ext4_evict_inode()
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Jan Kara <jack@suse.cz>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit 822dbba33458cd6ad0e715f3f4a57ebc99d54d1b
+
+ The following race can lead to ext4_evict_inode() seeing i_ioend_count
+ > 0 and thus triggering a sanity check warning:
+
+         CPU1                                    CPU2
+ ext4_end_bio()                          ext4_evict_inode()
+   ext4_finish_bio()
+     end_page_writeback();
+                                           truncate_inode_pages()
+                                             evict page
+                                         WARN_ON(i_ioend_count > 0);
+   ext4_put_io_end_defer()
+     ext4_release_io_end()
+       dec i_ioend_count
+
+ This is possible use-after-free bug since we decrement i_ioend_count in
+ possibly released inode.
+
+ Since i_ioend_count is used only for sanity checks one possible solution
+ would be to just remove it but for now I'd like to keep those sanity
+ checks to help debugging the new ext4 writeback code.
+
+ This patch changes ext4_end_bio() to call ext4_put_io_end_defer() before
+ ext4_finish_bio() in the shortcut case when unwritten extent conversion
+ isn't needed.  In that case we don't need the io_end so we are safe to
+ drop it early.
+
+ Reported-by: Guenter Roeck <linux@roeck-us.net>
+ Tested-by: Guenter Roeck <linux@roeck-us.net>
+ Signed-off-by: Jan Kara <jack@suse.cz>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 7a5342f..999753f 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -309,6 +309,7 @@ ext4_io_end_t *ext4_get_io_end(ext4_io_end_t *io_end)
+  return io_end;
+ }
+ 
++/* BIO completion function for page writeback */
+ static void ext4_end_bio(struct bio *bio, int error)
+ {
+  ext4_io_end_t *io_end = bio->bi_private;
+@@ -319,18 +320,6 @@ static void ext4_end_bio(struct bio *bio, int error)
+  if (test_bit(BIO_UPTODATE, &bio->bi_flags))
+   error = 0;
+ 
+- if (io_end->flag & EXT4_IO_END_UNWRITTEN) {
+-  /*
+-   * Link bio into list hanging from io_end. We have to do it
+-   * atomically as bio completions can be racing against each
+-   * other.
+-   */
+-  bio->bi_private = xchg(&io_end->bio, bio);
+- } else {
+-  ext4_finish_bio(bio);
+-  bio_put(bio);
+- }
+-
+  if (error) {
+   struct inode *inode = io_end->inode;
+ 
+@@ -342,7 +331,24 @@ static void ext4_end_bio(struct bio *bio, int error)
+         (unsigned long long)
+         bi_sector >> (inode->i_blkbits - 9));
+  }
+- ext4_put_io_end_defer(io_end);
++
++ if (io_end->flag & EXT4_IO_END_UNWRITTEN) {
++  /*
++   * Link bio into list hanging from io_end. We have to do it
++   * atomically as bio completions can be racing against each
++   * other.
++   */
++  bio->bi_private = xchg(&io_end->bio, bio);
++  ext4_put_io_end_defer(io_end);
++ } else {
++  /*
++   * Drop io_end reference early. Inode can get freed once
++   * we finish the bio.
++   */
++  ext4_put_io_end_defer(io_end);
++  ext4_finish_bio(bio);
++  bio_put(bio);
++ }
+ }
+ 
+ void ext4_io_submit(struct ext4_io_submit *io)
+-- 
+1.7.1

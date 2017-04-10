@@ -1,0 +1,92 @@
+From bb7ec6c323d90b25a71b32bf4e0178fb035c387a Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+Date: Tue, 18 Nov 2014 15:49:21 -0500
+Subject: [net] ceph: fix a use after free issue in osdmap_set_max_osd
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1416325805-26490-7-git-send-email-idryomov@redhat.com>
+Patchwork-id: 100197
+O-Subject: [RHEL7.1 PATCH 06/50] libceph: fix a use after free issue in osdmap_set_max_osd
+Bugzilla: 1165232
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Sage Weil <sweil@redhat.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+
+From: Li RongQing <roy.qing.li@gmail.com>
+
+If the state variable is krealloced successfully, map->osd_state will be
+freed, once following two reallocation failed, and exit the function
+without resetting map->osd_state, map->osd_state become a wild pointer.
+
+fix it by resetting them after krealloc successfully.
+
+Signed-off-by: Li RongQing <roy.qing.li@gmail.com>
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+(cherry picked from commit 589506f1e7f135943bcd34903bcdcf1fdaf00549)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index c547e46..ec4d9e2 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -671,26 +671,26 @@ static int osdmap_set_max_osd(struct ceph_osdmap *map, int max)
+  int i;
+ 
+  state = krealloc(map->osd_state, max*sizeof(*state), GFP_NOFS);
++ if (!state)
++  return -ENOMEM;
++ map->osd_state = state;
++
+  weight = krealloc(map->osd_weight, max*sizeof(*weight), GFP_NOFS);
+- addr = krealloc(map->osd_addr, max*sizeof(*addr), GFP_NOFS);
+- if (!state || !weight || !addr) {
+-  kfree(state);
+-  kfree(weight);
+-  kfree(addr);
++ if (!weight)
++  return -ENOMEM;
++ map->osd_weight = weight;
+ 
++ addr = krealloc(map->osd_addr, max*sizeof(*addr), GFP_NOFS);
++ if (!addr)
+   return -ENOMEM;
+- }
++ map->osd_addr = addr;
+ 
+  for (i = map->max_osd; i < max; i++) {
+-  state[i] = 0;
+-  weight[i] = CEPH_OSD_OUT;
+-  memset(addr + i, 0, sizeof(*addr));
++  map->osd_state[i] = 0;
++  map->osd_weight[i] = CEPH_OSD_OUT;
++  memset(map->osd_addr + i, 0, sizeof(*map->osd_addr));
+  }
+ 
+- map->osd_state = state;
+- map->osd_weight = weight;
+- map->osd_addr = addr;
+-
+  if (map->osd_primary_affinity) {
+   u32 *affinity;
+ 
+@@ -698,11 +698,11 @@ static int osdmap_set_max_osd(struct ceph_osdmap *map, int max)
+         max*sizeof(*affinity), GFP_NOFS);
+   if (!affinity)
+    return -ENOMEM;
++  map->osd_primary_affinity = affinity;
+ 
+   for (i = map->max_osd; i < max; i++)
+-   affinity[i] = CEPH_OSD_DEFAULT_PRIMARY_AFFINITY;
+-
+-  map->osd_primary_affinity = affinity;
++   map->osd_primary_affinity[i] =
++       CEPH_OSD_DEFAULT_PRIMARY_AFFINITY;
+  }
+ 
+  map->max_osd = max;
+-- 
+1.7.1

@@ -1,0 +1,80 @@
+From 52ee7fdb6bcc20c5394ae4938da24de57f9c0165 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:20:39 -0400
+Subject: [fs] nfs: fix two problems in lookup_revalidate in RCU-walk
+
+Message-id: <1411050057-12417-77-git-send-email-steved@redhat.com>
+Patchwork-id: 96232
+O-Subject: [RHEL7.1 PATCH 76/94] NFS: fix two problems in lookup_revalidate in RCU-walk
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: NeilBrown <neilb@suse.de>
+
+1/ rcu_dereference isn't correct: that field isn't
+   RCU protected.   It could potentially change at any time
+   so ACCESS_ONCE might be justified.
+
+   changes to ->d_parent are protected by ->d_seq.  However
+   that isn't always checked after ->d_revalidate is called,
+   so it is safest to keep the double-check that ->d_parent
+   hasn't changed at the end of these functions.
+
+2/ in nfs4_lookup_revalidate, "->d_parent" was forgotten.
+   So 'parent' was not the parent of 'dentry'.
+   This fails safe is the context is that dentry->d_inode is
+   NULL, and the result of parent->d_inode being NULL is
+   that ECHILD is returned, which is always safe.
+
+Reported-by: kbuild test robot <fengguang.wu@intel.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 50d77739fa1972030daf1c8902404551e49bf232
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index b509207..b61b218 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -1103,7 +1103,7 @@ static int nfs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+  int error;
+ 
+  if (flags & LOOKUP_RCU) {
+-  parent = rcu_dereference(dentry->d_parent);
++  parent = ACCESS_ONCE(dentry->d_parent);
+   dir = ACCESS_ONCE(parent->d_inode);
+   if (!dir)
+    return -ECHILD;
+@@ -1185,7 +1185,7 @@ out_set_verifier:
+  nfs_advise_use_readdirplus(dir);
+  out_valid_noent:
+  if (flags & LOOKUP_RCU) {
+-  if (parent != rcu_dereference(dentry->d_parent))
++  if (parent != ACCESS_ONCE(dentry->d_parent))
+    return -ECHILD;
+  } else
+   dput(parent);
+@@ -1586,7 +1586,7 @@ static int nfs4_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+   struct inode *dir;
+ 
+   if (flags & LOOKUP_RCU) {
+-   parent = rcu_dereference(dentry);
++   parent = ACCESS_ONCE(dentry->d_parent);
+    dir = ACCESS_ONCE(parent->d_inode);
+    if (!dir)
+     return -ECHILD;
+@@ -1600,7 +1600,7 @@ static int nfs4_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+    ret = -ECHILD;
+   if (!(flags & LOOKUP_RCU))
+    dput(parent);
+-  else if (parent != rcu_dereference(dentry))
++  else if (parent != ACCESS_ONCE(dentry->d_parent))
+    return -ECHILD;
+   goto out;
+  }
+-- 
+1.7.1

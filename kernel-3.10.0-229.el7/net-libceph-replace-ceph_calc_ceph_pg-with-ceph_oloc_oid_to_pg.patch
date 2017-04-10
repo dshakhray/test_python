@@ -1,0 +1,136 @@
+From 430ed7f7bc651ef700e3831882e43fb787537a91 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:24:07 -0400
+Subject: [net] libceph: replace ceph_calc_ceph_pg() with ceph_oloc_oid_to_pg()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-141-git-send-email-sweil@redhat.com>
+Patchwork-id: 89712
+O-Subject: [PATCH 140/303] libceph: replace ceph_calc_ceph_pg() with ceph_oloc_oid_to_pg()
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+Switch ceph_calc_ceph_pg() to new oloc and oid abstractions and rename
+it to ceph_oloc_oid_to_pg() to make its purpose more clear.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit 7c13cb64352230deac24d3cb058387a6c0676f83)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ceph/ioctl.c b/fs/ceph/ioctl.c
+index 669622f..dc66c9e 100644
+--- a/fs/ceph/ioctl.c
++++ b/fs/ceph/ioctl.c
+@@ -183,6 +183,8 @@ static long ceph_ioctl_get_dataloc(struct file *file, void __user *arg)
+  struct ceph_inode_info *ci = ceph_inode(inode);
+  struct ceph_osd_client *osdc =
+   &ceph_sb_to_client(inode->i_sb)->client->osdc;
++ struct ceph_object_locator oloc;
++ struct ceph_object_id oid;
+  u64 len = 1, olen;
+  u64 tmp;
+  struct ceph_pg pgid;
+@@ -211,8 +213,10 @@ static long ceph_ioctl_get_dataloc(struct file *file, void __user *arg)
+  snprintf(dl.object_name, sizeof(dl.object_name), "%llx.%08llx",
+    ceph_ino(inode), dl.object_no);
+ 
+- r = ceph_calc_ceph_pg(&pgid, dl.object_name, osdc->osdmap,
+-    ceph_file_layout_pg_pool(ci->i_layout));
++ oloc.pool = ceph_file_layout_pg_pool(ci->i_layout);
++ ceph_oid_set_name(&oid, dl.object_name);
++
++ r = ceph_oloc_oid_to_pg(osdc->osdmap, &oloc, &oid, &pgid);
+  if (r < 0) {
+   up_read(&osdc->map_sem);
+   return r;
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index c85f7d4..ebb8ec2 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -163,8 +163,11 @@ extern int ceph_calc_file_object_mapping(struct ceph_file_layout *layout,
+       u64 *bno, u64 *oxoff, u64 *oxlen);
+ 
+ /* calculate mapping of object to a placement group */
+-extern int ceph_calc_ceph_pg(struct ceph_pg *pg, const char *oid,
+-     struct ceph_osdmap *osdmap, uint64_t pool);
++extern int ceph_oloc_oid_to_pg(struct ceph_osdmap *osdmap,
++          struct ceph_object_locator *oloc,
++          struct ceph_object_id *oid,
++          struct ceph_pg *pg_out);
++
+ extern int ceph_calc_pg_acting(struct ceph_osdmap *osdmap,
+           struct ceph_pg pgid,
+           int *acting);
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 2988d68..10360de 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -1269,8 +1269,8 @@ static int __map_request(struct ceph_osd_client *osdc,
+  bool was_paused;
+ 
+  dout("map_request %p tid %lld\n", req, req->r_tid);
+- err = ceph_calc_ceph_pg(&pgid, req->r_oid.name, osdc->osdmap,
+-    req->r_oloc.pool);
++ err = ceph_oloc_oid_to_pg(osdc->osdmap, &req->r_oloc, &req->r_oid,
++      &pgid);
+  if (err) {
+   list_move(&req->r_req_lru_item, &osdc->req_notarget);
+   return err;
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index 8b1a6b4..768dd04 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -1090,25 +1090,30 @@ invalid:
+ EXPORT_SYMBOL(ceph_calc_file_object_mapping);
+ 
+ /*
+- * calculate an object layout (i.e. pgid) from an oid,
+- * file_layout, and osdmap
++ * Calculate mapping of a (oloc, oid) pair to a PG.  Should only be
++ * called with target's (oloc, oid), since tiering isn't taken into
++ * account.
+  */
+-int ceph_calc_ceph_pg(struct ceph_pg *pg, const char *oid,
+-   struct ceph_osdmap *osdmap, uint64_t pool)
++int ceph_oloc_oid_to_pg(struct ceph_osdmap *osdmap,
++   struct ceph_object_locator *oloc,
++   struct ceph_object_id *oid,
++   struct ceph_pg *pg_out)
+ {
+- struct ceph_pg_pool_info *pool_info;
++ struct ceph_pg_pool_info *pi;
+ 
+- BUG_ON(!osdmap);
+- pool_info = __lookup_pg_pool(&osdmap->pg_pools, pool);
+- if (!pool_info)
++ pi = __lookup_pg_pool(&osdmap->pg_pools, oloc->pool);
++ if (!pi)
+   return -EIO;
+- pg->pool = pool;
+- pg->seed = ceph_str_hash(pool_info->object_hash, oid, strlen(oid));
+ 
+- dout("%s '%s' pgid %lld.%x\n", __func__, oid, pg->pool, pg->seed);
++ pg_out->pool = oloc->pool;
++ pg_out->seed = ceph_str_hash(pi->object_hash, oid->name,
++         oid->name_len);
++
++ dout("%s '%.*s' pgid %llu.%x\n", __func__, oid->name_len, oid->name,
++      pg_out->pool, pg_out->seed);
+  return 0;
+ }
+-EXPORT_SYMBOL(ceph_calc_ceph_pg);
++EXPORT_SYMBOL(ceph_oloc_oid_to_pg);
+ 
+ static int crush_do_rule_ary(const struct crush_map *map, int ruleno, int x,
+         int *result, int result_max,
+-- 
+1.7.1

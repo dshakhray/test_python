@@ -1,0 +1,135 @@
+From 079bcbda2927ffbcfe24ed7d812893be909a257e Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:07:59 -0400
+Subject: [tools] perf: Introduce hists__inc_nr_samples()
+
+Message-id: <1410181752-25631-235-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91822
+O-Subject: [PATCH RHEL7.1 BZ1134356 234/307] perf tools: Introduce hists__inc_nr_samples()
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 1844dbcbe78503e0f4a8996d69da725d5e7a5177
+Author: Namhyung Kim <namhyung@kernel.org>
+Date: Wed May 28 14:12:18 2014 +0900
+
+description
+===========
+There're some duplicate code for counting number of samples.  Add
+hists__inc_nr_samples() and reuse it.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-annotate.c b/tools/perf/builtin-annotate.c
+index d30d2c2..bf52461 100644
+--- a/tools/perf/builtin-annotate.c
++++ b/tools/perf/builtin-annotate.c
+@@ -70,7 +70,7 @@ static int perf_evsel__add_sample(struct perf_evsel *evsel,
+   return -ENOMEM;
+ 
+  ret = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
+- hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
++ hists__inc_nr_samples(&evsel->hists, true);
+  return ret;
+ }
+ 
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index bc0eec1..4a3b84d 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -92,9 +92,7 @@ static void report__inc_stats(struct report *rep, struct hist_entry *he)
+   * counted in perf_session_deliver_event().  The dump_trace
+   * requires this info is ready before going to the output tree.
+   */
+- hists__inc_nr_events(he->hists, PERF_RECORD_SAMPLE);
+- if (!he->filtered)
+-  he->hists->stats.nr_non_filtered_samples++;
++ hists__inc_nr_samples(he->hists, he->filtered);
+ }
+ 
+ static int report__add_mem_hist_entry(struct report *rep, struct addr_location *al,
+diff --git a/tools/perf/builtin-sched.c b/tools/perf/builtin-sched.c
+index d717683..c38d06c 100644
+--- a/tools/perf/builtin-sched.c
++++ b/tools/perf/builtin-sched.c
+@@ -1428,7 +1428,7 @@ static int perf_sched__process_tracepoint_sample(struct perf_tool *tool __maybe_
+  int err = 0;
+ 
+  evsel->hists.stats.total_period += sample->period;
+- hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
++ hists__inc_nr_samples(&evsel->hists, true);
+ 
+  if (evsel->handler != NULL) {
+   tracepoint_handler f = evsel->handler;
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index 5b389ce..5130926 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -252,10 +252,7 @@ static struct hist_entry *perf_evsel__add_hist_entry(struct perf_evsel *evsel,
+  if (he == NULL)
+   return NULL;
+ 
+- hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
+- if (!he->filtered)
+-  evsel->hists.stats.nr_non_filtered_samples++;
+-
++ hists__inc_nr_samples(&evsel->hists, he->filtered);
+  return he;
+ }
+ 
+diff --git a/tools/perf/tests/hists_filter.c b/tools/perf/tests/hists_filter.c
+index c5ba924..0a71ef4 100644
+--- a/tools/perf/tests/hists_filter.c
++++ b/tools/perf/tests/hists_filter.c
+@@ -85,9 +85,7 @@ static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
+    fake_samples[i].map = al.map;
+    fake_samples[i].sym = al.sym;
+ 
+-   hists__inc_nr_events(he->hists, PERF_RECORD_SAMPLE);
+-   if (!he->filtered)
+-    he->hists->stats.nr_non_filtered_samples++;
++   hists__inc_nr_samples(he->hists, he->filtered);
+   }
+  }
+ 
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index b262b44..5943ba6 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -800,6 +800,13 @@ void hists__inc_nr_events(struct hists *hists, u32 type)
+  events_stats__inc(&hists->stats, type);
+ }
+ 
++void hists__inc_nr_samples(struct hists *hists, bool filtered)
++{
++ events_stats__inc(&hists->stats, PERF_RECORD_SAMPLE);
++ if (!filtered)
++  hists->stats.nr_non_filtered_samples++;
++}
++
+ static struct hist_entry *hists__add_dummy_entry(struct hists *hists,
+        struct hist_entry *pair)
+ {
+diff --git a/tools/perf/util/hist.h b/tools/perf/util/hist.h
+index a8418d1..03ae1db 100644
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@ -119,6 +119,7 @@ u64 hists__total_period(struct hists *hists);
+ void hists__reset_stats(struct hists *hists);
+ void hists__inc_stats(struct hists *hists, struct hist_entry *h);
+ void hists__inc_nr_events(struct hists *hists, u32 type);
++void hists__inc_nr_samples(struct hists *hists, bool filtered);
+ void events_stats__inc(struct events_stats *stats, u32 type);
+ size_t events_stats__fprintf(struct events_stats *stats, FILE *fp);
+ 
+-- 
+1.7.1

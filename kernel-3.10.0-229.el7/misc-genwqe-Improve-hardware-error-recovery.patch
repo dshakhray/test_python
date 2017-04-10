@@ -1,0 +1,112 @@
+From f82c6ba77e0a826fe15e0311af5d2823c3e86131 Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Mon, 13 Oct 2014 22:30:13 -0400
+Subject: [misc] genwqe: Improve hardware error recovery
+
+Message-id: <1413239416-7778-26-git-send-email-gduarte@redhat.com>
+Patchwork-id: 97546
+O-Subject: [RHEL7.1 PATCH BZ 1088491 25/28 v2] GenWQE: Improve hardware error recovery
+Bugzilla: 1088491
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1088491
+Upstream Status: 93b772b25fa905c9158ee73c11c87b48668eabd0
+
+commit 93b772b25fa905c9158ee73c11c87b48668eabd0
+Author: Kleber Sacilotto de Souza <klebers@linux.vnet.ibm.com>
+Date:   Wed Jun 4 10:57:52 2014 -0300
+
+    GenWQE: Improve hardware error recovery
+
+    Currently, in the event of a fatal hardware error, the driver tries a
+    recovery procedure that calls pci_reset_function() to reset the card.
+    This is not sufficient in some cases, needing a fundamental reset to
+    bring the card back.
+
+    This patch implements a call to the platform fundamental reset procedure
+    on the error recovery path if GENWQE_PLATFORM_ERROR_RECOVERY is enabled.
+    This is implemented by default only on PPC64, since this can cause
+    problems on other archs, e.g. zSeries, where the platform has its own
+    recovery procedures, leading to a potencial race conditition. For these
+    cases, the recovery is kept as it was before.
+
+    Signed-off-by: Kleber Sacilotto de Souza <klebers@linux.vnet.ibm.com>
+    Acked-by: Frank Haverkamp <haver@linux.vnet.ibm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/misc/genwqe/card_base.c b/drivers/misc/genwqe/card_base.c
+index 87ebaba..abb7961 100644
+--- a/drivers/misc/genwqe/card_base.c
++++ b/drivers/misc/genwqe/card_base.c
+@@ -797,6 +797,41 @@ static int genwqe_pci_fundamental_reset(struct pci_dev *pci_dev)
+  return rc;
+ }
+ 
++
++static int genwqe_platform_recovery(struct genwqe_dev *cd)
++{
++ struct pci_dev *pci_dev = cd->pci_dev;
++ int rc;
++
++ dev_info(&pci_dev->dev,
++   "[%s] resetting card for error recovery\n", __func__);
++
++ /* Clear out error injection flags */
++ cd->err_inject &= ~(GENWQE_INJECT_HARDWARE_FAILURE |
++       GENWQE_INJECT_GFIR_FATAL |
++       GENWQE_INJECT_GFIR_INFO);
++
++ genwqe_stop(cd);
++
++ /* Try recoverying the card with fundamental reset */
++ rc = genwqe_pci_fundamental_reset(pci_dev);
++ if (!rc) {
++  rc = genwqe_start(cd);
++  if (!rc)
++   dev_info(&pci_dev->dev,
++     "[%s] card recovered\n", __func__);
++  else
++   dev_err(&pci_dev->dev,
++    "[%s] err: cannot start card services! (err=%d)\n",
++    __func__, rc);
++ } else {
++  dev_err(&pci_dev->dev,
++   "[%s] card reset failed\n", __func__);
++ }
++
++ return rc;
++}
++
+ /*
+  * genwqe_reload_bistream() - reload card bitstream
+  *
+@@ -875,6 +910,7 @@ static int genwqe_health_thread(void *data)
+  struct pci_dev *pci_dev = cd->pci_dev;
+  u64 gfir, gfir_masked, slu_unitcfg, app_unitcfg;
+ 
++ health_thread_begin:
+  while (!kthread_should_stop()) {
+   rc = wait_event_interruptible_timeout(cd->health_waitq,
+     (genwqe_health_check_cond(cd, &gfir) ||
+@@ -960,6 +996,15 @@ static int genwqe_health_thread(void *data)
+   /* We do nothing if the card is going over PCI recovery */
+   if (pci_channel_offline(pci_dev))
+    return -EIO;
++
++  /*
++   * If it's supported by the platform, we try a fundamental reset
++   * to recover from a fatal error. Otherwise, we continue to wait
++   * for an external recovery procedure to take care of it.
++   */
++  rc = genwqe_platform_recovery(cd);
++  if (!rc)
++   goto health_thread_begin;
+  }
+ 
+  dev_err(&pci_dev->dev,
+-- 
+1.7.1

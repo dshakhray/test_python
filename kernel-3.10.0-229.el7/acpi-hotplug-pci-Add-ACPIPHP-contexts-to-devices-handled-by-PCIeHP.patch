@@ -1,0 +1,83 @@
+From 26448a4513b68cb939ae84539b60b3509de6603b Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 19 Sep 2014 12:29:20 -0400
+Subject: [acpi] hotplug/pci: Add ACPIPHP contexts to devices handled by PCIeHP
+
+Message-id: <1411129776-21656-46-git-send-email-prarit@redhat.com>
+Patchwork-id: 96368
+O-Subject: [RHEL7.1 PATCH BZ 1141846 45/61] ACPI / hotplug / PCI: Add ACPIPHP contexts to devices handled by PCIeHP
+Bugzilla: 1141846
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1141846
+
+commit cc6254e00eb676dda6501655f8185aef7b761b4f
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Sun Feb 16 00:12:09 2014 +0100
+
+    ACPI / hotplug / PCI: Add ACPIPHP contexts to devices handled by PCIeHP
+
+    Currently, ACPIPHP does not add hotplug context to devices that
+    should be handled by the native PCI hotplug (PCIeHP) code.  The
+    reason why was because PCIeHP didn't know about the devices'
+    connections with ACPI and would not clean up things properly
+    during an eject of an ACPI-backed device, for example.
+
+    However, after recent changes that made the ACPI core create struct
+    acpi_device objects for all namespace nodes regardless of the
+    underlying devices' status and added PCI rescan-remove locking to
+    both ACPIPHP and PCIeHP, that concern is not valid any more.
+    Namely, after those changes PCIeHP need not care about the ACPI
+    side of things any more and it should be serialized with respect to
+    ACPIPHP and they won't be running concurrently with each other in
+    any case.
+
+    For this reason, make ACPIPHP to add its hotplug context to
+    all devices with ACPI companions, even the ones that should be
+    handled by PCIeHP in principle.  That may work around hotplug
+    issues on some systems where PCIeHP is supposed to work, but it
+    doesn't and the ACPI hotplug signaling works instead.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Myron Stowe <mstowe@redhat.com>
+Cc: Andy Gospodarek <agospoda@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index 4bfb155..99e0717 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -277,9 +277,6 @@ static acpi_status acpiphp_add_context(acpi_handle handle, u32 lvl, void *data,
+  struct pci_dev *pdev = bridge->pci_dev;
+  u32 val;
+ 
+- if (pdev && device_is_managed_by_native_pciehp(pdev))
+-  return AE_OK;
+-
+  status = acpi_evaluate_integer(handle, "_ADR", NULL, &adr);
+  if (ACPI_FAILURE(status)) {
+   if (status != AE_NOT_FOUND)
+@@ -338,8 +335,14 @@ static acpi_status acpiphp_add_context(acpi_handle handle, u32 lvl, void *data,
+ 
+  list_add_tail(&slot->node, &bridge->slots);
+ 
+- /* Register slots for ejectable funtions only. */
+- if (acpi_pci_check_ejectable(pbus, handle)  || is_dock_device(handle)) {
++ /*
++  * Expose slots to user space for functions that have _EJ0 or _RMV or
++  * are located in dock stations.  Do not expose them for devices handled
++  * by the native PCIe hotplug (PCIeHP), becuase that code is supposed to
++  * expose slots to user space in those cases.
++  */
++ if ((acpi_pci_check_ejectable(pbus, handle) || is_dock_device(handle))
++     && !(pdev && device_is_managed_by_native_pciehp(pdev))) {
+   unsigned long long sun;
+   int retval;
+ 
+-- 
+1.7.1

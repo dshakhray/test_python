@@ -1,0 +1,63 @@
+From 994cb75ead34b1cd3977fd8a15bb2d296a151f7f Mon Sep 17 00:00:00 2001
+From: Jacob Tanenbaum <jtanenba@redhat.com>
+Date: Tue, 13 Jan 2015 16:37:38 -0500
+Subject: [fs] ext4: fix overwrite race condition
+
+Message-id: <1421167058-10531-1-git-send-email-jtanenba@redhat.com>
+Patchwork-id: 102837
+O-Subject: [RHEL7 PATCH BZ1152607] CVE-2014-8086 Kernel: fs: ext4 race condition
+Bugzilla: 1152607
+CVE: CVE-2014-8086
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+
+Linux kernel built with an Ext4 file system(CONFIG_EXT4_FS) support is
+vulnerable to a race condition flaw. It could occur while performing
+asynchronous & Direct I/O operations and fcntl(F_SETFL) call
+concurrently.
+
+An unprivileged user/process could use this flaw to crash the system
+kernel resulting in DoS.
+
+The race occurs because the check for O_DIRECT happens in
+ext4_file_write() and the O_DIRECT flag can change at any
+time. regardless of the path taken eventually
+__generic_file_aio_write() gets called which based on O_DIRECT can
+call ext4_direct_IO() which expects iocb->private to be set.
+Initializing iocb->private in ext4_file_write() prevents the race
+condition.
+
+the ext4 code has deviated significantly from upstream and I thought it
+was beyond the scope of the CVE to apply the upstream fix
+(a41537e69b4aa43f0fea02498c2595a81267383b) directly.
+
+BUGZILLA: https://bugzilla.redhat.com/show_bug.cgi?id=1152607
+BREW: https://brewweb.devel.redhat.com/taskinfo?taskID=8471422
+BEAKER: https://beaker.engineering.redhat.com/jobs/843561
+        https://beaker.engineering.redhat.com/jobs/843876
+
+No issues seen in brew build or beaker tests.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/file.c b/fs/ext4/file.c
+index 4bea59b..140e57b 100644
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -170,6 +170,7 @@ ext4_file_write(struct kiocb *iocb, const struct iovec *iov,
+ {
+  struct inode *inode = file_inode(iocb->ki_filp);
+  ssize_t ret;
++ int overwrite = 0;
+ 
+  /*
+   * If we have encountered a bitmap-format file, the size limit
+@@ -190,6 +191,7 @@ ext4_file_write(struct kiocb *iocb, const struct iovec *iov,
+   }
+  }
+ 
++ iocb->private = &overwrite; /* RHEL7 only - prevent DIO race */
+  if (unlikely(iocb->ki_filp->f_flags & O_DIRECT))
+   ret = ext4_file_dio_write(iocb, iov, nr_segs, pos);
+  else
+-- 
+1.7.1

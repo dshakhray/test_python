@@ -1,0 +1,88 @@
+From e275b3390696de3612191318d1693f5c44f75f45 Mon Sep 17 00:00:00 2001
+From: Sai Vemuri <svemuri@redhat.com>
+Date: Wed, 12 Nov 2014 19:08:10 -0500
+Subject: [infiniband] cxgb4: Take IPv6 into account for best_mtu and set_emss
+
+Message-id: <1415819300-32670-10-git-send-email-svemuri@redhat.com>
+Patchwork-id: 99863
+O-Subject: [RHEL7.1 PATCH BZ 1163467 09/19] RDMA/cxgb4: Take IPv6 into account for best_mtu and set_emss
+Bugzilla: 1163467
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+best_mtu and set_emss were not considering ipv6 header for ipv6 case.
+
+Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 04524a47c36bc7fc573a4856b4e0fd8cf66c3126)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/cxgb4/cm.c b/drivers/infiniband/hw/cxgb4/cm.c
+index 0ad68f6..301b84d 100644
+--- a/drivers/infiniband/hw/cxgb4/cm.c
++++ b/drivers/infiniband/hw/cxgb4/cm.c
+@@ -236,10 +236,12 @@ static void release_tid(struct c4iw_rdev *rdev, u32 hwtid, struct sk_buff *skb)
+ static void set_emss(struct c4iw_ep *ep, u16 opt)
+ {
+  ep->emss = ep->com.dev->rdev.lldi.mtus[GET_TCPOPT_MSS(opt)] -
+-     sizeof(struct iphdr) - sizeof(struct tcphdr);
++     ((AF_INET == ep->com.remote_addr.ss_family) ?
++      sizeof(struct iphdr) : sizeof(struct ipv6hdr)) -
++     sizeof(struct tcphdr);
+  ep->mss = ep->emss;
+  if (GET_TCPOPT_TSTAMP(opt))
+-  ep->emss -= 12;
++  ep->emss -= round_up(TCPOLEN_TIMESTAMP, 4);
+  if (ep->emss < 128)
+   ep->emss = 128;
+  if (ep->emss & 7)
+@@ -581,11 +583,14 @@ static void c4iw_record_pm_msg(struct c4iw_ep *ep,
+ }
+ 
+ static void best_mtu(const unsigned short *mtus, unsigned short mtu,
+-       unsigned int *idx, int use_ts)
++       unsigned int *idx, int use_ts, int ipv6)
+ {
+- unsigned short hdr_size = sizeof(struct iphdr) +
++ unsigned short hdr_size = (ipv6 ?
++       sizeof(struct ipv6hdr) :
++       sizeof(struct iphdr)) +
+       sizeof(struct tcphdr) +
+-      (use_ts ? 12 : 0);
++      (use_ts ?
++       round_up(TCPOLEN_TIMESTAMP, 4) : 0);
+  unsigned short data_size = mtu - hdr_size;
+ 
+  cxgb4_best_aligned_mtu(mtus, hdr_size, data_size, 8, idx);
+@@ -634,7 +639,8 @@ static int send_connect(struct c4iw_ep *ep)
+  set_wr_txq(skb, CPL_PRIORITY_SETUP, ep->ctrlq_idx);
+ 
+  best_mtu(ep->com.dev->rdev.lldi.mtus, ep->mtu, &mtu_idx,
+-   enable_tcp_timestamps);
++   enable_tcp_timestamps,
++   (AF_INET == ep->com.remote_addr.ss_family) ? 0 : 1);
+  wscale = compute_wscale(rcv_win);
+ 
+  /*
+@@ -1763,7 +1769,8 @@ static void send_fw_act_open_req(struct c4iw_ep *ep, unsigned int atid)
+  req->tcb.tx_max = (__force __be32) jiffies;
+  req->tcb.rcv_adv = htons(1);
+  best_mtu(ep->com.dev->rdev.lldi.mtus, ep->mtu, &mtu_idx,
+-   enable_tcp_timestamps);
++   enable_tcp_timestamps,
++   (AF_INET == ep->com.remote_addr.ss_family) ? 0 : 1);
+  wscale = compute_wscale(rcv_win);
+ 
+  /*
+@@ -2161,7 +2168,8 @@ static void accept_cr(struct c4iw_ep *ep, struct sk_buff *skb,
+           ep->hwtid));
+ 
+  best_mtu(ep->com.dev->rdev.lldi.mtus, ep->mtu, &mtu_idx,
+-   enable_tcp_timestamps && req->tcpopt.tstamp);
++   enable_tcp_timestamps && req->tcpopt.tstamp,
++   (AF_INET == ep->com.remote_addr.ss_family) ? 0 : 1);
+  wscale = compute_wscale(rcv_win);
+ 
+  /*
+-- 
+1.7.1

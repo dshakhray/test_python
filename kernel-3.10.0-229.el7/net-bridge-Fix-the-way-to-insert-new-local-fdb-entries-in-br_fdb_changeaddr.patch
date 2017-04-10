@@ -1,0 +1,115 @@
+From 79b2fbd271de4cecd6e72b14c9991af39ecca18b Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Tue, 16 Dec 2014 14:23:32 -0500
+Subject: [net] bridge: Fix the way to insert new local fdb entries in br_fdb_changeaddr
+
+Message-id: <1418739817-22923-3-git-send-email-vyasevic@redhat.com>
+Patchwork-id: 102091
+O-Subject: [RHEL7 PATCH 2/7] bridge: Fix the way to insert new local fdb entries in br_fdb_changeaddr
+Bugzilla: 1164653
+RH-Acked-by: Michael S. Tsirkin <mst@redhat.com>
+RH-Acked-by: Marcelo Leitner <mleitner@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1164653
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8371670
+
+Upstream commit 2836882fe07718fe3263745b1aa07284ec71871c
+Author: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+Date:   Fri Feb 7 16:48:19 2014 +0900
+
+    bridge: Fix the way to insert new local fdb entries in br_fdb_changeaddr
+
+    Since commit bc9a25d21ef8 ("bridge: Add vlan support for local fdb entries"),
+    br_fdb_changeaddr() has inserted a new local fdb entry only if it can
+    find old one. But if we have two ports where they have the same address
+    or user has deleted a local entry, there will be no entry for one of the
+    ports.
+
+    Example of problematic case:
+      ip link set eth0 address aa:bb:cc:dd:ee:ff
+      ip link set eth1 address aa:bb:cc:dd:ee:ff
+      brctl addif br0 eth0
+      brctl addif br0 eth1 # eth1 will not have a local entry due to dup.
+      ip link set eth1 address 12:34:56:78:90:ab
+    Then, the new entry for the address 12:34:56:78:90:ab will not be
+    created, and the bridge device will not be able to communicate.
+
+    Insert new entries regardless of whether we can find old entries or not.
+
+    Signed-off-by: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+    Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+This commit is needed to resolve dependencies and is required by a later
+commit.
+
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 84ec589..3d39d62 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -140,8 +140,10 @@ static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f)
+ void br_fdb_changeaddr(struct net_bridge_port *p, const unsigned char *newaddr)
+ {
+  struct net_bridge *br = p->br;
+- bool no_vlan = (nbp_get_vlan_info(p) == NULL) ? true : false;
++ struct net_port_vlans *pv = nbp_get_vlan_info(p);
++ bool no_vlan = !pv;
+  int i;
++ u16 vid;
+ 
+  spin_lock_bh(&br->hash_lock);
+ 
+@@ -162,28 +164,37 @@ void br_fdb_changeaddr(struct net_bridge_port *p, const unsigned char *newaddr)
+             f->addr.addr) &&
+          nbp_vlan_find(op, vid)) {
+       f->dst = op;
+-      goto insert;
++      goto skip_delete;
+      }
+     }
+ 
+     /* delete old one */
+     fdb_delete(br, f);
+-insert:
+-    /* insert new address,  may fail if invalid
+-     * address or dup.
+-     */
+-    fdb_insert(br, p, newaddr, vid);
+-
++skip_delete:
+     /* if this port has no vlan information
+      * configured, we can safely be done at
+      * this point.
+      */
+     if (no_vlan)
+-     goto done;
++     goto insert;
+    }
+   }
+  }
+ 
++insert:
++ /* insert new address,  may fail if invalid address or dup. */
++ fdb_insert(br, p, newaddr, 0);
++
++ if (no_vlan)
++  goto done;
++
++ /* Now add entries for every VLAN configured on the port.
++  * This function runs under RTNL so the bitmap will not change
++  * from under us.
++  */
++ for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID)
++  fdb_insert(br, p, newaddr, vid);
++
+ done:
+  spin_unlock_bh(&br->hash_lock);
+ }
+-- 
+1.7.1

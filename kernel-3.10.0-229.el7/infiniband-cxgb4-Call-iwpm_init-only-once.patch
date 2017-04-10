@@ -1,0 +1,101 @@
+From c39243f685ab7d642d56afdb9cbc0f261735829d Mon Sep 17 00:00:00 2001
+From: Sai Vemuri <svemuri@redhat.com>
+Date: Thu, 11 Sep 2014 22:43:41 -0400
+Subject: [infiniband] cxgb4: Call iwpm_init() only once
+
+Message-id: <1410475447-94392-83-git-send-email-svemuri@redhat.com>
+Patchwork-id: 93853
+O-Subject: [RHEL7.1 PATCH BZ 1124947 082/108] RDMA/cxgb4: Call iwpm_init() only once
+Bugzilla: 1124947
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+We need to only register with the iwpm core once.  Currently it is
+being done for every adapter, which causes a failure for each adapter
+but the first, making multiple adapters unusable.
+
+Fixes: 9eccfe109b27 ("RDMA/cxgb4: Add support for iWARP Port Mapper user space service")
+Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 46c1376db1b85ae412a7917cec148c6e60f79428)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/cxgb4/cm.c b/drivers/infiniband/hw/cxgb4/cm.c
+index afb0058..48bc038 100644
+--- a/drivers/infiniband/hw/cxgb4/cm.c
++++ b/drivers/infiniband/hw/cxgb4/cm.c
+@@ -3925,7 +3925,7 @@ int __init c4iw_cm_init(void)
+  return 0;
+ }
+ 
+-void __exit c4iw_cm_term(void)
++void c4iw_cm_term(void)
+ {
+  WARN_ON(!list_empty(&timeout_list));
+  flush_workqueue(workq);
+diff --git a/drivers/infiniband/hw/cxgb4/device.c b/drivers/infiniband/hw/cxgb4/device.c
+index 16b75de..7db82b2 100644
+--- a/drivers/infiniband/hw/cxgb4/device.c
++++ b/drivers/infiniband/hw/cxgb4/device.c
+@@ -730,7 +730,6 @@ static void c4iw_dealloc(struct uld_ctx *ctx)
+  if (ctx->dev->rdev.oc_mw_kva)
+   iounmap(ctx->dev->rdev.oc_mw_kva);
+  ib_dealloc_device(&ctx->dev->ibdev);
+- iwpm_exit(RDMA_NL_C4IW);
+  ctx->dev = NULL;
+ }
+ 
+@@ -827,12 +826,6 @@ static struct c4iw_dev *c4iw_alloc(const struct cxgb4_lld_info *infop)
+   setup_debugfs(devp);
+  }
+ 
+- ret = iwpm_init(RDMA_NL_C4IW);
+- if (ret) {
+-  pr_err("port mapper initialization failed with %d\n", ret);
+-  ib_dealloc_device(&devp->ibdev);
+-  return ERR_PTR(ret);
+- }
+ 
+  return devp;
+ }
+@@ -1333,6 +1326,15 @@ static int __init c4iw_init_module(void)
+   pr_err("%s[%u]: Failed to add netlink callback\n"
+          , __func__, __LINE__);
+ 
++ err = iwpm_init(RDMA_NL_C4IW);
++ if (err) {
++  pr_err("port mapper initialization failed with %d\n", err);
++  ibnl_remove_client(RDMA_NL_C4IW);
++  c4iw_cm_term();
++  debugfs_remove_recursive(c4iw_debugfs_root);
++  return err;
++ }
++
+  cxgb4_register_uld(CXGB4_ULD_RDMA, &c4iw_uld_info);
+ 
+  return 0;
+@@ -1350,6 +1352,7 @@ static void __exit c4iw_exit_module(void)
+  }
+  mutex_unlock(&dev_mutex);
+  cxgb4_unregister_uld(CXGB4_ULD_RDMA);
++ iwpm_exit(RDMA_NL_C4IW);
+  ibnl_remove_client(RDMA_NL_C4IW);
+  c4iw_cm_term();
+  debugfs_remove_recursive(c4iw_debugfs_root);
+diff --git a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+index 125bc5d..361fff7 100644
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@ -908,7 +908,7 @@ int c4iw_destroy_ctrl_qp(struct c4iw_rdev *rdev);
+ int c4iw_register_device(struct c4iw_dev *dev);
+ void c4iw_unregister_device(struct c4iw_dev *dev);
+ int __init c4iw_cm_init(void);
+-void __exit c4iw_cm_term(void);
++void c4iw_cm_term(void);
+ void c4iw_release_dev_ucontext(struct c4iw_rdev *rdev,
+           struct c4iw_dev_ucontext *uctx);
+ void c4iw_init_dev_ucontext(struct c4iw_rdev *rdev,
+-- 
+1.7.1

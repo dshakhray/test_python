@@ -1,0 +1,144 @@
+From b1495cf1772828df107a2ab424ac92f73b97614f Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:24:30 -0400
+Subject: [net] libceph: add support for CEPH_OSD_OP_SETALLOCHINT osd op
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-164-git-send-email-sweil@redhat.com>
+Patchwork-id: 89827
+O-Subject: [PATCH 163/303] libceph: add support for CEPH_OSD_OP_SETALLOCHINT osd op
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+This is primarily for rbd's benefit and is supposed to combat
+fragmentation:
+
+"... knowing that rbd images have a 4m size, librbd can pass a hint
+that will let the osd do the xfs allocation size ioctl on new files so
+that they are allocated in 1m or 4m chunks.  We've seen cases where
+users with rbd workloads have very high levels of fragmentation in xfs
+and this would mitigate that and probably have a pretty nice
+performance benefit."
+
+SETALLOCHINT is considered advisory, so our backwards compatibility
+mechanism here is to set FAILOK flag for all SETALLOCHINT ops.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+(cherry picked from commit c647b8a8c6366f849c2a237bfe525cb1d316d5f4)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/ceph/osd_client.h b/include/linux/ceph/osd_client.h
+index e94f5da..c42d1ad 100644
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@ -103,6 +103,10 @@ struct ceph_osd_req_op {
+    u32 timeout;
+    __u8 flag;
+   } watch;
++  struct {
++   u64 expected_object_size;
++   u64 expected_write_size;
++  } alloc_hint;
+  };
+ };
+ 
+@@ -294,6 +298,10 @@ extern void osd_req_op_cls_init(struct ceph_osd_request *osd_req,
+ extern void osd_req_op_watch_init(struct ceph_osd_request *osd_req,
+      unsigned int which, u16 opcode,
+      u64 cookie, u64 version, int flag);
++extern void osd_req_op_alloc_hint_init(struct ceph_osd_request *osd_req,
++           unsigned int which,
++           u64 expected_object_size,
++           u64 expected_write_size);
+ 
+ extern struct ceph_osd_request *ceph_osdc_alloc_request(struct ceph_osd_client *osdc,
+             struct ceph_snap_context *snapc,
+diff --git a/include/linux/ceph/rados.h b/include/linux/ceph/rados.h
+index 8f9bf45..2caabef 100644
+--- a/include/linux/ceph/rados.h
++++ b/include/linux/ceph/rados.h
+@@ -227,6 +227,9 @@ enum {
+  CEPH_OSD_OP_OMAPRMKEYS    = CEPH_OSD_OP_MODE_WR | CEPH_OSD_OP_TYPE_DATA | 24,
+  CEPH_OSD_OP_OMAP_CMP      = CEPH_OSD_OP_MODE_RD | CEPH_OSD_OP_TYPE_DATA | 25,
+ 
++ /* hints */
++ CEPH_OSD_OP_SETALLOCHINT = CEPH_OSD_OP_MODE_WR | CEPH_OSD_OP_TYPE_DATA | 35,
++
+  /** multi **/
+  CEPH_OSD_OP_CLONERANGE = CEPH_OSD_OP_MODE_WR | CEPH_OSD_OP_TYPE_MULTI | 1,
+  CEPH_OSD_OP_ASSERT_SRC_VERSION = CEPH_OSD_OP_MODE_RD | CEPH_OSD_OP_TYPE_MULTI | 2,
+@@ -416,6 +419,10 @@ struct ceph_osd_op {
+    __le64 offset, length;
+    __le64 src_offset;
+   } __attribute__ ((packed)) clonerange;
++  struct {
++   __le64 expected_object_size;
++   __le64 expected_write_size;
++  } __attribute__ ((packed)) alloc_hint;
+  };
+  __le32 payload_len;
+ } __attribute__ ((packed));
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 5d7fd0b..71830d7 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -436,6 +436,7 @@ static bool osd_req_opcode_valid(u16 opcode)
+  case CEPH_OSD_OP_OMAPCLEAR:
+  case CEPH_OSD_OP_OMAPRMKEYS:
+  case CEPH_OSD_OP_OMAP_CMP:
++ case CEPH_OSD_OP_SETALLOCHINT:
+  case CEPH_OSD_OP_CLONERANGE:
+  case CEPH_OSD_OP_ASSERT_SRC_VERSION:
+  case CEPH_OSD_OP_SRC_CMPXATTR:
+@@ -591,6 +592,26 @@ void osd_req_op_watch_init(struct ceph_osd_request *osd_req,
+ }
+ EXPORT_SYMBOL(osd_req_op_watch_init);
+ 
++void osd_req_op_alloc_hint_init(struct ceph_osd_request *osd_req,
++    unsigned int which,
++    u64 expected_object_size,
++    u64 expected_write_size)
++{
++ struct ceph_osd_req_op *op = _osd_req_op_init(osd_req, which,
++            CEPH_OSD_OP_SETALLOCHINT);
++
++ op->alloc_hint.expected_object_size = expected_object_size;
++ op->alloc_hint.expected_write_size = expected_write_size;
++
++ /*
++  * CEPH_OSD_OP_SETALLOCHINT op is advisory and therefore deemed
++  * not worth a feature bit.  Set FAILOK per-op flag to make
++  * sure older osds don't trip over an unsupported opcode.
++  */
++ op->flags |= CEPH_OSD_OP_FLAG_FAILOK;
++}
++EXPORT_SYMBOL(osd_req_op_alloc_hint_init);
++
+ static void ceph_osdc_msg_data_add(struct ceph_msg *msg,
+     struct ceph_osd_data *osd_data)
+ {
+@@ -681,6 +702,12 @@ static u64 osd_req_encode_op(struct ceph_osd_request *req,
+   dst->watch.ver = cpu_to_le64(src->watch.ver);
+   dst->watch.flag = src->watch.flag;
+   break;
++ case CEPH_OSD_OP_SETALLOCHINT:
++  dst->alloc_hint.expected_object_size =
++      cpu_to_le64(src->alloc_hint.expected_object_size);
++  dst->alloc_hint.expected_write_size =
++      cpu_to_le64(src->alloc_hint.expected_write_size);
++  break;
+  default:
+   pr_err("unsupported osd opcode %s\n",
+    ceph_osd_op_name(src->op));
+-- 
+1.7.1

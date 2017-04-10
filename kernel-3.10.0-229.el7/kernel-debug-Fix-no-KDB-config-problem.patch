@@ -1,0 +1,115 @@
+From b49a541813d49eb3380de71008076934b6bd04cd Mon Sep 17 00:00:00 2001
+From: George Beshers <gbeshers@redhat.com>
+Date: Fri, 5 Sep 2014 05:25:42 -0400
+Subject: [kernel] debug: Fix no KDB config problem
+
+Message-id: <20140905052542.846.59094.sendpatchset@sgi-xe250-01.lab.bos.redhat.com>
+Patchwork-id: 91394
+O-Subject: [RHEL7.1 PATCH 7/9] kgdb/kdb: Fix no KDB config problem
+Bugzilla: 1138519
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+bz1138519: UV NMI cleanup to support perf tools
+First Post
+
+Brew Build: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=7921941
+
+Simple backport of:
+
+    commit fc8b13740b2978b34872650cc8e928392e3758aa
+    Author: Mike Travis <travis@sgi.com>
+    Date:   Tue Jan 14 10:25:52 2014 -0600
+
+ kgdb/kdb: Fix no KDB config problem
+
+ Some code added to the debug_core module had KDB dependencies
+ that it shouldn't have.  Move the KDB dependent REASON back to
+ the caller to remove the dependency in the debug core code.
+
+ Update the call from the UV NMI handler to conform to the new
+ interface.
+
+ Signed-off-by: Mike Travis <travis@sgi.com>
+ Reviewed-by: Hedi Berriche <hedi@sgi.com>
+ Cc: Russ Anderson <rja@sgi.com>
+ Cc: Jason Wessel <jason.wessel@windriver.com>
+ Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+ Cc: Paul Mackerras <paulus@samba.org>
+ Cc: Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+ Link: http://lkml.kernel.org/r/20140114162551.318251993@asylum.americas.sgi.com
+ Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/platform/uv/uv_nmi.c b/arch/x86/platform/uv/uv_nmi.c
+index a5c9cb4..67c85dc 100644
+--- a/arch/x86/platform/uv/uv_nmi.c
++++ b/arch/x86/platform/uv/uv_nmi.c
+@@ -546,7 +546,7 @@ static void uv_call_kdb(int cpu, struct pt_regs *regs, int master)
+  if (master) {
+   /* call KGDB NMI handler as MASTER */
+   ret = kgdb_nmicallin(cpu, X86_TRAP_NMI, regs,
+-     &uv_nmi_slave_continue);
++   KDB_REASON_SYSTEM_NMI, &uv_nmi_slave_continue);
+   if (ret) {
+    pr_alert("KDB returned error, is kgdboc set?\n");
+    atomic_set(&uv_nmi_slave_continue, SLAVE_EXIT);
+diff --git a/include/linux/kgdb.h b/include/linux/kgdb.h
+index dfb4f2f..6b06d37 100644
+--- a/include/linux/kgdb.h
++++ b/include/linux/kgdb.h
+@@ -310,7 +310,8 @@ extern int
+ kgdb_handle_exception(int ex_vector, int signo, int err_code,
+         struct pt_regs *regs);
+ extern int kgdb_nmicallback(int cpu, void *regs);
+-extern int kgdb_nmicallin(int cpu, int trapnr, void *regs, atomic_t *snd_rdy);
++extern int kgdb_nmicallin(int cpu, int trapnr, void *regs, int err_code,
++     atomic_t *snd_rdy);
+ extern void gdbstub_exit(int status);
+ 
+ extern int   kgdb_single_step;
+diff --git a/kernel/debug/debug_core.c b/kernel/debug/debug_core.c
+index 7d2f35e..334b398 100644
+--- a/kernel/debug/debug_core.c
++++ b/kernel/debug/debug_core.c
+@@ -736,7 +736,8 @@ int kgdb_nmicallback(int cpu, void *regs)
+  return 1;
+ }
+ 
+-int kgdb_nmicallin(int cpu, int trapnr, void *regs, atomic_t *send_ready)
++int kgdb_nmicallin(int cpu, int trapnr, void *regs, int err_code,
++       atomic_t *send_ready)
+ {
+ #ifdef CONFIG_SMP
+  if (!kgdb_io_ready(0) || !send_ready)
+@@ -750,7 +751,7 @@ int kgdb_nmicallin(int cpu, int trapnr, void *regs, atomic_t *send_ready)
+   ks->cpu   = cpu;
+   ks->ex_vector  = trapnr;
+   ks->signo  = SIGTRAP;
+-  ks->err_code  = KGDB_KDB_REASON_SYSTEM_NMI;
++  ks->err_code  = err_code;
+   ks->linux_regs  = regs;
+   ks->send_ready  = send_ready;
+   kgdb_cpu_enter(ks, regs, DCPU_WANT_MASTER);
+diff --git a/kernel/debug/debug_core.h b/kernel/debug/debug_core.h
+index 572aa4f..127d9bc 100644
+--- a/kernel/debug/debug_core.h
++++ b/kernel/debug/debug_core.h
+@@ -75,13 +75,11 @@ extern int kdb_stub(struct kgdb_state *ks);
+ extern int kdb_parse(const char *cmdstr);
+ extern int kdb_common_init_state(struct kgdb_state *ks);
+ extern int kdb_common_deinit_state(void);
+-#define KGDB_KDB_REASON_SYSTEM_NMI KDB_REASON_SYSTEM_NMI
+ #else /* ! CONFIG_KGDB_KDB */
+ static inline int kdb_stub(struct kgdb_state *ks)
+ {
+  return DBG_PASS_EVENT;
+ }
+-#define KGDB_KDB_REASON_SYSTEM_NMI 0
+ #endif /* CONFIG_KGDB_KDB */
+ 
+ #endif /* _DEBUG_CORE_H_ */
+-- 
+1.7.1

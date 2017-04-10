@@ -1,0 +1,118 @@
+From 0002b73f6d74230479db013f9d7223b0070636fb Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 24 Sep 2014 15:21:41 -0400
+Subject: [infiniband] ocrdma: SQ and RQ doorbell offset clean up
+
+Message-id: <3a2193ca3bcb9c55c36de779995deab795ae406a.1411571481.git.dledford@redhat.com>
+Patchwork-id: 96642
+O-Subject: [Patch RHEL7 06/48] RDMA/ocrdma: SQ and RQ doorbell offset clean up
+Bugzilla: 1081067 1088577
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Devesh Sharma <Devesh.Sharma@Emulex.Com>
+
+Introducing new macros to define SQ and RQ doorbell offset.
+
+Signed-off-by: Devesh Sharma <devesh.sharma@emulex.com>
+Signed-off-by: Selvin Xavier <selvin.xavier@emulex.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 2df84fa87f4d00299031b1335748c54176edfe87)
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma.h b/drivers/infiniband/hw/ocrdma/ocrdma.h
+index 61f508e..1b51e67 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma.h
++++ b/drivers/infiniband/hw/ocrdma/ocrdma.h
+@@ -386,13 +386,6 @@ static inline struct ocrdma_srq *get_ocrdma_srq(struct ib_srq *ibsrq)
+  return container_of(ibsrq, struct ocrdma_srq, ibsrq);
+ }
+ 
+-
+-static inline int ocrdma_get_num_posted_shift(struct ocrdma_qp *qp)
+-{
+- return ((qp->dev->nic_info.dev_family == OCRDMA_GEN2_FAMILY &&
+-   qp->id < 128) ? 24 : 16);
+-}
+-
+ static inline int is_cqe_valid(struct ocrdma_cq *cq, struct ocrdma_cqe *cqe)
+ {
+  int cqe_valid;
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_sli.h b/drivers/infiniband/hw/ocrdma/ocrdma_sli.h
+index 60d5ac2..e71685a 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_sli.h
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_sli.h
+@@ -103,7 +103,10 @@ enum {
+  OCRDMA_DB_GEN2_SRQ_OFFSET = OCRDMA_DB_GEN2_RQ_OFFSET,
+  OCRDMA_DB_CQ_OFFSET  = 0x120,
+  OCRDMA_DB_EQ_OFFSET  = OCRDMA_DB_CQ_OFFSET,
+- OCRDMA_DB_MQ_OFFSET  = 0x140
++ OCRDMA_DB_MQ_OFFSET  = 0x140,
++
++ OCRDMA_DB_SQ_SHIFT  = 16,
++ OCRDMA_DB_RQ_SHIFT  = 24
+ };
+ 
+ #define OCRDMA_DB_CQ_RING_ID_MASK       0x3FF /* bits 0 - 9 */
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index 2489da4..03bea8b 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -1125,15 +1125,9 @@ static int ocrdma_copy_qp_uresp(struct ocrdma_qp *qp,
+  }
+  uresp.db_page_addr = usr_db;
+  uresp.db_page_size = dev->nic_info.db_page_size;
+- if (dev->nic_info.dev_family == OCRDMA_GEN2_FAMILY) {
+-  uresp.db_sq_offset = OCRDMA_DB_GEN2_SQ_OFFSET;
+-  uresp.db_rq_offset = OCRDMA_DB_GEN2_RQ_OFFSET;
+-  uresp.db_shift = 24;
+- } else {
+-  uresp.db_sq_offset = OCRDMA_DB_SQ_OFFSET;
+-  uresp.db_rq_offset = OCRDMA_DB_RQ_OFFSET;
+-  uresp.db_shift = 16;
+- }
++ uresp.db_sq_offset = OCRDMA_DB_GEN2_SQ_OFFSET;
++ uresp.db_rq_offset = OCRDMA_DB_GEN2_RQ_OFFSET;
++ uresp.db_shift = OCRDMA_DB_RQ_SHIFT;
+ 
+  if (qp->dpp_enabled) {
+   uresp.dpp_credit = dpp_credit_lmt;
+@@ -1306,7 +1300,7 @@ static void ocrdma_flush_rq_db(struct ocrdma_qp *qp)
+ {
+  if (qp->db_cache) {
+   u32 val = qp->rq.dbid | (qp->db_cache <<
+-    ocrdma_get_num_posted_shift(qp));
++    OCRDMA_DB_RQ_SHIFT);
+   iowrite32(val, qp->rq_db);
+   qp->db_cache = 0;
+  }
+@@ -2050,7 +2044,7 @@ static int ocrdma_build_fr(struct ocrdma_qp *qp, struct ocrdma_hdr_wqe *hdr,
+ 
+ static void ocrdma_ring_sq_db(struct ocrdma_qp *qp)
+ {
+- u32 val = qp->sq.dbid | (1 << 16);
++ u32 val = qp->sq.dbid | (1 << OCRDMA_DB_SQ_SHIFT);
+ 
+  iowrite32(val, qp->sq_db);
+ }
+@@ -2155,12 +2149,9 @@ int ocrdma_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 
+ static void ocrdma_ring_rq_db(struct ocrdma_qp *qp)
+ {
+- u32 val = qp->rq.dbid | (1 << ocrdma_get_num_posted_shift(qp));
++ u32 val = qp->rq.dbid | (1 << OCRDMA_DB_RQ_SHIFT);
+ 
+- if (qp->state != OCRDMA_QPS_INIT)
+-  iowrite32(val, qp->rq_db);
+- else
+-  qp->db_cache++;
++ iowrite32(val, qp->rq_db);
+ }
+ 
+ static void ocrdma_build_rqe(struct ocrdma_hdr_wqe *rqe, struct ib_recv_wr *wr,
+-- 
+1.7.1

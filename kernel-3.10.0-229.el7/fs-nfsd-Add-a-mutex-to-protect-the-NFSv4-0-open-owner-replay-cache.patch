@@ -1,0 +1,234 @@
+From 3cbc42bdd56d5e67f4c4a752ebf5f2cc24a4568e Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:19:52 -0400
+Subject: [fs] nfsd: Add a mutex to protect the NFSv4.0 open owner replay cache
+
+Message-id: <1410898849-22126-109-git-send-email-bfields@redhat.com>
+Patchwork-id: 95757
+O-Subject: [Patch RHEL7 108/165] nfsd: Add a mutex to protect the NFSv4.0 open owner replay cache
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jlayton@primarydata.com>
+
+We don't want to rely on the client_mutex for protection in the case of
+NFSv4 open owners. Instead, we add a mutex that will only be taken for
+NFSv4.0 state mutating operations, and that will be released once the
+entire compound is done.
+
+Also, ensure that nfsd4_cstate_assign_replay/nfsd4_cstate_clear_replay
+take a reference to the stateowner when they are using it for NFSv4.0
+open and lock replay caching.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 58fb12e6a42f30adf209f8f41385a3bbb2c82420
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c
+index 64fdf41..5dfa03b 100644
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@ -468,12 +468,9 @@ out:
+   fh_put(resfh);
+   kfree(resfh);
+  }
+- nfsd4_cleanup_open_state(open, status);
+- if (open->op_openowner && !nfsd4_has_session(cstate))
+-  cstate->replay_owner = &open->op_openowner->oo_owner;
++ nfsd4_cleanup_open_state(cstate, open, status);
+  nfsd4_bump_seqid(cstate, status);
+- if (!cstate->replay_owner)
+-  nfs4_unlock_state();
++ nfs4_unlock_state();
+  return status;
+ }
+ 
+@@ -1394,10 +1391,7 @@ encode_op:
+    args->ops, args->opcnt, resp->opcnt, op->opnum,
+    be32_to_cpu(status));
+ 
+-  if (cstate->replay_owner) {
+-   nfs4_unlock_state();
+-   cstate->replay_owner = NULL;
+-  }
++  nfsd4_cstate_clear_replay(cstate);
+   /* XXX Ugh, we need to get rid of this kind of special case: */
+   if (op->opnum == OP_READ && op->u.read.rd_filp)
+    fput(op->u.read.rd_filp);
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 5a93e5f..749608b 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -1069,7 +1069,7 @@ void nfsd4_bump_seqid(struct nfsd4_compound_state *cstate, __be32 nfserr)
+   return;
+ 
+  if (!seqid_mutating_err(ntohl(nfserr))) {
+-  cstate->replay_owner = NULL;
++  nfsd4_cstate_clear_replay(cstate);
+   return;
+  }
+  if (!so)
+@@ -2940,6 +2940,28 @@ static void init_nfs4_replay(struct nfs4_replay *rp)
+  rp->rp_status = nfserr_serverfault;
+  rp->rp_buflen = 0;
+  rp->rp_buf = rp->rp_ibuf;
++ mutex_init(&rp->rp_mutex);
++}
++
++static void nfsd4_cstate_assign_replay(struct nfsd4_compound_state *cstate,
++  struct nfs4_stateowner *so)
++{
++ if (!nfsd4_has_session(cstate)) {
++  mutex_lock(&so->so_replay.rp_mutex);
++  cstate->replay_owner = so;
++  atomic_inc(&so->so_count);
++ }
++}
++
++void nfsd4_cstate_clear_replay(struct nfsd4_compound_state *cstate)
++{
++ struct nfs4_stateowner *so = cstate->replay_owner;
++
++ if (so != NULL) {
++  cstate->replay_owner = NULL;
++  mutex_unlock(&so->so_replay.rp_mutex);
++  nfs4_put_stateowner(so);
++ }
+ }
+ 
+ static inline void *alloc_stateowner(struct kmem_cache *slab, struct xdr_netobj *owner, struct nfs4_client *clp)
+@@ -3855,7 +3877,8 @@ out:
+  return status;
+ }
+ 
+-void nfsd4_cleanup_open_state(struct nfsd4_open *open, __be32 status)
++void nfsd4_cleanup_open_state(struct nfsd4_compound_state *cstate,
++         struct nfsd4_open *open, __be32 status)
+ {
+  if (open->op_openowner) {
+   struct nfs4_openowner *oo = open->op_openowner;
+@@ -3869,6 +3892,8 @@ void nfsd4_cleanup_open_state(struct nfsd4_open *open, __be32 status)
+    } else
+     oo->oo_flags &= ~NFS4_OO_NEW;
+   }
++  if (open->op_openowner)
++   nfsd4_cstate_assign_replay(cstate, &oo->oo_owner);
+  }
+  if (open->op_file)
+   nfsd4_free_file(open->op_file);
+@@ -4399,8 +4424,7 @@ nfs4_preprocess_seqid_op(struct nfsd4_compound_state *cstate, u32 seqid,
+  if (status)
+   return status;
+  stp = openlockstateid(s);
+- if (!nfsd4_has_session(cstate))
+-  cstate->replay_owner = stp->st_stateowner;
++ nfsd4_cstate_assign_replay(cstate, stp->st_stateowner);
+ 
+  status = nfs4_seqid_op_checks(cstate, stateid, seqid, stp);
+  if (!status)
+@@ -4469,8 +4493,7 @@ put_stateid:
+  nfs4_put_stid(&stp->st_stid);
+ out:
+  nfsd4_bump_seqid(cstate, status);
+- if (!cstate->replay_owner)
+-  nfs4_unlock_state();
++ nfs4_unlock_state();
+  return status;
+ }
+ 
+@@ -4544,8 +4567,7 @@ put_stateid:
+  nfs4_put_stid(&stp->st_stid);
+ out:
+  nfsd4_bump_seqid(cstate, status);
+- if (!cstate->replay_owner)
+-  nfs4_unlock_state();
++ nfs4_unlock_state();
+  return status;
+ }
+ 
+@@ -4610,8 +4632,7 @@ nfsd4_close(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+  /* put reference from nfs4_preprocess_seqid_op */
+  nfs4_put_stid(&stp->st_stid);
+ out:
+- if (!cstate->replay_owner)
+-  nfs4_unlock_state();
++ nfs4_unlock_state();
+  return status;
+ }
+ 
+@@ -5071,8 +5092,7 @@ out:
+  if (status && new_state)
+   release_lock_stateid(lock_stp);
+  nfsd4_bump_seqid(cstate, status);
+- if (!cstate->replay_owner)
+-  nfs4_unlock_state();
++ nfs4_unlock_state();
+  if (file_lock)
+   locks_free_lock(file_lock);
+  if (conflock)
+@@ -5236,8 +5256,7 @@ put_stateid:
+  nfs4_put_stid(&stp->st_stid);
+ out:
+  nfsd4_bump_seqid(cstate, status);
+- if (!cstate->replay_owner)
+-  nfs4_unlock_state();
++ nfs4_unlock_state();
+  if (file_lock)
+   locks_free_lock(file_lock);
+  return status;
+diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c
+index 671c206..f9821ce 100644
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@ -3925,8 +3925,6 @@ status:
+  * 
+  * XDR note: do not encode rp->rp_buflen: the buffer contains the
+  * previously sent already encoded operation.
+- *
+- * called with nfs4_lock_state() held
+  */
+ void
+ nfsd4_encode_replay(struct xdr_stream *xdr, struct nfsd4_op *op)
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index dc725de..9cba295 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -328,6 +328,7 @@ struct nfs4_replay {
+  unsigned int  rp_buflen;
+  char   *rp_buf;
+  struct knfsd_fh  rp_openfh;
++ struct mutex  rp_mutex;
+  char   rp_ibuf[NFSD4_REPLAY_ISIZE];
+ };
+ 
+diff --git a/fs/nfsd/xdr4.h b/fs/nfsd/xdr4.h
+index 5abf6c9..465e779 100644
+--- a/fs/nfsd/xdr4.h
++++ b/fs/nfsd/xdr4.h
+@@ -599,7 +599,9 @@ extern __be32 nfsd4_process_open1(struct nfsd4_compound_state *,
+   struct nfsd4_open *open, struct nfsd_net *nn);
+ extern __be32 nfsd4_process_open2(struct svc_rqst *rqstp,
+   struct svc_fh *current_fh, struct nfsd4_open *open);
+-extern void nfsd4_cleanup_open_state(struct nfsd4_open *open, __be32 status);
++extern void nfsd4_cstate_clear_replay(struct nfsd4_compound_state *cstate);
++extern void nfsd4_cleanup_open_state(struct nfsd4_compound_state *cstate,
++  struct nfsd4_open *open, __be32 status);
+ extern __be32 nfsd4_open_confirm(struct svc_rqst *rqstp,
+   struct nfsd4_compound_state *, struct nfsd4_open_confirm *oc);
+ extern __be32 nfsd4_close(struct svc_rqst *rqstp,
+@@ -630,6 +632,7 @@ extern __be32 nfsd4_test_stateid(struct svc_rqst *rqstp,
+ extern __be32 nfsd4_free_stateid(struct svc_rqst *rqstp,
+   struct nfsd4_compound_state *, struct nfsd4_free_stateid *free_stateid);
+ extern void nfsd4_bump_seqid(struct nfsd4_compound_state *, __be32 nfserr);
++
+ #endif
+ 
+ /*
+-- 
+1.7.1

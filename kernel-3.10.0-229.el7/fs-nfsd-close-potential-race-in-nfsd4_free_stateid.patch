@@ -1,0 +1,79 @@
+From 19282310c9feb825cf5b4fc4963eda4040f26895 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:20:05 -0400
+Subject: [fs] nfsd: close potential race in nfsd4_free_stateid
+
+Message-id: <1410898849-22126-122-git-send-email-bfields@redhat.com>
+Patchwork-id: 95794
+O-Subject: [Patch RHEL7 121/165] nfsd: close potential race in nfsd4_free_stateid
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jlayton@primarydata.com>
+
+Once we remove the client_mutex, it'll be possible for the sc_type of a
+lock stateid to change after it's found and checked, but before we can
+go to destroy it. If that happens, we can end up putting the persistent
+reference to the stateid more than once, and unhash it more than once.
+
+Fix this by unhashing the lock stateid prior to dropping the cl_lock but
+after finding it.
+
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: fc5a96c3b70d00c863f69ff4ea7f5dfddbcbc0d8
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 9358cbe..9c7dcbb 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -4397,17 +4397,6 @@ unlock_state:
+  return status;
+ }
+ 
+-static __be32
+-nfsd4_free_lock_stateid(struct nfs4_ol_stateid *stp)
+-{
+- struct nfs4_lockowner *lo = lockowner(stp->st_stateowner);
+-
+- if (check_for_locks(stp->st_stid.sc_file, lo))
+-  return nfserr_locks_held;
+- release_lock_stateid(stp);
+- return nfs_ok;
+-}
+-
+ /*
+  * Test if the stateid is valid
+  */
+@@ -4434,6 +4423,7 @@ nfsd4_free_stateid(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+  stateid_t *stateid = &free_stateid->fr_stateid;
+  struct nfs4_stid *s;
+  struct nfs4_delegation *dp;
++ struct nfs4_ol_stateid *stp;
+  struct nfs4_client *cl = cstate->session->se_client;
+  __be32 ret = nfserr_bad_stateid;
+ 
+@@ -4456,8 +4446,15 @@ nfsd4_free_stateid(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+   ret = check_stateid_generation(stateid, &s->sc_stateid, 1);
+   if (ret)
+    break;
++  stp = openlockstateid(s);
++  ret = nfserr_locks_held;
++  if (check_for_locks(stp->st_stid.sc_file,
++        lockowner(stp->st_stateowner)))
++   break;
++  unhash_lock_stateid(stp);
+   spin_unlock(&cl->cl_lock);
+-  ret = nfsd4_free_lock_stateid(openlockstateid(s));
++  nfs4_put_stid(s);
++  ret = nfs_ok;
+   goto out;
+  case NFS4_REVOKED_DELEG_STID:
+   dp = delegstateid(s);
+-- 
+1.7.1

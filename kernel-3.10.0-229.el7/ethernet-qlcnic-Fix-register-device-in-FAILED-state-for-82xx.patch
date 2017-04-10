@@ -1,0 +1,173 @@
+From 7d573c16c60a89140077982cbf7a9687a75e8685 Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Thu, 21 Aug 2014 13:05:06 -0400
+Subject: [ethernet] qlcnic: Fix register device in FAILED state for 82xx
+
+Message-id: <1408626422-3941-23-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 88556
+O-Subject: [PATCH RHEL 7.1 022/138] qlcnic: Fix register device in FAILED state for 82xx.
+Bugzilla: 1089352
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Sucheta Chakraborty <sucheta.chakraborty@qlogic.com>
+
+Bug 1089352 (https://bugzilla.redhat.com/show_bug.cgi?id=1089352)
+
+net commit id 6645161513b90823ddc787f5763d8dbea7d40c8c
+
+o Commit 7e2cf4feba058476324dc545e3d1b316998c91e6
+  ("qlcnic: change driver hardware interface mechanism")
+  has overwritten
+  commit b43e5ee76a4320c070cf0fe65cf4927198fbb4d1
+  ("qlcnic: Register device in FAILED state")
+
+Signed-off-by: Sucheta Chakraborty <sucheta.chakraborty@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+index c4a2f5e..1379e2e 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+@@ -1796,3 +1796,11 @@ const struct ethtool_ops qlcnic_sriov_vf_ethtool_ops = {
+  .set_msglevel  = qlcnic_set_msglevel,
+  .get_msglevel  = qlcnic_get_msglevel,
+ };
++
++const struct ethtool_ops qlcnic_ethtool_failed_ops = {
++ .get_settings  = qlcnic_get_settings,
++ .get_drvinfo  = qlcnic_get_drvinfo,
++ .set_msglevel  = qlcnic_set_msglevel,
++ .get_msglevel  = qlcnic_get_msglevel,
++ .set_dump  = qlcnic_set_dump,
++};
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index 06bee37..adcb915 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -431,6 +431,9 @@ static void qlcnic_82xx_cancel_idc_work(struct qlcnic_adapter *adapter)
+  while (test_and_set_bit(__QLCNIC_RESETTING, &adapter->state))
+   usleep_range(10000, 11000);
+ 
++ if (!adapter->fw_work.work.func)
++  return;
++
+  cancel_delayed_work_sync(&adapter->fw_work);
+ }
+ 
+@@ -2276,8 +2279,9 @@ qlcnic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+   adapter->portnum = adapter->ahw->pci_func;
+   err = qlcnic_start_firmware(adapter);
+   if (err) {
+-   dev_err(&pdev->dev, "Loading fw failed.Please Reboot\n");
+-   goto err_out_free_hw;
++   dev_err(&pdev->dev, "Loading fw failed.Please Reboot\n"
++    "\t\tIf reboot doesn't help, try flashing the card\n");
++   goto err_out_maintenance_mode;
+   }
+ 
+   qlcnic_get_multiq_capability(adapter);
+@@ -2409,6 +2413,22 @@ err_out_disable_pdev:
+  pci_set_drvdata(pdev, NULL);
+  pci_disable_device(pdev);
+  return err;
++
++err_out_maintenance_mode:
++ netdev->netdev_ops = &qlcnic_netdev_failed_ops;
++ SET_ETHTOOL_OPS(netdev, &qlcnic_ethtool_failed_ops);
++ err = register_netdev(netdev);
++
++ if (err) {
++  dev_err(&pdev->dev, "Failed to register net device\n");
++  qlcnic_clr_all_drv_state(adapter, 0);
++  goto err_out_free_hw;
++ }
++
++ pci_set_drvdata(pdev, adapter);
++ qlcnic_add_sysfs(adapter);
++
++ return 0;
+ }
+ 
+ static void qlcnic_remove(struct pci_dev *pdev)
+@@ -2519,8 +2539,16 @@ static int qlcnic_resume(struct pci_dev *pdev)
+ static int qlcnic_open(struct net_device *netdev)
+ {
+  struct qlcnic_adapter *adapter = netdev_priv(netdev);
++ u32 state;
+  int err;
+ 
++ state = QLC_SHARED_REG_RD32(adapter, QLCNIC_CRB_DEV_STATE);
++ if (state == QLCNIC_DEV_FAILED || state == QLCNIC_DEV_BADBAD) {
++  netdev_err(netdev, "%s: Device is in FAILED state\n", __func__);
++
++  return -EIO;
++ }
++
+  netif_carrier_off(netdev);
+ 
+  err = qlcnic_attach(adapter);
+@@ -3223,6 +3251,13 @@ void qlcnic_82xx_dev_request_reset(struct qlcnic_adapter *adapter, u32 key)
+   return;
+ 
+  state = QLC_SHARED_REG_RD32(adapter, QLCNIC_CRB_DEV_STATE);
++ if (state == QLCNIC_DEV_FAILED || state == QLCNIC_DEV_BADBAD) {
++  netdev_err(adapter->netdev, "%s: Device is in FAILED state\n",
++      __func__);
++  qlcnic_api_unlock(adapter);
++
++  return;
++ }
+ 
+  if (state == QLCNIC_DEV_READY) {
+   QLC_SHARED_REG_WR32(adapter, QLCNIC_CRB_DEV_STATE,
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sysfs.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sysfs.c
+index c6165d0..019f437 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sysfs.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sysfs.c
+@@ -1272,6 +1272,7 @@ void qlcnic_remove_sysfs_entries(struct qlcnic_adapter *adapter)
+ void qlcnic_create_diag_entries(struct qlcnic_adapter *adapter)
+ {
+  struct device *dev = &adapter->pdev->dev;
++ u32 state;
+ 
+  if (device_create_bin_file(dev, &bin_attr_port_stats))
+   dev_info(dev, "failed to create port stats sysfs entry");
+@@ -1285,8 +1286,13 @@ void qlcnic_create_diag_entries(struct qlcnic_adapter *adapter)
+  if (device_create_bin_file(dev, &bin_attr_mem))
+   dev_info(dev, "failed to create mem sysfs entry\n");
+ 
++ state = QLC_SHARED_REG_RD32(adapter, QLCNIC_CRB_DEV_STATE);
++ if (state == QLCNIC_DEV_FAILED || state == QLCNIC_DEV_BADBAD)
++  return;
++
+  if (device_create_bin_file(dev, &bin_attr_pci_config))
+   dev_info(dev, "failed to create pci config sysfs entry");
++
+  if (device_create_file(dev, &dev_attr_beacon))
+   dev_info(dev, "failed to create beacon sysfs entry");
+ 
+@@ -1307,6 +1313,7 @@ void qlcnic_create_diag_entries(struct qlcnic_adapter *adapter)
+ void qlcnic_remove_diag_entries(struct qlcnic_adapter *adapter)
+ {
+  struct device *dev = &adapter->pdev->dev;
++ u32 state;
+ 
+  device_remove_bin_file(dev, &bin_attr_port_stats);
+ 
+@@ -1315,6 +1322,11 @@ void qlcnic_remove_diag_entries(struct qlcnic_adapter *adapter)
+  device_remove_file(dev, &dev_attr_diag_mode);
+  device_remove_bin_file(dev, &bin_attr_crb);
+  device_remove_bin_file(dev, &bin_attr_mem);
++
++ state = QLC_SHARED_REG_RD32(adapter, QLCNIC_CRB_DEV_STATE);
++ if (state == QLCNIC_DEV_FAILED || state == QLCNIC_DEV_BADBAD)
++  return;
++
+  device_remove_bin_file(dev, &bin_attr_pci_config);
+  device_remove_file(dev, &dev_attr_beacon);
+  if (!(adapter->flags & QLCNIC_ESWITCH_ENABLED))
+-- 
+1.7.1

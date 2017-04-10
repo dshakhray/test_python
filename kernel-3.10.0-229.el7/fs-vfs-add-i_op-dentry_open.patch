@@ -1,0 +1,152 @@
+From e48f80b07d05d4ecde80364cfe2187d3f12094c6 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 25 Nov 2014 16:34:31 -0500
+Subject: [fs] vfs: add i_op->dentry_open()
+
+Message-id: <20141125163430.18115.46785.stgit@warthog.procyon.org.uk>
+Patchwork-id: 100922
+O-Subject: [PATCH 22/47] vfs: add i_op->dentry_open()
+Bugzilla: 985875
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+From: Miklos Szeredi <mszeredi@suse.cz>
+
+Add a new inode operation i_op->dentry_open().  This is for stacked filesystems
+that want to return a struct file from a different filesystem.
+
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+Original-commit: 4aa7c6346be395bdf776f82bbb2e3e2bc60bdd2b
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/filesystems/Locking b/Documentation/filesystems/Locking
+index 959cdfe..4282d57 100644
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@ -66,6 +66,7 @@ prototypes:
+  int (*atomic_open)(struct inode *, struct dentry *,
+     struct file *, unsigned open_flag,
+     umode_t create_mode, int *opened);
++ int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
+ 
+ locking rules:
+  all may block
+@@ -94,6 +95,7 @@ removexattr: yes
+ fiemap:  no
+ update_time: no
+ atomic_open: yes
++dentry_open: no
+ 
+  Additionally, ->rmdir(), ->unlink() and ->rename() have ->i_mutex on
+ victim.
+diff --git a/Documentation/filesystems/vfs.txt b/Documentation/filesystems/vfs.txt
+index 4dbb42c..ef86ace 100644
+--- a/Documentation/filesystems/vfs.txt
++++ b/Documentation/filesystems/vfs.txt
+@@ -363,6 +363,7 @@ struct inode_operations {
+  void (*update_time)(struct inode *, struct timespec *, int);
+  int (*atomic_open)(struct inode *, struct dentry *, struct file *,
+        unsigned open_flag, umode_t create_mode, int *opened);
++ int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
+ };
+ 
+ Again, all methods are called without any locks being held, unless
+@@ -698,6 +699,12 @@ struct address_space_operations {
+    but instead uses bmap to find out where the blocks in the file
+    are and uses those addresses directly.
+ 
++  dentry_open: *WARNING: probably going away soon, do not use!* This is an
++ alternative to f_op->open(), the difference is that this method may open
++ a file not necessarily originating from the same filesystem as the one
++ i_op->open() was called on.  It may be useful for stacking filesystems
++ which want to allow native I/O directly on underlying files.
++
+ 
+   invalidatepage: If a page has PagePrivate set, then invalidatepage
+         will be called when part or all of the page is to be removed
+diff --git a/fs/namei.c b/fs/namei.c
+index f801f1b..fff0e6e 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -3067,9 +3067,12 @@ finish_open_created:
+  error = may_open(&nd->path, acc_mode, open_flag);
+  if (error)
+   goto out;
+- file->f_path.mnt = nd->path.mnt;
+- error = finish_open(file, nd->path.dentry, NULL, opened);
+- if (error) {
++
++ BUG_ON(*opened & FILE_OPENED); /* once it's opened, it's opened */
++ error = vfs_open(&nd->path, file, current_cred());
++ if (!error) {
++  *opened |= FILE_OPENED;
++ } else {
+   if (error == -EOPENSTALE)
+    goto stale_open;
+   goto out;
+diff --git a/fs/open.c b/fs/open.c
+index 1106819..24eaae3 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -849,8 +849,7 @@ struct file *dentry_open(const struct path *path, int flags,
+  f = get_empty_filp();
+  if (!IS_ERR(f)) {
+   f->f_flags = flags;
+-  f->f_path = *path;
+-  error = do_dentry_open(f, NULL, cred);
++  error = vfs_open(path, f, cred);
+   if (!error) {
+    /* from now on we need fput() to dispose of f */
+    error = open_check_o_direct(f);
+@@ -867,6 +866,26 @@ struct file *dentry_open(const struct path *path, int flags,
+ }
+ EXPORT_SYMBOL(dentry_open);
+ 
++/**
++ * vfs_open - open the file at the given path
++ * @path: path to open
++ * @filp: newly allocated file with f_flag initialized
++ * @cred: credentials to use
++ */
++int vfs_open(const struct path *path, struct file *filp,
++      const struct cred *cred)
++{
++ struct inode *inode = path->dentry->d_inode;
++
++ if (inode->i_op->dentry_open)
++  return inode->i_op->dentry_open(path->dentry, filp, cred);
++ else {
++  filp->f_path = *path;
++  return do_dentry_open(filp, NULL, cred);
++ }
++}
++EXPORT_SYMBOL(vfs_open);
++
+ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *op)
+ {
+  int lookup_flags = 0;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index d00c6a4..4cc46be 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1606,6 +1606,9 @@ struct inode_operations {
+  int (*atomic_open)(struct inode *, struct dentry *,
+       struct file *, unsigned open_flag,
+       umode_t create_mode, int *opened);
++
++ /* WARNING: probably going away soon, do not use! */
++ int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
+ } ____cacheline_aligned;
+ 
+ ssize_t rw_copy_check_uvector(int type, const struct iovec __user * uvector,
+@@ -2110,6 +2113,7 @@ extern struct file *file_open_name(struct filename *, int, umode_t);
+ extern struct file *filp_open(const char *, int, umode_t);
+ extern struct file *file_open_root(struct dentry *, struct vfsmount *,
+        const char *, int);
++extern int vfs_open(const struct path *, struct file *, const struct cred *);
+ extern struct file * dentry_open(const struct path *, int, const struct cred *);
+ extern int filp_close(struct file *, fl_owner_t id);
+ 
+-- 
+1.7.1

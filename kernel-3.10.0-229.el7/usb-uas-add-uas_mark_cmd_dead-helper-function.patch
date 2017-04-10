@@ -1,0 +1,89 @@
+From 2a388062fa434221026f7c3e63098397905b2fcb Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:46 -0400
+Subject: [usb] uas: add uas_mark_cmd_dead helper function
+
+Message-id: <1410887463-20674-335-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95323
+O-Subject: [RHEL7 PATCH 334/591] uas: add uas_mark_cmd_dead helper function
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit da3033ea08397fb70279f22789002e6001432f3d
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Tue Nov 12 13:57:24 2013 +0100
+
+    uas: add uas_mark_cmd_dead helper function
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index 1a18839..7810c13 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -146,6 +146,21 @@ static void uas_do_work(struct work_struct *work)
+  spin_unlock_irqrestore(&devinfo->lock, flags);
+ }
+ 
++static void uas_mark_cmd_dead(struct uas_dev_info *devinfo,
++         struct uas_cmd_info *cmdinfo, const char *caller)
++{
++ struct scsi_pointer *scp = (void *)cmdinfo;
++ struct scsi_cmnd *cmnd = container_of(scp, struct scsi_cmnd, SCp);
++
++ uas_log_cmd_state(cmnd, caller);
++ WARN_ON_ONCE(!spin_is_locked(&devinfo->lock));
++ WARN_ON_ONCE(cmdinfo->state & COMMAND_ABORTED);
++ cmdinfo->state |= COMMAND_ABORTED;
++ cmdinfo->state &= ~IS_IN_WORK_LIST;
++ list_del(&cmdinfo->inflight);
++ list_add_tail(&cmdinfo->dead, &devinfo->dead_list);
++}
++
+ static void uas_abort_inflight(struct uas_dev_info *devinfo)
+ {
+  struct uas_cmd_info *cmdinfo;
+@@ -154,17 +169,8 @@ static void uas_abort_inflight(struct uas_dev_info *devinfo)
+ 
+  spin_lock_irqsave(&devinfo->lock, flags);
+  list_for_each_entry_safe(cmdinfo, temp, &devinfo->inflight_list,
+-     inflight) {
+-  struct scsi_pointer *scp = (void *)cmdinfo;
+-  struct scsi_cmnd *cmnd = container_of(scp, struct scsi_cmnd,
+-            SCp);
+-  uas_log_cmd_state(cmnd, __func__);
+-  WARN_ON_ONCE(cmdinfo->state & COMMAND_ABORTED);
+-  cmdinfo->state |= COMMAND_ABORTED;
+-  cmdinfo->state &= ~IS_IN_WORK_LIST;
+-  list_del(&cmdinfo->inflight);
+-  list_add_tail(&cmdinfo->dead, &devinfo->dead_list);
+- }
++     inflight)
++  uas_mark_cmd_dead(devinfo, cmdinfo, __func__);
+  spin_unlock_irqrestore(&devinfo->lock, flags);
+ }
+ 
+@@ -806,13 +812,8 @@ static int uas_eh_abort_handler(struct scsi_cmnd *cmnd)
+  unsigned long flags;
+  int ret;
+ 
+- uas_log_cmd_state(cmnd, __func__);
+  spin_lock_irqsave(&devinfo->lock, flags);
+- WARN_ON_ONCE(cmdinfo->state & COMMAND_ABORTED);
+- cmdinfo->state |= COMMAND_ABORTED;
+- cmdinfo->state &= ~IS_IN_WORK_LIST;
+- list_del(&cmdinfo->inflight);
+- list_add_tail(&cmdinfo->dead, &devinfo->dead_list);
++ uas_mark_cmd_dead(devinfo, cmdinfo, __func__);
+  if (cmdinfo->state & COMMAND_INFLIGHT) {
+   spin_unlock_irqrestore(&devinfo->lock, flags);
+   ret = uas_eh_task_mgmt(cmnd, "ABORT TASK", TMF_ABORT_TASK);
+-- 
+1.7.1

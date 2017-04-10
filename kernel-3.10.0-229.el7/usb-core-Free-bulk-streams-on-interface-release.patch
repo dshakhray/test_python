@@ -1,0 +1,77 @@
+From dea623e0a812e8e6477feeaa8803919e29d83a7c Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:00 -0400
+Subject: [usb] core: Free bulk streams on interface release
+
+Message-id: <1410887463-20674-289-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95179
+O-Subject: [RHEL7 PATCH 288/591] usb-core: Free bulk streams on interface release
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 6343e8bf09de16ab4dcae2c6ca1a0e8dbd4dd770
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Wed Oct 9 17:19:26 2013 +0200
+
+    usb-core: Free bulk streams on interface release
+
+    Documentation/usb/bulk-streams.txt says:
+
+    All stream IDs will be deallocated when the driver releases the interface, to
+    ensure that drivers that don't support streams will be able to use the endpoint
+
+    This commit actually implements this.
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/driver.c b/drivers/usb/core/driver.c
+index 8d989b1..ef44f90 100644
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -369,8 +369,9 @@ static int usb_unbind_interface(struct device *dev)
+ {
+  struct usb_driver *driver = to_usb_driver(dev->driver);
+  struct usb_interface *intf = to_usb_interface(dev);
++ struct usb_host_endpoint *ep, **eps = NULL;
+  struct usb_device *udev;
+- int error, r, lpm_disable_error;
++ int i, j, error, r, lpm_disable_error;
+ 
+  intf->condition = USB_INTERFACE_UNBINDING;
+ 
+@@ -394,6 +395,26 @@ static int usb_unbind_interface(struct device *dev)
+  driver->disconnect(intf);
+  usb_cancel_queued_reset(intf);
+ 
++ /* Free streams */
++ for (i = 0, j = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
++  ep = &intf->cur_altsetting->endpoint[i];
++  if (ep->streams == 0)
++   continue;
++  if (j == 0) {
++   eps = kmalloc(USB_MAXENDPOINTS * sizeof(void *),
++          GFP_KERNEL);
++   if (!eps) {
++    dev_warn(dev, "oom, leaking streams\n");
++    break;
++   }
++  }
++  eps[j++] = ep;
++ }
++ if (j) {
++  usb_free_streams(intf, eps, j, GFP_KERNEL);
++  kfree(eps);
++ }
++
+  /* Reset other interface state.
+   * We cannot do a Set-Interface if the device is suspended or
+   * if it is prepared for a system sleep (since installing a new
+-- 
+1.7.1

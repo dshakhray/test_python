@@ -1,0 +1,211 @@
+From ae328920e26f30eb605387f3026e3ef985dcfd18 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:05 -0400
+Subject: [usb] fs: Add support for allocating / freeing streams
+
+Message-id: <1410887463-20674-294-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95318
+O-Subject: [RHEL7 PATCH 293/591] usbfs: Add support for allocating / freeing streams
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit bcf7f6e39335af4f03da8c26a98185fd49754fcc
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Wed Oct 9 17:19:31 2013 +0200
+
+    usbfs: Add support for allocating / freeing streams
+
+    This allows userspace to use bulk-streams, just like in kernel drivers, see
+    Documentation/usb/bulk-streams.txt for details on the in kernel API. This
+    is exported pretty much one on one to userspace.
+
+    To use streams an app must first make a USBDEVFS_ALLOC_STREAMS ioctl,
+    on success this will return the number of streams available (which may be
+    less then requested). If there are n streams the app can then submit
+    usbdevfs_urb-s with their stream_id member set to 1-n to use a specific
+    stream. IE if USBDEVFS_ALLOC_STREAMS returns 4 then stream_id 1-4 can be
+    used.
+
+    When the app is done using streams it should call USBDEVFS_FREE_STREAMS
+
+    Note applications are advised to use libusb rather then using the
+    usbdevfs api directly. The latest version of libusb has support for streams.
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/devio.c b/drivers/usb/core/devio.c
+index 502974b..12401ee 100644
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -778,6 +778,79 @@ static struct usb_host_endpoint *ep_to_host_endpoint(struct usb_device *dev,
+   return dev->ep_out[ep & USB_ENDPOINT_NUMBER_MASK];
+ }
+ 
++static int parse_usbdevfs_streams(struct dev_state *ps,
++      struct usbdevfs_streams __user *streams,
++      unsigned int *num_streams_ret,
++      unsigned int *num_eps_ret,
++      struct usb_host_endpoint ***eps_ret,
++      struct usb_interface **intf_ret)
++{
++ unsigned int i, num_streams, num_eps;
++ struct usb_host_endpoint **eps;
++ struct usb_interface *intf = NULL;
++ unsigned char ep;
++ int ifnum, ret;
++
++ if (get_user(num_streams, &streams->num_streams) ||
++     get_user(num_eps, &streams->num_eps))
++  return -EFAULT;
++
++ if (num_eps < 1 || num_eps > USB_MAXENDPOINTS)
++  return -EINVAL;
++
++ /* The XHCI controller allows max 2 ^ 16 streams */
++ if (num_streams_ret && (num_streams < 2 || num_streams > 65536))
++  return -EINVAL;
++
++ eps = kmalloc(num_eps * sizeof(*eps), GFP_KERNEL);
++ if (!eps)
++  return -ENOMEM;
++
++ for (i = 0; i < num_eps; i++) {
++  if (get_user(ep, &streams->eps[i])) {
++   ret = -EFAULT;
++   goto error;
++  }
++  eps[i] = ep_to_host_endpoint(ps->dev, ep);
++  if (!eps[i]) {
++   ret = -EINVAL;
++   goto error;
++  }
++
++  /* usb_alloc/free_streams operate on an usb_interface */
++  ifnum = findintfep(ps->dev, ep);
++  if (ifnum < 0) {
++   ret = ifnum;
++   goto error;
++  }
++
++  if (i == 0) {
++   ret = checkintf(ps, ifnum);
++   if (ret < 0)
++    goto error;
++   intf = usb_ifnum_to_if(ps->dev, ifnum);
++  } else {
++   /* Verify all eps belong to the same interface */
++   if (ifnum != intf->altsetting->desc.bInterfaceNumber) {
++    ret = -EINVAL;
++    goto error;
++   }
++  }
++ }
++
++ if (num_streams_ret)
++  *num_streams_ret = num_streams;
++ *num_eps_ret = num_eps;
++ *eps_ret = eps;
++ *intf_ret = intf;
++
++ return 0;
++
++error:
++ kfree(eps);
++ return ret;
++}
++
+ static int match_devt(struct device *dev, void *data)
+ {
+  return dev->devt == (dev_t) (unsigned long) data;
+@@ -2009,6 +2082,45 @@ static int proc_disconnect_claim(struct dev_state *ps, void __user *arg)
+  return claimintf(ps, dc.interface);
+ }
+ 
++static int proc_alloc_streams(struct dev_state *ps, void __user *arg)
++{
++ unsigned num_streams, num_eps;
++ struct usb_host_endpoint **eps;
++ struct usb_interface *intf;
++ int r;
++
++ r = parse_usbdevfs_streams(ps, arg, &num_streams, &num_eps,
++       &eps, &intf);
++ if (r)
++  return r;
++
++ destroy_async_on_interface(ps,
++       intf->altsetting[0].desc.bInterfaceNumber);
++
++ r = usb_alloc_streams(intf, eps, num_eps, num_streams, GFP_KERNEL);
++ kfree(eps);
++ return r;
++}
++
++static int proc_free_streams(struct dev_state *ps, void __user *arg)
++{
++ unsigned num_eps;
++ struct usb_host_endpoint **eps;
++ struct usb_interface *intf;
++ int r;
++
++ r = parse_usbdevfs_streams(ps, arg, NULL, &num_eps, &eps, &intf);
++ if (r)
++  return r;
++
++ destroy_async_on_interface(ps,
++       intf->altsetting[0].desc.bInterfaceNumber);
++
++ r = usb_free_streams(intf, eps, num_eps, GFP_KERNEL);
++ kfree(eps);
++ return r;
++}
++
+ /*
+  * NOTE:  All requests here that have interface numbers as parameters
+  * are assuming that somehow the configuration has been prevented from
+@@ -2185,6 +2297,12 @@ static long usbdev_do_ioctl(struct file *file, unsigned int cmd,
+  case USBDEVFS_DISCONNECT_CLAIM:
+   ret = proc_disconnect_claim(ps, p);
+   break;
++ case USBDEVFS_ALLOC_STREAMS:
++  ret = proc_alloc_streams(ps, p);
++  break;
++ case USBDEVFS_FREE_STREAMS:
++  ret = proc_free_streams(ps, p);
++  break;
+  }
+  usb_unlock_device(dev);
+  if (ret >= 0)
+diff --git a/include/uapi/linux/usbdevice_fs.h b/include/uapi/linux/usbdevice_fs.h
+index cbf122d..abe5f4b 100644
+--- a/include/uapi/linux/usbdevice_fs.h
++++ b/include/uapi/linux/usbdevice_fs.h
+@@ -147,6 +147,11 @@ struct usbdevfs_disconnect_claim {
+  char driver[USBDEVFS_MAXDRIVERNAME + 1];
+ };
+ 
++struct usbdevfs_streams {
++ unsigned int num_streams; /* Not used by USBDEVFS_FREE_STREAMS */
++ unsigned int num_eps;
++ unsigned char eps[0];
++};
+ 
+ #define USBDEVFS_CONTROL           _IOWR('U', 0, struct usbdevfs_ctrltransfer)
+ #define USBDEVFS_CONTROL32           _IOWR('U', 0, struct usbdevfs_ctrltransfer32)
+@@ -179,5 +184,7 @@ struct usbdevfs_disconnect_claim {
+ #define USBDEVFS_RELEASE_PORT      _IOR('U', 25, unsigned int)
+ #define USBDEVFS_GET_CAPABILITIES  _IOR('U', 26, __u32)
+ #define USBDEVFS_DISCONNECT_CLAIM  _IOR('U', 27, struct usbdevfs_disconnect_claim)
++#define USBDEVFS_ALLOC_STREAMS     _IOR('U', 28, struct usbdevfs_streams)
++#define USBDEVFS_FREE_STREAMS      _IOR('U', 29, struct usbdevfs_streams)
+ 
+ #endif /* _UAPI_LINUX_USBDEVICE_FS_H */
+-- 
+1.7.1

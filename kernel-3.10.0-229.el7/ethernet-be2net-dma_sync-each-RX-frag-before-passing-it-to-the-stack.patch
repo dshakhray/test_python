@@ -1,0 +1,134 @@
+From a49d7dd001a5b60b5dca1eeefb1727234f5a22c4 Mon Sep 17 00:00:00 2001
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Mon, 8 Sep 2014 16:13:33 -0400
+Subject: [ethernet] be2net: dma_sync each RX frag before passing it to the stack
+
+Message-id: <1410192881-30702-11-git-send-email-ivecera@redhat.com>
+Patchwork-id: 92414
+O-Subject: [RHEL7.1 PATCH 10/78] be2net: dma_sync each RX frag before passing it to the stack
+Bugzilla: 1088575
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+
+BZ: #1088575
+
+Upstream commit(s):
+commit e50287be7c007a10e6e2e3332e52466faf4b6a04
+Author: Sathya Perla <sathya.perla@emulex.com>
+Date:   Tue Mar 4 12:14:38 2014 +0530
+
+    be2net: dma_sync each RX frag before passing it to the stack
+
+    The driver currently maps a page for DMA, divides the page into multiple
+    frags and posts them to the HW. It un-maps the page after data is received
+    on all the frags of the page. This scheme doesn't work when bounce buffers
+    are used for DMA (swiotlb=force kernel param).
+
+    This patch fixes this problem by calling dma_sync_single_for_cpu() for each
+    frag (excepting the last one) so that the data is copied from the bounce
+    buffers. The page is un-mapped only when DMA finishes on the last frag of
+    the page.
+    (Thanks Ben H. for suggesting the dma_sync API!)
+
+    This patch also renames the "last_page_user" field of be_rx_page_info{}
+    struct to "last_frag" to improve readability of the fixed code.
+
+    Reported-by: Li Fengmao <li.fengmao@zte.com.cn>
+    Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/emulex/benet/be.h b/drivers/net/ethernet/emulex/benet/be.h
+index 05bd11e..22db6df 100644
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@ -261,9 +261,10 @@ struct be_tx_obj {
+ /* Struct to remember the pages posted for rx frags */
+ struct be_rx_page_info {
+  struct page *page;
++ /* set to page-addr for last frag of the page & frag-addr otherwise */
+  DEFINE_DMA_UNMAP_ADDR(bus);
+  u16 page_offset;
+- bool last_page_user;
++ bool last_frag;  /* last frag of the page */
+ };
+ 
+ struct be_rx_stats {
+diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
+index dc42b90..5f6b1c6 100644
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -1464,11 +1464,15 @@ static struct be_rx_page_info *get_rx_page_info(struct be_rx_obj *rxo)
+  rx_page_info = &rxo->page_info_tbl[frag_idx];
+  BUG_ON(!rx_page_info->page);
+ 
+- if (rx_page_info->last_page_user) {
++ if (rx_page_info->last_frag) {
+   dma_unmap_page(&adapter->pdev->dev,
+           dma_unmap_addr(rx_page_info, bus),
+           adapter->big_page_size, DMA_FROM_DEVICE);
+-  rx_page_info->last_page_user = false;
++  rx_page_info->last_frag = false;
++ } else {
++  dma_sync_single_for_cpu(&adapter->pdev->dev,
++     dma_unmap_addr(rx_page_info, bus),
++     rx_frag_size, DMA_FROM_DEVICE);
+  }
+ 
+  queue_tail_inc(rxq);
+@@ -1802,17 +1806,16 @@ static void be_post_rx_frags(struct be_rx_obj *rxo, gfp_t gfp)
+     rx_stats(rxo)->rx_post_fail++;
+     break;
+    }
+-   page_info->page_offset = 0;
++   page_offset = 0;
+   } else {
+    get_page(pagep);
+-   page_info->page_offset = page_offset + rx_frag_size;
++   page_offset += rx_frag_size;
+   }
+-  page_offset = page_info->page_offset;
++  page_info->page_offset = page_offset;
+   page_info->page = pagep;
+-  dma_unmap_addr_set(page_info, bus, page_dmaaddr);
+-  frag_dmaaddr = page_dmaaddr + page_info->page_offset;
+ 
+   rxd = queue_head_node(rxq);
++  frag_dmaaddr = page_dmaaddr + page_info->page_offset;
+   rxd->fragpa_lo = cpu_to_le32(frag_dmaaddr & 0xFFFFFFFF);
+   rxd->fragpa_hi = cpu_to_le32(upper_32_bits(frag_dmaaddr));
+ 
+@@ -1820,15 +1823,24 @@ static void be_post_rx_frags(struct be_rx_obj *rxo, gfp_t gfp)
+   if ((page_offset + rx_frag_size + rx_frag_size) >
+      adapter->big_page_size) {
+    pagep = NULL;
+-   page_info->last_page_user = true;
++   page_info->last_frag = true;
++   dma_unmap_addr_set(page_info, bus, page_dmaaddr);
++  } else {
++   dma_unmap_addr_set(page_info, bus, frag_dmaaddr);
+   }
+ 
+   prev_page_info = page_info;
+   queue_head_inc(rxq);
+   page_info = &rxo->page_info_tbl[rxq->head];
+  }
+- if (pagep)
+-  prev_page_info->last_page_user = true;
++
++ /* Mark the last frag of a page when we break out of the above loop
++  * with no more slots available in the RXQ
++  */
++ if (pagep) {
++  prev_page_info->last_frag = true;
++  dma_unmap_addr_set(prev_page_info, bus, page_dmaaddr);
++ }
+ 
+  if (posted) {
+   atomic_add(posted, &rxq->used);
+-- 
+1.7.1

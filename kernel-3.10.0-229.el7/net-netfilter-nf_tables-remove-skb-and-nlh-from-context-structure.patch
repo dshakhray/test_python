@@ -1,0 +1,288 @@
+From ff9705f1e5bf5f726f3b1dcb665eed0ceb8270ac Mon Sep 17 00:00:00 2001
+From: Marcelo Leitner <mleitner@redhat.com>
+Date: Tue, 21 Oct 2014 16:18:29 -0400
+Subject: [net] netfilter: nf_tables: remove skb and nlh from context structure
+
+Message-id: <20141021161829.22888.85316.stgit@localhost.localdomain>
+Patchwork-id: 97958
+O-Subject: [RHEL7 net PATCH 061/124] netfilter: nf_tables: remove skb and nlh from context structure
+Bugzilla: 1148041 1155088
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Backport of upstream commit: 128ad3322ba5de8fa346203c9931d1fdcab8da87
+
+ commit 128ad3322ba5de8fa346203c9931d1fdcab8da87
+ Author: Pablo Neira Ayuso <pablo@netfilter.org>
+ Date:   Fri May 9 17:14:24 2014 +0200
+
+    netfilter: nf_tables: remove skb and nlh from context structure
+
+    Instead of caching the original skbuff that contains the netlink
+    messages, this stores the netlink message sequence number, the
+    netlink portID and the report flag. This helps to prepare the
+    introduction of the object release via call_rcu.
+
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index b08f2a9..1ed2797 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -72,21 +72,23 @@ static inline void nft_data_debug(const struct nft_data *data)
+  * struct nft_ctx - nf_tables rule/set context
+  *
+  * @net: net namespace
+- *  @skb: netlink skb
+- *  @nlh: netlink message header
+  *  @afi: address family info
+  *  @table: the table the chain is contained in
+  *  @chain: the chain the rule is contained in
+  * @nla: netlink attributes
++ * @portid: netlink portID of the original message
++ * @seq: netlink sequence number
++ * @report: notify via unicast netlink message
+  */
+ struct nft_ctx {
+  struct net   *net;
+- const struct sk_buff  *skb;
+- const struct nlmsghdr  *nlh;
+  struct nft_af_info  *afi;
+  struct nft_table  *table;
+  struct nft_chain  *chain;
+  const struct nlattr * const  *nla;
++ u32    portid;
++ u32    seq;
++ bool    report;
+ };
+ 
+ struct nft_data_desc {
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 1ff9d56..753dc59 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -96,13 +96,14 @@ static void nft_ctx_init(struct nft_ctx *ctx,
+     struct nft_chain *chain,
+     const struct nlattr * const *nla)
+ {
+- ctx->net   = sock_net(skb->sk);
+- ctx->skb   = skb;
+- ctx->nlh   = nlh;
+- ctx->afi   = afi;
+- ctx->table = table;
+- ctx->chain = chain;
+- ctx->nla   = nla;
++ ctx->net = sock_net(skb->sk);
++ ctx->afi = afi;
++ ctx->table = table;
++ ctx->chain = chain;
++ ctx->nla    = nla;
++ ctx->portid = NETLINK_CB(skb).portid;
++ ctx->report = nlmsg_report(nlh);
++ ctx->seq = nlh->nlmsg_seq;
+ }
+ 
+ static struct nft_trans *nft_trans_alloc(struct nft_ctx *ctx, int msg_type,
+@@ -238,14 +239,10 @@ nla_put_failure:
+ static int nf_tables_table_notify(const struct nft_ctx *ctx, int event)
+ {
+  struct sk_buff *skb;
+- u32 portid = NETLINK_CB(ctx->skb).portid;
+- u32 seq = ctx->nlh->nlmsg_seq;
+- struct net *net = sock_net(ctx->skb->sk);
+- bool report;
+  int err;
+ 
+- report = nlmsg_report(ctx->nlh);
+- if (!report && !nfnetlink_has_listeners(net, NFNLGRP_NFTABLES))
++ if (!ctx->report &&
++     !nfnetlink_has_listeners(ctx->net, NFNLGRP_NFTABLES))
+   return 0;
+ 
+  err = -ENOBUFS;
+@@ -253,18 +250,20 @@ static int nf_tables_table_notify(const struct nft_ctx *ctx, int event)
+  if (skb == NULL)
+   goto err;
+ 
+- err = nf_tables_fill_table_info(skb, portid, seq, event, 0,
++ err = nf_tables_fill_table_info(skb, ctx->portid, ctx->seq, event, 0,
+      ctx->afi->family, ctx->table);
+  if (err < 0) {
+   kfree_skb(skb);
+   goto err;
+  }
+ 
+- err = nfnetlink_send(skb, net, portid, NFNLGRP_NFTABLES, report,
+-        GFP_KERNEL);
++ err = nfnetlink_send(skb, ctx->net, ctx->portid, NFNLGRP_NFTABLES,
++        ctx->report, GFP_KERNEL);
+ err:
+- if (err < 0)
+-  nfnetlink_set_err(net, portid, NFNLGRP_NFTABLES, err);
++ if (err < 0) {
++  nfnetlink_set_err(ctx->net, ctx->portid, NFNLGRP_NFTABLES,
++      err);
++ }
+  return err;
+ }
+ 
+@@ -721,14 +720,10 @@ nla_put_failure:
+ static int nf_tables_chain_notify(const struct nft_ctx *ctx, int event)
+ {
+  struct sk_buff *skb;
+- u32 portid = NETLINK_CB(ctx->skb).portid;
+- struct net *net = sock_net(ctx->skb->sk);
+- u32 seq = ctx->nlh->nlmsg_seq;
+- bool report;
+  int err;
+ 
+- report = nlmsg_report(ctx->nlh);
+- if (!report && !nfnetlink_has_listeners(net, NFNLGRP_NFTABLES))
++ if (!ctx->report &&
++     !nfnetlink_has_listeners(ctx->net, NFNLGRP_NFTABLES))
+   return 0;
+ 
+  err = -ENOBUFS;
+@@ -736,7 +731,7 @@ static int nf_tables_chain_notify(const struct nft_ctx *ctx, int event)
+  if (skb == NULL)
+   goto err;
+ 
+- err = nf_tables_fill_chain_info(skb, portid, seq, event, 0,
++ err = nf_tables_fill_chain_info(skb, ctx->portid, ctx->seq, event, 0,
+      ctx->afi->family, ctx->table,
+      ctx->chain);
+  if (err < 0) {
+@@ -744,11 +739,13 @@ static int nf_tables_chain_notify(const struct nft_ctx *ctx, int event)
+   goto err;
+  }
+ 
+- err = nfnetlink_send(skb, net, portid, NFNLGRP_NFTABLES, report,
+-        GFP_KERNEL);
++ err = nfnetlink_send(skb, ctx->net, ctx->portid, NFNLGRP_NFTABLES,
++        ctx->report, GFP_KERNEL);
+ err:
+- if (err < 0)
+-  nfnetlink_set_err(net, portid, NFNLGRP_NFTABLES, err);
++ if (err < 0) {
++  nfnetlink_set_err(ctx->net, ctx->portid, NFNLGRP_NFTABLES,
++      err);
++ }
+  return err;
+ }
+ 
+@@ -1473,16 +1470,11 @@ static int nf_tables_rule_notify(const struct nft_ctx *ctx,
+      const struct nft_rule *rule,
+      int event)
+ {
+- const struct sk_buff *oskb = ctx->skb;
+  struct sk_buff *skb;
+- u32 portid = NETLINK_CB(oskb).portid;
+- struct net *net = sock_net(oskb->sk);
+- u32 seq = ctx->nlh->nlmsg_seq;
+- bool report;
+  int err;
+ 
+- report = nlmsg_report(ctx->nlh);
+- if (!report && !nfnetlink_has_listeners(net, NFNLGRP_NFTABLES))
++ if (!ctx->report &&
++     !nfnetlink_has_listeners(ctx->net, NFNLGRP_NFTABLES))
+   return 0;
+ 
+  err = -ENOBUFS;
+@@ -1490,7 +1482,7 @@ static int nf_tables_rule_notify(const struct nft_ctx *ctx,
+  if (skb == NULL)
+   goto err;
+ 
+- err = nf_tables_fill_rule_info(skb, portid, seq, event, 0,
++ err = nf_tables_fill_rule_info(skb, ctx->portid, ctx->seq, event, 0,
+            ctx->afi->family, ctx->table,
+            ctx->chain, rule);
+  if (err < 0) {
+@@ -1498,11 +1490,13 @@ static int nf_tables_rule_notify(const struct nft_ctx *ctx,
+   goto err;
+  }
+ 
+- err = nfnetlink_send(skb, net, portid, NFNLGRP_NFTABLES, report,
+-        GFP_KERNEL);
++ err = nfnetlink_send(skb, ctx->net, ctx->portid, NFNLGRP_NFTABLES,
++        ctx->report, GFP_KERNEL);
+ err:
+- if (err < 0)
+-  nfnetlink_set_err(net, portid, NFNLGRP_NFTABLES, err);
++ if (err < 0) {
++  nfnetlink_set_err(ctx->net, ctx->portid, NFNLGRP_NFTABLES,
++      err);
++ }
+  return err;
+ }
+ 
+@@ -2142,8 +2136,8 @@ static int nf_tables_fill_set(struct sk_buff *skb, const struct nft_ctx *ctx,
+  struct nfgenmsg *nfmsg;
+  struct nlmsghdr *nlh;
+  struct nlattr *desc;
+- u32 portid = NETLINK_CB(ctx->skb).portid;
+- u32 seq = ctx->nlh->nlmsg_seq;
++ u32 portid = ctx->portid;
++ u32 seq = ctx->seq;
+ 
+  event |= NFNL_SUBSYS_NFTABLES << 8;
+  nlh = nlmsg_put(skb, portid, seq, event, sizeof(struct nfgenmsg),
+@@ -2195,12 +2189,11 @@ static int nf_tables_set_notify(const struct nft_ctx *ctx,
+     int event)
+ {
+  struct sk_buff *skb;
+- u32 portid = NETLINK_CB(ctx->skb).portid;
+- bool report;
++ u32 portid = ctx->portid;
+  int err;
+ 
+- report = nlmsg_report(ctx->nlh);
+- if (!report && !nfnetlink_has_listeners(ctx->net, NFNLGRP_NFTABLES))
++ if (!ctx->report &&
++     !nfnetlink_has_listeners(ctx->net, NFNLGRP_NFTABLES))
+   return 0;
+ 
+  err = -ENOBUFS;
+@@ -2214,8 +2207,8 @@ static int nf_tables_set_notify(const struct nft_ctx *ctx,
+   goto err;
+  }
+ 
+- err = nfnetlink_send(skb, ctx->net, portid, NFNLGRP_NFTABLES, report,
+-        GFP_KERNEL);
++ err = nfnetlink_send(skb, ctx->net, portid, NFNLGRP_NFTABLES,
++        ctx->report, GFP_KERNEL);
+ err:
+  if (err < 0)
+   nfnetlink_set_err(ctx->net, portid, NFNLGRP_NFTABLES, err);
+@@ -2957,14 +2950,12 @@ static int nf_tables_setelem_notify(const struct nft_ctx *ctx,
+         const struct nft_set_elem *elem,
+         int event, u16 flags)
+ {
+- const struct sk_buff *oskb = ctx->skb;
+- struct net *net = sock_net(oskb->sk);
+- u32 portid = NETLINK_CB(oskb).portid;
+- bool report = nlmsg_report(ctx->nlh);
++ struct net *net = ctx->net;
++ u32 portid = ctx->portid;
+  struct sk_buff *skb;
+  int err;
+ 
+- if (!report && !nfnetlink_has_listeners(net, NFNLGRP_NFTABLES))
++ if (!ctx->report && !nfnetlink_has_listeners(net, NFNLGRP_NFTABLES))
+   return 0;
+ 
+  err = -ENOBUFS;
+@@ -2979,7 +2970,7 @@ static int nf_tables_setelem_notify(const struct nft_ctx *ctx,
+   goto err;
+  }
+ 
+- err = nfnetlink_send(skb, net, portid, NFNLGRP_NFTABLES, report,
++ err = nfnetlink_send(skb, net, portid, NFNLGRP_NFTABLES, ctx->report,
+         GFP_KERNEL);
+ err:
+  if (err < 0)
+-- 
+1.7.1

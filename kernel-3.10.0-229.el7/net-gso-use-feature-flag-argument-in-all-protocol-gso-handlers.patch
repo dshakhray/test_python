@@ -1,0 +1,117 @@
+From 19d8993e64c53ac05c4c14a8a0add119746c0ad5 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 24 Oct 2014 20:55:32 -0400
+Subject: [net] gso: use feature flag argument in all protocol gso handlers
+
+Message-id: <59c2289c3b03b9f7827dde58dde9265689af8b82.1414183890.git.jbenc@redhat.com>
+Patchwork-id: 98458
+O-Subject: [RHEL7.1 net PATCH 3/5] net: gso: use feature flag argument in all protocol gso handlers
+Bugzilla: 1144571
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Jesper Brouer <jbrouer@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1144571
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8159555
+
+RHEL changes: UDP code in a different file, different variable name in
+ipv6 offload.
+
+commit 1e16aa3ddf863c6b9f37eddf52503230a62dedb3
+Author: Florian Westphal <fw@strlen.de>
+Date:   Mon Oct 20 13:49:16 2014 +0200
+
+    net: gso: use feature flag argument in all protocol gso handlers
+
+    skb_gso_segment() has a 'features' argument representing offload features
+    available to the output path.
+
+    A few handlers, e.g. GRE, instead re-fetch the features of skb->dev and use
+    those instead of the provided ones when handing encapsulation/tunnels.
+
+    Depending on dev->hw_enc_features of the output device skb_gso_segment() can
+    then return NULL even when the caller has disabled all GSO feature bits,
+    as segmentation of inner header thinks device will take care of segmentation.
+
+    This e.g. affects the tbf scheduler, which will silently drop GRE-encap GSO skbs
+    that did not fit the remaining token quota as the segmentation does not work
+    when device supports corresponding hw offload capabilities.
+
+    Cc: Pravin B Shelar <pshelar@nicira.com>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 2e72565..790d43f 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1314,7 +1314,7 @@ static struct sk_buff *inet_gso_segment(struct sk_buff *skb,
+ 
+  encap = SKB_GSO_CB(skb)->encap_level > 0;
+  if (encap)
+-  features = skb->dev->hw_enc_features & netif_skb_features(skb);
++  features &= skb->dev->hw_enc_features;
+  SKB_GSO_CB(skb)->encap_level += ihl;
+ 
+  skb_reset_transport_header(skb);
+diff --git a/net/ipv4/gre_offload.c b/net/ipv4/gre_offload.c
+index d3fe2ac..fdaace3 100644
+--- a/net/ipv4/gre_offload.c
++++ b/net/ipv4/gre_offload.c
+@@ -72,7 +72,7 @@ static struct sk_buff *gre_gso_segment(struct sk_buff *skb,
+  skb->mac_len = skb_inner_network_offset(skb);
+ 
+  /* segment inner packet. */
+- enc_features = skb->dev->hw_enc_features & netif_skb_features(skb);
++ enc_features = skb->dev->hw_enc_features & features;
+  segs = skb_mac_gso_segment(skb, enc_features);
+  if (IS_ERR_OR_NULL(segs)) {
+   skb_gso_error_unwind(skb, protocol, ghl, mac_offset, mac_len);
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 718970c..e75dd5d 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -2369,7 +2369,7 @@ struct sk_buff *skb_udp_tunnel_segment(struct sk_buff *skb,
+   skb->encap_hdr_csum = 1;
+ 
+  /* segment inner packet. */
+- enc_features = skb->dev->hw_enc_features & netif_skb_features(skb);
++ enc_features = skb->dev->hw_enc_features & features;
+  segs = skb_mac_gso_segment(skb, enc_features);
+  if (IS_ERR_OR_NULL(segs)) {
+   skb_gso_error_unwind(skb, protocol, tnl_hlen, mac_offset,
+diff --git a/net/ipv6/ip6_offload.c b/net/ipv6/ip6_offload.c
+index c12d5c7..1e45e56 100644
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@ -116,7 +116,7 @@ static struct sk_buff *ipv6_gso_segment(struct sk_buff *skb,
+ 
+  tunnel = SKB_GSO_CB(skb)->encap_level > 0;
+  if (tunnel)
+-  features = skb->dev->hw_enc_features & netif_skb_features(skb);
++  features &= skb->dev->hw_enc_features;
+  SKB_GSO_CB(skb)->encap_level += sizeof(*ipv6h);
+ 
+  ipv6h = ipv6_hdr(skb);
+diff --git a/net/mpls/mpls_gso.c b/net/mpls/mpls_gso.c
+index 6b38d08..fefda6c 100644
+--- a/net/mpls/mpls_gso.c
++++ b/net/mpls/mpls_gso.c
+@@ -48,7 +48,7 @@ static struct sk_buff *mpls_gso_segment(struct sk_buff *skb,
+  __skb_push(skb, skb->mac_len);
+ 
+  /* Segment inner packet. */
+- mpls_features = skb->dev->mpls_features & netif_skb_features(skb);
++ mpls_features = skb->dev->mpls_features & features;
+  segs = skb_mac_gso_segment(skb, mpls_features);
+ 
+ 
+-- 
+1.7.1

@@ -1,0 +1,103 @@
+From 87e99222f9b57533d03190c04dcae893141cd8f0 Mon Sep 17 00:00:00 2001
+From: Panu Matilainen <pmatilai@redhat.com>
+Date: Thu, 27 Nov 2014 13:03:26 -0500
+Subject: [net] vti: Fix kernel panic due to tunnel not being removed on link deletion
+
+Message-id: <97498097ce5cf25cb8f24a0dce91727a4057e96c.1417093386.git.pmatilai@redhat.com>
+Patchwork-id: 100991
+O-Subject: [RHEL7 PATCH net] vti: Fix kernel panic due to tunnel not being removed on link deletion
+Bugzilla: 1167725
+RH-Acked-by: Marcelo Leitner <mleitner@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1167725
+Upstream: 20ea60ca9952bd19d4b0d74719daba305aef5178 (davem/net.git)
+Tested: Locally in VM
+Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=8305705
+
+The missing dellink operation on vti causes a kernel panic on next
+link addition, unlike upstream commit explains rmmod is not necessary
+to trigger it, simply
+ ip link del ip_vti0 type vti
+ ip link add ip_vti0 type vti
+can be sufficient to panic.
+
+RHEL 7 kernel has no virtual tunnel support on IPv6 so the fix is
+reduced to a one-liner on IPv4 side from the upstream commit:
+
+commit 20ea60ca9952bd19d4b0d74719daba305aef5178
+Author: lucien <lucien.xin@gmail.com>
+Date:   Sun Nov 23 15:04:11 2014 +0800
+
+    ip_tunnel: the lack of vti_link_ops' dellink() cause kernel panic
+
+    Now the vti_link_ops do not point the .dellink, for fb tunnel device
+    (ip_vti0), the net_device will be removed as the default .dellink is
+    unregister_netdevice_queue,but the tunnel still in the tunnel list,
+    then if we add a new vti tunnel, in ip_tunnel_find():
+
+            hlist_for_each_entry_rcu(t, head, hash_node) {
+                    if (local == t->parms.iph.saddr &&
+                        remote == t->parms.iph.daddr &&
+                        link == t->parms.link &&
+    ==>                 type == t->dev->type &&
+                        ip_tunnel_key_match(&t->parms, flags, key))
+                            break;
+            }
+
+    the panic will happen, cause dev of ip_tunnel *t is null:
+    [ 3835.072977] IP: [<ffffffffa04103fd>] ip_tunnel_find+0x9d/0xc0 [ip_tunnel]
+    [ 3835.073008] PGD b2c21067 PUD b7277067 PMD 0
+    [ 3835.073008] Oops: 0000 [#1] SMP
+    .....
+    [ 3835.073008] Stack:
+    [ 3835.073008]  ffff8800b72d77f0 ffffffffa0411924 ffff8800bb956000 ffff8800b
+    [ 3835.073008]  ffff8800b72d78a0 0000000000000000 ffffffffa040d100 ffff8800b
+    [ 3835.073008]  ffffffffa040b2e3 0000000000000000 0000000000000000 000000000
+    [ 3835.073008] Call Trace:
+    [ 3835.073008]  [<ffffffffa0411924>] ip_tunnel_newlink+0x64/0x160 [ip_tunnel
+    [ 3835.073008]  [<ffffffffa040b2e3>] vti_newlink+0x43/0x70 [ip_vti]
+    [ 3835.073008]  [<ffffffff8150d4da>] rtnl_newlink+0x4fa/0x5f0
+    [ 3835.073008]  [<ffffffff812f68bb>] ? nla_strlcpy+0x5b/0x70
+    [ 3835.073008]  [<ffffffff81508fb0>] ? rtnl_link_ops_get+0x40/0x60
+    [ 3835.073008]  [<ffffffff8150d11f>] ? rtnl_newlink+0x13f/0x5f0
+    [ 3835.073008]  [<ffffffff81509cf4>] rtnetlink_rcv_msg+0xa4/0x270
+    [ 3835.073008]  [<ffffffff8126adf5>] ? sock_has_perm+0x75/0x90
+    [ 3835.073008]  [<ffffffff81509c50>] ? rtnetlink_rcv+0x30/0x30
+    [ 3835.073008]  [<ffffffff81529e39>] netlink_rcv_skb+0xa9/0xc0
+    [ 3835.073008]  [<ffffffff81509c48>] rtnetlink_rcv+0x28/0x30
+    ....
+
+    modprobe ip_vti
+    ip link del ip_vti0 type vti
+    ip link add ip_vti0 type vti
+    rmmod ip_vti
+
+    do that one or more times, kernel will panic.
+
+    fix it by assigning ip_tunnel_dellink to vti_link_ops' dellink, in
+    which we skip the unregister of fb tunnel device. do the same on ip6_vti.
+
+    Signed-off-by: Xin Long <lucien.xin@gmail.com>
+    Signed-off-by: Cong Wang <cwang@twopensource.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Panu Matilainen <pmatilai@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ipv4/ip_vti.c b/net/ipv4/ip_vti.c
+index d855c69..2bca2e3 100644
+--- a/net/ipv4/ip_vti.c
++++ b/net/ipv4/ip_vti.c
+@@ -521,6 +521,7 @@ static struct rtnl_link_ops vti_link_ops __read_mostly = {
+  .validate = vti_tunnel_validate,
+  .newlink = vti_newlink,
+  .changelink = vti_changelink,
++ .dellink = ip_tunnel_dellink,
+  .get_size = vti_get_size,
+  .fill_info = vti_fill_info,
+ };
+-- 
+1.7.1

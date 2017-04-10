@@ -1,0 +1,800 @@
+From ecf4c6c01d417879a370bfd62b2da20be446c6d7 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 25 Nov 2014 16:36:23 -0500
+Subject: [fs] overlayfs: Fix the kABI for overlayfs
+
+Message-id: <20141125163623.18115.93555.stgit@warthog.procyon.org.uk>
+Patchwork-id: 100946
+O-Subject: [PATCH 46/47] Fix the kABI for overlayfs
+Bugzilla: 985875
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Fix up the kABI for overlayfs by the following means:
+
+ (1) Wrap the inode_operations struct with a wrapper whose presence is
+     signalled by S_IOPS_WRAPPER being flagged in inode->i_flags.
+
+     This wrapper provides the ->rename2() and ->dentry_open() methods and
+     also a version to handle future expansion.
+
+     Accessors are provided - get_{rename2,dentry_open}_iop(inode) - that
+     should be used to get hold of the member values rather than accessing the
+     wrapper directly.
+
+ (2) Wrap the super_block struct with a wrapper.  It is assumed that the
+     super_block struct can only be allocated in alloc_super() and no presence
+     flag is necessary.
+
+     This wrapper provides information to control the stacking depth of
+     overlays of overlays and also a version to handle future expansion.
+
+     An accessor is provided - get_s_stack_depth(sb) - which gets a pointer to
+     the stack depth if it exists, or NULL if it does not.
+
+     Since there doesn't appear to be any slack in the super_block struct to
+     store a flag indicating that the wrapper exists, a global variable is
+     used.  This will prevent any module that uses the superblock wrapper
+     contents from linking with an old kernel that doesn't allocate the
+     wrapper.
+
+ (3) The overlayfs filesystem is built as a module and makes a check on the
+     superblocks involved that the kernel supports the stack depth value in
+     its wrapper.
+
+Note that the SELinux fixes will require further kABI workarounds because
+struct security_operations will have to change.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/bad_inode.c b/fs/bad_inode.c
+index c8919ea..7a885e2 100644
+--- a/fs/bad_inode.c
++++ b/fs/bad_inode.c
+@@ -218,6 +218,12 @@ static int bad_inode_mknod (struct inode *dir, struct dentry *dentry,
+  return -EIO;
+ }
+ 
++static int bad_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
++       struct inode *new_dir, struct dentry *new_dentry)
++{
++ return -EIO;
++}
++
+ static int bad_inode_rename2(struct inode *old_dir, struct dentry *old_dentry,
+         struct inode *new_dir, struct dentry *new_dentry,
+         unsigned int flags)
+@@ -270,8 +276,9 @@ static int bad_inode_removexattr(struct dentry *dentry, const char *name)
+  return -EIO;
+ }
+ 
+-static const struct inode_operations bad_inode_ops =
++static const struct inode_operations_wrapper bad_inode_ops =
+ {
++ .ops = {
+  .create  = bad_inode_create,
+  .lookup  = bad_inode_lookup,
+  .link  = bad_inode_link,
+@@ -280,7 +287,7 @@ static const struct inode_operations bad_inode_ops =
+  .mkdir  = bad_inode_mkdir,
+  .rmdir  = bad_inode_rmdir,
+  .mknod  = bad_inode_mknod,
+- .rename2 = bad_inode_rename2,
++ .rename  = bad_inode_rename,
+  .readlink = bad_inode_readlink,
+  /* follow_link must be no-op, otherwise unmounting this inode
+     won't work */
+@@ -293,6 +300,8 @@ static const struct inode_operations bad_inode_ops =
+  .getxattr = bad_inode_getxattr,
+  .listxattr = bad_inode_listxattr,
+  .removexattr = bad_inode_removexattr,
++ },
++ .rename2 = bad_inode_rename2,
+ };
+ 
+ 
+@@ -321,8 +330,9 @@ void make_bad_inode(struct inode *inode)
+  inode->i_mode = S_IFREG;
+  inode->i_atime = inode->i_mtime = inode->i_ctime =
+   current_fs_time(inode->i_sb);
+- inode->i_op = &bad_inode_ops; 
+- inode->i_fop = &bad_file_ops; 
++ inode->i_op = &bad_inode_ops.ops;
++ inode->i_fop = &bad_file_ops;
++ inode->i_flags |= S_IOPS_WRAPPER;
+ }
+ EXPORT_SYMBOL(make_bad_inode);
+ 
+@@ -341,7 +351,7 @@ EXPORT_SYMBOL(make_bad_inode);
+  
+ int is_bad_inode(struct inode *inode)
+ {
+- return (inode->i_op == &bad_inode_ops); 
++ return (inode->i_op == &bad_inode_ops.ops);
+ }
+ 
+ EXPORT_SYMBOL(is_bad_inode);
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index aa66902..6a128d7 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -65,7 +65,7 @@ struct btrfs_iget_args {
+  struct btrfs_root *root;
+ };
+ 
+-static const struct inode_operations btrfs_dir_inode_operations;
++static const struct inode_operations_wrapper btrfs_dir_inode_operations;
+ static const struct inode_operations btrfs_symlink_inode_operations;
+ static const struct inode_operations btrfs_dir_ro_inode_operations;
+ static const struct inode_operations btrfs_special_inode_operations;
+@@ -3514,10 +3514,12 @@ cache_acl:
+   break;
+  case S_IFDIR:
+   inode->i_fop = &btrfs_dir_file_operations;
+-  if (root == root->fs_info->tree_root)
++  if (root == root->fs_info->tree_root) {
+    inode->i_op = &btrfs_dir_ro_inode_operations;
+-  else
+-   inode->i_op = &btrfs_dir_inode_operations;
++  } else {
++   inode->i_op = &btrfs_dir_inode_operations.ops;
++   inode->i_flags |= S_IOPS_WRAPPER;
++  }
+   break;
+  case S_IFLNK:
+   inode->i_op = &btrfs_symlink_inode_operations;
+@@ -6048,7 +6050,7 @@ static int btrfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+  if (err)
+   goto out_fail;
+ 
+- inode->i_op = &btrfs_dir_inode_operations;
++ inode->i_op = &btrfs_dir_inode_operations.ops;
+  inode->i_fop = &btrfs_dir_file_operations;
+ 
+  btrfs_i_size_write(inode, 0);
+@@ -8051,7 +8053,7 @@ int btrfs_create_subvol_root(struct btrfs_trans_handle *trans,
+     &index);
+  if (IS_ERR(inode))
+   return PTR_ERR(inode);
+- inode->i_op = &btrfs_dir_inode_operations;
++ inode->i_op = &btrfs_dir_inode_operations.ops;
+  inode->i_fop = &btrfs_dir_file_operations;
+ 
+  set_nlink(inode, 1);
+@@ -8967,7 +8969,8 @@ static int btrfs_permission(struct inode *inode, int mask)
+  return generic_permission(inode, mask);
+ }
+ 
+-static const struct inode_operations btrfs_dir_inode_operations = {
++static const struct inode_operations_wrapper btrfs_dir_inode_operations = {
++ .ops = {
+  .getattr = btrfs_getattr,
+  .lookup  = btrfs_lookup,
+  .create  = btrfs_create,
+@@ -8975,7 +8978,7 @@ static const struct inode_operations btrfs_dir_inode_operations = {
+  .link  = btrfs_link,
+  .mkdir  = btrfs_mkdir,
+  .rmdir  = btrfs_rmdir,
+- .rename2 = btrfs_rename2,
++ .rename  = btrfs_rename,
+  .symlink = btrfs_symlink,
+  .setattr = btrfs_setattr,
+  .mknod  = btrfs_mknod,
+@@ -8986,6 +8989,8 @@ static const struct inode_operations btrfs_dir_inode_operations = {
+  .permission = btrfs_permission,
+  .get_acl = btrfs_get_acl,
+  .update_time = btrfs_update_time,
++ },
++ .rename2 = btrfs_rename2,
+ };
+ static const struct inode_operations btrfs_dir_ro_inode_operations = {
+  .lookup  = btrfs_lookup,
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+index 4c75149..35309d1 100644
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -818,6 +818,12 @@ static int cifs_setlease(struct file *file, long arg, struct file_lock **lease)
+   return -EAGAIN;
+ }
+ 
++static int cifs_rename(struct inode *old_dir, struct dentry *old,
++         struct inode *new_dir, struct dentry *new)
++{
++ return cifs_rename2(old_dir, old, new_dir, new, 0);
++}
++
+ struct file_system_type cifs_fs_type = {
+  .owner = THIS_MODULE,
+  .name = "cifs",
+@@ -826,7 +832,8 @@ struct file_system_type cifs_fs_type = {
+  /*  .fs_flags */
+ };
+ MODULE_ALIAS_FS("cifs");
+-const struct inode_operations cifs_dir_inode_ops = {
++const struct inode_operations_wrapper cifs_dir_inode_ops = {
++ .ops = {
+  .create = cifs_create,
+  .atomic_open = cifs_atomic_open,
+  .lookup = cifs_lookup,
+@@ -835,7 +842,7 @@ const struct inode_operations cifs_dir_inode_ops = {
+  .link = cifs_hardlink,
+  .mkdir = cifs_mkdir,
+  .rmdir = cifs_rmdir,
+- .rename2 = cifs_rename2,
++ .rename = cifs_rename,
+  .permission = cifs_permission,
+ /* revalidate:cifs_revalidate,   */
+  .setattr = cifs_setattr,
+@@ -847,6 +854,8 @@ const struct inode_operations cifs_dir_inode_ops = {
+  .listxattr = cifs_listxattr,
+  .removexattr = cifs_removexattr,
+ #endif
++ },
++ .rename2 = cifs_rename2,
+ };
+ 
+ const struct inode_operations cifs_file_inode_ops = {
+diff --git a/fs/cifs/cifsfs.h b/fs/cifs/cifsfs.h
+index 9f21c7c..e9c35e2 100644
+--- a/fs/cifs/cifsfs.h
++++ b/fs/cifs/cifsfs.h
+@@ -54,7 +54,7 @@ extern void cifs_sb_active(struct super_block *sb);
+ extern void cifs_sb_deactive(struct super_block *sb);
+ 
+ /* Functions related to inodes */
+-extern const struct inode_operations cifs_dir_inode_ops;
++extern const struct inode_operations_wrapper cifs_dir_inode_ops;
+ extern struct inode *cifs_root_iget(struct super_block *);
+ extern int cifs_create(struct inode *, struct dentry *, umode_t,
+          bool excl);
+diff --git a/fs/cifs/inode.c b/fs/cifs/inode.c
+index aa2446b..7d8b504 100644
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -71,8 +71,9 @@ static void cifs_set_ops(struct inode *inode)
+ #else /* NO DFS support, treat as a directory */
+   {
+ #endif
+-   inode->i_op = &cifs_dir_inode_ops;
++   inode->i_op = &cifs_dir_inode_ops.ops;
+    inode->i_fop = &cifs_dir_ops;
++   inode->i_flags |= S_IOPS_WRAPPER;
+   }
+   break;
+  case S_IFLNK:
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index df85a35..e582295 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2668,7 +2668,7 @@ static inline int ext4_has_inline_data(struct inode *inode)
+ }
+ 
+ /* namei.c */
+-extern const struct inode_operations ext4_dir_inode_operations;
++extern const struct inode_operations_wrapper ext4_dir_inode_operations;
+ extern const struct inode_operations ext4_special_inode_operations;
+ extern struct dentry *ext4_get_parent(struct dentry *child);
+ extern struct ext4_dir_entry_2 *ext4_init_dot_dotdot(struct inode *inode,
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 7f9de41..6553376 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4118,8 +4118,9 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
+   inode->i_fop = &ext4_file_operations;
+   ext4_set_aops(inode);
+  } else if (S_ISDIR(inode->i_mode)) {
+-  inode->i_op = &ext4_dir_inode_operations;
++  inode->i_op = &ext4_dir_inode_operations.ops;
+   inode->i_fop = &ext4_dir_operations;
++  inode->i_flags |= S_IOPS_WRAPPER;
+  } else if (S_ISLNK(inode->i_mode)) {
+   if (ext4_inode_is_fast_symlink(inode)) {
+    inode->i_op = &ext4_fast_symlink_inode_operations;
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index e7a9823..dd45ec4 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -2392,7 +2392,7 @@ retry:
+  if (IS_ERR(inode))
+   goto out_stop;
+ 
+- inode->i_op = &ext4_dir_inode_operations;
++ inode->i_op = &ext4_dir_inode_operations.ops;
+  inode->i_fop = &ext4_dir_operations;
+  err = ext4_init_new_dir(handle, dir, inode);
+  if (err)
+@@ -3484,10 +3484,17 @@ static int ext4_rename2(struct inode *old_dir, struct dentry *old_dentry,
+  return ext4_rename(old_dir, old_dentry, new_dir, new_dentry, flags);
+ }
+ 
++static int ext4_rename_old(struct inode *old_dir, struct dentry *old_dentry,
++      struct inode *new_dir, struct dentry *new_dentry)
++{
++ return ext4_rename(old_dir, old_dentry, new_dir, new_dentry, 0);
++}
++
+ /*
+  * directories can handle most operations...
+  */
+-const struct inode_operations ext4_dir_inode_operations = {
++const struct inode_operations_wrapper ext4_dir_inode_operations = {
++ .ops = {
+  .create  = ext4_create,
+  .lookup  = ext4_lookup,
+  .link  = ext4_link,
+@@ -3496,7 +3503,7 @@ const struct inode_operations ext4_dir_inode_operations = {
+  .mkdir  = ext4_mkdir,
+  .rmdir  = ext4_rmdir,
+  .mknod  = ext4_mknod,
+- .rename2 = ext4_rename2,
++ .rename  = ext4_rename_old,
+  .setattr = ext4_setattr,
+  .setxattr = generic_setxattr,
+  .getxattr = generic_getxattr,
+@@ -3504,6 +3511,8 @@ const struct inode_operations ext4_dir_inode_operations = {
+  .removexattr = generic_removexattr,
+  .get_acl = ext4_get_acl,
+  .fiemap         = ext4_fiemap,
++ },
++ .rename2 = ext4_rename2,
+ };
+ 
+ const struct inode_operations ext4_special_inode_operations = {
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index aa43bb6..07254ac 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -848,6 +848,14 @@ static int fuse_rename2(struct inode *olddir, struct dentry *oldent,
+  return err;
+ }
+ 
++static int fuse_rename(struct inode *olddir, struct dentry *oldent,
++         struct inode *newdir, struct dentry *newent)
++{
++ return fuse_rename_common(olddir, oldent, newdir, newent, 0,
++      FUSE_RENAME,
++      sizeof(struct fuse_rename_in));
++}
++
+ static int fuse_link(struct dentry *entry, struct inode *newdir,
+        struct dentry *newent)
+ {
+@@ -1930,13 +1938,14 @@ static int fuse_removexattr(struct dentry *entry, const char *name)
+  return err;
+ }
+ 
+-static const struct inode_operations fuse_dir_inode_operations = {
++static const struct inode_operations_wrapper fuse_dir_inode_operations = {
++ .ops = {
+  .lookup  = fuse_lookup,
+  .mkdir  = fuse_mkdir,
+  .symlink = fuse_symlink,
+  .unlink  = fuse_unlink,
+  .rmdir  = fuse_rmdir,
+- .rename2 = fuse_rename2,
++ .rename  = fuse_rename,
+  .link  = fuse_link,
+  .setattr = fuse_setattr,
+  .create  = fuse_create,
+@@ -1948,6 +1957,8 @@ static const struct inode_operations fuse_dir_inode_operations = {
+  .getxattr = fuse_getxattr,
+  .listxattr = fuse_listxattr,
+  .removexattr = fuse_removexattr,
++ },
++ .rename2 = fuse_rename2,
+ };
+ 
+ static const struct file_operations fuse_dir_operations = {
+@@ -1990,8 +2001,9 @@ void fuse_init_common(struct inode *inode)
+ 
+ void fuse_init_dir(struct inode *inode)
+ {
+- inode->i_op = &fuse_dir_inode_operations;
++ inode->i_op = &fuse_dir_inode_operations.ops;
+  inode->i_fop = &fuse_dir_operations;
++ inode->i_flags |= S_IOPS_WRAPPER;
+ }
+ 
+ void fuse_init_symlink(struct inode *inode)
+diff --git a/fs/namei.c b/fs/namei.c
+index b3eaad7..90e5e65 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -3993,6 +3993,7 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+  struct inode *target = new_dentry->d_inode;
+  bool new_is_dir = false;
+  unsigned max_links = new_dir->i_sb->s_max_links;
++ iop_rename2_t rename2;
+ 
+  if (source == target)
+   return 0;
+@@ -4014,10 +4015,11 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+  if (error)
+   return error;
+ 
+- if (!old_dir->i_op->rename && !old_dir->i_op->rename2)
++ rename2 = get_rename2_iop(old_dir);
++ if (!old_dir->i_op->rename && !rename2)
+   return -EPERM;
+ 
+- if (flags && !old_dir->i_op->rename2)
++ if (flags && !rename2)
+   return -EINVAL;
+ 
+  /*
+@@ -4073,13 +4075,13 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+   if (error)
+    goto out;
+  }
+- if (!old_dir->i_op->rename2) {
++ if (!rename2) {
+   error = old_dir->i_op->rename(old_dir, old_dentry,
+            new_dir, new_dentry);
+  } else {
+   WARN_ON(old_dir->i_op->rename != NULL);
+-  error = old_dir->i_op->rename2(old_dir, old_dentry,
+-            new_dir, new_dentry, flags);
++  error = rename2(old_dir, old_dentry,
++    new_dir, new_dentry, flags);
+  }
+  if (error)
+   goto out;
+diff --git a/fs/open.c b/fs/open.c
+index 24eaae3..5cf4cfd 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -876,9 +876,10 @@ int vfs_open(const struct path *path, struct file *filp,
+       const struct cred *cred)
+ {
+  struct inode *inode = path->dentry->d_inode;
++ iop_dentry_open_t dentry_open = get_dentry_open_iop(inode);
+ 
+- if (inode->i_op->dentry_open)
+-  return inode->i_op->dentry_open(path->dentry, filp, cred);
++ if (dentry_open)
++  return dentry_open(path->dentry, filp, cred);
+  else {
+   filp->f_path = *path;
+   return do_dentry_open(filp, NULL, cred);
+diff --git a/fs/overlayfs/dir.c b/fs/overlayfs/dir.c
+index 15cd91a..011aa76 100644
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@ -901,13 +901,20 @@ out:
+  return err;
+ }
+ 
+-const struct inode_operations ovl_dir_inode_operations = {
++static int ovl_rename(struct inode *olddir, struct dentry *old,
++        struct inode *newdir, struct dentry *new)
++{
++ return ovl_rename2(olddir, old, newdir, new, 0);
++}
++
++const struct inode_operations_wrapper ovl_dir_inode_operations = {
++ .ops = {
+  .lookup  = ovl_lookup,
+  .mkdir  = ovl_mkdir,
+  .symlink = ovl_symlink,
+  .unlink  = ovl_unlink,
+  .rmdir  = ovl_rmdir,
+- .rename2 = ovl_rename2,
++ .rename  = ovl_rename,
+  .link  = ovl_link,
+  .setattr = ovl_setattr,
+  .create  = ovl_create,
+@@ -918,4 +925,6 @@ const struct inode_operations ovl_dir_inode_operations = {
+  .getxattr = ovl_getxattr,
+  .listxattr = ovl_listxattr,
+  .removexattr = ovl_removexattr,
++ },
++ .rename2 = ovl_rename2,
+ };
+diff --git a/fs/overlayfs/inode.c b/fs/overlayfs/inode.c
+index af2d18c..a3ddc0e 100644
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@ -357,7 +357,8 @@ out:
+  return err;
+ }
+ 
+-static const struct inode_operations ovl_file_inode_operations = {
++static const struct inode_operations_wrapper ovl_file_inode_operations = {
++ .ops = {
+  .setattr = ovl_setattr,
+  .permission = ovl_permission,
+  .getattr = ovl_getattr,
+@@ -365,6 +366,7 @@ static const struct inode_operations ovl_file_inode_operations = {
+  .getxattr = ovl_getxattr,
+  .listxattr = ovl_listxattr,
+  .removexattr = ovl_removexattr,
++ },
+  .dentry_open = ovl_dentry_open,
+ };
+ 
+@@ -398,8 +400,9 @@ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+  switch (mode) {
+  case S_IFDIR:
+   inode->i_private = oe;
+-  inode->i_op = &ovl_dir_inode_operations;
++  inode->i_op = &ovl_dir_inode_operations.ops;
+   inode->i_fop = &ovl_dir_operations;
++  inode->i_flags |= S_IOPS_WRAPPER;
+   break;
+ 
+  case S_IFLNK:
+@@ -411,7 +414,8 @@ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+  case S_IFBLK:
+  case S_IFCHR:
+  case S_IFIFO:
+-  inode->i_op = &ovl_file_inode_operations;
++  inode->i_op = &ovl_file_inode_operations.ops;
++  inode->i_flags |= S_IOPS_WRAPPER;
+   break;
+ 
+  default:
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 814bed3..de76635 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -175,7 +175,7 @@ static inline void ovl_copyattr(struct inode *from, struct inode *to)
+ }
+ 
+ /* dir.c */
+-extern const struct inode_operations ovl_dir_inode_operations;
++extern const struct inode_operations_wrapper ovl_dir_inode_operations;
+ struct dentry *ovl_lookup_temp(struct dentry *workdir, struct dentry *dentry);
+ int ovl_create_real(struct inode *dir, struct dentry *newdentry,
+       struct kstat *stat, const char *link,
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index 08b704c..1620eb3 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -607,6 +607,8 @@ static int ovl_fill_super(struct super_block *sb, void *data, int silent)
+  struct ovl_entry *oe;
+  struct ovl_fs *ufs;
+  struct kstatfs statfs;
++ const int *upper_stack_depth, *lower_stack_depth;
++ int *overlay_stack_depth;
+  int err;
+ 
+  err = -ENOMEM;
+@@ -677,11 +679,19 @@ static int ovl_fill_super(struct super_block *sb, void *data, int silent)
+  }
+  ufs->lower_namelen = statfs.f_namelen;
+ 
+- sb->s_stack_depth = max(upperpath.mnt->mnt_sb->s_stack_depth,
+-    lowerpath.mnt->mnt_sb->s_stack_depth) + 1;
++ upper_stack_depth = get_s_stack_depth(upperpath.mnt->mnt_sb);
++ lower_stack_depth = get_s_stack_depth(lowerpath.mnt->mnt_sb);
++ overlay_stack_depth = get_s_stack_depth(sb);
++ err = -EOPNOTSUPP;
++ if (!upper_stack_depth || !lower_stack_depth || !overlay_stack_depth) {
++  pr_err("overlayfs: superblock missing extension wrapper (old kernel?)\n");
++  goto out_put_workpath;
++ }
++
++ *overlay_stack_depth = max(*upper_stack_depth, *lower_stack_depth) + 1;
+ 
+  err = -EINVAL;
+- if (sb->s_stack_depth > FILESYSTEM_MAX_STACK_DEPTH) {
++ if (*overlay_stack_depth > FILESYSTEM_MAX_STACK_DEPTH) {
+   pr_err("overlayfs: maximum fs stacking depth exceeded\n");
+   goto out_put_workpath;
+  }
+diff --git a/fs/super.c b/fs/super.c
+index 09838ee..eedd3bd 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -36,6 +36,7 @@
+ #include <linux/lockdep.h>
+ #include "internal.h"
+ 
++const unsigned super_block_wrapper_version = 0;
+ 
+ LIST_HEAD(super_blocks);
+ DEFINE_SPINLOCK(sb_lock);
+@@ -137,7 +138,7 @@ static void destroy_super(struct super_block *s)
+  */
+ static struct super_block *alloc_super(struct file_system_type *type, int flags)
+ {
+- struct super_block *s = kzalloc(sizeof(struct super_block),  GFP_USER);
++ struct super_block *s = kzalloc(sizeof(struct super_block_wrapper),  GFP_USER);
+  static const struct super_operations default_op;
+  int i;
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 324a66f..664b4d1 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1367,13 +1367,38 @@ struct super_block {
+ 
+  /* Being remounted read-only */
+  int s_readonly_remount;
++};
++
++extern const unsigned super_block_wrapper_version;
++struct super_block_wrapper {
++ struct super_block sb;
+ 
++ /* -- Wrapper version 0 -- */
+  /*
+   * Indicates how deep in a filesystem stack this SB is
+   */
+  int s_stack_depth;
++
++ /* -- Wrapper version 1 -- */
+ };
+ 
++static inline struct super_block_wrapper *get_sb_wrapper(struct super_block *sb,
++        unsigned version)
++{
++ /* Make sure we get a link failure if this function is used against an
++  * older kernel that doesn't have the superblock wrapper.
++  */
++ if (super_block_wrapper_version < version)
++  return NULL;
++ return container_of(sb, struct super_block_wrapper, sb);
++}
++
++static inline int *get_s_stack_depth(struct super_block *sb)
++{
++ struct super_block_wrapper *wrapper = get_sb_wrapper(sb, 0);
++ return wrapper ? &wrapper->s_stack_depth : NULL;
++}
++
+ /* superblock cache pruning functions */
+ extern void prune_icache_sb(struct super_block *sb, int nr_to_scan);
+ extern void prune_dcache_sb(struct super_block *sb, int nr_to_scan);
+@@ -1614,8 +1639,6 @@ struct inode_operations {
+  int (*mknod) (struct inode *,struct dentry *,umode_t,dev_t);
+  int (*rename) (struct inode *, struct dentry *,
+    struct inode *, struct dentry *);
+- int (*rename2) (struct inode *, struct dentry *,
+-   struct inode *, struct dentry *, unsigned int);
+  int (*setattr) (struct dentry *, struct iattr *);
+  int (*getattr) (struct vfsmount *mnt, struct dentry *, struct kstat *);
+  int (*setxattr) (struct dentry *, const char *,const void *,size_t,int);
+@@ -1628,9 +1651,28 @@ struct inode_operations {
+  int (*atomic_open)(struct inode *, struct dentry *,
+       struct file *, unsigned open_flag,
+       umode_t create_mode, int *opened);
++} ____cacheline_aligned;
++
++
++/*
++ * RHEL inode struct wrapper - should only be used with get_*_iop() accessors.
++ */
++typedef int (*iop_rename2_t) (struct inode *, struct dentry *,
++         struct inode *, struct dentry *, unsigned int);
++
++typedef int (*iop_dentry_open_t) (struct dentry *, struct file *, const struct cred *);
++
++struct inode_operations_wrapper {
++ struct inode_operations ops;
++ unsigned version;
++ /* -- Wrapper version 0 -- */
++ int (*rename2) (struct inode *, struct dentry *,
++   struct inode *, struct dentry *, unsigned int);
+ 
+  /* WARNING: probably going away soon, do not use! */
+  int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
++
++ /* -- Wrapper version 1 -- */
+ } ____cacheline_aligned;
+ 
+ ssize_t rw_copy_check_uvector(int type, const struct iovec __user * uvector,
+@@ -1690,6 +1732,7 @@ struct super_operations {
+ #define S_IMA  1024 /* Inode has an associated IMA struct */
+ #define S_AUTOMOUNT 2048 /* Automount/referral quasi-directory */
+ #define S_NOSEC  4096 /* no suid or xattr security attributes */
++#define S_IOPS_WRAPPER 8192 /* i_op points to struct inode_operations_wrapper */
+ 
+ /*
+  * Note that nosuid etc flags are inode-specific: setting some file-system
+@@ -1727,6 +1770,7 @@ struct super_operations {
+ #define IS_IMA(inode)  ((inode)->i_flags & S_IMA)
+ #define IS_AUTOMOUNT(inode) ((inode)->i_flags & S_AUTOMOUNT)
+ #define IS_NOSEC(inode)  ((inode)->i_flags & S_NOSEC)
++#define IS_IOPS_WRAPPER(inode) ((inode)->i_flags & S_IOPS_WRAPPER)
+ 
+ #define IS_WHITEOUT(inode) (S_ISCHR(inode->i_mode) && \
+      (inode)->i_rdev == WHITEOUT_DEV)
+@@ -2848,4 +2892,29 @@ static inline void inode_has_no_xattr(struct inode *inode)
+   inode->i_flags |= S_NOSEC;
+ }
+ 
++static inline const struct inode_operations_wrapper *get_iop_wrapper(struct inode *inode,
++             unsigned version)
++{
++ const struct inode_operations_wrapper *wrapper;
++  
++ if (!IS_IOPS_WRAPPER(inode))
++  return NULL;
++ wrapper = container_of(inode->i_op, const struct inode_operations_wrapper, ops);
++ if (wrapper->version < version)
++  return NULL;
++ return wrapper;
++}
++
++static inline iop_rename2_t get_rename2_iop(struct inode *inode)
++{
++ const struct inode_operations_wrapper *wrapper = get_iop_wrapper(inode, 0);
++ return wrapper ? wrapper->rename2 : NULL;
++}
++
++static inline iop_dentry_open_t get_dentry_open_iop(struct inode *inode)
++{
++ const struct inode_operations_wrapper *wrapper = get_iop_wrapper(inode, 0);
++ return wrapper ? wrapper->dentry_open : NULL;
++}
++
+ #endif /* _LINUX_FS_H */
+diff --git a/mm/shmem.c b/mm/shmem.c
+index e65d4f7..7983381 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -171,7 +171,7 @@ static const struct super_operations shmem_ops;
+ static const struct address_space_operations shmem_aops;
+ static const struct file_operations shmem_file_operations;
+ static const struct inode_operations shmem_inode_operations;
+-static const struct inode_operations shmem_dir_inode_operations;
++static const struct inode_operations_wrapper shmem_dir_inode_operations;
+ static const struct inode_operations shmem_special_inode_operations;
+ static const struct vm_operations_struct shmem_vm_ops;
+ 
+@@ -1404,8 +1404,9 @@ static struct inode *shmem_get_inode(struct super_block *sb, const struct inode
+    inc_nlink(inode);
+    /* Some things misbehave if size == 0 on a directory */
+    inode->i_size = 2 * BOGO_DIRENT_SIZE;
+-   inode->i_op = &shmem_dir_inode_operations;
++   inode->i_op = &shmem_dir_inode_operations.ops;
+    inode->i_fop = &simple_dir_operations;
++   inode->i_flags |= S_IOPS_WRAPPER;
+    break;
+   case S_IFLNK:
+    /*
+@@ -2145,6 +2146,11 @@ static int shmem_rename2(struct inode *old_dir, struct dentry *old_dentry, struc
+  return 0;
+ }
+ 
++static int shmem_rename(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry)
++{
++ return shmem_rename2(old_dir, old_dentry, new_dir, new_dentry, 0);
++}
++
+ static int shmem_symlink(struct inode *dir, struct dentry *dentry, const char *symname)
+ {
+  int error;
+@@ -2794,7 +2800,8 @@ static const struct inode_operations shmem_inode_operations = {
+ #endif
+ };
+ 
+-static const struct inode_operations shmem_dir_inode_operations = {
++static const struct inode_operations_wrapper shmem_dir_inode_operations = {
++ .ops = {
+ #ifdef CONFIG_TMPFS
+  .create  = shmem_create,
+  .lookup  = simple_lookup,
+@@ -2804,7 +2811,7 @@ static const struct inode_operations shmem_dir_inode_operations = {
+  .mkdir  = shmem_mkdir,
+  .rmdir  = shmem_rmdir,
+  .mknod  = shmem_mknod,
+- .rename2 = shmem_rename2,
++ .rename  = shmem_rename,
+ #endif
+ #ifdef CONFIG_TMPFS_XATTR
+  .setxattr = shmem_setxattr,
+@@ -2815,6 +2822,10 @@ static const struct inode_operations shmem_dir_inode_operations = {
+ #ifdef CONFIG_TMPFS_POSIX_ACL
+  .setattr = shmem_setattr,
+ #endif
++ },
++#ifdef CONFIG_TMPFS
++ .rename2 = shmem_rename2,
++#endif
+ };
+ 
+ static const struct inode_operations shmem_special_inode_operations = {
+-- 
+1.7.1

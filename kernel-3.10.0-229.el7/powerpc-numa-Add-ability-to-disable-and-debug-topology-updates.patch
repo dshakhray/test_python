@@ -1,0 +1,131 @@
+From 2de0888d84a02fab086e95b155d5c1f7fd7a1977 Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Tue, 4 Nov 2014 22:07:15 -0500
+Subject: [powerpc] numa: Add ability to disable and debug topology updates
+
+Message-id: <1415138837-28185-7-git-send-email-gduarte@redhat.com>
+Patchwork-id: 99395
+O-Subject: [RHEL7.1 PATCH BZ 1150097 6/8] powerpc/numa: Add ability to disable and debug topology updates
+Bugzilla: 1150097
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+BZ 1150097
+Upstream Status: 2d73bae12b26db6eba074b70406c707961b6cda9
+
+commit 2d73bae12b26db6eba074b70406c707961b6cda9
+Author: Nishanth Aravamudan <nacc@linux.vnet.ibm.com>
+Date:   Fri Oct 10 09:04:49 2014 -0700
+
+    powerpc/numa: Add ability to disable and debug topology updates
+
+    We have hit a few customer issues with the topology update code (VPHN
+    and PRRN). It would be nice to be able to debug the notifications coming
+    from the hypervisor in both cases to the LPAR, as well as to disable
+    responding to the notifications at boot-time, to narrow down the source
+    of the problems. Add a basic level of such functionality, similar to the
+    numa= command-line parameter. We already have a toggle in
+    /proc/powerpc/topology_updates that allows run-time enabling/disabling,
+    so the updates can be started at run-time if desired. But the bugs we've
+    run into have occured during boot or very shortly after coming to login,
+    and have resulted in a broken NUMA topology.
+
+    Signed-off-by: Nishanth Aravamudan <nacc@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index 9c0209e..5436696 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -3101,6 +3101,12 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+    e.g. base its process migration decisions on it.
+    Default is on.
+ 
++ topology_updates= [KNL, PPC, NUMA]
++   Format: {off}
++   Specify if the kernel should ignore (off)
++   topology updates sent by the hypervisor to this
++   LPAR.
++
+  tp720=  [HW,PS2]
+ 
+  tpm_suspend_pcr=[HW,TPM]
+diff --git a/arch/powerpc/mm/numa.c b/arch/powerpc/mm/numa.c
+index 17c65b6..9123e8f 100644
+--- a/arch/powerpc/mm/numa.c
++++ b/arch/powerpc/mm/numa.c
+@@ -8,6 +8,8 @@
+  * as published by the Free Software Foundation; either version
+  * 2 of the License, or (at your option) any later version.
+  */
++#define pr_fmt(fmt) "numa: " fmt
++
+ #include <linux/threads.h>
+ #include <linux/bootmem.h>
+ #include <linux/init.h>
+@@ -1162,6 +1164,22 @@ static int __init early_numa(char *p)
+ }
+ early_param("numa", early_numa);
+ 
++static bool topology_updates_enabled = true;
++
++static int __init early_topology_updates(char *p)
++{
++ if (!p)
++  return 0;
++
++ if (!strcmp(p, "off")) {
++  pr_info("Disabling topology updates\n");
++  topology_updates_enabled = false;
++ }
++
++ return 0;
++}
++early_param("topology_updates", early_topology_updates);
++
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ /*
+  * Find the node associated with a hot added memory section for
+@@ -1548,6 +1566,9 @@ int arch_update_cpu_topology(void)
+  struct device *dev;
+  int weight, new_nid, i = 0;
+ 
++ if (!prrn_enabled && !vphn_enabled)
++  return 0;
++
+  weight = cpumask_weight(&cpu_associativity_changes_mask);
+  if (!weight)
+   return 0;
+@@ -1601,6 +1622,15 @@ int arch_update_cpu_topology(void)
+   cpu = cpu_last_thread_sibling(cpu);
+  }
+ 
++ pr_debug("Topology update for the following CPUs:\n");
++ if (cpumask_weight(&updated_cpus)) {
++  for (ud = &updates[0]; ud; ud = ud->next) {
++   pr_debug("cpu %d moving from node %d "
++       "to %d\n", ud->cpu,
++       ud->old_nid, ud->new_nid);
++  }
++ }
++
+  /*
+   * In cases where we have nothing to update (because the updates list
+   * is too short or because the new topology is same as the old one),
+@@ -1809,7 +1839,10 @@ static const struct file_operations topology_ops = {
+ 
+ static int topology_update_init(void)
+ {
+- start_topology_update();
++ /* Do not poll for changes if disabled at boot */
++ if (topology_updates_enabled)
++  start_topology_update();
++
+  if (!proc_create("powerpc/topology_updates", 0644, NULL, &topology_ops))
+   return -ENOMEM;
+ 
+-- 
+1.7.1

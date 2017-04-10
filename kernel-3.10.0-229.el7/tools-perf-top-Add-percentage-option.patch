@@ -1,0 +1,170 @@
+From cc9d0c72b64b7c2edaf6965cc55af9dc845e1673 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:06:33 -0400
+Subject: [tools] perf/top: Add --percentage option
+
+Message-id: <1410181752-25631-149-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91798
+O-Subject: [PATCH RHEL7.1 BZ1134356 148/307] perf top: Add --percentage option
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 33db4568e1f41efe6d0e4695483f968fc1135bf3
+Author: Namhyung Kim <namhyung@kernel.org>
+Date: Fri Feb 7 12:06:07 2014 +0900
+
+description
+===========
+The --percentage option is for controlling overhead percentage
+displayed.  It can only receive either of "relative" or "absolute".
+Move the parser callback function into a common location since it's
+used by multiple commands now.
+
+For more information, please see previous commit same thing done to
+"perf report".
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/Documentation/perf-top.txt b/tools/perf/Documentation/perf-top.txt
+index 976b00c..64ed79c 100644
+--- a/tools/perf/Documentation/perf-top.txt
++++ b/tools/perf/Documentation/perf-top.txt
+@@ -123,13 +123,16 @@ Default is to monitor all CPUS.
+  Show a column with the sum of periods.
+ 
+ --dsos::
+- Only consider symbols in these dsos.
++ Only consider symbols in these dsos.  This option will affect the
++ percentage of the overhead column.  See --percentage for more info.
+ 
+ --comms::
+- Only consider symbols in these comms.
++ Only consider symbols in these comms.  This option will affect the
++ percentage of the overhead column.  See --percentage for more info.
+ 
+ --symbols::
+- Only consider these symbols.
++ Only consider these symbols.  This option will affect the
++ percentage of the overhead column.  See --percentage for more info.
+ 
+ -M::
+ --disassembler-style=:: Set disassembler style for objdump.
+@@ -165,6 +168,15 @@ Default is to monitor all CPUS.
+  Do not show entries which have an overhead under that percent.
+  (Default: 0).
+ 
++--percentage::
++ Determine how to display the overhead percentage of filtered entries.
++ Filters can be applied by --comms, --dsos and/or --symbols options and
++ Zoom operations on the TUI (thread, dso, etc).
++
++ "relative" means it's relative to filtered entries only so that the
++ sum of shown entries will be always 100%. "absolute" means it retains
++ the original value before and after the filter is applied.
++
+ INTERACTIVE PROMPTING KEYS
+ --------------------------
+ 
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 7ec351b..af8cb7a 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -717,20 +717,6 @@ parse_percent_limit(const struct option *opt, const char *str,
+  return 0;
+ }
+ 
+-static int
+-parse_percentage(const struct option *opt __maybe_unused, const char *str,
+-   int unset __maybe_unused)
+-{
+- if (!strcmp(str, "relative"))
+-  symbol_conf.filter_relative = true;
+- else if (!strcmp(str, "absolute"))
+-  symbol_conf.filter_relative = false;
+- else
+-  return -1;
+-
+- return 0;
+-}
+-
+ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
+ {
+  struct perf_session *session;
+@@ -854,7 +840,7 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
+  OPT_CALLBACK(0, "percent-limit", &report, "percent",
+        "Don't show entries under that percent", parse_percent_limit),
+  OPT_CALLBACK(0, "percentage", NULL, "relative|absolute",
+-       "how to display percentage of filtered entries", parse_percentage),
++       "how to display percentage of filtered entries", parse_filter_percentage),
+  OPT_END()
+  };
+  struct perf_data_file file = {
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index 2526901..37d3046 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -697,8 +697,7 @@ static void perf_event__process_sample(struct perf_tool *tool,
+  if (event->header.misc & PERF_RECORD_MISC_EXACT_IP)
+   top->exact_samples++;
+ 
+- if (perf_event__preprocess_sample(event, machine, &al, sample) < 0 ||
+-     al.filtered)
++ if (perf_event__preprocess_sample(event, machine, &al, sample) < 0)
+   return;
+ 
+  if (!top->kptr_restrict_warned &&
+@@ -1119,6 +1118,8 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
+  OPT_STRING('u', "uid", &target->uid_str, "user", "user to profile"),
+  OPT_CALLBACK(0, "percent-limit", &top, "percent",
+        "Don't show entries under that percent", parse_percent_limit),
++ OPT_CALLBACK(0, "percentage", NULL, "relative|absolute",
++       "How to display percentage of filtered entries", parse_filter_percentage),
+  OPT_END()
+  };
+  const char * const top_usage[] = {
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index 3ebd89a..3c2dd23 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -943,3 +943,16 @@ u64 hists__total_period(struct hists *hists)
+  return symbol_conf.filter_relative ? hists->stats.total_non_filtered_period :
+   hists->stats.total_period;
+ }
++
++int parse_filter_percentage(const struct option *opt __maybe_unused,
++       const char *arg, int unset __maybe_unused)
++{
++ if (!strcmp(arg, "relative"))
++  symbol_conf.filter_relative = true;
++ else if (!strcmp(arg, "absolute"))
++  symbol_conf.filter_relative = false;
++ else
++  return -1;
++
++ return 0;
++}
+diff --git a/tools/perf/util/hist.h b/tools/perf/util/hist.h
+index 3191496..a4ec336 100644
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@ -254,4 +254,9 @@ static inline int script_browse(const char *script_opt __maybe_unused)
+ #endif
+ 
+ unsigned int hists__sort_list_width(struct hists *hists);
++
++struct option;
++int parse_filter_percentage(const struct option *opt __maybe_unused,
++       const char *arg, int unset __maybe_unused);
++
+ #endif /* __PERF_HIST_H */
+-- 
+1.7.1

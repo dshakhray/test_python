@@ -1,0 +1,144 @@
+From 8af821e11e05f499854063ea525fc37b0cfe2de2 Mon Sep 17 00:00:00 2001
+From: Sai Vemuri <svemuri@redhat.com>
+Date: Wed, 12 Nov 2014 19:08:06 -0500
+Subject: [ethernet] cxgb4: Add support for adaptive rx
+
+Message-id: <1415819300-32670-6-git-send-email-svemuri@redhat.com>
+Patchwork-id: 99861
+O-Subject: [RHEL7.1 PATCH BZ 1163467 05/19] cxgb4: Add support for adaptive rx
+Bugzilla: 1163467
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Based on original work by Kumar Sanghvi <kumaras@chelsio.com>
+
+Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e553ec3ff95ad8ad0176939e9b5c195dc97e3689)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index e8a098a..9bb37e0 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -447,6 +447,7 @@ struct sge_rspq {                   /* state for an SGE response queue */
+  u8 gen;                     /* current generation bit */
+  u8 intr_params;             /* interrupt holdoff parameters */
+  u8 next_intr_params;        /* holdoff params for next interrupt */
++ u8 adaptive_rx;
+  u8 pktcnt_idx;              /* interrupt packet threshold */
+  u8 uld;                     /* ULD handling this queue */
+  u8 idx;                     /* queue index within its group */
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 8218dbf..9fb2883 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -2594,8 +2594,31 @@ static int set_rx_intr_params(struct net_device *dev,
+  return 0;
+ }
+ 
++static int set_adaptive_rx_setting(struct net_device *dev, int adaptive_rx)
++{
++ int i;
++ struct port_info *pi = netdev_priv(dev);
++ struct adapter *adap = pi->adapter;
++ struct sge_eth_rxq *q = &adap->sge.ethrxq[pi->first_qset];
++
++ for (i = 0; i < pi->nqsets; i++, q++)
++  q->rspq.adaptive_rx = adaptive_rx;
++
++ return 0;
++}
++
++static int get_adaptive_rx_setting(struct net_device *dev)
++{
++ struct port_info *pi = netdev_priv(dev);
++ struct adapter *adap = pi->adapter;
++ struct sge_eth_rxq *q = &adap->sge.ethrxq[pi->first_qset];
++
++ return q->rspq.adaptive_rx;
++}
++
+ static int set_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
+ {
++ set_adaptive_rx_setting(dev, c->use_adaptive_rx_coalesce);
+  return set_rx_intr_params(dev, c->rx_coalesce_usecs,
+       c->rx_max_coalesced_frames);
+ }
+@@ -2609,6 +2632,7 @@ static int get_coalesce(struct net_device *dev, struct ethtool_coalesce *c)
+  c->rx_coalesce_usecs = qtimer_val(adap, rq);
+  c->rx_max_coalesced_frames = (rq->intr_params & QINTR_CNT_EN) ?
+   adap->sge.counter_val[rq->pktcnt_idx] : 0;
++ c->use_adaptive_rx_coalesce = get_adaptive_rx_setting(dev);
+  return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/sge.c b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+index 0bb4b15..a8aee36 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@ -203,6 +203,9 @@ enum {
+  RX_LARGE_MTU_BUF = 0x3,   /* large MTU buffer */
+ };
+ 
++static int timer_pkt_quota[] = {1, 1, 2, 3, 4, 5};
++#define MIN_NAPI_WORK  1
++
+ static inline dma_addr_t get_buf_addr(const struct rx_sw_desc *d)
+ {
+  return d->dma_addr & ~(dma_addr_t)RX_BUF_FLAGS;
+@@ -1967,9 +1970,26 @@ static int napi_rx_handler(struct napi_struct *napi, int budget)
+  u32 val;
+ 
+  if (likely(work_done < budget)) {
++  int timer_index;
++
+   napi_complete(napi);
+-  params = q->next_intr_params;
+-  q->next_intr_params = q->intr_params;
++  timer_index = QINTR_TIMER_IDX_GET(q->next_intr_params);
++
++  if (q->adaptive_rx) {
++   if (work_done > max(timer_pkt_quota[timer_index],
++         MIN_NAPI_WORK))
++    timer_index = (timer_index + 1);
++   else
++    timer_index = timer_index - 1;
++
++   timer_index = clamp(timer_index, 0, SGE_TIMERREGS - 1);
++   q->next_intr_params = QINTR_TIMER_IDX(timer_index) |
++             V_QINTR_CNT_EN;
++   params = q->next_intr_params;
++  } else {
++   params = q->next_intr_params;
++   q->next_intr_params = q->intr_params;
++  }
+  } else
+   params = QINTR_TIMER_IDX(7);
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
+index 10128d7..4fc2494 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.h
+@@ -135,6 +135,7 @@ struct rsp_ctrl {
+ #define RSPD_GEN(x)  ((x) >> 7)
+ #define RSPD_TYPE(x) (((x) >> 4) & 3)
+ 
++#define V_QINTR_CNT_EN    0x0
+ #define QINTR_CNT_EN       0x1
+ #define QINTR_TIMER_IDX(x) ((x) << 1)
+ #define QINTR_TIMER_IDX_GET(x) (((x) >> 1) & 0x7)
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h b/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+index f227588..93f6f1c 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_regs.h
+@@ -77,6 +77,7 @@
+ #define  PIDX_T5(x)  (((x) >> S_PIDX_T5) & M_PIDX_T5)
+ 
+ 
++#define SGE_TIMERREGS 6
+ #define SGE_PF_GTS 0x4
+ #define  INGRESSQID_MASK   0xffff0000U
+ #define  INGRESSQID_SHIFT  16
+-- 
+1.7.1

@@ -1,0 +1,84 @@
+From f27c51a819d3de524941ce61aadd5f86237a8541 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Wed, 29 Oct 2014 16:34:39 -0400
+Subject: [fs] ext4: don't orphan or truncate the boot loader inode
+
+Message-id: <1414600485-1929-50-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98560
+O-Subject: [RHEL 7.1 PATCH v2 49/55] ext4: don't orphan or truncate the boot loader inode
+Bugzilla: 1156096
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Theodore Ts'o <tytso@mit.edu>
+
+BZ 1156096
+https://bugzilla.redhat.com/show_bug.cgi?id=1156096
+
+BREW 8169722
+https://brewweb.devel.redhat.com/taskinfo?taskID=8169722
+
+Upstream commit e2bfb088fac03c0f621886a04cffc7faa2b49b1d
+
+ The boot loader inode (inode #5) should never be visible in the
+ directory hierarchy, but it's possible if the file system is corrupted
+ that there will be a directory entry that points at inode #5.  In
+ order to avoid accidentally trashing it, when such a directory inode
+ is opened, the inode will be marked as a bad inode, so that it's not
+ possible to modify (or read) the inode from userspace.
+
+ Unfortunately, when we unlink this (invalid/illegal) directory entry,
+ we will put the bad inode on the ophan list, and then when try to
+ unlink the directory, we don't actually remove the bad inode from the
+ orphan list before freeing in-memory inode structure.  This means the
+ in-memory orphan list is corrupted, leading to a kernel oops.
+
+ In addition, avoid truncating a bad inode in ext4_destroy_inode(),
+ since truncating the boot loader inode is not a smart thing to do.
+
+ Reported-by: Sami Liedes <sami.liedes@iki.fi>
+ Reviewed-by: Jan Kara <jack@suse.cz>
+ Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+ Cc: stable@vger.kernel.org
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 742d714..921f83c 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -223,16 +223,15 @@ void ext4_evict_inode(struct inode *inode)
+   goto no_delete;
+  }
+ 
+- if (!is_bad_inode(inode))
+-  dquot_initialize(inode);
++ if (is_bad_inode(inode))
++  goto no_delete;
++ dquot_initialize(inode);
+ 
+  if (ext4_should_order_data(inode))
+   ext4_begin_ordered_truncate(inode, 0);
+  truncate_inode_pages_final(&inode->i_data);
+ 
+  WARN_ON(atomic_read(&EXT4_I(inode)->i_ioend_count));
+- if (is_bad_inode(inode))
+-  goto no_delete;
+ 
+  /*
+   * Protect us against freezing - iput() caller didn't have to have any
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index d12a255..537895f 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -2531,7 +2531,7 @@ int ext4_orphan_add(handle_t *handle, struct inode *inode)
+  int err = 0, rc;
+  bool dirty = false;
+ 
+- if (!sbi->s_journal)
++ if (!sbi->s_journal || is_bad_inode(inode))
+   return 0;
+ 
+  WARN_ON_ONCE(!(inode->i_state & (I_NEW | I_FREEING)) &&
+-- 
+1.7.1

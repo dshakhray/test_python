@@ -1,0 +1,71 @@
+From eb4e2a1fa8c42d5daf0f07318094d0a3b68a549d Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Mon, 3 Nov 2014 07:52:33 -0500
+Subject: [infiniband] iser: Allow bind only when connection state is UP
+
+Message-id: <ef4cadffe044273a2f3cf5eda55a3e38b38d6210.1415000301.git.avadai@redhat.com>
+Patchwork-id: 98704
+O-Subject: [Patch RHEL7.1 35/37] IB/iser: Allow bind only when connection state is UP
+Bugzilla: 1107622
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Doug Ledford <dledford@redhat.com>
+
+From: Sagi Grimberg <sagig@mellanox.com>
+
+We need to fail the bind operation if the iser connection state != UP
+(started teardown) and this should be done under the state lock.
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 91eb1df39a1fba21bbc28895a84630782cd442ed)
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.c b/drivers/infiniband/ulp/iser/iscsi_iser.c
+index 61ee91d..93ce62f 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@ -344,7 +344,6 @@ iscsi_iser_conn_bind(struct iscsi_cls_session *cls_session,
+        int is_leading)
+ {
+  struct iscsi_conn *conn = cls_conn->dd_data;
+- struct iscsi_session *session;
+  struct iser_conn *ib_conn;
+  struct iscsi_endpoint *ep;
+  int error;
+@@ -363,9 +362,17 @@ iscsi_iser_conn_bind(struct iscsi_cls_session *cls_session,
+  }
+  ib_conn = ep->dd_data;
+ 
+- session = conn->session;
+- if (iser_alloc_rx_descriptors(ib_conn, session))
+-  return -ENOMEM;
++ mutex_lock(&ib_conn->state_mutex);
++ if (ib_conn->state != ISER_CONN_UP) {
++  error = -EINVAL;
++  iser_err("iser_conn %p state is %d, teardown started\n",
++    ib_conn, ib_conn->state);
++  goto out;
++ }
++
++ error = iser_alloc_rx_descriptors(ib_conn, conn->session);
++ if (error)
++  goto out;
+ 
+  /* binds the iSER connection retrieved from the previously
+   * connected ep_handle to the iSCSI layer connection. exchanges
+@@ -375,7 +382,9 @@ iscsi_iser_conn_bind(struct iscsi_cls_session *cls_session,
+  conn->dd_data = ib_conn;
+  ib_conn->iscsi_conn = conn;
+ 
+- return 0;
++out:
++ mutex_unlock(&ib_conn->state_mutex);
++ return error;
+ }
+ 
+ static int
+-- 
+1.7.1

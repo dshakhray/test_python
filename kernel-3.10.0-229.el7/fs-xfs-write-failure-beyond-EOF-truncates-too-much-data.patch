@@ -1,0 +1,72 @@
+From adb5b773e678b9d0744d3e554976bae374393aab Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Thu, 23 Oct 2014 19:39:04 -0400
+Subject: [fs] xfs: write failure beyond EOF truncates too much data
+
+Message-id: <1414093144-51675-5-git-send-email-bfoster@redhat.com>
+Patchwork-id: 98332
+O-Subject: [RHEL7.1 PATCH 4/4] xfs: write failure beyond EOF truncates too much data
+Bugzilla: 1032968
+RH-Acked-by: Carlos Maiolino <cmaiolino@redhat.com>
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+commit 72ab70a19b4ebb19dbe2a79faaa6a4ccead58e70
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Mon Apr 14 18:13:29 2014 +1000
+
+    xfs: write failure beyond EOF truncates too much data
+
+    If we fail a write beyond EOF and have to handle it in
+    xfs_vm_write_begin(), we truncate the inode back to the current inode
+    size. This doesn't take into account the fact that we may have
+    already made successful writes to the same page (in the case of block
+    size < page size) and hence we can truncate the page cache away from
+    blocks with valid data in them. If these blocks are delayed
+    allocation blocks, we now have a mismatch between the page cache and
+    the extent tree, and this will trigger - at minimum - a delayed
+    block count mismatch assert when the inode is evicted from the cache.
+    We can also trip over it when block mapping for direct IO - this is
+    the most common symptom seen from fsx and fsstress when run from
+    xfstests.
+
+    Fix it by only truncating away the exact range we are updating state
+    for in this write_begin call.
+
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Tested-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 2d0f55e..a02548f 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -1647,12 +1647,21 @@ xfs_vm_write_begin(
+  status = __block_write_begin(page, pos, len, xfs_get_blocks);
+  if (unlikely(status)) {
+   struct inode *inode = mapping->host;
++  size_t  isize = i_size_read(inode);
+ 
+   xfs_vm_write_failed(inode, page, pos, len);
+   unlock_page(page);
+ 
+-  if (pos + len > i_size_read(inode))
+-   truncate_pagecache(inode, i_size_read(inode));
++  /*
++   * If the write is beyond EOF, we only want to kill blocks
++   * allocated in this write, not blocks that were previously
++   * written successfully.
++   */
++  if (pos + len > isize) {
++   ssize_t start = max_t(ssize_t, pos, isize);
++
++   truncate_pagecache_range(inode, start, pos + len);
++  }
+ 
+   page_cache_release(page);
+   page = NULL;
+-- 
+1.7.1

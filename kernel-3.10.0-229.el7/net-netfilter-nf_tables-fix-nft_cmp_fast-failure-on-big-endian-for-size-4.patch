@@ -1,0 +1,92 @@
+From 01952c3fce737d6b57b630ac815a05dcf8e4a5a0 Mon Sep 17 00:00:00 2001
+From: Marcelo Leitner <mleitner@redhat.com>
+Date: Tue, 21 Oct 2014 16:17:20 -0400
+Subject: [net] netfilter: nf_tables: fix nft_cmp_fast failure on big endian for size < 4
+
+Message-id: <20141021161720.22888.33438.stgit@localhost.localdomain>
+Patchwork-id: 97934
+O-Subject: [RHEL7 net PATCH 037/124] netfilter: nf_tables: fix nft_cmp_fast failure on big endian for size < 4
+Bugzilla: 1148041 1155088
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Backport of upstream commit: b855d416dc17061ebb271ea7ef1201d100531770
+
+ commit b855d416dc17061ebb271ea7ef1201d100531770
+ Author: Patrick McHardy <kaber@trash.net>
+ Date:   Sat Apr 12 13:17:57 2014 +0200
+
+    netfilter: nf_tables: fix nft_cmp_fast failure on big endian for size < 4
+
+    nft_cmp_fast is used for equality comparisions of size <= 4. For
+    comparisions of size < 4 byte a mask is calculated that is applied to
+    both the data from userspace (during initialization) and the register
+    value (during runtime). Both values are stored using (in effect) memcpy
+    to a memory area that is then interpreted as u32 by nft_cmp_fast.
+
+    This works fine on little endian since smaller types have the same base
+    address, however on big endian this is not true and the smaller types
+    are interpreted as a big number with trailing zero bytes.
+
+    The mask therefore must not include the lower bytes, but the higher bytes
+    on big endian. Add a helper function that does a cpu_to_le32 to switch
+    the bytes on big endian. Since we're dealing with a mask of just consequitive
+    bits, this works out fine.
+
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/netfilter/nf_tables_core.h b/include/net/netfilter/nf_tables_core.h
+index cf2b7ae..a75fc8e 100644
+--- a/include/net/netfilter/nf_tables_core.h
++++ b/include/net/netfilter/nf_tables_core.h
+@@ -13,6 +13,16 @@ struct nft_cmp_fast_expr {
+  u8   len;
+ };
+ 
++/* Calculate the mask for the nft_cmp_fast expression. On big endian the
++ * mask needs to include the *upper* bytes when interpreting that data as
++ * something smaller than the full u32, therefore a cpu_to_le32 is done.
++ */
++static inline u32 nft_cmp_fast_mask(unsigned int len)
++{
++ return cpu_to_le32(~0U >> (FIELD_SIZEOF(struct nft_cmp_fast_expr,
++      data) * BITS_PER_BYTE - len));
++}
++
+ extern const struct nft_expr_ops nft_cmp_fast_ops;
+ 
+ int nft_cmp_module_init(void);
+diff --git a/net/netfilter/nf_tables_core.c b/net/netfilter/nf_tables_core.c
+index 3cf7f01..f4340dc 100644
+--- a/net/netfilter/nf_tables_core.c
++++ b/net/netfilter/nf_tables_core.c
+@@ -25,9 +25,8 @@ static void nft_cmp_fast_eval(const struct nft_expr *expr,
+          struct nft_data data[NFT_REG_MAX + 1])
+ {
+  const struct nft_cmp_fast_expr *priv = nft_expr_priv(expr);
+- u32 mask;
++ u32 mask = nft_cmp_fast_mask(priv->len);
+ 
+- mask = ~0U >> (sizeof(priv->data) * BITS_PER_BYTE - priv->len);
+  if ((data[priv->sreg].data[0] & mask) == priv->data)
+   return;
+  data[NFT_REG_VERDICT].verdict = NFT_BREAK;
+diff --git a/net/netfilter/nft_cmp.c b/net/netfilter/nft_cmp.c
+index 954925d..e2b3f51 100644
+--- a/net/netfilter/nft_cmp.c
++++ b/net/netfilter/nft_cmp.c
+@@ -128,7 +128,7 @@ static int nft_cmp_fast_init(const struct nft_ctx *ctx,
+  BUG_ON(err < 0);
+  desc.len *= BITS_PER_BYTE;
+ 
+- mask = ~0U >> (sizeof(priv->data) * BITS_PER_BYTE - desc.len);
++ mask = nft_cmp_fast_mask(desc.len);
+  priv->data = data.data[0] & mask;
+  priv->len  = desc.len;
+  return 0;
+-- 
+1.7.1

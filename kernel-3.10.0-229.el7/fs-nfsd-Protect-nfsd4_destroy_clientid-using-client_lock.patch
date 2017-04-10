@@ -1,0 +1,75 @@
+From 3c9a3ee04d0a0d0da84a71f3be17bece6417e1d2 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:20:17 -0400
+Subject: [fs] nfsd: Protect nfsd4_destroy_clientid using client_lock
+
+Message-id: <1410898849-22126-134-git-send-email-bfields@redhat.com>
+Patchwork-id: 95737
+O-Subject: [Patch RHEL7 133/165] nfsd: Protect nfsd4_destroy_clientid using client_lock
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+...instead of relying on the client_mutex.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 6b10ad193d391c295146f23cbe8523e48df78999
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 52a4677..68383b0 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -2826,22 +2826,23 @@ nfsd4_sequence_done(struct nfsd4_compoundres *resp)
+ __be32
+ nfsd4_destroy_clientid(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate, struct nfsd4_destroy_clientid *dc)
+ {
+- struct nfs4_client *conf, *unconf, *clp;
++ struct nfs4_client *conf, *unconf;
++ struct nfs4_client *clp = NULL;
+  __be32 status = 0;
+  struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+ 
+  nfs4_lock_state();
++ spin_lock(&nn->client_lock);
+  unconf = find_unconfirmed_client(&dc->clientid, true, nn);
+  conf = find_confirmed_client(&dc->clientid, true, nn);
+  WARN_ON_ONCE(conf && unconf);
+ 
+  if (conf) {
+-  clp = conf;
+-
+   if (client_has_state(conf)) {
+    status = nfserr_clientid_busy;
+    goto out;
+   }
++  clp = conf;
+  } else if (unconf)
+   clp = unconf;
+  else {
+@@ -2849,12 +2850,16 @@ nfsd4_destroy_clientid(struct svc_rqst *rqstp, struct nfsd4_compound_state *csta
+   goto out;
+  }
+  if (!mach_creds_match(clp, rqstp)) {
++  clp = NULL;
+   status = nfserr_wrong_cred;
+   goto out;
+  }
+- expire_client(clp);
++ unhash_client_locked(clp);
+ out:
++ spin_unlock(&nn->client_lock);
+  nfs4_unlock_state();
++ if (clp)
++  expire_client(clp);
+  return status;
+ }
+ 
+-- 
+1.7.1

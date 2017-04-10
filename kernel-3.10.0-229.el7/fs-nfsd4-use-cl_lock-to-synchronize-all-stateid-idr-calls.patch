@@ -1,0 +1,116 @@
+From 9d7e307d1118def4477dbb3a3bedf58a98647a3f Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:19:35 -0400
+Subject: [fs] nfsd4: use cl_lock to synchronize all stateid idr calls
+
+Message-id: <1410898849-22126-92-git-send-email-bfields@redhat.com>
+Patchwork-id: 95711
+O-Subject: [Patch RHEL7 091/165] nfsd4: use cl_lock to synchronize all stateid idr calls
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jlayton@primarydata.com>
+
+Currently, this is serialized by the client_mutex, which is slated for
+removal. Add finer-grained locking here. Also, do some cleanup around
+find_stateid to prepare for taking references.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Benny Halevy <bhalevy@primarydata.com>
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 4770d722014b99e5438c0d1dc44db31ac4547af1
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 344cd1a..bb37cc4 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -467,7 +467,6 @@ static void nfs4_file_put_access(struct nfs4_file *fp, u32 access)
+ static struct nfs4_stid *nfs4_alloc_stid(struct nfs4_client *cl,
+       struct kmem_cache *slab)
+ {
+- struct idr *stateids = &cl->cl_stateids;
+  struct nfs4_stid *stid;
+  int new_id;
+ 
+@@ -475,7 +474,11 @@ static struct nfs4_stid *nfs4_alloc_stid(struct nfs4_client *cl,
+  if (!stid)
+   return NULL;
+ 
+- new_id = idr_alloc_cyclic(stateids, stid, 0, 0, GFP_KERNEL);
++ idr_preload(GFP_KERNEL);
++ spin_lock(&cl->cl_lock);
++ new_id = idr_alloc_cyclic(&cl->cl_stateids, stid, 0, 0, GFP_NOWAIT);
++ spin_unlock(&cl->cl_lock);
++ idr_preload_end();
+  if (new_id < 0)
+   goto out_free;
+  stid->sc_client = cl;
+@@ -635,9 +638,12 @@ nfs4_put_stid(struct nfs4_stid *s)
+  struct nfs4_file *fp = s->sc_file;
+  struct nfs4_client *clp = s->sc_client;
+ 
+- if (!atomic_dec_and_test(&s->sc_count))
++ might_lock(&clp->cl_lock);
++
++ if (!atomic_dec_and_lock(&s->sc_count, &clp->cl_lock))
+   return;
+  idr_remove(&clp->cl_stateids, s->sc_stateid.si_opaque.so_id);
++ spin_unlock(&clp->cl_lock);
+  s->sc_free(s);
+  if (fp)
+   put_nfs4_file(fp);
+@@ -1652,7 +1658,8 @@ static void gen_confirm(struct nfs4_client *clp)
+  memcpy(clp->cl_confirm.data, verf, sizeof(clp->cl_confirm.data));
+ }
+ 
+-static struct nfs4_stid *find_stateid(struct nfs4_client *cl, stateid_t *t)
++static struct nfs4_stid *
++find_stateid_locked(struct nfs4_client *cl, stateid_t *t)
+ {
+  struct nfs4_stid *ret;
+ 
+@@ -1662,16 +1669,28 @@ static struct nfs4_stid *find_stateid(struct nfs4_client *cl, stateid_t *t)
+  return ret;
+ }
+ 
+-static struct nfs4_stid *find_stateid_by_type(struct nfs4_client *cl, stateid_t *t, char typemask)
++static struct nfs4_stid *
++find_stateid(struct nfs4_client *cl, stateid_t *t)
++{
++ struct nfs4_stid *ret;
++
++ spin_lock(&cl->cl_lock);
++ ret = find_stateid_locked(cl, t);
++ spin_unlock(&cl->cl_lock);
++ return ret;
++}
++
++static struct nfs4_stid *
++find_stateid_by_type(struct nfs4_client *cl, stateid_t *t, char typemask)
+ {
+  struct nfs4_stid *s;
+ 
+- s = find_stateid(cl, t);
+- if (!s)
+-  return NULL;
+- if (typemask & s->sc_type)
+-  return s;
+- return NULL;
++ spin_lock(&cl->cl_lock);
++ s = find_stateid_locked(cl, t);
++ if (s != NULL && !(typemask & s->sc_type))
++  s = NULL;
++ spin_unlock(&cl->cl_lock);
++ return s;
+ }
+ 
+ static struct nfs4_client *create_client(struct xdr_netobj name,
+-- 
+1.7.1

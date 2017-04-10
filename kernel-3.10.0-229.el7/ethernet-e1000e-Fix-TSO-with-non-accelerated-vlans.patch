@@ -1,0 +1,133 @@
+From c756e4f07344b73fef8ebf8746f7acd43fad51c6 Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Fri, 29 Aug 2014 21:23:16 -0400
+Subject: [ethernet] e1000e: Fix TSO with non-accelerated vlans
+
+Message-id: <1409347403-2401-6-git-send-email-vyasevic@redhat.com>
+Patchwork-id: 89923
+O-Subject: [RHEL7 PATCH 05/12] e1000e: Fix TSO with non-accelerated vlans
+Bugzilla: 1135619
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: John Greene <jogreene@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+
+From: Vlad Yasevich <vyasevich@gmail.com>
+
+This device claims  TSO support for vlans.  It also allows a
+user to control vlan acceleration offloading.  As such, it is
+possible to turn off vlan acceleration and configure a vlan
+which will continue to support TSO.
+
+In such situation the packet passed down the the device will contain
+a vlan header and skb->protocol will be set to ETH_P_8021Q.
+The device assumes that skb->protocol contains network protocol
+value and uses that value to set up TSO information.  This results
+in corrupted frames sent on the wire.  Corruptions include
+incorrect IP total length and invalid IP checksum.
+
+This patch extract the protocol value correctly and corrects TSO
+for non-accelerated traffic.
+
+CC: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+CC: Jesse Brandeburg <jesse.brandeburg@intel.com>
+CC: Bruce Allan <bruce.w.allan@intel.com>
+CC: Carolyn Wyborny <carolyn.wyborny@intel.com>
+CC: Don Skidmore <donald.c.skidmore@intel.com>
+CC: Greg Rose <gregory.v.rose@intel.com>
+CC: Alex Duyck <alexander.h.duyck@intel.com>
+CC: John Ronciak <john.ronciak@intel.com>
+CC: Mitch Williams <mitch.a.williams@intel.com>
+CC: Linux NICS <linux.nics@intel.com>
+CC: e1000-devel@lists.sourceforge.net
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 47ccd1edc57ddabb81f6ba07e1e30201a8f578d6)
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index e87e9b0..e3313eb 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -5056,7 +5056,8 @@ link_up:
+ #define E1000_TX_FLAGS_VLAN_MASK 0xffff0000
+ #define E1000_TX_FLAGS_VLAN_SHIFT 16
+ 
+-static int e1000_tso(struct e1000_ring *tx_ring, struct sk_buff *skb)
++static int e1000_tso(struct e1000_ring *tx_ring, struct sk_buff *skb,
++       __be16 protocol)
+ {
+  struct e1000_context_desc *context_desc;
+  struct e1000_buffer *buffer_info;
+@@ -5077,7 +5078,7 @@ static int e1000_tso(struct e1000_ring *tx_ring, struct sk_buff *skb)
+ 
+  hdr_len = skb_transport_offset(skb) + tcp_hdrlen(skb);
+  mss = skb_shinfo(skb)->gso_size;
+- if (skb->protocol == htons(ETH_P_IP)) {
++ if (protocol == htons(ETH_P_IP)) {
+   struct iphdr *iph = ip_hdr(skb);
+   iph->tot_len = 0;
+   iph->check = 0;
+@@ -5125,7 +5126,8 @@ static int e1000_tso(struct e1000_ring *tx_ring, struct sk_buff *skb)
+  return 1;
+ }
+ 
+-static bool e1000_tx_csum(struct e1000_ring *tx_ring, struct sk_buff *skb)
++static bool e1000_tx_csum(struct e1000_ring *tx_ring, struct sk_buff *skb,
++     __be16 protocol)
+ {
+  struct e1000_adapter *adapter = tx_ring->adapter;
+  struct e1000_context_desc *context_desc;
+@@ -5133,16 +5135,10 @@ static bool e1000_tx_csum(struct e1000_ring *tx_ring, struct sk_buff *skb)
+  unsigned int i;
+  u8 css;
+  u32 cmd_len = E1000_TXD_CMD_DEXT;
+- __be16 protocol;
+ 
+  if (skb->ip_summed != CHECKSUM_PARTIAL)
+   return 0;
+ 
+- if (skb->protocol == cpu_to_be16(ETH_P_8021Q))
+-  protocol = vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
+- else
+-  protocol = skb->protocol;
+-
+  switch (protocol) {
+  case cpu_to_be16(ETH_P_IP):
+   if (ip_hdr(skb)->protocol == IPPROTO_TCP)
+@@ -5440,6 +5436,7 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
+  int count = 0;
+  int tso;
+  unsigned int f;
++ __be16 protocol = vlan_get_protocol(skb);
+ 
+  if (test_bit(__E1000_DOWN, &adapter->state)) {
+   dev_kfree_skb_any(skb);
+@@ -5514,7 +5511,7 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
+ 
+  first = tx_ring->next_to_use;
+ 
+- tso = e1000_tso(tx_ring, skb);
++ tso = e1000_tso(tx_ring, skb, protocol);
+  if (tso < 0) {
+   dev_kfree_skb_any(skb);
+   return NETDEV_TX_OK;
+@@ -5522,14 +5519,14 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
+ 
+  if (tso)
+   tx_flags |= E1000_TX_FLAGS_TSO;
+- else if (e1000_tx_csum(tx_ring, skb))
++ else if (e1000_tx_csum(tx_ring, skb, protocol))
+   tx_flags |= E1000_TX_FLAGS_CSUM;
+ 
+  /* Old method was to assume IPv4 packet by default if TSO was enabled.
+   * 82571 hardware supports TSO capabilities for IPv6 as well...
+   * no longer assume, we must.
+   */
+- if (skb->protocol == htons(ETH_P_IP))
++ if (protocol == htons(ETH_P_IP))
+   tx_flags |= E1000_TX_FLAGS_IPV4;
+ 
+  if (unlikely(skb->no_fcs))
+-- 
+1.7.1

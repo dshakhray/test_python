@@ -1,0 +1,79 @@
+From a07c950f84979c477ac618044e6c6390d8655540 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Thu, 4 Dec 2014 22:24:03 -0500
+Subject: [fs] aio: fix race between aio event completion and reaping
+
+Message-id: <x49d27zrr3w.fsf@segfault.boston.devel.redhat.com>
+Patchwork-id: 101153
+O-Subject: [RHEL7 PATCH] aio: fix race between aio event completion and reaping
+Bugzilla: 1131312
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+Hi,
+
+Somehow I managed to miss an important hunk in my aio series for 7.1
+(which was also backported to 7.0.z).  IBM had reported issues where
+Mariadb would simply hang waiting for aio completions that had already
+occurred.  The problem ended up being a combination of a missing memory
+barrier and reading the ctx->tail pointer multiple times.  We got the
+former fix in, but in a way that wasn't actually useful (we did the
+barrier before even dereferencing the tail pointer).
+
+IBM reported that things were still failing, and the below patch fixes
+it.  This is part of the bug fix for bz1131312.
+
+Cheers,
+Jeff
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/aio.c b/fs/aio.c
+index a2c14ca..97c0b46 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -1015,7 +1015,7 @@ static long aio_read_events_ring(struct kioctx *ctx,
+      struct io_event __user *event, long nr)
+ {
+  struct aio_ring *ring;
+- unsigned head, pos;
++ unsigned head, tail, pos;
+  long ret = 0;
+  int copy_ret;
+  unsigned long flags;
+@@ -1031,11 +1031,12 @@ static long aio_read_events_ring(struct kioctx *ctx,
+   * Ensure that once we've read the current tail pointer, that
+   * we also see the events that were stored up to the tail.
+   */
++ tail = ctx->tail;
+  smp_rmb();
+ 
+- pr_debug("h%u t%u m%u\n", head, ctx->tail, ctx->nr_events);
++ pr_debug("h%u t%u m%u\n", head, tail, ctx->nr_events);
+ 
+- if (head == ctx->tail)
++ if (head == tail)
+   goto out;
+ 
+  head %= ctx->nr_events;
+@@ -1045,8 +1046,8 @@ static long aio_read_events_ring(struct kioctx *ctx,
+   struct io_event *ev;
+   struct page *page;
+ 
+-  avail = (head <= ctx->tail ? ctx->tail : ctx->nr_events) - head;
+-  if (head == ctx->tail)
++  avail = (head <= tail ? tail : ctx->nr_events) - head;
++  if (head == tail)
+    break;
+ 
+   avail = min(avail, nr - ret);
+@@ -1087,7 +1088,7 @@ static long aio_read_events_ring(struct kioctx *ctx,
+ 
+  spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ 
+- pr_debug("%li  h%u t%u\n", ret, head, ctx->tail);
++ pr_debug("%li  h%u t%u\n", ret, head, tail);
+ 
+ out:
+  mutex_unlock(&ctx->ring_lock);
+-- 
+1.7.1

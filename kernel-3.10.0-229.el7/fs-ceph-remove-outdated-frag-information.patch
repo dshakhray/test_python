@@ -1,0 +1,87 @@
+From 648b56d3e3091a786433e1fd1eb52e25936f457b Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:22:55 -0400
+Subject: [fs] ceph: remove outdated frag information
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-69-git-send-email-sweil@redhat.com>
+Patchwork-id: 89556
+O-Subject: [PATCH 068/303] ceph: remove outdated frag information
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: "Yan, Zheng" <zheng.z.yan@intel.com>
+
+If directory fragments change, fill_inode() inserts new frags into
+the fragtree, but it does not remove outdated frags from the fragtree.
+This patch fixes it.
+
+Signed-off-by: Yan, Zheng <zheng.z.yan@intel.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit 53e879a485f9def0e55c404dbc7187470a01602d)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index 5a6ba00..98515b1 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -569,6 +569,8 @@ static int fill_inode(struct inode *inode,
+  int issued = 0, implemented;
+  struct timespec mtime, atime, ctime;
+  u32 nsplits;
++ struct ceph_inode_frag *frag;
++ struct rb_node *rb_node;
+  struct ceph_buffer *xattr_blob = NULL;
+  int err = 0;
+  int queue_trunc = 0;
+@@ -743,15 +745,38 @@ no_change:
+  /* FIXME: move me up, if/when version reflects fragtree changes */
+  nsplits = le32_to_cpu(info->fragtree.nsplits);
+  mutex_lock(&ci->i_fragtree_mutex);
++ rb_node = rb_first(&ci->i_fragtree);
+  for (i = 0; i < nsplits; i++) {
+   u32 id = le32_to_cpu(info->fragtree.splits[i].frag);
+-  struct ceph_inode_frag *frag = __get_or_create_frag(ci, id);
+-
+-  if (IS_ERR(frag))
+-   continue;
++  frag = NULL;
++  while (rb_node) {
++   frag = rb_entry(rb_node, struct ceph_inode_frag, node);
++   if (ceph_frag_compare(frag->frag, id) >= 0) {
++    if (frag->frag != id)
++     frag = NULL;
++    else
++     rb_node = rb_next(rb_node);
++    break;
++   }
++   rb_node = rb_next(rb_node);
++   rb_erase(&frag->node, &ci->i_fragtree);
++   kfree(frag);
++   frag = NULL;
++  }
++  if (!frag) {
++   frag = __get_or_create_frag(ci, id);
++   if (IS_ERR(frag))
++    continue;
++  }
+   frag->split_by = le32_to_cpu(info->fragtree.splits[i].by);
+   dout(" frag %x split by %d\n", frag->frag, frag->split_by);
+  }
++ while (rb_node) {
++  frag = rb_entry(rb_node, struct ceph_inode_frag, node);
++  rb_node = rb_next(rb_node);
++  rb_erase(&frag->node, &ci->i_fragtree);
++  kfree(frag);
++ }
+  mutex_unlock(&ci->i_fragtree_mutex);
+ 
+  /* were we issued a capability? */
+-- 
+1.7.1

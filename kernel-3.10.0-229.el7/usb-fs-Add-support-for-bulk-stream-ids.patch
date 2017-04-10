@@ -1,0 +1,95 @@
+From f6bd37c420251ee84ee71e22071e940ef0d208ae Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:03 -0400
+Subject: [usb] fs: Add support for bulk stream ids
+
+Message-id: <1410887463-20674-292-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95357
+O-Subject: [RHEL7 PATCH 291/591] usbfs: Add support for bulk stream ids
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 948cd8c18c466fdcbe707bb2a42a148796bfccdd
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Wed Oct 9 17:19:29 2013 +0200
+
+    usbfs: Add support for bulk stream ids
+
+    This patch makes it possible to specify a bulk stream id when submitting
+    an urb using the async usbfs API. It overloads the number_of_packets
+    usbdevfs_urb field for this. This is not pretty, but given other
+    constraints it is the best we can do. The reasoning leading to this goes
+    as follows:
+
+    1) We want to support bulk streams in the usbfs API
+    2) We do not want to extend the usbdevfs_urb struct with a new member, as
+       that would mean defining new ioctl numbers for all async API ioctls +
+       adding compat versions for the old ones (times 2 for 32 bit support)
+    3) 1 + 2 means we need to re-use an existing field
+    4) number_of_packets is only used for isoc urbs, and streams are bulk only
+       so it is the best (and only) candidate for re-using
+
+    Note that:
+    1) This patch only uses number_of_packets as stream_id if the app has
+       actually allocated streams on the ep, so that old apps which may have
+       garbage in there (as it was unused until now in the bulk case), will not
+       break
+    2) This patch does not add support for allocating / freeing bulk-streams, that
+       is done in a follow up patch
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/devio.c b/drivers/usb/core/devio.c
+index c88d8bf..d7571a6 100644
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -1209,6 +1209,7 @@ static int proc_do_submiturb(struct dev_state *ps, struct usbdevfs_urb *uurb,
+  unsigned int u, totlen, isofrmlen;
+  int i, ret, is_in, num_sgs = 0, ifnum = -1;
+  int number_of_packets = 0;
++ unsigned int stream_id = 0;
+  void *buf;
+ 
+  if (uurb->flags & ~(USBDEVFS_URB_ISO_ASAP |
+@@ -1294,6 +1295,8 @@ static int proc_do_submiturb(struct dev_state *ps, struct usbdevfs_urb *uurb,
+   num_sgs = DIV_ROUND_UP(uurb->buffer_length, USB_SG_SIZE);
+   if (num_sgs == 1 || num_sgs > ps->dev->bus->sg_tablesize)
+    num_sgs = 0;
++  if (ep->streams)
++   stream_id = uurb->stream_id;
+   break;
+ 
+  case USBDEVFS_URB_TYPE_INTERRUPT:
+@@ -1444,6 +1447,7 @@ static int proc_do_submiturb(struct dev_state *ps, struct usbdevfs_urb *uurb,
+  dr = NULL;
+  as->urb->start_frame = uurb->start_frame;
+  as->urb->number_of_packets = number_of_packets;
++ as->urb->stream_id = stream_id;
+  if (uurb->type == USBDEVFS_URB_TYPE_ISO ||
+    ps->dev->speed == USB_SPEED_HIGH)
+   as->urb->interval = 1 << min(15, ep->desc.bInterval - 1);
+diff --git a/include/uapi/linux/usbdevice_fs.h b/include/uapi/linux/usbdevice_fs.h
+index 0c65e4b..cbf122d 100644
+--- a/include/uapi/linux/usbdevice_fs.h
++++ b/include/uapi/linux/usbdevice_fs.h
+@@ -102,7 +102,10 @@ struct usbdevfs_urb {
+  int buffer_length;
+  int actual_length;
+  int start_frame;
+- int number_of_packets;
++ union {
++  int number_of_packets; /* Only used for isoc urbs */
++  unsigned int stream_id; /* Only used with bulk streams */
++ };
+  int error_count;
+  unsigned int signr; /* signal to be sent on completion,
+       or 0 if none should be sent. */
+-- 
+1.7.1

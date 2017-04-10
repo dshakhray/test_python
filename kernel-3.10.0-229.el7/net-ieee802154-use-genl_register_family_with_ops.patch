@@ -1,0 +1,323 @@
+From 0de549359338a4da142e2d61541e453098124123 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 12 Sep 2014 14:26:46 -0400
+Subject: [net] ieee802154: use genl_register_family_with_ops()
+
+Message-id: <894a89facfbf61619c232ccb48d21c3a52105c3d.1410528958.git.jbenc@redhat.com>
+Patchwork-id: 93954
+O-Subject: [RHEL7.1 net PATCH 04/23] ieee802154: use genl_register_family_with_ops()
+Bugzilla: 1140656
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1140656
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7948291
+
+commit 1c582d915da13ca21ad375ae04ec1bd6193418b2
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Thu Nov 14 17:14:41 2013 +0100
+
+    ieee802154: use genl_register_family_with_ops()
+
+    This simplifies the code since there's no longer a need to
+    have error handling in the registration.
+
+    Unfortunately it means more extern function declarations are
+    needed, but the overall goal would seem to justify this.
+
+    While at it, also fix the registration error path - if the
+    family registration failed then it shouldn't be unregistered.
+
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ieee802154/ieee802154.h b/net/ieee802154/ieee802154.h
+index aadec42..14d5dab 100644
+--- a/net/ieee802154/ieee802154.h
++++ b/net/ieee802154/ieee802154.h
+@@ -47,7 +47,22 @@ struct sk_buff *ieee802154_nl_new_reply(struct genl_info *info,
+ int ieee802154_nl_reply(struct sk_buff *msg, struct genl_info *info);
+ 
+ extern struct genl_family nl802154_family;
+-int nl802154_mac_register(void);
+-int nl802154_phy_register(void);
++
++/* genetlink ops/groups */
++int ieee802154_list_phy(struct sk_buff *skb, struct genl_info *info);
++int ieee802154_dump_phy(struct sk_buff *skb, struct netlink_callback *cb);
++int ieee802154_add_iface(struct sk_buff *skb, struct genl_info *info);
++int ieee802154_del_iface(struct sk_buff *skb, struct genl_info *info);
++
++extern struct genl_multicast_group ieee802154_coord_mcgrp;
++extern struct genl_multicast_group ieee802154_beacon_mcgrp;
++
++int ieee802154_associate_req(struct sk_buff *skb, struct genl_info *info);
++int ieee802154_associate_resp(struct sk_buff *skb, struct genl_info *info);
++int ieee802154_disassociate_req(struct sk_buff *skb, struct genl_info *info);
++int ieee802154_scan_req(struct sk_buff *skb, struct genl_info *info);
++int ieee802154_start_req(struct sk_buff *skb, struct genl_info *info);
++int ieee802154_list_iface(struct sk_buff *skb, struct genl_info *info);
++int ieee802154_dump_iface(struct sk_buff *skb, struct netlink_callback *cb);
+ 
+ #endif
+diff --git a/net/ieee802154/netlink.c b/net/ieee802154/netlink.c
+index 7e49bbc..eb9faef 100644
+--- a/net/ieee802154/netlink.c
++++ b/net/ieee802154/netlink.c
+@@ -109,24 +109,39 @@ out:
+  return -ENOBUFS;
+ }
+ 
++static struct genl_ops ieee8021154_ops[] = {
++ /* see nl-phy.c */
++ IEEE802154_DUMP(IEEE802154_LIST_PHY, ieee802154_list_phy,
++   ieee802154_dump_phy),
++ IEEE802154_OP(IEEE802154_ADD_IFACE, ieee802154_add_iface),
++ IEEE802154_OP(IEEE802154_DEL_IFACE, ieee802154_del_iface),
++ /* see nl-mac.c */
++ IEEE802154_OP(IEEE802154_ASSOCIATE_REQ, ieee802154_associate_req),
++ IEEE802154_OP(IEEE802154_ASSOCIATE_RESP, ieee802154_associate_resp),
++ IEEE802154_OP(IEEE802154_DISASSOCIATE_REQ, ieee802154_disassociate_req),
++ IEEE802154_OP(IEEE802154_SCAN_REQ, ieee802154_scan_req),
++ IEEE802154_OP(IEEE802154_START_REQ, ieee802154_start_req),
++ IEEE802154_DUMP(IEEE802154_LIST_IFACE, ieee802154_list_iface,
++   ieee802154_dump_iface),
++};
++
+ int __init ieee802154_nl_init(void)
+ {
+  int rc;
+ 
+- rc = genl_register_family(&nl802154_family);
++ rc = genl_register_family_with_ops(&nl802154_family, ieee8021154_ops,
++        ARRAY_SIZE(ieee8021154_ops));
+  if (rc)
+-  goto fail;
++  return rc;
+ 
+- rc = nl802154_mac_register();
++ rc = genl_register_mc_group(&nl802154_family, &ieee802154_coord_mcgrp);
+  if (rc)
+   goto fail;
+ 
+- rc = nl802154_phy_register();
++ rc = genl_register_mc_group(&nl802154_family, &ieee802154_beacon_mcgrp);
+  if (rc)
+   goto fail;
+-
+  return 0;
+-
+ fail:
+  genl_unregister_family(&nl802154_family);
+  return rc;
+@@ -136,4 +151,3 @@ void __exit ieee802154_nl_exit(void)
+ {
+  genl_unregister_family(&nl802154_family);
+ }
+-
+diff --git a/net/ieee802154/nl-mac.c b/net/ieee802154/nl-mac.c
+index b0bdd8c..28d4930 100644
+--- a/net/ieee802154/nl-mac.c
++++ b/net/ieee802154/nl-mac.c
+@@ -39,11 +39,11 @@
+ 
+ #include "ieee802154.h"
+ 
+-static struct genl_multicast_group ieee802154_coord_mcgrp = {
++struct genl_multicast_group ieee802154_coord_mcgrp = {
+  .name  = IEEE802154_MCAST_COORD_NAME,
+ };
+ 
+-static struct genl_multicast_group ieee802154_beacon_mcgrp = {
++struct genl_multicast_group ieee802154_beacon_mcgrp = {
+  .name  = IEEE802154_MCAST_BEACON_NAME,
+ };
+ 
+@@ -309,8 +309,7 @@ static struct net_device *ieee802154_nl_get_dev(struct genl_info *info)
+  return dev;
+ }
+ 
+-static int ieee802154_associate_req(struct sk_buff *skb,
+-  struct genl_info *info)
++int ieee802154_associate_req(struct sk_buff *skb, struct genl_info *info)
+ {
+  struct net_device *dev;
+  struct ieee802154_addr addr;
+@@ -357,8 +356,7 @@ out:
+  return ret;
+ }
+ 
+-static int ieee802154_associate_resp(struct sk_buff *skb,
+-  struct genl_info *info)
++int ieee802154_associate_resp(struct sk_buff *skb, struct genl_info *info)
+ {
+  struct net_device *dev;
+  struct ieee802154_addr addr;
+@@ -390,8 +388,7 @@ out:
+  return ret;
+ }
+ 
+-static int ieee802154_disassociate_req(struct sk_buff *skb,
+-  struct genl_info *info)
++int ieee802154_disassociate_req(struct sk_buff *skb, struct genl_info *info)
+ {
+  struct net_device *dev;
+  struct ieee802154_addr addr;
+@@ -433,7 +430,7 @@ out:
+  * PAN_coordinator, battery_life_extension = 0,
+  * coord_realignment = 0, security_enable = 0
+ */
+-static int ieee802154_start_req(struct sk_buff *skb, struct genl_info *info)
++int ieee802154_start_req(struct sk_buff *skb, struct genl_info *info)
+ {
+  struct net_device *dev;
+  struct ieee802154_addr addr;
+@@ -492,7 +489,7 @@ out:
+  return ret;
+ }
+ 
+-static int ieee802154_scan_req(struct sk_buff *skb, struct genl_info *info)
++int ieee802154_scan_req(struct sk_buff *skb, struct genl_info *info)
+ {
+  struct net_device *dev;
+  int ret = -EOPNOTSUPP;
+@@ -530,8 +527,7 @@ out:
+  return ret;
+ }
+ 
+-static int ieee802154_list_iface(struct sk_buff *skb,
+- struct genl_info *info)
++int ieee802154_list_iface(struct sk_buff *skb, struct genl_info *info)
+ {
+  /* Request for interface name, index, type, IEEE address,
+     PAN Id, short address */
+@@ -565,8 +561,7 @@ out_dev:
+ 
+ }
+ 
+-static int ieee802154_dump_iface(struct sk_buff *skb,
+- struct netlink_callback *cb)
++int ieee802154_dump_iface(struct sk_buff *skb, struct netlink_callback *cb)
+ {
+  struct net *net = sock_net(skb->sk);
+  struct net_device *dev;
+@@ -590,41 +585,3 @@ cont:
+ 
+  return skb->len;
+ }
+-
+-static struct genl_ops ieee802154_coordinator_ops[] = {
+- IEEE802154_OP(IEEE802154_ASSOCIATE_REQ, ieee802154_associate_req),
+- IEEE802154_OP(IEEE802154_ASSOCIATE_RESP, ieee802154_associate_resp),
+- IEEE802154_OP(IEEE802154_DISASSOCIATE_REQ, ieee802154_disassociate_req),
+- IEEE802154_OP(IEEE802154_SCAN_REQ, ieee802154_scan_req),
+- IEEE802154_OP(IEEE802154_START_REQ, ieee802154_start_req),
+- IEEE802154_DUMP(IEEE802154_LIST_IFACE, ieee802154_list_iface,
+-       ieee802154_dump_iface),
+-};
+-
+-/*
+- * No need to unregister as family unregistration will do it.
+- */
+-int nl802154_mac_register(void)
+-{
+- int i;
+- int rc;
+-
+- rc = genl_register_mc_group(&nl802154_family,
+-   &ieee802154_coord_mcgrp);
+- if (rc)
+-  return rc;
+-
+- rc = genl_register_mc_group(&nl802154_family,
+-   &ieee802154_beacon_mcgrp);
+- if (rc)
+-  return rc;
+-
+- for (i = 0; i < ARRAY_SIZE(ieee802154_coordinator_ops); i++) {
+-  rc = genl_register_ops(&nl802154_family,
+-    &ieee802154_coordinator_ops[i]);
+-  if (rc)
+-   return rc;
+- }
+-
+- return 0;
+-}
+diff --git a/net/ieee802154/nl-phy.c b/net/ieee802154/nl-phy.c
+index 22b1a70..d08c7a4 100644
+--- a/net/ieee802154/nl-phy.c
++++ b/net/ieee802154/nl-phy.c
+@@ -77,8 +77,7 @@ out:
+  return -EMSGSIZE;
+ }
+ 
+-static int ieee802154_list_phy(struct sk_buff *skb,
+- struct genl_info *info)
++int ieee802154_list_phy(struct sk_buff *skb, struct genl_info *info)
+ {
+  /* Request for interface name, index, type, IEEE address,
+     PAN Id, short address */
+@@ -151,8 +150,7 @@ static int ieee802154_dump_phy_iter(struct wpan_phy *phy, void *_data)
+  return 0;
+ }
+ 
+-static int ieee802154_dump_phy(struct sk_buff *skb,
+- struct netlink_callback *cb)
++int ieee802154_dump_phy(struct sk_buff *skb, struct netlink_callback *cb)
+ {
+  struct dump_phy_data data = {
+   .cb = cb,
+@@ -170,8 +168,7 @@ static int ieee802154_dump_phy(struct sk_buff *skb,
+  return skb->len;
+ }
+ 
+-static int ieee802154_add_iface(struct sk_buff *skb,
+-  struct genl_info *info)
++int ieee802154_add_iface(struct sk_buff *skb, struct genl_info *info)
+ {
+  struct sk_buff *msg;
+  struct wpan_phy *phy;
+@@ -273,8 +270,7 @@ out_dev:
+  return rc;
+ }
+ 
+-static int ieee802154_del_iface(struct sk_buff *skb,
+-  struct genl_info *info)
++int ieee802154_del_iface(struct sk_buff *skb, struct genl_info *info)
+ {
+  struct sk_buff *msg;
+  struct wpan_phy *phy;
+@@ -356,28 +352,3 @@ out_dev:
+ 
+  return rc;
+ }
+-
+-static struct genl_ops ieee802154_phy_ops[] = {
+- IEEE802154_DUMP(IEEE802154_LIST_PHY, ieee802154_list_phy,
+-       ieee802154_dump_phy),
+- IEEE802154_OP(IEEE802154_ADD_IFACE, ieee802154_add_iface),
+- IEEE802154_OP(IEEE802154_DEL_IFACE, ieee802154_del_iface),
+-};
+-
+-/*
+- * No need to unregister as family unregistration will do it.
+- */
+-int nl802154_phy_register(void)
+-{
+- int i;
+- int rc;
+-
+- for (i = 0; i < ARRAY_SIZE(ieee802154_phy_ops); i++) {
+-  rc = genl_register_ops(&nl802154_family,
+-    &ieee802154_phy_ops[i]);
+-  if (rc)
+-   return rc;
+- }
+-
+- return 0;
+-}
+-- 
+1.7.1

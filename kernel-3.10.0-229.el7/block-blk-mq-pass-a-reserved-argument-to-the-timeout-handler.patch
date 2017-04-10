@@ -1,0 +1,93 @@
+From f0ae8c8243a6684c21e1b8d45c6de3eba185feb8 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 10 Oct 2014 21:03:31 -0400
+Subject: [block] blk-mq: pass a reserved argument to the timeout handler
+
+Message-id: <1412975015-5370-31-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 97457
+O-Subject: [RHEL7 PATCH 30/34] blk-mq: pass a reserved argument to the timeout handler
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This commit is backported from the linux-block tree.  The
+scsi_lib.c change dropped due to missing scsi-mq support.  I
+added the genksysms hack around the timed_out_fn, and contest it
+is perfectly ok, since we did not support mq drivers in 7.0,
+so nobody should be looking at this structure.
+
+This resolves bug 1146660.
+
+  commit 0152fb6b57c4fae769ee75ea2ae670f4ff39fba9
+  Author: Christoph Hellwig <hch@lst.de>
+  Date:   Sat Sep 13 16:40:13 2014 -0700
+
+    blk-mq: pass a reserved argument to the timeout handler
+
+    Allow blk-mq to pass an argument to the timeout handler to indicate
+    if we're timing out a reserved or regular command.  For many drivers
+    those need to be handled different.
+
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 242adee..d9c6634 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -529,7 +529,7 @@ struct blk_mq_timeout_data {
+  unsigned int next_set;
+ };
+ 
+-static void blk_mq_rq_timed_out(struct request *req)
++static void blk_mq_rq_timed_out(struct request *req, bool reserved)
+ {
+  struct blk_mq_ops *ops = req->q->mq_ops;
+  enum blk_eh_timer_return ret = BLK_EH_RESET_TIMER;
+@@ -547,7 +547,7 @@ static void blk_mq_rq_timed_out(struct request *req)
+   return;
+ 
+  if (ops->timeout)
+-  ret = ops->timeout(req);
++  ret = ops->timeout(req, reserved);
+ 
+  switch (ret) {
+  case BLK_EH_HANDLED:
+@@ -575,7 +575,7 @@ static void blk_mq_check_expired(struct blk_mq_hw_ctx *hctx,
+ 
+  if (time_after_eq(jiffies, rq->deadline)) {
+   if (!blk_mark_rq_complete(rq))
+-   blk_mq_rq_timed_out(rq);
++   blk_mq_rq_timed_out(rq, reserved);
+  } else if (!data->next_set || time_after(data->next, rq->deadline)) {
+   data->next = rq->deadline;
+   data->next_set = 1;
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index b2f4a4d..e8c4972 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -126,6 +126,7 @@ typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+ typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_reg *,unsigned int);
+ typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ #endif
++typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
+ typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+ typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ typedef int (init_request_fn)(void *, struct request *, unsigned int,
+@@ -150,7 +151,11 @@ struct blk_mq_ops {
+  /*
+   * Called on request timeout
+   */
++#ifdef __GENKSYMS__
+  rq_timed_out_fn  *timeout;
++#else
++ timeout_fn  *timeout;
++#endif
+ 
+  softirq_done_fn  *complete;
+ 
+-- 
+1.7.1

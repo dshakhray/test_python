@@ -1,0 +1,130 @@
+From e424e938f0c508a17cc9f0134239eea5104ba819 Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Wed, 10 Sep 2014 15:16:20 -0400
+Subject: [net] bridge: Prevent insertion of FDB entry with disallowed vlan
+
+Message-id: <1410362181-9327-8-git-send-email-vyasevic@redhat.com>
+Patchwork-id: 93483
+O-Subject: [RHEL7 PATCH 7/8] bridge: Prevent insertion of FDB entry with disallowed vlan
+Bugzilla: 1139809
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+
+Bugzilla: 1139809
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7936510
+
+commit e0d7968ab6c8bce2437b36fa7f04117e333f196d
+From: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+Date: Mon, 26 May 2014 15:15:53 +0900
+
+    bridge: Prevent insertion of FDB entry with disallowed vlan
+
+    br_handle_local_finish() is allowing us to insert an FDB entry with
+    disallowed vlan. For example, when port 1 and 2 are communicating in
+    vlan 10, and even if vlan 10 is disallowed on port 3, port 3 can
+    interfere with their communication by spoofed src mac address with
+    vlan id 10.
+
+    Note: Even if it is judged that a frame should not be learned, it should
+    not be dropped because it is destined for not forwarding layer but higher
+    layer. See IEEE 802.1Q-2011 8.13.10.
+
+    Signed-off-by: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+    Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ net/bridge/br_input.c
+ - conflict due to fdb api change.
+
+ net/bridge/br_private.h
+ - conflict due to removal of 'extern' upstream.
+
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index ab67640..a66dca6 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -147,8 +147,8 @@ static int br_handle_local_finish(struct sk_buff *skb)
+  struct net_bridge_port *p = br_port_get_rcu(skb->dev);
+  u16 vid = 0;
+ 
+- br_vlan_get_tag(skb, &vid);
+- if (p->flags & BR_LEARNING)
++ /* check if vlan is allowed, to avoid spoofing */
++ if (p->flags & BR_LEARNING && br_should_learn(p, skb, &vid))
+   br_fdb_update(p->br, p, eth_hdr(skb)->h_source, vid);
+  return 0;  /* process further */
+ }
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index e4bb7a4..fcd1b79 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -629,6 +629,8 @@ extern bool br_allowed_ingress(struct net_bridge *br, struct net_port_vlans *v,
+ extern bool br_allowed_egress(struct net_bridge *br,
+          const struct net_port_vlans *v,
+          const struct sk_buff *skb);
++extern bool br_should_learn(struct net_bridge_port *p,
++       struct sk_buff *skb, u16 *vid);
+ extern struct sk_buff *br_handle_vlan(struct net_bridge *br,
+           const struct net_port_vlans *v,
+           struct sk_buff *skb);
+@@ -699,6 +701,12 @@ static inline bool br_allowed_egress(struct net_bridge *br,
+  return true;
+ }
+ 
++static inline bool br_should_learn(struct net_bridge_port *p,
++       struct sk_buff *skb, u16 *vid)
++{
++ return true;
++}
++
+ static inline struct sk_buff *br_handle_vlan(struct net_bridge *br,
+           const struct net_port_vlans *v,
+           struct sk_buff *skb)
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index b5cbf85..99cc869 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -241,6 +241,34 @@ bool br_allowed_egress(struct net_bridge *br,
+  return false;
+ }
+ 
++/* Called under RCU */
++bool br_should_learn(struct net_bridge_port *p, struct sk_buff *skb, u16 *vid)
++{
++ struct net_bridge *br = p->br;
++ struct net_port_vlans *v;
++
++ if (!br->vlan_enabled)
++  return true;
++
++ v = rcu_dereference(p->vlan_info);
++ if (!v)
++  return false;
++
++ br_vlan_get_tag(skb, vid);
++ if (!*vid) {
++  *vid = br_get_pvid(v);
++  if (*vid == VLAN_N_VID)
++   return false;
++
++  return true;
++ }
++
++ if (test_bit(*vid, v->vlan_bitmap))
++  return true;
++
++ return false;
++}
++
+ /* Must be protected by RTNL.
+  * Must be called with vid in range from 1 to 4094 inclusive.
+  */
+-- 
+1.7.1

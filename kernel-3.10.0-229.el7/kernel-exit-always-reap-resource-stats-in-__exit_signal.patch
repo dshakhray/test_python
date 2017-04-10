@@ -1,0 +1,89 @@
+From 31cb5a9b22842ff58346370d8ca0736f8331d84c Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@redhat.com>
+Date: Fri, 5 Sep 2014 14:17:00 -0400
+Subject: [kernel] exit: always reap resource stats in __exit_signal
+
+Message-id: <1409926623-25929-5-git-send-email-riel@redhat.com>
+Patchwork-id: 91456
+O-Subject: [RHEL7 PATCH 4/7] exit: always reap resource stats in __exit_signal
+Bugzilla: 1120307
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: Rik van Riel <riel@redhat.com>
+
+Upstream status: in peterz's tip queue
+
+Fixes bug 1120307
+
+Oleg pointed out that wait_task_zombie adds a task's usage statistics
+to the parent's signal struct, but the task's own signal struct should
+also propagate the statistics at exit time.
+
+This allows thread_group_cputime(reaped_zombie) to get the statistics
+after __unhash_process() has made the task invisible to for_each_thread,
+but before the thread has actually been rcu freed, making sure no
+non-monotonic results are returned inside that window.
+
+Suggested-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Rik van Riel <riel@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 8e21663..77a3dd8 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -115,30 +115,29 @@ static void __exit_signal(struct task_struct *tsk)
+ 
+   if (tsk == sig->curr_target)
+    sig->curr_target = next_thread(tsk);
+-  /*
+-   * Accumulate here the counters for all threads but the
+-   * group leader as they die, so they can be added into
+-   * the process-wide totals when those are taken.
+-   * The group leader stays around as a zombie as long
+-   * as there are other threads.  When it gets reaped,
+-   * the exit.c code will add its counts into these totals.
+-   * We won't ever get here for the group leader, since it
+-   * will have been the last reference on the signal_struct.
+-   */
+-  task_cputime(tsk, &utime, &stime);
+-  sig->utime += utime;
+-  sig->stime += stime;
+-  sig->gtime += task_gtime(tsk);
+-  sig->min_flt += tsk->min_flt;
+-  sig->maj_flt += tsk->maj_flt;
+-  sig->nvcsw += tsk->nvcsw;
+-  sig->nivcsw += tsk->nivcsw;
+-  sig->inblock += task_io_get_inblock(tsk);
+-  sig->oublock += task_io_get_oublock(tsk);
+-  task_io_accounting_add(&sig->ioac, &tsk->ioac);
+-  sig->sum_sched_runtime += tsk->se.sum_exec_runtime;
+  }
+ 
++ /*
++  * Accumulate here the counters for all threads but the group leader
++  * as they die, so they can be added into the process-wide totals
++  * when those are taken.  The group leader stays around as a zombie as
++  * long as there are other threads.  When it gets reaped, the exit.c
++  * code will add its counts into these totals.  We won't ever get here
++  * for the group leader, since it will have been the last reference on
++  * the signal_struct.
++  */
++ task_cputime(tsk, &utime, &stime);
++ sig->utime += utime;
++ sig->stime += stime;
++ sig->gtime += task_gtime(tsk);
++ sig->min_flt += tsk->min_flt;
++ sig->maj_flt += tsk->maj_flt;
++ sig->nvcsw += tsk->nvcsw;
++ sig->nivcsw += tsk->nivcsw;
++ sig->inblock += task_io_get_inblock(tsk);
++ sig->oublock += task_io_get_oublock(tsk);
++ task_io_accounting_add(&sig->ioac, &tsk->ioac);
++ sig->sum_sched_runtime += tsk->se.sum_exec_runtime;
+  sig->nr_threads--;
+  __unhash_process(tsk, group_dead);
+ 
+-- 
+1.7.1

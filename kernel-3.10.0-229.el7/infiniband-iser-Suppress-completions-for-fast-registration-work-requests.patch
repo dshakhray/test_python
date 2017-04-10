@@ -1,0 +1,118 @@
+From c068e20c1baa9a04cacccfc9dc9251ef89e37b97 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Mon, 3 Nov 2014 07:52:01 -0500
+Subject: [infiniband] iser: Suppress completions for fast registration work requests
+
+Message-id: <a36a56d88dfde8045c07e58852f904763aae3140.1415000301.git.avadai@redhat.com>
+Patchwork-id: 98672
+O-Subject: [Patch RHEL7.1 03/37] IB/iser: Suppress completions for fast registration work requests
+Bugzilla: 1107622
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Doug Ledford <dledford@redhat.com>
+
+From: Sagi Grimberg <sagig@mellanox.com>
+
+In case iSER uses fast registration method, it should not request for
+successful completions on fast registration nor local invalidate
+requests.  We color wr_id with ISER_FRWR_LI_WRID in order to correctly
+consume error completions.
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit db523b8de13545488b6ff6c952b4527596f3c16a)
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.h b/drivers/infiniband/ulp/iser/iscsi_iser.h
+index 6791402..e1a01c6 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@ -138,6 +138,8 @@
+ #define ISER_WSV   0x08
+ #define ISER_RSV   0x04
+ 
++#define ISER_FRWR_LI_WRID  0xffffffffffffffffULL
++
+ struct iser_hdr {
+  u8      flags;
+  u8      rsvd[3];
+diff --git a/drivers/infiniband/ulp/iser/iser_memory.c b/drivers/infiniband/ulp/iser/iser_memory.c
+index 1ce0c97..f770179 100644
+--- a/drivers/infiniband/ulp/iser/iser_memory.c
++++ b/drivers/infiniband/ulp/iser/iser_memory.c
+@@ -457,8 +457,8 @@ static int iser_fast_reg_mr(struct fast_reg_descriptor *desc,
+ 
+  if (!desc->valid) {
+   memset(&inv_wr, 0, sizeof(inv_wr));
++  inv_wr.wr_id = ISER_FRWR_LI_WRID;
+   inv_wr.opcode = IB_WR_LOCAL_INV;
+-  inv_wr.send_flags = IB_SEND_SIGNALED;
+   inv_wr.ex.invalidate_rkey = desc->data_mr->rkey;
+   wr = &inv_wr;
+   /* Bump the key */
+@@ -468,8 +468,8 @@ static int iser_fast_reg_mr(struct fast_reg_descriptor *desc,
+ 
+  /* Prepare FASTREG WR */
+  memset(&fastreg_wr, 0, sizeof(fastreg_wr));
++ fastreg_wr.wr_id = ISER_FRWR_LI_WRID;
+  fastreg_wr.opcode = IB_WR_FAST_REG_MR;
+- fastreg_wr.send_flags = IB_SEND_SIGNALED;
+  fastreg_wr.wr.fast_reg.iova_start = desc->data_frpl->page_list[0] + offset;
+  fastreg_wr.wr.fast_reg.page_list = desc->data_frpl;
+  fastreg_wr.wr.fast_reg.page_list_len = page_list_len;
+@@ -480,20 +480,13 @@ static int iser_fast_reg_mr(struct fast_reg_descriptor *desc,
+             IB_ACCESS_REMOTE_WRITE |
+             IB_ACCESS_REMOTE_READ);
+ 
+- if (!wr) {
++ if (!wr)
+   wr = &fastreg_wr;
+-  atomic_inc(&ib_conn->post_send_buf_count);
+- } else {
++ else
+   wr->next = &fastreg_wr;
+-  atomic_add(2, &ib_conn->post_send_buf_count);
+- }
+ 
+  ret = ib_post_send(ib_conn->qp, wr, &bad_wr);
+  if (ret) {
+-  if (bad_wr->next)
+-   atomic_sub(2, &ib_conn->post_send_buf_count);
+-  else
+-   atomic_dec(&ib_conn->post_send_buf_count);
+   iser_err("fast registration failed, ret:%d\n", ret);
+   return ret;
+  }
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index ca37ede..7bdb811 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -993,18 +993,16 @@ static int iser_drain_tx_cq(struct iser_device  *device, int cq_index)
+   if (wc.status == IB_WC_SUCCESS) {
+    if (wc.opcode == IB_WC_SEND)
+     iser_snd_completion(tx_desc, ib_conn);
+-   else if (wc.opcode == IB_WC_LOCAL_INV ||
+-     wc.opcode == IB_WC_FAST_REG_MR) {
+-    atomic_dec(&ib_conn->post_send_buf_count);
+-    continue;
+-   } else
++   else
+     iser_err("expected opcode %d got %d\n",
+      IB_WC_SEND, wc.opcode);
+   } else {
+    iser_err("tx id %llx status %d vend_err %x\n",
+-    wc.wr_id, wc.status, wc.vendor_err);
+-   atomic_dec(&ib_conn->post_send_buf_count);
+-   iser_handle_comp_error(tx_desc, ib_conn);
++     wc.wr_id, wc.status, wc.vendor_err);
++   if (wc.wr_id != ISER_FRWR_LI_WRID) {
++    atomic_dec(&ib_conn->post_send_buf_count);
++    iser_handle_comp_error(tx_desc, ib_conn);
++   }
+   }
+   completed_tx++;
+  }
+-- 
+1.7.1

@@ -1,0 +1,382 @@
+From b50206ad52f7863613443254c46a4f61c3ce16cf Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 13 Nov 2014 01:53:39 -0500
+Subject: [md] dm-cache: revert "remove remainder of distinct discard block size"
+
+Message-id: <1415843623-26132-6-git-send-email-snitzer@redhat.com>
+Patchwork-id: 99885
+O-Subject: [RHEL7.1 PATCH 5/9] dm cache: revert "remove remainder of distinct discard block size"
+Bugzilla: 1159001
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1159001
+
+Upstream linux-dm.git commit 1bad9bc4ee899a108499e5eac6baafff018b4d0b
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Fri Nov 7 14:47:07 2014 +0000
+
+    dm cache: revert "remove remainder of distinct discard block size"
+
+    This reverts commit 64ab346a360a4b15c28fb8531918d4a01f4eabd9 because we
+    actually do want to allow the discard blocksize to be larger than the
+    cache blocksize.  Further dm-cache discard changes will make this
+    possible.
+
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-cache-block-types.h b/drivers/md/dm-cache-block-types.h
+index aac0e2d..bed4ad4 100644
+--- a/drivers/md/dm-cache-block-types.h
++++ b/drivers/md/dm-cache-block-types.h
+@@ -19,6 +19,7 @@
+ 
+ typedef dm_block_t __bitwise__ dm_oblock_t;
+ typedef uint32_t __bitwise__ dm_cblock_t;
++typedef dm_block_t __bitwise__ dm_dblock_t;
+ 
+ static inline dm_oblock_t to_oblock(dm_block_t b)
+ {
+@@ -40,4 +41,14 @@ static inline uint32_t from_cblock(dm_cblock_t b)
+  return (__force uint32_t) b;
+ }
+ 
++static inline dm_dblock_t to_dblock(dm_block_t b)
++{
++ return (__force dm_dblock_t) b;
++}
++
++static inline dm_block_t from_dblock(dm_dblock_t b)
++{
++ return (__force dm_block_t) b;
++}
++
+ #endif /* DM_CACHE_BLOCK_TYPES_H */
+diff --git a/drivers/md/dm-cache-metadata.c b/drivers/md/dm-cache-metadata.c
+index 0670925..9fc616c 100644
+--- a/drivers/md/dm-cache-metadata.c
++++ b/drivers/md/dm-cache-metadata.c
+@@ -109,7 +109,7 @@ struct dm_cache_metadata {
+  dm_block_t discard_root;
+ 
+  sector_t discard_block_size;
+- dm_oblock_t discard_nr_blocks;
++ dm_dblock_t discard_nr_blocks;
+ 
+  sector_t data_block_size;
+  dm_cblock_t cache_blocks;
+@@ -329,7 +329,7 @@ static int __write_initial_superblock(struct dm_cache_metadata *cmd)
+  disk_super->hint_root = cpu_to_le64(cmd->hint_root);
+  disk_super->discard_root = cpu_to_le64(cmd->discard_root);
+  disk_super->discard_block_size = cpu_to_le64(cmd->discard_block_size);
+- disk_super->discard_nr_blocks = cpu_to_le64(from_oblock(cmd->discard_nr_blocks));
++ disk_super->discard_nr_blocks = cpu_to_le64(from_dblock(cmd->discard_nr_blocks));
+  disk_super->metadata_block_size = cpu_to_le32(DM_CACHE_METADATA_BLOCK_SIZE);
+  disk_super->data_block_size = cpu_to_le32(cmd->data_block_size);
+  disk_super->cache_blocks = cpu_to_le32(0);
+@@ -528,7 +528,7 @@ static void read_superblock_fields(struct dm_cache_metadata *cmd,
+  cmd->hint_root = le64_to_cpu(disk_super->hint_root);
+  cmd->discard_root = le64_to_cpu(disk_super->discard_root);
+  cmd->discard_block_size = le64_to_cpu(disk_super->discard_block_size);
+- cmd->discard_nr_blocks = to_oblock(le64_to_cpu(disk_super->discard_nr_blocks));
++ cmd->discard_nr_blocks = to_dblock(le64_to_cpu(disk_super->discard_nr_blocks));
+  cmd->data_block_size = le32_to_cpu(disk_super->data_block_size);
+  cmd->cache_blocks = to_cblock(le32_to_cpu(disk_super->cache_blocks));
+  strncpy(cmd->policy_name, disk_super->policy_name, sizeof(cmd->policy_name));
+@@ -626,7 +626,7 @@ static int __commit_transaction(struct dm_cache_metadata *cmd,
+  disk_super->hint_root = cpu_to_le64(cmd->hint_root);
+  disk_super->discard_root = cpu_to_le64(cmd->discard_root);
+  disk_super->discard_block_size = cpu_to_le64(cmd->discard_block_size);
+- disk_super->discard_nr_blocks = cpu_to_le64(from_oblock(cmd->discard_nr_blocks));
++ disk_super->discard_nr_blocks = cpu_to_le64(from_dblock(cmd->discard_nr_blocks));
+  disk_super->cache_blocks = cpu_to_le32(from_cblock(cmd->cache_blocks));
+  strncpy(disk_super->policy_name, cmd->policy_name, sizeof(disk_super->policy_name));
+  disk_super->policy_version[0] = cpu_to_le32(cmd->policy_version[0]);
+@@ -797,15 +797,15 @@ out:
+ 
+ int dm_cache_discard_bitset_resize(struct dm_cache_metadata *cmd,
+        sector_t discard_block_size,
+-       dm_oblock_t new_nr_entries)
++       dm_dblock_t new_nr_entries)
+ {
+  int r;
+ 
+  down_write(&cmd->root_lock);
+  r = dm_bitset_resize(&cmd->discard_info,
+         cmd->discard_root,
+-        from_oblock(cmd->discard_nr_blocks),
+-        from_oblock(new_nr_entries),
++        from_dblock(cmd->discard_nr_blocks),
++        from_dblock(new_nr_entries),
+         false, &cmd->discard_root);
+  if (!r) {
+   cmd->discard_block_size = discard_block_size;
+@@ -818,28 +818,28 @@ int dm_cache_discard_bitset_resize(struct dm_cache_metadata *cmd,
+  return r;
+ }
+ 
+-static int __set_discard(struct dm_cache_metadata *cmd, dm_oblock_t b)
++static int __set_discard(struct dm_cache_metadata *cmd, dm_dblock_t b)
+ {
+  return dm_bitset_set_bit(&cmd->discard_info, cmd->discard_root,
+-     from_oblock(b), &cmd->discard_root);
++     from_dblock(b), &cmd->discard_root);
+ }
+ 
+-static int __clear_discard(struct dm_cache_metadata *cmd, dm_oblock_t b)
++static int __clear_discard(struct dm_cache_metadata *cmd, dm_dblock_t b)
+ {
+  return dm_bitset_clear_bit(&cmd->discard_info, cmd->discard_root,
+-       from_oblock(b), &cmd->discard_root);
++       from_dblock(b), &cmd->discard_root);
+ }
+ 
+-static int __is_discarded(struct dm_cache_metadata *cmd, dm_oblock_t b,
++static int __is_discarded(struct dm_cache_metadata *cmd, dm_dblock_t b,
+      bool *is_discarded)
+ {
+  return dm_bitset_test_bit(&cmd->discard_info, cmd->discard_root,
+-      from_oblock(b), &cmd->discard_root,
++      from_dblock(b), &cmd->discard_root,
+       is_discarded);
+ }
+ 
+ static int __discard(struct dm_cache_metadata *cmd,
+-       dm_oblock_t dblock, bool discard)
++       dm_dblock_t dblock, bool discard)
+ {
+  int r;
+ 
+@@ -852,7 +852,7 @@ static int __discard(struct dm_cache_metadata *cmd,
+ }
+ 
+ int dm_cache_set_discard(struct dm_cache_metadata *cmd,
+-    dm_oblock_t dblock, bool discard)
++    dm_dblock_t dblock, bool discard)
+ {
+  int r;
+ 
+@@ -870,8 +870,8 @@ static int __load_discards(struct dm_cache_metadata *cmd,
+  dm_block_t b;
+  bool discard;
+ 
+- for (b = 0; b < from_oblock(cmd->discard_nr_blocks); b++) {
+-  dm_oblock_t dblock = to_oblock(b);
++ for (b = 0; b < from_dblock(cmd->discard_nr_blocks); b++) {
++  dm_dblock_t dblock = to_dblock(b);
+ 
+   if (cmd->clean_when_opened) {
+    r = __is_discarded(cmd, dblock, &discard);
+diff --git a/drivers/md/dm-cache-metadata.h b/drivers/md/dm-cache-metadata.h
+index 7383c90..4ecc403 100644
+--- a/drivers/md/dm-cache-metadata.h
++++ b/drivers/md/dm-cache-metadata.h
+@@ -70,14 +70,14 @@ dm_cblock_t dm_cache_size(struct dm_cache_metadata *cmd);
+ 
+ int dm_cache_discard_bitset_resize(struct dm_cache_metadata *cmd,
+        sector_t discard_block_size,
+-       dm_oblock_t new_nr_entries);
++       dm_dblock_t new_nr_entries);
+ 
+ typedef int (*load_discard_fn)(void *context, sector_t discard_block_size,
+-          dm_oblock_t dblock, bool discarded);
++          dm_dblock_t dblock, bool discarded);
+ int dm_cache_load_discards(struct dm_cache_metadata *cmd,
+       load_discard_fn fn, void *context);
+ 
+-int dm_cache_set_discard(struct dm_cache_metadata *cmd, dm_oblock_t dblock, bool discard);
++int dm_cache_set_discard(struct dm_cache_metadata *cmd, dm_dblock_t dblock, bool discard);
+ 
+ int dm_cache_remove_mapping(struct dm_cache_metadata *cmd, dm_cblock_t cblock);
+ int dm_cache_insert_mapping(struct dm_cache_metadata *cmd, dm_cblock_t cblock, dm_oblock_t oblock);
+diff --git a/drivers/md/dm-cache-target.c b/drivers/md/dm-cache-target.c
+index a15c70f..7c964b1 100644
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@ -230,8 +230,9 @@ struct cache {
+  /*
+   * origin_blocks entries, discarded if set.
+   */
+- dm_oblock_t discard_nr_blocks;
++ dm_dblock_t discard_nr_blocks;
+  unsigned long *discard_bitset;
++ uint32_t discard_block_size;
+ 
+  /*
+   * Rather than reconstructing the table line for the status we just
+@@ -518,33 +519,48 @@ static dm_block_t block_div(dm_block_t b, uint32_t n)
+  return b;
+ }
+ 
+-static void set_discard(struct cache *cache, dm_oblock_t b)
++static dm_dblock_t oblock_to_dblock(struct cache *cache, dm_oblock_t oblock)
++{
++ uint32_t discard_blocks = cache->discard_block_size;
++ dm_block_t b = from_oblock(oblock);
++
++ if (!block_size_is_power_of_two(cache))
++  discard_blocks = discard_blocks / cache->sectors_per_block;
++ else
++  discard_blocks >>= cache->sectors_per_block_shift;
++
++ b = block_div(b, discard_blocks);
++
++ return to_dblock(b);
++}
++
++static void set_discard(struct cache *cache, dm_dblock_t b)
+ {
+  unsigned long flags;
+ 
+  atomic_inc(&cache->stats.discard_count);
+ 
+  spin_lock_irqsave(&cache->lock, flags);
+- set_bit(from_oblock(b), cache->discard_bitset);
++ set_bit(from_dblock(b), cache->discard_bitset);
+  spin_unlock_irqrestore(&cache->lock, flags);
+ }
+ 
+-static void clear_discard(struct cache *cache, dm_oblock_t b)
++static void clear_discard(struct cache *cache, dm_dblock_t b)
+ {
+  unsigned long flags;
+ 
+  spin_lock_irqsave(&cache->lock, flags);
+- clear_bit(from_oblock(b), cache->discard_bitset);
++ clear_bit(from_dblock(b), cache->discard_bitset);
+  spin_unlock_irqrestore(&cache->lock, flags);
+ }
+ 
+-static bool is_discarded(struct cache *cache, dm_oblock_t b)
++static bool is_discarded(struct cache *cache, dm_dblock_t b)
+ {
+  int r;
+  unsigned long flags;
+ 
+  spin_lock_irqsave(&cache->lock, flags);
+- r = test_bit(from_oblock(b), cache->discard_bitset);
++ r = test_bit(from_dblock(b), cache->discard_bitset);
+  spin_unlock_irqrestore(&cache->lock, flags);
+ 
+  return r;
+@@ -556,7 +572,8 @@ static bool is_discarded_oblock(struct cache *cache, dm_oblock_t b)
+  unsigned long flags;
+ 
+  spin_lock_irqsave(&cache->lock, flags);
+- r = test_bit(from_oblock(b), cache->discard_bitset);
++ r = test_bit(from_dblock(oblock_to_dblock(cache, b)),
++       cache->discard_bitset);
+  spin_unlock_irqrestore(&cache->lock, flags);
+ 
+  return r;
+@@ -681,7 +698,7 @@ static void remap_to_origin_clear_discard(struct cache *cache, struct bio *bio,
+  check_if_tick_bio_needed(cache, bio);
+  remap_to_origin(cache, bio);
+  if (bio_data_dir(bio) == WRITE)
+-  clear_discard(cache, oblock);
++  clear_discard(cache, oblock_to_dblock(cache, oblock));
+ }
+ 
+ static void remap_to_cache_dirty(struct cache *cache, struct bio *bio,
+@@ -691,7 +708,7 @@ static void remap_to_cache_dirty(struct cache *cache, struct bio *bio,
+  remap_to_cache(cache, bio, cblock);
+  if (bio_data_dir(bio) == WRITE) {
+   set_dirty(cache, oblock, cblock);
+-  clear_discard(cache, oblock);
++  clear_discard(cache, oblock_to_dblock(cache, oblock));
+  }
+ }
+ 
+@@ -1295,14 +1312,14 @@ static void process_flush_bio(struct cache *cache, struct bio *bio)
+ static void process_discard_bio(struct cache *cache, struct bio *bio)
+ {
+  dm_block_t start_block = dm_sector_div_up(bio->bi_sector,
+-        cache->sectors_per_block);
++        cache->discard_block_size);
+  dm_block_t end_block = bio->bi_sector + bio_sectors(bio);
+  dm_block_t b;
+ 
+- end_block = block_div(end_block, cache->sectors_per_block);
++ end_block = block_div(end_block, cache->discard_block_size);
+ 
+  for (b = start_block; b < end_block; b++)
+-  set_discard(cache, to_oblock(b));
++  set_discard(cache, to_dblock(b));
+ 
+  bio_endio(bio, 0);
+ }
+@@ -2297,13 +2314,14 @@ static int cache_create(struct cache_args *ca, struct cache **result)
+  }
+  clear_bitset(cache->dirty_bitset, from_cblock(cache->cache_size));
+ 
+- cache->discard_nr_blocks = cache->origin_blocks;
+- cache->discard_bitset = alloc_bitset(from_oblock(cache->discard_nr_blocks));
++ cache->discard_block_size = cache->sectors_per_block;
++ cache->discard_nr_blocks = oblock_to_dblock(cache, cache->origin_blocks);
++ cache->discard_bitset = alloc_bitset(from_dblock(cache->discard_nr_blocks));
+  if (!cache->discard_bitset) {
+   *error = "could not allocate discard bitset";
+   goto bad;
+  }
+- clear_bitset(cache->discard_bitset, from_oblock(cache->discard_nr_blocks));
++ clear_bitset(cache->discard_bitset, from_dblock(cache->discard_nr_blocks));
+ 
+  cache->copier = dm_kcopyd_client_create(&dm_kcopyd_throttle);
+  if (IS_ERR(cache->copier)) {
+@@ -2598,16 +2616,16 @@ static int write_discard_bitset(struct cache *cache)
+ {
+  unsigned i, r;
+ 
+- r = dm_cache_discard_bitset_resize(cache->cmd, cache->sectors_per_block,
+-        cache->origin_blocks);
++ r = dm_cache_discard_bitset_resize(cache->cmd, cache->discard_block_size,
++        cache->discard_nr_blocks);
+  if (r) {
+   DMERR("could not resize on-disk discard bitset");
+   return r;
+  }
+ 
+- for (i = 0; i < from_oblock(cache->discard_nr_blocks); i++) {
+-  r = dm_cache_set_discard(cache->cmd, to_oblock(i),
+-      is_discarded(cache, to_oblock(i)));
++ for (i = 0; i < from_dblock(cache->discard_nr_blocks); i++) {
++  r = dm_cache_set_discard(cache->cmd, to_dblock(i),
++      is_discarded(cache, to_dblock(i)));
+   if (r)
+    return r;
+  }
+@@ -2680,14 +2698,16 @@ static int load_mapping(void *context, dm_oblock_t oblock, dm_cblock_t cblock,
+ }
+ 
+ static int load_discard(void *context, sector_t discard_block_size,
+-   dm_oblock_t oblock, bool discard)
++   dm_dblock_t dblock, bool discard)
+ {
+  struct cache *cache = context;
+ 
++ /* FIXME: handle mis-matched block size */
++
+  if (discard)
+-  set_discard(cache, oblock);
++  set_discard(cache, dblock);
+  else
+-  clear_discard(cache, oblock);
++  clear_discard(cache, dblock);
+ 
+  return 0;
+ }
+@@ -3078,8 +3098,8 @@ static void set_discard_limits(struct cache *cache, struct queue_limits *limits)
+  /*
+   * FIXME: these limits may be incompatible with the cache device
+   */
+- limits->max_discard_sectors = cache->sectors_per_block;
+- limits->discard_granularity = cache->sectors_per_block << SECTOR_SHIFT;
++ limits->max_discard_sectors = cache->discard_block_size;
++ limits->discard_granularity = cache->discard_block_size << SECTOR_SHIFT;
+ }
+ 
+ static void cache_io_hints(struct dm_target *ti, struct queue_limits *limits)
+-- 
+1.7.1

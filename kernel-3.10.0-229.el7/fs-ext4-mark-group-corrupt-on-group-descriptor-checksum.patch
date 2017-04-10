@@ -1,0 +1,91 @@
+From 58fd12c130a0cfbbd9f471a41c96a2635fa6ec52 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:53:41 -0400
+Subject: [fs] ext4: mark group corrupt on group descriptor checksum
+
+Message-id: <1414058125-4183-68-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98250
+O-Subject: [RHEL 7.1 PATCH v2 067/171] ext4: mark group corrupt on group descriptor checksum
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: "Darrick J. Wong" <darrick.wong@oracle.com>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit bdfb6ff4a255dcebeb09a901250e13a97eff75af
+
+ If the group descriptor fails validation, mark the whole blockgroup
+ corrupt so that the inode/block allocators skip this group.  The
+ previous approach takes the risk of writing to a damaged group
+ descriptor; hopefully it was never the case that the [ib]bitmap fields
+ pointed to another valid block and got dirtied, since the memset would
+ fill the page with 1s.
+
+ Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/balloc.c b/fs/ext4/balloc.c
+index d9b66c4..dc5d572 100644
+--- a/fs/ext4/balloc.c
++++ b/fs/ext4/balloc.c
+@@ -184,6 +184,7 @@ void ext4_init_block_bitmap(struct super_block *sb, struct buffer_head *bh,
+  struct ext4_sb_info *sbi = EXT4_SB(sb);
+  ext4_fsblk_t start, tmp;
+  int flex_bg = 0;
++ struct ext4_group_info *grp;
+ 
+  J_ASSERT_BH(bh, buffer_locked(bh));
+ 
+@@ -191,11 +192,9 @@ void ext4_init_block_bitmap(struct super_block *sb, struct buffer_head *bh,
+   * essentially implementing a per-group read-only flag. */
+  if (!ext4_group_desc_csum_verify(sb, block_group, gdp)) {
+   ext4_error(sb, "Checksum bad for group %u", block_group);
+-  ext4_free_group_clusters_set(sb, gdp, 0);
+-  ext4_free_inodes_set(sb, gdp, 0);
+-  ext4_itable_unused_set(sb, gdp, 0);
+-  memset(bh->b_data, 0xff, sb->s_blocksize);
+-  ext4_block_bitmap_csum_set(sb, block_group, gdp, bh);
++  grp = ext4_get_group_info(sb, block_group);
++  set_bit(EXT4_GROUP_INFO_BBITMAP_CORRUPT_BIT, &grp->bb_state);
++  set_bit(EXT4_GROUP_INFO_IBITMAP_CORRUPT_BIT, &grp->bb_state);
+   return;
+  }
+  memset(bh->b_data, 0, sb->s_blocksize);
+diff --git a/fs/ext4/ialloc.c b/fs/ext4/ialloc.c
+index d510607..137193f 100644
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@ -70,18 +70,16 @@ static unsigned ext4_init_inode_bitmap(struct super_block *sb,
+            ext4_group_t block_group,
+            struct ext4_group_desc *gdp)
+ {
++ struct ext4_group_info *grp;
+  J_ASSERT_BH(bh, buffer_locked(bh));
+ 
+  /* If checksum is bad mark all blocks and inodes use to prevent
+   * allocation, essentially implementing a per-group read-only flag. */
+  if (!ext4_group_desc_csum_verify(sb, block_group, gdp)) {
+   ext4_error(sb, "Checksum bad for group %u", block_group);
+-  ext4_free_group_clusters_set(sb, gdp, 0);
+-  ext4_free_inodes_set(sb, gdp, 0);
+-  ext4_itable_unused_set(sb, gdp, 0);
+-  memset(bh->b_data, 0xff, sb->s_blocksize);
+-  ext4_inode_bitmap_csum_set(sb, block_group, gdp, bh,
+-        EXT4_INODES_PER_GROUP(sb) / 8);
++  grp = ext4_get_group_info(sb, block_group);
++  set_bit(EXT4_GROUP_INFO_BBITMAP_CORRUPT_BIT, &grp->bb_state);
++  set_bit(EXT4_GROUP_INFO_IBITMAP_CORRUPT_BIT, &grp->bb_state);
+   return 0;
+  }
+ 
+-- 
+1.7.1

@@ -1,0 +1,120 @@
+From ae80821041d2e181cf94120a7b526ce4215065f8 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:06:10 -0400
+Subject: [usb] uas: Urbs must be anchored before submitting them
+
+Message-id: <1410887463-20674-299-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95556
+O-Subject: [RHEL7 PATCH 298/591] uas: Urbs must be anchored before submitting them
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit d5f808d3f88e90b13a4839e07b3dc6e715e2ba88
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Thu Oct 17 19:30:26 2013 +0200
+
+    uas: Urbs must be anchored before submitting them
+
+    Otherwise they may complete before they get anchored and thus never get
+    unanchored (as the unanchoring is done by the usb core on completion).
+
+    This commit also remove the usb_get_urb / usb_put_urb around cmd submission +
+    anchoring, since if done in the proper order this is not necessary.
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index 046eedf..059ce62 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -531,10 +531,12 @@ static int uas_submit_task_urb(struct scsi_cmnd *cmnd, gfp_t gfp,
+      usb_free_urb, NULL);
+  urb->transfer_flags |= URB_FREE_BUFFER;
+ 
++ usb_anchor_urb(urb, &devinfo->cmd_urbs);
+  err = usb_submit_urb(urb, gfp);
+- if (err)
++ if (err) {
++  usb_unanchor_urb(urb);
+   goto err;
+- usb_anchor_urb(urb, &devinfo->cmd_urbs);
++ }
+ 
+  return 0;
+ 
+@@ -558,13 +560,14 @@ static int uas_submit_sense_urb(struct Scsi_Host *shost,
+  urb = uas_alloc_sense_urb(devinfo, gfp, shost, stream);
+  if (!urb)
+   return SCSI_MLQUEUE_DEVICE_BUSY;
++ usb_anchor_urb(urb, &devinfo->sense_urbs);
+  if (usb_submit_urb(urb, gfp)) {
++  usb_unanchor_urb(urb);
+   shost_printk(KERN_INFO, shost,
+         "sense urb submission failure\n");
+   usb_free_urb(urb);
+   return SCSI_MLQUEUE_DEVICE_BUSY;
+  }
+- usb_anchor_urb(urb, &devinfo->sense_urbs);
+  return 0;
+ }
+ 
+@@ -594,14 +597,15 @@ static int uas_submit_urbs(struct scsi_cmnd *cmnd,
+  }
+ 
+  if (cmdinfo->state & SUBMIT_DATA_IN_URB) {
++  usb_anchor_urb(cmdinfo->data_in_urb, &devinfo->data_urbs);
+   if (usb_submit_urb(cmdinfo->data_in_urb, gfp)) {
++   usb_unanchor_urb(cmdinfo->data_in_urb);
+    scmd_printk(KERN_INFO, cmnd,
+      "data in urb submission failure\n");
+    return SCSI_MLQUEUE_DEVICE_BUSY;
+   }
+   cmdinfo->state &= ~SUBMIT_DATA_IN_URB;
+   cmdinfo->state |= DATA_IN_URB_INFLIGHT;
+-  usb_anchor_urb(cmdinfo->data_in_urb, &devinfo->data_urbs);
+  }
+ 
+  if (cmdinfo->state & ALLOC_DATA_OUT_URB) {
+@@ -614,14 +618,15 @@ static int uas_submit_urbs(struct scsi_cmnd *cmnd,
+  }
+ 
+  if (cmdinfo->state & SUBMIT_DATA_OUT_URB) {
++  usb_anchor_urb(cmdinfo->data_out_urb, &devinfo->data_urbs);
+   if (usb_submit_urb(cmdinfo->data_out_urb, gfp)) {
++   usb_unanchor_urb(cmdinfo->data_out_urb);
+    scmd_printk(KERN_INFO, cmnd,
+      "data out urb submission failure\n");
+    return SCSI_MLQUEUE_DEVICE_BUSY;
+   }
+   cmdinfo->state &= ~SUBMIT_DATA_OUT_URB;
+   cmdinfo->state |= DATA_OUT_URB_INFLIGHT;
+-  usb_anchor_urb(cmdinfo->data_out_urb, &devinfo->data_urbs);
+  }
+ 
+  if (cmdinfo->state & ALLOC_CMD_URB) {
+@@ -633,14 +638,13 @@ static int uas_submit_urbs(struct scsi_cmnd *cmnd,
+  }
+ 
+  if (cmdinfo->state & SUBMIT_CMD_URB) {
+-  usb_get_urb(cmdinfo->cmd_urb);
++  usb_anchor_urb(cmdinfo->cmd_urb, &devinfo->cmd_urbs);
+   if (usb_submit_urb(cmdinfo->cmd_urb, gfp)) {
++   usb_unanchor_urb(cmdinfo->cmd_urb);
+    scmd_printk(KERN_INFO, cmnd,
+      "cmd urb submission failure\n");
+    return SCSI_MLQUEUE_DEVICE_BUSY;
+   }
+-  usb_anchor_urb(cmdinfo->cmd_urb, &devinfo->cmd_urbs);
+-  usb_put_urb(cmdinfo->cmd_urb);
+   cmdinfo->cmd_urb = NULL;
+   cmdinfo->state &= ~SUBMIT_CMD_URB;
+   cmdinfo->state |= COMMAND_INFLIGHT;
+-- 
+1.7.1

@@ -1,0 +1,221 @@
+From 149b7780632969ec90f9ab90de0372e74cc9e627 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:14:43 -0400
+Subject: [net] Split sk_no_check into sk_no_check_{rx, tx}
+
+Message-id: <1409652920-431-21-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90147
+O-Subject: [PATCH 20/57] [RHEL7.1 net] net: Split sk_no_check into sk_no_check_{rx, tx}
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+KABI breaker due to the struct sock member change.
+Size is not affected since :2 is split into two members.
+Wrapped the struct sock change in GENKSYMS.
+
+Jiri Benc points out that this is only used by protocols, and,
+as we dont have anything that allows custom protocols in kabi yet
+the removal of old member name is safe.
+
+commit 28448b80456feafe07e2d05b6363b00f61f6171e
+Author: Tom Herbert <therbert@google.com>
+Date:   Fri May 23 08:47:19 2014 -0700
+
+    net: Split sk_no_check into sk_no_check_{rx,tx}
+
+    Define separate fields in the sock structure for configuring disabling
+    checksums in both TX and RX-- sk_no_check_tx and sk_no_check_rx.
+    The SO_NO_CHECK socket option only affects sk_no_check_tx. Also,
+    removed UDP_CSUM_* defines since they are no longer necessary.
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/iscsi_tcp.c b/drivers/scsi/iscsi_tcp.c
+index add6d15..a70e7d9 100644
+--- a/drivers/scsi/iscsi_tcp.c
++++ b/drivers/scsi/iscsi_tcp.c
+@@ -244,7 +244,7 @@ iscsi_sw_tcp_conn_restore_callbacks(struct iscsi_conn *conn)
+  sk->sk_data_ready   = tcp_sw_conn->old_data_ready;
+  sk->sk_state_change = tcp_sw_conn->old_state_change;
+  sk->sk_write_space  = tcp_sw_conn->old_write_space;
+- sk->sk_no_check  = 0;
++ sk->sk_no_check_tx = 0;
+  write_unlock_bh(&sk->sk_callback_lock);
+ }
+ 
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 64ff6c7..1488a6b 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -242,7 +242,8 @@ struct cg_proto;
+   * @sk_sndbuf: size of send buffer in bytes
+   * @sk_flags: %SO_LINGER (l_onoff), %SO_BROADCAST, %SO_KEEPALIVE,
+   *     %SO_OOBINLINE settings, %SO_TIMESTAMPING settings
+-  * @sk_no_check: %SO_NO_CHECK setting, whether or not checkup packets
++  * @sk_no_check_tx: %SO_NO_CHECK setting, set checksum in TX packets
++  * @sk_no_check_rx: allow zero checksum in RX packets
+   * @sk_route_caps: route capabilities (e.g. %NETIF_F_TSO)
+   * @sk_route_nocaps: forbidden route capabilities (e.g NETIF_F_GSO_MASK)
+   * @sk_gso_type: GSO type (e.g. %SKB_GSO_TCPV4)
+@@ -370,7 +371,12 @@ struct sock {
+  struct sk_buff_head sk_write_queue;
+  kmemcheck_bitfield_begin(flags);
+  unsigned int  sk_shutdown  : 2,
+-    sk_no_check  : 2,
++#ifdef __GENKSYMS__
++    sk_no_check : 2,
++#else
++    sk_no_check_tx : 1,
++    sk_no_check_rx : 1,
++#endif
+     sk_userlocks : 4,
+     sk_protocol  : 8,
+     sk_type      : 16;
+diff --git a/include/net/udp.h b/include/net/udp.h
+index 74c10ec..8244638 100644
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -95,15 +95,6 @@ static inline struct udp_hslot *udp_hashslot2(struct udp_table *table,
+  return &table->hash2[hash & table->mask];
+ }
+ 
+-/* Note: this must match 'valbool' in sock_setsockopt */
+-#define UDP_CSUM_NOXMIT  1
+-
+-/* Used by SunRPC/xprt layer. */
+-#define UDP_CSUM_NORCV  2
+-
+-/* Default, as per the RFC, is to always do csums. */
+-#define UDP_CSUM_DEFAULT 0
+-
+ extern struct proto udp_prot;
+ 
+ extern atomic_long_t udp_memory_allocated;
+diff --git a/net/core/sock.c b/net/core/sock.c
+index c464812..891af77 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -740,7 +740,7 @@ set_rcvbuf:
+   break;
+ 
+  case SO_NO_CHECK:
+-  sk->sk_no_check = valbool;
++  sk->sk_no_check_tx = valbool;
+   break;
+ 
+  case SO_PRIORITY:
+@@ -1014,7 +1014,7 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
+   break;
+ 
+  case SO_NO_CHECK:
+-  v.val = sk->sk_no_check;
++  v.val = sk->sk_no_check_tx;
+   break;
+ 
+  case SO_PRIORITY:
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 770dc8d..2006ee5 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -764,7 +764,7 @@ static int udp_send_skb(struct sk_buff *skb, struct flowi4 *fl4)
+  if (is_udplite)       /*     UDP-Lite      */
+   csum = udplite_csum(skb);
+ 
+- else if (sk->sk_no_check == UDP_CSUM_NOXMIT) {   /* UDP csum disabled */
++ else if (sk->sk_no_check_tx) {   /* UDP csum disabled */
+ 
+   skb->ip_summed = CHECKSUM_NONE;
+   goto send;
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index 4136c26..b8cb764 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -767,7 +767,7 @@ static int __udp6_lib_mcast_deliver(struct net *net, struct sk_buff *skb,
+   /* If zero checksum and sk_no_check is not on for
+    * the socket then skip it.
+    */
+-  if (uh->check || sk->sk_no_check)
++  if (uh->check || sk->sk_no_check_rx)
+    stack[count++] = sk;
+ 
+   sk = udp_v6_mcast_next(net, sk_nulls_next(sk), uh->dest, daddr,
+@@ -857,7 +857,7 @@ int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+  if (sk != NULL) {
+   int ret;
+ 
+-  if (!uh->check && !sk->sk_no_check) {
++  if (!uh->check && !sk->sk_no_check_rx) {
+    sock_put(sk);
+    udp6_csum_zero_error(skb);
+    goto csum_error;
+@@ -1007,7 +1007,7 @@ static int udp_v6_push_pending_frames(struct sock *sk)
+ 
+  if (is_udplite)
+   csum = udplite_csum_outgoing(sk, skb);
+- else if (sk->sk_no_check == UDP_CSUM_NOXMIT) {   /* UDP csum disabled */
++ else if (sk->sk_no_check_tx) {   /* UDP csum disabled */
+   skb->ip_summed = CHECKSUM_NONE;
+   goto send;
+  } else if (skb->ip_summed == CHECKSUM_PARTIAL) { /* UDP hardware csum */
+diff --git a/net/l2tp/l2tp_core.c b/net/l2tp/l2tp_core.c
+index 142c59d..33bfa12 100644
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@ -1152,7 +1152,7 @@ int l2tp_xmit_skb(struct l2tp_session *session, struct sk_buff *skb, int hdr_len
+    l2tp_xmit_ipv6_csum(sk, skb, udp_len);
+   else
+ #endif
+-  if (sk->sk_no_check == UDP_CSUM_NOXMIT)
++  if (sk->sk_no_check_tx)
+    skb->ip_summed = CHECKSUM_NONE;
+   else if ((skb_dst(skb) && skb_dst(skb)->dev) &&
+     (!(skb_dst(skb)->dev->features & NETIF_F_V4_CSUM))) {
+@@ -1429,7 +1429,7 @@ static int l2tp_tunnel_sock_create(struct net *net,
+   }
+ 
+   if (!cfg->use_udp_checksums)
+-   sock->sk->sk_no_check = UDP_CSUM_NOXMIT;
++   sock->sk->sk_no_check_tx = 1;
+ 
+   break;
+ 
+diff --git a/net/l2tp/l2tp_netlink.c b/net/l2tp/l2tp_netlink.c
+index be446d5..03a794f 100644
+--- a/net/l2tp/l2tp_netlink.c
++++ b/net/l2tp/l2tp_netlink.c
+@@ -297,8 +297,7 @@ static int l2tp_nl_tunnel_send(struct sk_buff *skb, u32 portid, u32 seq, int fla
+  case L2TP_ENCAPTYPE_UDP:
+   if (nla_put_u16(skb, L2TP_ATTR_UDP_SPORT, ntohs(inet->inet_sport)) ||
+       nla_put_u16(skb, L2TP_ATTR_UDP_DPORT, ntohs(inet->inet_dport)) ||
+-      nla_put_u8(skb, L2TP_ATTR_UDP_CSUM,
+-          (sk->sk_no_check != UDP_CSUM_NOXMIT)))
++      nla_put_u8(skb, L2TP_ATTR_UDP_CSUM, !sk->sk_no_check_tx))
+    goto nla_put_failure;
+   /* NOBREAK */
+  case L2TP_ENCAPTYPE_IP:
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index eb10f7f..2936204 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -6884,7 +6884,8 @@ void sctp_copy_sock(struct sock *newsk, struct sock *sk,
+  newsk->sk_type = sk->sk_type;
+  newsk->sk_bound_dev_if = sk->sk_bound_dev_if;
+  newsk->sk_flags = sk->sk_flags;
+- newsk->sk_no_check = sk->sk_no_check;
++ newsk->sk_no_check_tx = sk->sk_no_check_tx;
++ newsk->sk_no_check_rx = sk->sk_no_check_rx;
+  newsk->sk_reuse = sk->sk_reuse;
+ 
+  newsk->sk_shutdown = sk->sk_shutdown;
+-- 
+1.7.1

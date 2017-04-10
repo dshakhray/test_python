@@ -1,0 +1,121 @@
+From 6b2d01201850b4a1352851214357fb9a7d0ed29a Mon Sep 17 00:00:00 2001
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Mon, 8 Sep 2014 16:13:29 -0400
+Subject: [ethernet] be2net: Fix to reset transparent vlan tagging
+
+Message-id: <1410192881-30702-7-git-send-email-ivecera@redhat.com>
+Patchwork-id: 92405
+O-Subject: [RHEL7.1 PATCH 06/78] be2net: Fix to reset transparent vlan tagging
+Bugzilla: 1088575
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+
+BZ: #1088575
+
+Upstream commit(s):
+commit c502224efb2eaec47f16da39235079598a0f3ed2
+Author: Somnath Kotur <somnath.kotur@emulex.com>
+Date:   Mon Mar 3 14:24:20 2014 +0530
+
+    be2net: Fix to reset transparent vlan tagging
+
+    For disabling transparent tagging issue SET_HSW_CONFIG with pvid_valid=1
+    and pvid=0xFFFF and not with the default pvid as this case would fail in Lancer.
+    Hence removing the get_hsw_config call from be_vf_setup() as it's
+    only use of getting default pvid is no longer needed.
+
+    Also do proper housekeeping only if the FW command succeeds.
+
+    Signed-off-by: Kalesh AP <kalesh.purayil@emulex.com>
+    Signed-off-by: Somnath Kotur <somnath.kotur@emulex.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/emulex/benet/be.h b/drivers/net/ethernet/emulex/benet/be.h
+index f2a22a5..05bd11e 100644
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@ -349,11 +349,13 @@ struct be_drv_stats {
+  u32 roce_drops_crc;
+ };
+ 
++/* A vlan-id of 0xFFFF must be used to clear transparent vlan-tagging */
++#define BE_RESET_VLAN_TAG_ID 0xFFFF
++
+ struct be_vf_cfg {
+  unsigned char mac_addr[ETH_ALEN];
+  int if_handle;
+  int pmac_id;
+- u16 def_vid;
+  u16 vlan_tag;
+  u32 tx_rate;
+ };
+diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
+index 5912a74..0a48de1 100644
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -1287,24 +1287,20 @@ static int be_set_vf_vlan(struct net_device *netdev,
+ 
+  if (vlan || qos) {
+   vlan |= qos << VLAN_PRIO_SHIFT;
+-  if (vf_cfg->vlan_tag != vlan) {
+-   /* If this is new value, program it. Else skip. */
+-   vf_cfg->vlan_tag = vlan;
++  if (vf_cfg->vlan_tag != vlan)
+    status = be_cmd_set_hsw_config(adapter, vlan, vf + 1,
+              vf_cfg->if_handle, 0);
+-  }
+  } else {
+   /* Reset Transparent Vlan Tagging. */
+-  vf_cfg->vlan_tag = 0;
+-  vlan = vf_cfg->def_vid;
+-  status = be_cmd_set_hsw_config(adapter, vlan, vf + 1,
+-            vf_cfg->if_handle, 0);
++  status = be_cmd_set_hsw_config(adapter, BE_RESET_VLAN_TAG_ID,
++            vf + 1, vf_cfg->if_handle, 0);
+  }
+ 
+-
+- if (status)
++ if (!status)
++  vf_cfg->vlan_tag = vlan;
++ else
+   dev_info(&adapter->pdev->dev,
+-    "VLAN %d config on VF %d failed\n", vlan, vf);
++    "VLAN %d config on VF %d failed\n", vlan, vf);
+  return status;
+ }
+ 
+@@ -3017,11 +3013,11 @@ static int be_vf_setup_init(struct be_adapter *adapter)
+ 
+ static int be_vf_setup(struct be_adapter *adapter)
+ {
++ struct device *dev = &adapter->pdev->dev;
+  struct be_vf_cfg *vf_cfg;
+- u16 def_vlan, lnk_speed;
+  int status, old_vfs, vf;
+- struct device *dev = &adapter->pdev->dev;
+  u32 privileges;
++ u16 lnk_speed;
+ 
+  old_vfs = pci_num_vf(adapter->pdev);
+  if (old_vfs) {
+@@ -3088,12 +3084,6 @@ static int be_vf_setup(struct be_adapter *adapter)
+   if (!status)
+    vf_cfg->tx_rate = lnk_speed;
+ 
+-  status = be_cmd_get_hsw_config(adapter, &def_vlan,
+-            vf + 1, vf_cfg->if_handle, NULL);
+-  if (status)
+-   goto err;
+-  vf_cfg->def_vid = def_vlan;
+-
+   if (!old_vfs)
+    be_cmd_enable_vf(adapter, vf + 1);
+  }
+-- 
+1.7.1

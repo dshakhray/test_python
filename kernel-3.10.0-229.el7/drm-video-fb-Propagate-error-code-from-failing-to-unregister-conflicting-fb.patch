@@ -1,0 +1,129 @@
+From bf8c4c45480c131c877e685404b5a41d579d42bb Mon Sep 17 00:00:00 2001
+From: Rob Clark <rclark@redhat.com>
+Date: Wed, 17 Dec 2014 21:39:35 -0500
+Subject: [drm] video/fb: Propagate error code from failing to unregister conflicting fb
+
+Message-id: <1418852380-13061-85-git-send-email-rclark@redhat.com>
+Patchwork-id: 102212
+O-Subject: [RHEL7 drm 84/89] video/fb: Propagate error code from failing to unregister conflicting fb
+Bugzilla: 1173317
+RH-Acked-by: Jerome Glisse <jglisse@redhat.com>
+RH-Acked-by: Dave Airlie <airlied@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1173317
+Upstream: since drm-intel-fixes-2014-02-06
+
+commit 46eeb2c144956e88197439b5ee5cf221a91b0a81
+
+Author:     Chris Wilson <chris@chris-wilson.co.uk>
+AuthorDate: Mon Dec 16 15:57:39 2013 +0000
+Commit:     Rob Clark <rclark@redhat.com>
+CommitDate: Mon Dec 15 14:48:30 2014 -0500
+
+    video/fb: Propagate error code from failing to unregister conflicting fb
+
+    If we fail to remove a conflicting fb driver, we need to abort the
+    loading of the second driver to avoid likely kernel panics.
+
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Jean-Christophe Plagniol-Villard <plagnioj@jcrosoft.com>
+    Cc: Tomi Valkeinen <tomi.valkeinen@ti.com>
+    Cc: linux-fbdev@vger.kernel.org
+    Cc: dri-devel@lists.freedesktop.org
+    Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+Signed-off-by: Rob Clark <rclark@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/video/fbmem.c b/drivers/video/fbmem.c
+index 0399ad8..49b1d06 100644
+--- a/drivers/video/fbmem.c
++++ b/drivers/video/fbmem.c
+@@ -1566,10 +1566,10 @@ static bool fb_do_apertures_overlap(struct apertures_struct *gena,
+ static int do_unregister_framebuffer(struct fb_info *fb_info);
+ 
+ #define VGA_FB_PHYS 0xA0000
+-static void do_remove_conflicting_framebuffers(struct apertures_struct *a,
+-         const char *name, bool primary)
++static int do_remove_conflicting_framebuffers(struct apertures_struct *a,
++           const char *name, bool primary)
+ {
+- int i;
++ int i, ret;
+ 
+  /* check all firmware fbs and kick off if the base addr overlaps */
+  for (i = 0 ; i < FB_MAX; i++) {
+@@ -1588,22 +1588,29 @@ static void do_remove_conflicting_framebuffers(struct apertures_struct *a,
+    printk(KERN_INFO "fb: conflicting fb hw usage "
+           "%s vs %s - removing generic driver\n",
+           name, registered_fb[i]->fix.id);
+-   do_unregister_framebuffer(registered_fb[i]);
++   ret = do_unregister_framebuffer(registered_fb[i]);
++   if (ret)
++    return ret;
+   }
+  }
++
++ return 0;
+ }
+ 
+ static int do_register_framebuffer(struct fb_info *fb_info)
+ {
+- int i;
++ int i, ret;
+  struct fb_event event;
+  struct fb_videomode mode;
+ 
+  if (fb_check_foreignness(fb_info))
+   return -ENOSYS;
+ 
+- do_remove_conflicting_framebuffers(fb_info->apertures, fb_info->fix.id,
+-      fb_is_primary_device(fb_info));
++ ret = do_remove_conflicting_framebuffers(fb_info->apertures,
++       fb_info->fix.id,
++       fb_is_primary_device(fb_info));
++ if (ret)
++  return ret;
+ 
+  if (num_registered_fb == FB_MAX)
+   return -ENXIO;
+@@ -1728,12 +1735,16 @@ int unlink_framebuffer(struct fb_info *fb_info)
+ }
+ EXPORT_SYMBOL(unlink_framebuffer);
+ 
+-void remove_conflicting_framebuffers(struct apertures_struct *a,
+-         const char *name, bool primary)
++int remove_conflicting_framebuffers(struct apertures_struct *a,
++        const char *name, bool primary)
+ {
++ int ret;
++
+  mutex_lock(&registration_lock);
+- do_remove_conflicting_framebuffers(a, name, primary);
++ ret = do_remove_conflicting_framebuffers(a, name, primary);
+  mutex_unlock(&registration_lock);
++
++ return ret;
+ }
+ EXPORT_SYMBOL(remove_conflicting_framebuffers);
+ 
+diff --git a/include/linux/fb.h b/include/linux/fb.h
+index ffac70a..8439a16 100644
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -613,8 +613,8 @@ extern ssize_t fb_sys_write(struct fb_info *info, const char __user *buf,
+ extern int register_framebuffer(struct fb_info *fb_info);
+ extern int unregister_framebuffer(struct fb_info *fb_info);
+ extern int unlink_framebuffer(struct fb_info *fb_info);
+-extern void remove_conflicting_framebuffers(struct apertures_struct *a,
+-    const char *name, bool primary);
++extern int remove_conflicting_framebuffers(struct apertures_struct *a,
++        const char *name, bool primary);
+ extern int fb_prepare_logo(struct fb_info *fb_info, int rotate);
+ extern int fb_show_logo(struct fb_info *fb_info, int rotate);
+ extern char* fb_get_buffer_offset(struct fb_info *info, struct fb_pixmap *buf, u32 size);
+-- 
+1.7.1

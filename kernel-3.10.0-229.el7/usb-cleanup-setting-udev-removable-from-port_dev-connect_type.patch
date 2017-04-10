@@ -1,0 +1,147 @@
+From b8dc4d9a2b60d063dfbd249ecd46112d224b3364 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:09:40 -0400
+Subject: [usb] cleanup setting udev->removable from port_dev->connect_type
+
+Message-id: <1410887463-20674-509-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95653
+O-Subject: [RHEL7 PATCH 508/591] usb: cleanup setting udev->removable from port_dev->connect_type
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=821903
+
+commit a4204ff0bd576fc114357eed70e7c4e776ddf396
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue May 20 18:08:22 2014 -0700
+
+    usb: cleanup setting udev->removable from port_dev->connect_type
+
+    Once usb-acpi has set the port's connect type the usb_device's
+    ->removable attribute can be set in the standard location
+    set_usb_port_removable().
+
+    This also changes behavior in the case where the firmware says that the
+    port connect type is unknown.  In that case just use the default setting
+    determined from the hub descriptor.
+
+    Note, we no longer pass udev->portnum to acpi_find_child_device() in the
+    root hub case since:
+    1/ the usb-core sets this to zero
+    2/ acpi always expects zero
+    ...just pass zero.
+
+    Suggested-by: Alan Stern <stern@rowland.harvard.edu>
+    Acked-by: Alan Stern <stern@rowland.harvard.edu>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+backport notes:  again workaround upstream's acpi_companion stuff
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index d1390a3..b12c092 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -2310,6 +2310,22 @@ static void set_usb_port_removable(struct usb_device *udev)
+   udev->removable = USB_DEVICE_REMOVABLE;
+  else
+   udev->removable = USB_DEVICE_FIXED;
++
++ /*
++  * Platform firmware may have populated an alternative value for
++  * removable.  If the parent port has a known connect_type use
++  * that instead.
++  */
++ switch (hub->ports[udev->portnum - 1]->connect_type) {
++ case USB_PORT_CONNECT_TYPE_HOT_PLUG:
++  udev->removable = USB_DEVICE_REMOVABLE;
++  break;
++ case USB_PORT_CONNECT_TYPE_HARD_WIRED:
++  udev->removable = USB_DEVICE_FIXED;
++  break;
++ default: /* use what was set above */
++  break;
++ }
+ }
+ 
+ /**
+@@ -2379,11 +2395,7 @@ int usb_new_device(struct usb_device *udev)
+ 
+  device_enable_async_suspend(&udev->dev);
+ 
+- /*
+-  * check whether the hub marks this port as non-removable. Do it
+-  * now so that platform-specific data can override it in
+-  * device_add()
+-  */
++ /* check whether the hub or firmware marks this port as non-removable */
+  if (udev->parent)
+   set_usb_port_removable(udev);
+ 
+diff --git a/drivers/usb/core/usb-acpi.c b/drivers/usb/core/usb-acpi.c
+index 8ed2958..deef91b 100644
+--- a/drivers/usb/core/usb-acpi.c
++++ b/drivers/usb/core/usb-acpi.c
+@@ -137,8 +137,8 @@ out:
+ 
+ static int usb_acpi_find_device(struct device *dev, acpi_handle *handle)
+ {
+- int port1;
+  struct usb_device *udev;
++ struct acpi_device *adev;
+  acpi_handle *parent_handle;
+ 
+  /*
+@@ -156,42 +156,21 @@ static int usb_acpi_find_device(struct device *dev, acpi_handle *handle)
+   */
+  if (is_usb_device(dev)) {
+   udev = to_usb_device(dev);
+-  port1 = udev->portnum;
+-  if (udev->parent) {
+-   struct usb_hub *hub;
+-
+-   hub = usb_hub_to_struct_hub(udev->parent);
+-   /*
+-    * According usb port's connect type to set usb device's
+-    * removability.
+-    */
+-   switch (hub->ports[port1 - 1]->connect_type) {
+-   case USB_PORT_CONNECT_TYPE_HOT_PLUG:
+-    udev->removable = USB_DEVICE_REMOVABLE;
+-    break;
+-   case USB_PORT_CONNECT_TYPE_HARD_WIRED:
+-    udev->removable = USB_DEVICE_FIXED;
+-    break;
+-   default:
+-    udev->removable = USB_DEVICE_REMOVABLE_UNKNOWN;
+-    break;
+-   }
+-
++  if (udev->parent)
+    return -ENODEV;
+-  }
+ 
+-  /* root hub's parent is the usb hcd. */
++  /* root hub is only child (_ADR=0) under its parent, the HC */
+   parent_handle = DEVICE_ACPI_HANDLE(dev->parent);
+-  *handle = acpi_get_child(parent_handle, port1);
++  *handle = acpi_get_child(parent_handle, 0);
+   if (!*handle)
+    return -ENODEV;
+   return 0;
+  } else if (is_usb_port(dev)) {
+   struct usb_port *port_dev = to_usb_port(dev);
++  int port1 = port_dev->portnum;
+ 
+   /* Get the struct usb_device point of port's hub */
+   udev = to_usb_device(dev->parent->parent);
+-  port1 = port_dev->portnum;
+ 
+   /*
+    * The root hub ports' parent is the root hub. The non-root-hub
+-- 
+1.7.1

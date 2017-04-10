@@ -1,0 +1,187 @@
+From 11e086905145a482f557c0d723307cd38b69d774 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:14:44 -0400
+Subject: [net] udp: Make enabling of zero UDP6 csums more restrictive
+
+Message-id: <1409652920-431-22-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90146
+O-Subject: [PATCH 21/57] [RHEL7.1 net] net: Make enabling of zero UDP6 csums more restrictive
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+commit 1c19448c9ba6545b80ded18488a64a7f3d8e6998
+Author: Tom Herbert <therbert@google.com>
+Date:   Fri May 23 08:47:32 2014 -0700
+
+    net: Make enabling of zero UDP6 csums more restrictive
+
+    RFC 6935 permits zero checksums to be used in IPv6 however this is
+    recommended only for certain tunnel protocols, it does not make
+    checksums completely optional like they are in IPv4.
+
+    This patch restricts the use of IPv6 zero checksums that was previously
+    intoduced. no_check6_tx and no_check6_rx have been added to control
+    the use of checksums in UDP6 RX and TX path. The normal
+    sk_no_check_{rx,tx} settings are not used (this avoids ambiguity when
+    dealing with a dual stack socket).
+
+    A helper function has been added (udp_set_no_check6) which can be
+    called by tunnel impelmentations to all zero checksums (send on the
+    socket, and accept them as valid).
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/udp.h b/include/linux/udp.h
+index 42278bb..247cfdc 100644
+--- a/include/linux/udp.h
++++ b/include/linux/udp.h
+@@ -47,7 +47,9 @@ struct udp_sock {
+ #define udp_portaddr_node inet.sk.__sk_common.skc_portaddr_node
+  int   pending; /* Any pending frames ? */
+  unsigned int  corkflag; /* Cork is required */
+-   __u16   encap_type; /* Is this an Encapsulation socket? */
++ __u8   encap_type; /* Is this an Encapsulation socket? */
++ unsigned char  no_check6_tx:1,/* Send zero UDP6 checksums on TX? */
++    no_check6_rx:1;/* Allow zero UDP6 checksums on RX? */
+  /*
+   * Following member retains the information to create a UDP header
+   * when the socket is uncorked.
+@@ -76,6 +78,26 @@ static inline struct udp_sock *udp_sk(const struct sock *sk)
+  return (struct udp_sock *)sk;
+ }
+ 
++static inline void udp_set_no_check6_tx(struct sock *sk, bool val)
++{
++ udp_sk(sk)->no_check6_tx = val;
++}
++
++static inline void udp_set_no_check6_rx(struct sock *sk, bool val)
++{
++ udp_sk(sk)->no_check6_rx = val;
++}
++
++static inline bool udp_get_no_check6_tx(struct sock *sk)
++{
++ return udp_sk(sk)->no_check6_tx;
++}
++
++static inline bool udp_get_no_check6_rx(struct sock *sk)
++{
++ return udp_sk(sk)->no_check6_rx;
++}
++
+ #define udp_portaddr_for_each_entry(__sk, node, list) \
+  hlist_nulls_for_each_entry(__sk, node, list, __sk_common.skc_portaddr_node)
+ 
+diff --git a/include/uapi/linux/udp.h b/include/uapi/linux/udp.h
+index e2bcfd7..16574ea 100644
+--- a/include/uapi/linux/udp.h
++++ b/include/uapi/linux/udp.h
+@@ -29,6 +29,8 @@ struct udphdr {
+ /* UDP socket options */
+ #define UDP_CORK 1 /* Never send partially complete segments */
+ #define UDP_ENCAP 100 /* Set the socket to accept encapsulated packets */
++#define UDP_NO_CHECK6_TX 101 /* Disable sending checksum for UDP6X */
++#define UDP_NO_CHECK6_RX 102 /* Disable accpeting checksum for UDP6 */
+ 
+ /* UDP encapsulation types */
+ #define UDP_ENCAP_ESPINUDP_NON_IKE 1 /* draft-ietf-ipsec-nat-t-ike-00/01 */
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 2006ee5..7e43fce 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1784,7 +1784,7 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
+          int (*push_pending_frames)(struct sock *))
+ {
+  struct udp_sock *up = udp_sk(sk);
+- int val;
++ int val, valbool;
+  int err = 0;
+  int is_udplite = IS_UDPLITE(sk);
+ 
+@@ -1794,6 +1794,8 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
+  if (get_user(val, (int __user *)optval))
+   return -EFAULT;
+ 
++ valbool = val ? 1 : 0;
++
+  switch (optname) {
+  case UDP_CORK:
+   if (val != 0) {
+@@ -1823,6 +1825,14 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
+   }
+   break;
+ 
++ case UDP_NO_CHECK6_TX:
++  up->no_check6_tx = valbool;
++  break;
++
++ case UDP_NO_CHECK6_RX:
++  up->no_check6_rx = valbool;
++  break;
++
+  /*
+   *  UDP-Lite's partial checksum coverage (RFC 3828).
+   */
+@@ -1905,6 +1915,14 @@ int udp_lib_getsockopt(struct sock *sk, int level, int optname,
+   val = up->encap_type;
+   break;
+ 
++ case UDP_NO_CHECK6_TX:
++  val = up->no_check6_tx;
++  break;
++
++ case UDP_NO_CHECK6_RX:
++  val = up->no_check6_rx;
++  break;
++
+  /* The following two cannot be changed on UDP sockets, the return is
+   * always 0 (which corresponds to the full checksum coverage of UDP). */
+  case UDPLITE_SEND_CSCOV:
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index b8cb764..e61689a 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -764,10 +764,10 @@ static int __udp6_lib_mcast_deliver(struct net *net, struct sk_buff *skb,
+  dif = inet6_iif(skb);
+  sk = udp_v6_mcast_next(net, sk, uh->dest, daddr, uh->source, saddr, dif);
+  while (sk) {
+-  /* If zero checksum and sk_no_check is not on for
++  /* If zero checksum and no_check is not on for
+    * the socket then skip it.
+    */
+-  if (uh->check || sk->sk_no_check_rx)
++  if (uh->check || udp_sk(sk)->no_check6_rx)
+    stack[count++] = sk;
+ 
+   sk = udp_v6_mcast_next(net, sk_nulls_next(sk), uh->dest, daddr,
+@@ -857,7 +857,7 @@ int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+  if (sk != NULL) {
+   int ret;
+ 
+-  if (!uh->check && !sk->sk_no_check_rx) {
++  if (!uh->check && !udp_sk(sk)->no_check6_rx) {
+    sock_put(sk);
+    udp6_csum_zero_error(skb);
+    goto csum_error;
+@@ -1007,7 +1007,7 @@ static int udp_v6_push_pending_frames(struct sock *sk)
+ 
+  if (is_udplite)
+   csum = udplite_csum_outgoing(sk, skb);
+- else if (sk->sk_no_check_tx) {   /* UDP csum disabled */
++ else if (up->no_check6_tx) {   /* UDP csum disabled */
+   skb->ip_summed = CHECKSUM_NONE;
+   goto send;
+  } else if (skb->ip_summed == CHECKSUM_PARTIAL) { /* UDP hardware csum */
+-- 
+1.7.1

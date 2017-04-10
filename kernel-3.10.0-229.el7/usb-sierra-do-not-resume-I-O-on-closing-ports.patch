@@ -1,0 +1,86 @@
+From 340f3e007a2e0a668257fb18de8dbfc0f71764b2 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:08:32 -0400
+Subject: [usb] sierra: do not resume I/O on closing ports
+
+Message-id: <1410887463-20674-441-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95616
+O-Subject: [RHEL7 PATCH 440/591] USB: sierra: do not resume I/O on closing ports
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit c2e45d704723723e5691c7b4bcd0ff4aeb813522
+Author: Johan Hovold <jhovold@gmail.com>
+Date:   Mon May 26 19:23:09 2014 +0200
+
+    USB: sierra: do not resume I/O on closing ports
+
+    Use tty-port initialised flag rather than private flag to determine when
+    port is closing down.
+
+    Since the tty-port flag is set prior to dropping DTR/RTS (when HUPCL is
+    set) this avoid submitting the read urbs when resuming the interface in
+    dtr_rts() only to immediately kill them again in shutdown().
+
+    Signed-off-by: Johan Hovold <jhovold@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/serial/sierra.c b/drivers/usb/serial/sierra.c
+index be4a759..6f7f01e 100644
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -316,7 +316,6 @@ struct sierra_port_private {
+  int dsr_state;
+  int dcd_state;
+  int ri_state;
+- unsigned int opened:1;
+ };
+ 
+ static int sierra_send_setup(struct usb_serial_port *port)
+@@ -769,8 +768,11 @@ static void sierra_close(struct usb_serial_port *port)
+ 
+  portdata = usb_get_serial_port_data(port);
+ 
++ /*
++  * Need to take susp_lock to make sure port is not already being
++  * resumed, but no need to hold it due to ASYNC_INITIALIZED.
++  */
+  spin_lock_irq(&intfdata->susp_lock);
+- portdata->opened = 0;
+  if (--intfdata->open_ports == 0)
+   serial->interface->needs_remote_wakeup = 0;
+  spin_unlock_irq(&intfdata->susp_lock);
+@@ -826,7 +828,6 @@ static int sierra_open(struct tty_struct *tty, struct usb_serial_port *port)
+   goto err_submit;
+ 
+  spin_lock_irq(&intfdata->susp_lock);
+- portdata->opened = 1;
+  if (++intfdata->open_ports == 1)
+   serial->interface->needs_remote_wakeup = 1;
+  spin_unlock_irq(&intfdata->susp_lock);
+@@ -1025,16 +1026,14 @@ static int sierra_resume(struct usb_serial *serial)
+ {
+  struct usb_serial_port *port;
+  struct sierra_intf_private *intfdata = usb_get_serial_data(serial);
+- struct sierra_port_private *portdata;
+  int ec = 0;
+  int i, err;
+ 
+  spin_lock_irq(&intfdata->susp_lock);
+  for (i = 0; i < serial->num_ports; i++) {
+   port = serial->port[i];
+-  portdata = usb_get_serial_port_data(port);
+ 
+-  if (!portdata || !portdata->opened)
++  if (!test_bit(ASYNCB_INITIALIZED, &port->port.flags))
+    continue;
+ 
+   err = sierra_submit_delayed_urbs(port);
+-- 
+1.7.1

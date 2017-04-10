@@ -1,0 +1,144 @@
+From 2c72a1d931b23be31a1db3b70208e78c46dfd676 Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@redhat.com>
+Date: Mon, 8 Dec 2014 17:32:57 -0500
+Subject: [net] xfrm: introduce helper for safe determination of mtu
+
+Message-id: <852f545539918a7aeb1024c40fff9046eb6e3219.1418058212.git.hannes@redhat.com>
+Patchwork-id: 101176
+O-Subject: [RHEL7.1 net 01/13] xfrm: introduce helper for safe determination of mtu
+Bugzilla: 1170116
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1170116
+Upstream Status: 0ea9d5e3e0e03a63b11392f5613378977dae7eca
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8344420
+
+Upstream Commit:
+commit 0ea9d5e3e0e03a63b11392f5613378977dae7eca
+Author: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date:   Tue Aug 13 04:35:58 2013 +0200
+
+    xfrm: introduce helper for safe determination of mtu
+
+    skb->sk socket can be of AF_INET or AF_INET6 address family. Thus we
+    always have to make sure we a referring to the correct interpretation
+    of skb->sk.
+
+    We only depend on header defines to query the mtu, so we don't introduce
+    a new dependency to ipv6 by this change.
+
+    Cc: Steffen Klassert <steffen.klassert@secunet.com>
+    Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+
+Signed-off-by: Hannes Frederic Sowa <hannes@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/route.h b/include/net/route.h
+index 0a659cc..cb9afc7 100644
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -318,4 +318,12 @@ static inline int ip4_dst_hoplimit(const struct dst_entry *dst)
+  return hoplimit;
+ }
+ 
++static inline int ip_skb_dst_mtu(struct sk_buff *skb)
++{
++ struct inet_sock *inet = skb->sk ? inet_sk(skb->sk) : NULL;
++
++ return (inet && inet->pmtudisc == IP_PMTUDISC_PROBE) ?
++        skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
++}
++
+ #endif /* _ROUTE_H */
+diff --git a/include/net/xfrm.h b/include/net/xfrm.h
+index 542f56c..8975a25 100644
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -20,6 +20,7 @@
+ #include <net/route.h>
+ #include <net/ipv6.h>
+ #include <net/ip6_fib.h>
++#include <net/ip6_route.h>
+ #include <net/flow.h>
+ 
+ #include <linux/interrupt.h>
+@@ -1781,4 +1782,16 @@ static inline int xfrm_tunnel_check(struct sk_buff *skb, struct xfrm_state *x,
+ 
+  return 0;
+ }
++
++static inline int xfrm_skb_dst_mtu(struct sk_buff *skb)
++{
++ struct sock *sk = skb->sk;
++
++ if (sk && sk->sk_family == AF_INET6)
++  return ip6_skb_dst_mtu(skb);
++ else if (sk && sk->sk_family == AF_INET)
++  return ip_skb_dst_mtu(skb);
++ return dst_mtu(skb_dst(skb));
++}
++
+ #endif /* _NET_XFRM_H */
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index a108d98..99fe99d 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -211,14 +211,6 @@ static inline int ip_finish_output2(struct sk_buff *skb)
+  return -EINVAL;
+ }
+ 
+-static inline int ip_skb_dst_mtu(struct sk_buff *skb)
+-{
+- struct inet_sock *inet = skb->sk ? inet_sk(skb->sk) : NULL;
+-
+- return (inet && inet->pmtudisc == IP_PMTUDISC_PROBE) ?
+-        skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
+-}
+-
+ static int ip_finish_output_gso(struct sk_buff *skb)
+ {
+  netdev_features_t features;
+diff --git a/net/ipv4/xfrm4_output.c b/net/ipv4/xfrm4_output.c
+index 6722761..658b67f 100644
+--- a/net/ipv4/xfrm4_output.c
++++ b/net/ipv4/xfrm4_output.c
+@@ -21,7 +21,6 @@
+ static int xfrm4_tunnel_check_size(struct sk_buff *skb)
+ {
+  int mtu, ret = 0;
+- struct dst_entry *dst;
+ 
+  if (IPCB(skb)->flags & IPSKB_XFRM_TUNNEL_SIZE)
+   goto out;
+@@ -29,8 +28,7 @@ static int xfrm4_tunnel_check_size(struct sk_buff *skb)
+  if (!(ip_hdr(skb)->frag_off & htons(IP_DF)) || skb->local_df)
+   goto out;
+ 
+- dst = skb_dst(skb);
+- mtu = dst_mtu(dst);
++ mtu = xfrm_skb_dst_mtu(skb);
+  if (skb->len > mtu) {
+   if (skb->sk)
+    ip_local_error(skb->sk, EMSGSIZE, ip_hdr(skb)->daddr,
+diff --git a/net/ipv6/xfrm6_output.c b/net/ipv6/xfrm6_output.c
+index 2066d2b..7bcbcb4 100644
+--- a/net/ipv6/xfrm6_output.c
++++ b/net/ipv6/xfrm6_output.c
+@@ -136,7 +136,10 @@ static int __xfrm6_output(struct sk_buff *skb)
+ {
+  struct dst_entry *dst = skb_dst(skb);
+  struct xfrm_state *x = dst->xfrm;
+- int mtu = ip6_skb_dst_mtu(skb);
++ int mtu = xfrm_skb_dst_mtu(skb);
++
++ if (mtu < IPV6_MIN_MTU)
++  mtu = IPV6_MIN_MTU;
+ 
+  if (skb->len > mtu && xfrm6_local_dontfrag(skb)) {
+   xfrm6_local_rxpmtu(skb, mtu);
+-- 
+1.7.1

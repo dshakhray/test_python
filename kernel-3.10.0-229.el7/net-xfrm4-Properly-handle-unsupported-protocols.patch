@@ -1,0 +1,91 @@
+From 1de8d574a8ce6f451525f6e9d531625bcbf96fa3 Mon Sep 17 00:00:00 2001
+From: Jiri Pirko <jpirko@redhat.com>
+Date: Mon, 15 Sep 2014 09:32:03 -0400
+Subject: [net] xfrm4: Properly handle unsupported protocols
+
+Message-id: <1410773525-8735-1-git-send-email-jpirko@redhat.com>
+Patchwork-id: 94791
+O-Subject: [patch rhel7 net 19/21] xfrm4: Properly handle unsupported protocols
+Bugzilla: 1091561
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ1091561
+https://brewweb.devel.redhat.com/taskinfo?taskID=7954687
+
+upstream commit 61622cc6f29034d0479f7ac16f3d48f1eeabf3a1
+Author: Steffen Klassert <steffen.klassert@secunet.com>
+Date:   Tue Apr 29 07:50:44 2014 +0200
+
+    xfrm4: Properly handle unsupported protocols
+
+    We don't catch the case if an unsupported protocol is submitted
+    to the xfrm4 protocol handlers, this can lead to NULL pointer
+    dereferences. Fix this by adding the appropriate checks.
+
+Signed-off-by: Jiri Pirko <jpirko@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ipv4/xfrm4_protocol.c b/net/ipv4/xfrm4_protocol.c
+index cdc09ef..b52c390 100644
+--- a/net/ipv4/xfrm4_protocol.c
++++ b/net/ipv4/xfrm4_protocol.c
+@@ -50,8 +50,12 @@ int xfrm4_rcv_cb(struct sk_buff *skb, u8 protocol, int err)
+ {
+  int ret;
+  struct xfrm4_protocol *handler;
++ struct xfrm4_protocol __rcu **head = proto_handlers(protocol);
+ 
+- for_each_protocol_rcu(*proto_handlers(protocol), handler)
++ if (!head)
++  return 0;
++
++ for_each_protocol_rcu(*head, handler)
+   if ((ret = handler->cb_handler(skb, err)) <= 0)
+    return ret;
+ 
+@@ -64,15 +68,20 @@ int xfrm4_rcv_encap(struct sk_buff *skb, int nexthdr, __be32 spi,
+ {
+  int ret;
+  struct xfrm4_protocol *handler;
++ struct xfrm4_protocol __rcu **head = proto_handlers(nexthdr);
+ 
+  XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4 = NULL;
+  XFRM_SPI_SKB_CB(skb)->family = AF_INET;
+  XFRM_SPI_SKB_CB(skb)->daddroff = offsetof(struct iphdr, daddr);
+ 
+- for_each_protocol_rcu(*proto_handlers(nexthdr), handler)
++ if (!head)
++  goto out;
++
++ for_each_protocol_rcu(*head, handler)
+   if ((ret = handler->input_handler(skb, nexthdr, spi, encap_type)) != -EINVAL)
+    return ret;
+ 
++out:
+  icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
+ 
+  kfree_skb(skb);
+@@ -203,6 +212,9 @@ int xfrm4_protocol_register(struct xfrm4_protocol *handler,
+  int ret = -EEXIST;
+  int priority = handler->priority;
+ 
++ if (!proto_handlers(protocol) || !netproto(protocol))
++  return -EINVAL;
++
+  mutex_lock(&xfrm4_protocol_mutex);
+ 
+  if (!rcu_dereference_protected(*proto_handlers(protocol),
+@@ -245,6 +257,9 @@ int xfrm4_protocol_deregister(struct xfrm4_protocol *handler,
+  struct xfrm4_protocol *t;
+  int ret = -ENOENT;
+ 
++ if (!proto_handlers(protocol) || !netproto(protocol))
++  return -EINVAL;
++
+  mutex_lock(&xfrm4_protocol_mutex);
+ 
+  for (pprev = proto_handlers(protocol);
+-- 
+1.7.1

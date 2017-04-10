@@ -1,0 +1,106 @@
+From 39ea240643aa33ee7b6a5f066d9b2c6e9074e8c4 Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@redhat.com>
+Date: Tue, 21 Oct 2014 17:05:38 -0400
+Subject: [net] ipv4: fix dst race in sk_dst_get()
+
+Message-id: <aa46d37f5c170e7c0eed7d412189f9f008bdf4d5.1413910820.git.hannes@redhat.com>
+Patchwork-id: 98025
+O-Subject: [RHEL7.1 net PATCH 2/4] ipv4: fix dst race in sk_dst_get()
+Bugzilla: 1155155
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1155155
+Upstream Status: f88649721268999bdff09777847080a52004f691
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8142603
+
+Conflict resolution:
+Removed the changes from upstream patch regarding dst tunnel caching
+(in net/ipv4/ip_tunnel.c). Dst tunnel caching is not present in RHEL7.
+
+This is important to remember if tunnel caching for dst_entries will
+be backported!
+
+Upstream Commit:
+commit f88649721268999bdff09777847080a52004f691
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Tue Jun 24 10:05:11 2014 -0700
+
+    ipv4: fix dst race in sk_dst_get()
+
+    When IP route cache had been removed in linux-3.6, we broke assumption
+    that dst entries were all freed after rcu grace period. DST_NOCACHE
+    dst were supposed to be freed from dst_release(). But it appears
+    we want to keep such dst around, either in UDP sockets or tunnels.
+
+    In sk_dst_get() we need to make sure dst refcount is not 0
+    before incrementing it, or else we might end up freeing a dst
+    twice.
+
+    DST_NOCACHE set on a dst does not mean this dst can not be attached
+    to a socket or a tunnel.
+
+    Then, before actual freeing, we need to observe a rcu grace period
+    to make sure all other cpus can catch the fact the dst is no longer
+    usable.
+
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Reported-by: Dormando <dormando@rydia.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Hannes Frederic Sowa <hannes@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 1488a6b..e2b9c8a 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1774,8 +1774,8 @@ sk_dst_get(struct sock *sk)
+ 
+  rcu_read_lock();
+  dst = rcu_dereference(sk->sk_dst_cache);
+- if (dst)
+-  dst_hold(dst);
++ if (dst && !atomic_inc_not_zero(&dst->__refcnt))
++  dst = NULL;
+  rcu_read_unlock();
+  return dst;
+ }
+diff --git a/net/core/dst.c b/net/core/dst.c
+index 6e3f8cb..4a1ea88 100644
+--- a/net/core/dst.c
++++ b/net/core/dst.c
+@@ -269,6 +269,15 @@ again:
+ }
+ EXPORT_SYMBOL(dst_destroy);
+ 
++static void dst_destroy_rcu(struct rcu_head *head)
++{
++ struct dst_entry *dst = container_of(head, struct dst_entry, rcu_head);
++
++ dst = dst_destroy(dst);
++ if (dst)
++  __dst_free(dst);
++}
++
+ void dst_release(struct dst_entry *dst)
+ {
+  if (dst) {
+@@ -276,11 +285,8 @@ void dst_release(struct dst_entry *dst)
+ 
+   newrefcnt = atomic_dec_return(&dst->__refcnt);
+   WARN_ON(newrefcnt < 0);
+-  if (unlikely(dst->flags & DST_NOCACHE) && !newrefcnt) {
+-   dst = dst_destroy(dst);
+-   if (dst)
+-    __dst_free(dst);
+-  }
++  if (unlikely(dst->flags & DST_NOCACHE) && !newrefcnt)
++   call_rcu(&dst->rcu_head, dst_destroy_rcu);
+  }
+ }
+ EXPORT_SYMBOL(dst_release);
+-- 
+1.7.1

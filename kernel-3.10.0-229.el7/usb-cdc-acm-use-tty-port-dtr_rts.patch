@@ -1,0 +1,112 @@
+From 5b690a74293668ed53c9b2a953e6d0daa14c8e23 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:09:14 -0400
+Subject: [usb] cdc-acm: use tty-port dtr_rts
+
+Message-id: <1410887463-20674-483-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95462
+O-Subject: [RHEL7 PATCH 482/591] USB: cdc-acm: use tty-port dtr_rts
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 0943d8ead30e9474034cc5e92225ab0fd29fd0d4
+Author: Johan Hovold <jhovold@gmail.com>
+Date:   Mon May 26 19:23:51 2014 +0200
+
+    USB: cdc-acm: use tty-port dtr_rts
+
+    Add dtr_rts tty-port operation which implements proper DTR/RTS handling
+    (e.g. only lower DTR/RTS during shutdown if HUPCL is set).
+
+    Note that modem-control locking still needs to be added throughout the
+    driver.
+
+    Signed-off-by: Johan Hovold <jhovold@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
+index 8f654ce..e934e19 100644
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -504,6 +504,25 @@ static int acm_tty_open(struct tty_struct *tty, struct file *filp)
+  return tty_port_open(&acm->port, tty, filp);
+ }
+ 
++static void acm_port_dtr_rts(struct tty_port *port, int raise)
++{
++ struct acm *acm = container_of(port, struct acm, port);
++ int val;
++ int res;
++
++ if (raise)
++  val = ACM_CTRL_DTR | ACM_CTRL_RTS;
++ else
++  val = 0;
++
++ /* FIXME: add missing ctrlout locking throughout driver */
++ acm->ctrlout = val;
++
++ res = acm_set_control(acm, val);
++ if (res && (acm->ctrl_caps & USB_CDC_CAP_LINE))
++  dev_err(&acm->control->dev, "failed to set dtr/rts\n");
++}
++
+ static int acm_port_activate(struct tty_port *port, struct tty_struct *tty)
+ {
+  struct acm *acm = container_of(port, struct acm, port);
+@@ -535,11 +554,6 @@ static int acm_port_activate(struct tty_port *port, struct tty_struct *tty)
+   goto error_submit_urb;
+  }
+ 
+- acm->ctrlout = ACM_CTRL_DTR | ACM_CTRL_RTS;
+- retval = acm_set_control(acm, acm->ctrlout);
+- if (retval < 0 && (acm->ctrl_caps & USB_CDC_CAP_LINE))
+-  goto error_set_control;
+-
+  /*
+   * Unthrottle device in case the TTY was closed while throttled.
+   */
+@@ -561,9 +575,6 @@ static int acm_port_activate(struct tty_port *port, struct tty_struct *tty)
+ error_submit_read_urbs:
+  for (i = 0; i < acm->rx_buflimit; i++)
+   usb_kill_urb(acm->read_urbs[i]);
+- acm->ctrlout = 0;
+- acm_set_control(acm, acm->ctrlout);
+-error_set_control:
+  usb_kill_urb(acm->ctrlurb);
+ error_submit_urb:
+  usb_autopm_put_interface(acm->control);
+@@ -595,8 +606,6 @@ static void acm_port_shutdown(struct tty_port *port)
+ 
+  dev_dbg(&acm->control->dev, "%s\n", __func__);
+ 
+- acm_set_control(acm, acm->ctrlout = 0);
+-
+  /*
+   * Need to grab write_lock to prevent race with resume, but no need to
+   * hold it due to the tty-port initialised flag.
+@@ -992,6 +1001,7 @@ static void acm_tty_set_termios(struct tty_struct *tty,
+ }
+ 
+ static const struct tty_port_operations acm_port_ops = {
++ .dtr_rts = acm_port_dtr_rts,
+  .shutdown = acm_port_shutdown,
+  .activate = acm_port_activate,
+  .destruct = acm_port_destruct,
+@@ -1429,8 +1439,6 @@ skip_countries:
+ 
+  dev_info(&intf->dev, "ttyACM%d: USB ACM device\n", minor);
+ 
+- acm_set_control(acm, acm->ctrlout);
+-
+  acm->line.dwDTERate = cpu_to_le32(9600);
+  acm->line.bDataBits = 8;
+  acm_set_line(acm, &acm->line);
+-- 
+1.7.1

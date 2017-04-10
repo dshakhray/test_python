@@ -1,0 +1,100 @@
+From 7356d396f375cfec8827e13794c1398e2edf2565 Mon Sep 17 00:00:00 2001
+From: Jaroslav Kysela <jkysela@redhat.com>
+Date: Wed, 3 Sep 2014 07:35:27 -0400
+Subject: [alsa] hd-audio: Don't continue probing i915 when nomodeset is given
+
+Message-id: <140972823573-340-patchset-jkysela@redhat.com>
+Patchwork-id: 91036
+O-Subject: [RHEL 7.1 PATCH 339/442] ALSA: drm/i915, HD-audio: Don't continue probing when nomodeset is given
+Bugzilla: 1112200
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+
+When a machine is booted with nomodeset option, i915 driver skips the
+whole initialization.  Meanwhile, HD-audio tries to bind wth i915 just
+by request_symbol() without knowing that the initialization was
+skipped, and eventually it hits WARN_ON() in i915_request_power_well()
+and i915_release_power_well() wrongly but still continues probing,
+even though it doesn't work at all.
+
+In this patch, both functions are changed to return an error in case
+of uninitialized state instead of WARN_ON(), so that HD-audio driver
+can give up HDMI controller initialization at the right time.
+
+Acked-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: <stable@vger.kernel.org> [3.15]
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+(picked from kernel: 74b0c2d75fb4cc89173944e6d8f9eb47aca0c343)
+rhbz#1112200
+Signed-off-by: Jaroslav Kysela <jkysela@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/sound/pci/hda/hda_i915.c b/sound/pci/hda/hda_i915.c
+index b0fe879..e9e8a4a 100644
+--- a/sound/pci/hda/hda_i915.c
++++ b/sound/pci/hda/hda_i915.c
+@@ -25,17 +25,17 @@
+ static int (*get_power)(void);
+ static int (*put_power)(void);
+ 
+-void hda_display_power(bool enable)
++int hda_display_power(bool enable)
+ {
+  if (!get_power || !put_power)
+-  return;
++  return -ENODEV;
+ 
+  pr_debug("HDA display power %s \n",
+    enable ? "Enable" : "Disable");
+  if (enable)
+-  get_power();
++  return get_power();
+  else
+-  put_power();
++  return put_power();
+ }
+ 
+ int hda_i915_init(void)
+diff --git a/sound/pci/hda/hda_i915.h b/sound/pci/hda/hda_i915.h
+index 5a63da2..bfd835f 100644
+--- a/sound/pci/hda/hda_i915.h
++++ b/sound/pci/hda/hda_i915.h
+@@ -17,11 +17,11 @@
+ #define __SOUND_HDA_I915_H
+ 
+ #ifdef CONFIG_SND_HDA_I915
+-void hda_display_power(bool enable);
++int hda_display_power(bool enable);
+ int hda_i915_init(void);
+ int hda_i915_exit(void);
+ #else
+-static inline void hda_display_power(bool enable) {}
++static inline int hda_display_power(bool enable) { return 0; }
+ static inline int hda_i915_init(void)
+ {
+  return -ENODEV;
+diff --git a/sound/pci/hda/hda_intel.c b/sound/pci/hda/hda_intel.c
+index 0a6b561..1918463 100644
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -1656,8 +1656,13 @@ static int azx_probe_continue(struct azx *chip)
+     "Error request power-well from i915\n");
+    goto out_free;
+   }
++  err = hda_display_power(true);
++  if (err < 0) {
++   dev_err(chip->card->dev,
++    "Cannot turn on display power on i915\n");
++   goto out_free;
++  }
+ #endif
+-  hda_display_power(true);
+  }
+ 
+  err = azx_first_init(chip);
+-- 
+1.7.1

@@ -1,0 +1,169 @@
+From e96e0bee9e69a760c076d6376623bbfc8824fd46 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:09:03 -0400
+Subject: [tools] perf: Cache dso data file descriptor
+
+Message-id: <1410181752-25631-299-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91949
+O-Subject: [PATCH RHEL7.1 BZ1134356 298/307] perf tools: Cache dso data file descriptor
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit c658045197814b7d762662f9aa9f652379121a03
+Author: Jiri Olsa <jolsa@kernel.org>
+Date: Wed Apr 30 15:47:27 2014 +0200
+
+description
+===========
+Caching dso data file descriptors to avoid expensive re-opens
+especially during DWARF unwind.
+
+We keep dsos data file descriptors open until their count reaches
+the half of the current fd open limit (RLIMIT_NOFILE). In this case
+we close file descriptor of the first opened dso object.
+
+We've got overall speedup (~27% for my workload) of report:
+ 'perf report --stdio -i perf-test.data' (3 runs)
+  (perf-test.data size was around 12GB)
+
+  current code:
+   545,640,944,228      cycles                     ( +-  0.53% )
+   785,255,798,320      instructions               ( +-  0.03% )
+
+     366.340910010 seconds time elapsed            ( +-  3.65% )
+
+  after change:
+   435,895,036,114      cycles                     ( +-  0.26% )
+   636,790,271,176      instructions               ( +-  0.04% )
+
+     266.481463387 seconds time elapsed            ( +-  0.13% )
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index 76e5c13..fbf6cc9 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -1,4 +1,6 @@
+ #include <asm/bug.h>
++#include <sys/time.h>
++#include <sys/resource.h>
+ #include "symbol.h"
+ #include "dso.h"
+ #include "machine.h"
+@@ -180,12 +182,20 @@ static int __open_dso(struct dso *dso, struct machine *machine)
+  return fd;
+ }
+ 
++static void check_data_close(void);
++
+ static int open_dso(struct dso *dso, struct machine *machine)
+ {
+  int fd = __open_dso(dso, machine);
+ 
+- if (fd > 0)
++ if (fd > 0) {
+   dso__list_add(dso);
++  /*
++   * Check if we crossed the allowed number
++   * of opened DSOs and close one if needed.
++   */
++  check_data_close();
++ }
+ 
+  return fd;
+ }
+@@ -204,6 +214,54 @@ static void close_dso(struct dso *dso)
+  close_data_fd(dso);
+ }
+ 
++static void close_first_dso(void)
++{
++ struct dso *dso;
++
++ dso = list_first_entry(&dso__data_open, struct dso, data.open_entry);
++ close_dso(dso);
++}
++
++static rlim_t get_fd_limit(void)
++{
++ struct rlimit l;
++ rlim_t limit = 0;
++
++ /* Allow half of the current open fd limit. */
++ if (getrlimit(RLIMIT_NOFILE, &l) == 0) {
++  if (l.rlim_cur == RLIM_INFINITY)
++   limit = l.rlim_cur;
++  else
++   limit = l.rlim_cur / 2;
++ } else {
++  pr_err("failed to get fd limit\n");
++  limit = 1;
++ }
++
++ return limit;
++}
++
++static bool may_cache_fd(void)
++{
++ static rlim_t limit;
++
++ if (!limit)
++  limit = get_fd_limit();
++
++ if (limit == RLIM_INFINITY)
++  return true;
++
++ return limit > (rlim_t) dso__data_open_cnt;
++}
++
++static void check_data_close(void)
++{
++ bool cache_fd = may_cache_fd();
++
++ if (!cache_fd)
++  close_first_dso();
++}
++
+ void dso__data_close(struct dso *dso)
+ {
+  close_dso(dso);
+@@ -356,7 +414,6 @@ dso_cache__read(struct dso *dso, struct machine *machine,
+  if (ret <= 0)
+   free(cache);
+ 
+- dso__data_close(dso);
+  return ret;
+ }
+ 
+diff --git a/tools/perf/util/unwind-libunwind.c b/tools/perf/util/unwind-libunwind.c
+index 4f8dd9e..25578b9 100644
+--- a/tools/perf/util/unwind-libunwind.c
++++ b/tools/perf/util/unwind-libunwind.c
+@@ -250,7 +250,6 @@ static int read_unwind_spec_eh_frame(struct dso *dso, struct machine *machine,
+ 
+  /* Check the .eh_frame section for unwinding info */
+  offset = elf_section_offset(fd, ".eh_frame_hdr");
+- dso__data_close(dso);
+ 
+  if (offset)
+   ret = unwind_spec_ehframe(dso, machine, offset,
+@@ -271,7 +270,6 @@ static int read_unwind_spec_debug_frame(struct dso *dso,
+ 
+  /* Check the .debug_frame section for unwinding info */
+  *offset = elf_section_offset(fd, ".debug_frame");
+- dso__data_close(dso);
+ 
+  if (*offset)
+   return 0;
+-- 
+1.7.1

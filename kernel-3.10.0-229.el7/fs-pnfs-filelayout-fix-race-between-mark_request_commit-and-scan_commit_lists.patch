@@ -1,0 +1,100 @@
+From 8c13acb7b94f5fe68f672ac6a37429680ea16a11 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:19:39 -0400
+Subject: [fs] pnfs/filelayout: fix race between mark_request_commit and scan_commit_lists
+
+Message-id: <1411050057-12417-17-git-send-email-steved@redhat.com>
+Patchwork-id: 96183
+O-Subject: [RHEL7.1 PATCH 16/94] pnfs/filelayout: fix race between mark_request_commit and scan_commit_lists
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: Peng Tao <tao.peng@primarydata.com>
+
+We need to hold cinfo lock while setting bucket->wlseg and adding req to nwritten
+list at the same time. Otherwise there might be a window where nwritten list
+is empty yet we set bucket->wlseg, in which case ff_layout_scan_ds_commit_list()
+may end up clearing bucket->wlseg incorrectly, casuing client to oops later on.
+
+This was found when testing flexfile layout but filelayout has the same problem.
+
+Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+Signed-off-by: Tom Haynes <Thomas.Haynes@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: c8a3292d246f3ed326698ed6acf3286c62b7bf11
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/filelayout/filelayout.c b/fs/nfs/filelayout/filelayout.c
+index 504d58a..a928f92 100644
+--- a/fs/nfs/filelayout/filelayout.c
++++ b/fs/nfs/filelayout/filelayout.c
+@@ -1035,18 +1035,22 @@ out:
+  pnfs_put_lseg(freeme);
+ }
+ 
+-static struct list_head *
+-filelayout_choose_commit_list(struct nfs_page *req,
+-         struct pnfs_layout_segment *lseg,
+-         struct nfs_commit_info *cinfo)
++static void
++filelayout_mark_request_commit(struct nfs_page *req,
++          struct pnfs_layout_segment *lseg,
++          struct nfs_commit_info *cinfo)
++
+ {
+  struct nfs4_filelayout_segment *fl = FILELAYOUT_LSEG(lseg);
+  u32 i, j;
+  struct list_head *list;
+  struct pnfs_commit_bucket *buckets;
+ 
+- if (fl->commit_through_mds)
+-  return &cinfo->mds->list;
++ if (fl->commit_through_mds) {
++  list = &cinfo->mds->list;
++  spin_lock(cinfo->lock);
++  goto mds_commit;
++ }
+ 
+  /* Note that we are calling nfs4_fl_calc_j_index on each page
+   * that ends up being committed to a data server.  An attractive
+@@ -1070,19 +1074,22 @@ filelayout_choose_commit_list(struct nfs_page *req,
+  }
+  set_bit(PG_COMMIT_TO_DS, &req->wb_flags);
+  cinfo->ds->nwritten++;
+- spin_unlock(cinfo->lock);
+- return list;
+-}
+ 
+-static void
+-filelayout_mark_request_commit(struct nfs_page *req,
+-          struct pnfs_layout_segment *lseg,
+-          struct nfs_commit_info *cinfo)
+-{
+- struct list_head *list;
+-
+- list = filelayout_choose_commit_list(req, lseg, cinfo);
+- nfs_request_add_commit_list(req, list, cinfo);
++mds_commit:
++ /* nfs_request_add_commit_list(). We need to add req to list without
++  * dropping cinfo lock.
++  */
++ set_bit(PG_CLEAN, &(req)->wb_flags);
++ nfs_list_add_request(req, list);
++ cinfo->mds->ncommit++;
++ spin_unlock(cinfo->lock);
++ if (!cinfo->dreq) {
++  inc_zone_page_state(req->wb_page, NR_UNSTABLE_NFS);
++  inc_bdi_stat(page_file_mapping(req->wb_page)->backing_dev_info,
++        BDI_RECLAIMABLE);
++  __mark_inode_dirty(req->wb_context->dentry->d_inode,
++       I_DIRTY_DATASYNC);
++ }
+ }
+ 
+ static u32 calc_ds_index_from_commit(struct pnfs_layout_segment *lseg, u32 i)
+-- 
+1.7.1

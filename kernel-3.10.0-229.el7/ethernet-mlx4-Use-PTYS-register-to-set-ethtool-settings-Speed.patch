@@ -1,0 +1,155 @@
+From c50787837f3f6c2d154457a7fc5d90556c2136fc Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Wed, 29 Oct 2014 15:55:00 -0400
+Subject: [ethernet] mlx4: Use PTYS register to set ethtool settings (Speed)
+
+Message-id: <0fce76aaacb9ffa5cdfe0c1801b8a56f25de77f0.1414597479.git.avadai@redhat.com>
+Patchwork-id: 98515
+O-Subject: [Patch RHEL7.1 9/9] net/mlx4_en: Use PTYS register to set ethtool settings (Speed)
+Bugzilla: 1060221
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Saeed Mahameed <saeedm@mellanox.com>
+
+Added Support to set speed or advertised link modes via ethtool:
+ethtool -s <ifname> [speed <speed>] [advertise <link modes>]
+
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d48b3ab4c0e4356f3b1ccaea8cb838cf1292f7da)
+Signed-off-by: Amir Vadai <avadai@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+index 2a50e09..6502bcc 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+@@ -569,6 +569,31 @@ static u32 ptys2ethtool_link_modes(u32 eth_proto, enum ethtool_report report)
+  return link_modes;
+ }
+ 
++static u32 ethtool2ptys_link_modes(u32 link_modes, enum ethtool_report report)
++{
++ int i;
++ u32 ptys_modes = 0;
++
++ for (i = 0; i < MLX4_LINK_MODES_SZ; i++) {
++  if (ptys2ethtool_map[i][report] & link_modes)
++   ptys_modes |= 1 << i;
++ }
++ return ptys_modes;
++}
++
++/* Convert actual speed (SPEED_XXX) to ptys link modes */
++static u32 speed2ptys_link_modes(u32 speed)
++{
++ int i;
++ u32 ptys_modes = 0;
++
++ for (i = 0; i < MLX4_LINK_MODES_SZ; i++) {
++  if (ptys2ethtool_map[i][SPEED] == speed)
++   ptys_modes |= 1 << i;
++ }
++ return ptys_modes;
++}
++
+ static int ethtool_get_ptys_settings(struct net_device *dev,
+          struct ethtool_cmd *cmd)
+ {
+@@ -697,14 +722,89 @@ static int mlx4_en_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
+  return 0;
+ }
+ 
++/* Calculate PTYS admin according ethtool speed (SPEED_XXX) */
++static __be32 speed_set_ptys_admin(struct mlx4_en_priv *priv, u32 speed,
++       __be32 proto_cap)
++{
++ __be32 proto_admin = 0;
++
++ if (!speed) { /* Speed = 0 ==> Reset Link modes */
++  proto_admin = proto_cap;
++  en_info(priv, "Speed was set to 0, Reset advertised Link Modes to default (%x)\n",
++   be32_to_cpu(proto_cap));
++ } else {
++  u32 ptys_link_modes = speed2ptys_link_modes(speed);
++
++  proto_admin = cpu_to_be32(ptys_link_modes) & proto_cap;
++  en_info(priv, "Setting Speed to %d\n", speed);
++ }
++ return proto_admin;
++}
++
+ static int mlx4_en_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
+ {
+- if ((cmd->autoneg == AUTONEG_ENABLE) ||
+-     (ethtool_cmd_speed(cmd) != SPEED_10000) ||
+-     (cmd->duplex != DUPLEX_FULL))
++ struct mlx4_en_priv *priv = netdev_priv(dev);
++ struct mlx4_ptys_reg ptys_reg;
++ __be32 proto_admin;
++ int ret;
++
++ u32 ptys_adv = ethtool2ptys_link_modes(cmd->advertising, ADVERTISED);
++ int speed = ethtool_cmd_speed(cmd);
++
++ en_dbg(DRV, priv, "Set Speed=%d adv=0x%x autoneg=%d duplex=%d\n",
++        speed, cmd->advertising, cmd->autoneg, cmd->duplex);
++
++ if (!(priv->mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_ETH_PROT_CTRL) ||
++     (cmd->autoneg == AUTONEG_ENABLE) || (cmd->duplex == DUPLEX_HALF))
+   return -EINVAL;
+ 
+- /* Nothing to change */
++ memset(&ptys_reg, 0, sizeof(ptys_reg));
++ ptys_reg.local_port = priv->port;
++ ptys_reg.proto_mask = MLX4_PTYS_EN;
++ ret = mlx4_ACCESS_PTYS_REG(priv->mdev->dev,
++       MLX4_ACCESS_REG_QUERY, &ptys_reg);
++ if (ret) {
++  en_warn(priv, "Failed to QUERY mlx4_ACCESS_PTYS_REG status(%x)\n",
++   ret);
++  return 0;
++ }
++
++ proto_admin = cpu_to_be32(ptys_adv);
++ if (speed >= 0 && speed != priv->port_state.link_speed)
++  /* If speed was set then speed decides :-) */
++  proto_admin = speed_set_ptys_admin(priv, speed,
++         ptys_reg.eth_proto_cap);
++
++ proto_admin &= ptys_reg.eth_proto_cap;
++
++ if (proto_admin == ptys_reg.eth_proto_admin)
++  return 0; /* Nothing to change */
++
++ if (!proto_admin) {
++  en_warn(priv, "Not supported link mode(s) requested, check supported link modes.\n");
++  return -EINVAL; /* nothing to change due to bad input */
++ }
++
++ en_dbg(DRV, priv, "mlx4_ACCESS_PTYS_REG SET: ptys_reg.eth_proto_admin = 0x%x\n",
++        be32_to_cpu(proto_admin));
++
++ ptys_reg.eth_proto_admin = proto_admin;
++ ret = mlx4_ACCESS_PTYS_REG(priv->mdev->dev, MLX4_ACCESS_REG_WRITE,
++       &ptys_reg);
++ if (ret) {
++  en_warn(priv, "Failed to write mlx4_ACCESS_PTYS_REG eth_proto_admin(0x%x) status(0x%x)",
++   be32_to_cpu(ptys_reg.eth_proto_admin), ret);
++  return ret;
++ }
++
++ en_warn(priv, "Port link mode changed, restarting port...\n");
++ mutex_lock(&priv->mdev->state_lock);
++ if (priv->port_up) {
++  mlx4_en_stop_port(dev, 1);
++  if (mlx4_en_start_port(dev))
++   en_err(priv, "Failed restarting port %d\n", priv->port);
++ }
++ mutex_unlock(&priv->mdev->state_lock);
+  return 0;
+ }
+ 
+-- 
+1.7.1

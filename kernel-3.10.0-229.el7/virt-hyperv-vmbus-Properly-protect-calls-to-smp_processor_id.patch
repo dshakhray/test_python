@@ -1,0 +1,106 @@
+From 36b2148214fcf7bae8cf1a138ab87f681c46dad4 Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Thu, 9 Oct 2014 06:13:24 -0400
+Subject: [virt] hyperv/vmbus: Properly protect calls to smp_processor_id()
+
+Message-id: <1412835210-22435-6-git-send-email-jasowang@redhat.com>
+Patchwork-id: 97287
+O-Subject: [RHEL7.1 PATCH V2 05/11] Drivers: hv: vmbus: Properly protect calls to smp_processor_id()
+Bugzilla: 1146358
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+
+From: K. Y. Srinivasan <kys@microsoft.com>
+
+Bugzilla: 1146358
+
+Disable preemption when sampling current processor ID when preemption
+is otherwise possible.
+
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Tested-by: Sitsofe Wheeler <sitsofe@yahoo.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 2115b5617adf2eecca49e78f3810f359ddc5c396)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/hv/channel.c b/drivers/hv/channel.c
+index da2bbfa..0303a1b 100644
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@ -529,11 +529,14 @@ static void vmbus_close_internal(struct vmbus_channel *channel)
+  channel->state = CHANNEL_OPEN_STATE;
+  channel->sc_creation_callback = NULL;
+  /* Stop callback and cancel the timer asap */
+- if (channel->target_cpu != smp_processor_id())
++ if (channel->target_cpu != get_cpu()) {
++  put_cpu();
+   smp_call_function_single(channel->target_cpu, reset_channel_cb,
+       channel, true);
+- else
++ } else {
+   reset_channel_cb(channel);
++  put_cpu();
++ }
+ 
+  /* Send a closing message */
+ 
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index 6c8b032..a7009a2 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -224,11 +224,14 @@ static void vmbus_process_rescind_offer(struct work_struct *work)
+  msg.header.msgtype = CHANNELMSG_RELID_RELEASED;
+  vmbus_post_msg(&msg, sizeof(struct vmbus_channel_relid_released));
+ 
+- if (channel->target_cpu != smp_processor_id())
++ if (channel->target_cpu != get_cpu()) {
++  put_cpu();
+   smp_call_function_single(channel->target_cpu,
+       percpu_channel_deq, channel, true);
+- else
++ } else {
+   percpu_channel_deq(channel);
++  put_cpu();
++ }
+ 
+  if (channel->primary_channel == NULL) {
+   spin_lock_irqsave(&vmbus_connection.channel_lock, flags);
+@@ -294,12 +297,15 @@ static void vmbus_process_offer(struct work_struct *work)
+  spin_unlock_irqrestore(&vmbus_connection.channel_lock, flags);
+ 
+  if (enq) {
+-  if (newchannel->target_cpu != smp_processor_id())
++  if (newchannel->target_cpu != get_cpu()) {
++   put_cpu();
+    smp_call_function_single(newchannel->target_cpu,
+        percpu_channel_enq,
+        newchannel, true);
+-  else
++  } else {
+    percpu_channel_enq(newchannel);
++   put_cpu();
++  }
+  }
+  if (!fnew) {
+   /*
+@@ -314,12 +320,15 @@ static void vmbus_process_offer(struct work_struct *work)
+    list_add_tail(&newchannel->sc_list, &channel->sc_list);
+    spin_unlock_irqrestore(&channel->sc_lock, flags);
+ 
+-   if (newchannel->target_cpu != smp_processor_id())
++   if (newchannel->target_cpu != get_cpu()) {
++    put_cpu();
+     smp_call_function_single(newchannel->target_cpu,
+         percpu_channel_enq,
+         newchannel, true);
+-   else
++   } else {
+     percpu_channel_enq(newchannel);
++    put_cpu();
++   }
+ 
+    newchannel->state = CHANNEL_OPEN_STATE;
+    if (channel->sc_creation_callback != NULL)
+-- 
+1.7.1

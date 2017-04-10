@@ -1,0 +1,127 @@
+From 2d89cc1b5a458023cc470933ac95b9b23f59461b Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:22 -0400
+Subject: [kernel] perf: Allow building PMU drivers as modules
+
+Message-id: <1410181752-25631-18-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91690
+O-Subject: [PATCH RHEL7.1 BZ1134356 017/307] perf: Allow building PMU drivers as modules
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit c464c76eec4be587604ca082e8cded7e6b89f3bf
+Author: Yan, Zheng <zheng.z.yan@intel.com>
+Date: Tue Mar 18 16:56:41 2014 +0800
+
+KABI
+=====
+The 'struct perf_event *' pointer is used within 'struct thread_struct',
+making 'struct perf_event' and all its members like 'struct pmu' KABI-broken
+any time we change it. At the moment we don't have any perf related function
+on KABI list, so masking the change with __GENKSYMS__ macro.
+
+description
+===========
+This patch adds support for building PMU driver as module. It exports
+the functions perf_pmu_{register,unregister}() and adds reference tracking
+for the PMU driver module.
+
+When the PMU driver is built as a module, each active event of the PMU
+holds a reference to the driver module.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 9d542fa..504b2ef 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -271,6 +271,10 @@ struct pmu {
+   * flush branch stack on context-switches (needed in cpu-wide mode)
+   */
+  void (*flush_branch_stack) (void);
++
++#ifndef __GENKSYMS__
++ struct module   *module;
++#endif
+ };
+ 
+ /**
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 19974d5..781cc5b 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -39,6 +39,7 @@
+ #include <linux/hw_breakpoint.h>
+ #include <linux/mm_types.h>
+ #include <linux/cgroup.h>
++#include <linux/module.h>
+ 
+ #include "internal.h"
+ 
+@@ -3255,6 +3256,9 @@ static void __free_event(struct perf_event *event)
+  if (event->ctx)
+   put_ctx(event->ctx);
+ 
++ if (event->pmu)
++  module_put(event->pmu->module);
++
+  call_rcu(&event->rcu_head, free_event_rcu);
+ }
+ static void free_event(struct perf_event *event)
+@@ -6580,6 +6584,7 @@ free_pdc:
+  free_percpu(pmu->pmu_disable_count);
+  goto unlock;
+ }
++EXPORT_SYMBOL_GPL(perf_pmu_register);
+ 
+ void perf_pmu_unregister(struct pmu *pmu)
+ {
+@@ -6601,6 +6606,7 @@ void perf_pmu_unregister(struct pmu *pmu)
+  put_device(pmu->dev);
+  free_pmu_context(pmu);
+ }
++EXPORT_SYMBOL_GPL(perf_pmu_unregister);
+ 
+ struct pmu *perf_init_event(struct perf_event *event)
+ {
+@@ -6614,6 +6620,10 @@ struct pmu *perf_init_event(struct perf_event *event)
+  pmu = idr_find(&pmu_idr, event->attr.type);
+  rcu_read_unlock();
+  if (pmu) {
++  if (!try_module_get(pmu->module)) {
++   pmu = ERR_PTR(-ENODEV);
++   goto unlock;
++  }
+   event->pmu = pmu;
+   ret = pmu->event_init(event);
+   if (ret)
+@@ -6622,6 +6632,10 @@ struct pmu *perf_init_event(struct perf_event *event)
+  }
+ 
+  list_for_each_entry_rcu(pmu, &pmus, entry) {
++  if (!try_module_get(pmu->module)) {
++   pmu = ERR_PTR(-ENODEV);
++   goto unlock;
++  }
+   event->pmu = pmu;
+   ret = pmu->event_init(event);
+   if (!ret)
+@@ -6799,6 +6813,7 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
+ err_pmu:
+  if (event->destroy)
+   event->destroy(event);
++ module_put(pmu->module);
+ err_ns:
+  if (event->ns)
+   put_pid_ns(event->ns);
+-- 
+1.7.1

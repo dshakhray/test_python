@@ -1,0 +1,93 @@
+From 8e162bba1f88d4b9b37bb99cb92cd34405c1a0e7 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Mon, 3 Nov 2014 07:52:27 -0500
+Subject: [infiniband] iser: Seperate iser_conn and iscsi_endpoint storage space
+
+Message-id: <f19fc20e35746b9443d19641b7f73c970acbebd0.1415000301.git.avadai@redhat.com>
+Patchwork-id: 98698
+O-Subject: [Patch RHEL7.1 29/37] IB/iser: Seperate iser_conn and iscsi_endpoint storage space
+Bugzilla: 1107622
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Doug Ledford <dledford@redhat.com>
+
+From: Ariel Nahum <arieln@mellanox.com>
+
+iser connection needs asynchronous cleanup completions which are
+triggered in ep_disconnect.  As a result we are keeping the
+corresponding iscsi_endpoint structure hanging for no good reason. In
+order to avoid that, we seperate iser_conn from iscsi_endpoint storage
+space to have their destruction being independent.
+
+iscsi_endpoint will be destroyed at ep_disconnect stage, while the
+iser connection will wait for asynchronous completions to be released
+in an orderly fashion.
+
+Signed-off-by: Ariel Nahum <arieln@mellanox.com>
+Signed-off-by: Roi Dayan <roid@mellanox.com>
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 0a6907588a8b9bf1aa9ee84b809a1d49caea594a)
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/iser/iscsi_iser.c b/drivers/infiniband/ulp/iser/iscsi_iser.c
+index 1a53fd2..d7acd4b 100644
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@ -596,19 +596,28 @@ iscsi_iser_ep_connect(struct Scsi_Host *shost, struct sockaddr *dst_addr,
+  struct iser_conn *ib_conn;
+  struct iscsi_endpoint *ep;
+ 
+- ep = iscsi_create_endpoint(sizeof(*ib_conn));
++ ep = iscsi_create_endpoint(0);
+  if (!ep)
+   return ERR_PTR(-ENOMEM);
+ 
+- ib_conn = ep->dd_data;
++ ib_conn = kzalloc(sizeof(*ib_conn), GFP_KERNEL);
++ if (!ib_conn) {
++  err = -ENOMEM;
++  goto failure;
++ }
++
++ ep->dd_data = ib_conn;
+  ib_conn->ep = ep;
+  iser_conn_init(ib_conn);
+ 
+  err = iser_connect(ib_conn, NULL, dst_addr, non_blocking);
+  if (err)
+-  return ERR_PTR(err);
++  goto failure;
+ 
+  return ep;
++failure:
++ iscsi_destroy_endpoint(ep);
++ return ERR_PTR(err);
+ }
+ 
+ static int
+@@ -658,6 +667,7 @@ iscsi_iser_ep_disconnect(struct iscsi_endpoint *ep)
+  } else {
+   iser_conn_release(ib_conn);
+  }
++ iscsi_destroy_endpoint(ep);
+ }
+ 
+ static umode_t iser_attr_is_visible(int param_type, int param)
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index 6c7d8ce..fffb4ac 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -620,7 +620,7 @@ void iser_conn_release(struct iser_conn *ib_conn)
+   rdma_destroy_id(ib_conn->cma_id);
+   ib_conn->cma_id = NULL;
+  }
+- iscsi_destroy_endpoint(ib_conn->ep);
++ kfree(ib_conn);
+ }
+ 
+ /**
+-- 
+1.7.1

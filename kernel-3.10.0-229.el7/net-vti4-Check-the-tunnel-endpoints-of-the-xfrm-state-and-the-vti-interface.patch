@@ -1,0 +1,88 @@
+From 7a720caf7e2c3e5788469ae34f8b0fa38be4f1c9 Mon Sep 17 00:00:00 2001
+From: Jiri Pirko <jpirko@redhat.com>
+Date: Thu, 7 Aug 2014 07:06:31 -0400
+Subject: [net] vti4: Check the tunnel endpoints of the xfrm state and the vti interface
+
+Message-id: <1407395194-3809-16-git-send-email-jpirko@redhat.com>
+Patchwork-id: 87529
+O-Subject: [patch rhel7 net 15/18] vti4: Check the tunnel endpoints of the xfrm state and the vti interface
+Bugzilla: 1091561
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+BZ1091561
+https://brewweb.devel.redhat.com/taskinfo?taskID=7794261
+Tested by jtluka's LNST smoke test recipe
+
+upstream commit 6e2de802af32704d9bc4af0c437da7045960112b
+Author: Steffen Klassert <steffen.klassert@secunet.com>
+Date:   Fri Feb 21 08:41:11 2014 +0100
+
+    vti4: Check the tunnel endpoints of the xfrm state and the vti interface
+
+    The tunnel endpoints of the xfrm_state we got from the xfrm_lookup
+    must match the tunnel endpoints of the vti interface. This patch
+    ensures this matching.
+
+Signed-off-by: Jiri Pirko <jpirko@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ipv4/ip_vti.c b/net/ipv4/ip_vti.c
+index 442803b..21f1624 100644
+--- a/net/ipv4/ip_vti.c
++++ b/net/ipv4/ip_vti.c
+@@ -123,10 +123,32 @@ static int vti_rcv_cb(struct sk_buff *skb, int err)
+  return 0;
+ }
+ 
++static bool vti_state_check(const struct xfrm_state *x, __be32 dst, __be32 src)
++{
++ xfrm_address_t *daddr = (xfrm_address_t *)&dst;
++ xfrm_address_t *saddr = (xfrm_address_t *)&src;
++
++ /* if there is no transform then this tunnel is not functional.
++  * Or if the xfrm is not mode tunnel.
++  */
++ if (!x || x->props.mode != XFRM_MODE_TUNNEL ||
++     x->props.family != AF_INET)
++  return false;
++
++ if (!dst)
++  return xfrm_addr_equal(saddr, &x->props.saddr, AF_INET);
++
++ if (!xfrm_state_addr_check(x, daddr, saddr, AF_INET))
++  return false;
++
++ return true;
++}
++
+ static netdev_tx_t vti_xmit(struct sk_buff *skb, struct net_device *dev,
+        struct flowi *fl)
+ {
+  struct ip_tunnel *tunnel = netdev_priv(dev);
++ struct ip_tunnel_parm *parms = &tunnel->parms;
+  struct dst_entry *dst = skb_dst(skb);
+  struct net_device *tdev; /* Device to other host */
+  int err;
+@@ -143,15 +165,12 @@ static netdev_tx_t vti_xmit(struct sk_buff *skb, struct net_device *dev,
+   goto tx_error_icmp;
+  }
+ 
+- /* if there is no transform then this tunnel is not functional.
+-  * Or if the xfrm is not mode tunnel.
+-  */
+- if (!dst->xfrm ||
+-     dst->xfrm->props.mode != XFRM_MODE_TUNNEL) {
++ if (!vti_state_check(dst->xfrm, parms->iph.daddr, parms->iph.saddr)) {
+   dev->stats.tx_carrier_errors++;
+   dst_release(dst);
+   goto tx_error_icmp;
+  }
++
+  tdev = dst->dev;
+ 
+  if (tdev == dev) {
+-- 
+1.7.1

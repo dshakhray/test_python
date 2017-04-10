@@ -1,0 +1,135 @@
+From 82931cc73cd5a53ab31e3482017c62d3e6e478ad Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Fri, 19 Dec 2014 05:57:23 -0500
+Subject: [virt] powerpc/kvm: book3s_hv - Fix KSM memory corruption
+
+Message-id: <1418968643-29384-1-git-send-email-dgibson@redhat.com>
+Patchwork-id: 102363
+O-Subject: [RHEL-7.1 kernel PATCH] KVM: PPC: Book3S HV: Fix KSM memory corruption
+Bugzilla: 1170394
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Testing with KSM active in the host showed occasional corruption of
+guest memory.  Typically a page that should have contained zeroes
+would contain values that look like the contents of a user process
+stack (values such as 0x0000_3fff_xxxx_xxx).
+
+Code inspection in kvmppc_h_protect revealed that there was a race
+condition with the possibility of granting write access to a page
+which is read-only in the host page tables.  The code attempts to keep
+the host mapping read-only if the host userspace PTE is read-only, but
+if that PTE had been temporarily made invalid for any reason, the
+read-only check would not trigger and the host HPTE could end up
+read-write.  Examination of the guest HPT in the failure situation
+revealed that there were indeed shared pages which should have been
+read-only that were mapped read-write.
+
+To close this race, we don't let a page go from being read-only to
+being read-write, as far as the real HPTE mapping the page is
+concerned (the guest view can go to read-write, but the actual mapping
+stays read-only).  When the guest tries to write to the page, we take
+an HDSI and let kvmppc_book3s_hv_page_fault take care of providing a
+writable HPTE for the page.
+
+This eliminates the occasional corruption of shared pages
+that was previously seen with KSM active.
+
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+(cherry picked from commit b4a839009a0842759c0405662637b8f1f35ff460)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ arch/powerpc/kvm/book3s_hv_rm_mmu.c
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1170394
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8407991
+Upstream: b4a839009a0842759c0405662637b8f1f35ff460 (Paolo's KVM tree)
+
+Conflicts were because the RHEL tree doesn't have the code for LE KVM host,
+specifically commit 6f22bd3265fb542acb2697026b953ec07298242d.  These are
+just extra byteswaps (that are no-ops on BE host), so easily resolved.
+This does mean this backport brings in a little of the LE host awareness,
+which is harmless, but there will be further conflicts when we bring in
+the LE host code for 7.2.
+
+Note that this is not yet in Linus tree.  It is however in Paolo's KVM
+-next tree, and the bug is urgent enough that I think we want to pull it
+into RHEL7.1 anyway.
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_mmu.c b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index 5a24d3c..f1ee45e 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@ -623,6 +623,7 @@ long kvmppc_h_protect(struct kvm_vcpu *vcpu, unsigned long flags,
+  unsigned long *hpte;
+  struct revmap_entry *rev;
+  unsigned long v, r, rb, mask, bits;
++ u64 pte;
+ 
+  if (pte_index >= kvm->arch.hpt_npte)
+   return H_PARAMETER;
+@@ -650,40 +651,30 @@ long kvmppc_h_protect(struct kvm_vcpu *vcpu, unsigned long flags,
+   rev->guest_rpte = r;
+   note_hpte_modification(kvm, rev);
+  }
+- r = (hpte[1] & ~mask) | bits;
+ 
+  /* Update HPTE */
+  if (v & HPTE_V_VALID) {
+-  rb = compute_tlbie_rb(v, r, pte_index);
+-  hpte[0] = v & ~HPTE_V_VALID;
+-  do_tlbies(kvm, &rb, 1, global_invalidates(kvm, flags), true);
+   /*
+-   * If the host has this page as readonly but the guest
+-   * wants to make it read/write, reduce the permissions.
+-   * Checking the host permissions involves finding the
+-   * memslot and then the Linux PTE for the page.
++   * If the page is valid, don't let it transition from
++   * readonly to writable.  If it should be writable, we'll
++   * take a trap and let the page fault code sort it out.
+    */
+-  if (hpte_is_writable(r) && kvm->arch.using_mmu_notifiers) {
+-   unsigned long psize, gfn, hva;
+-   struct kvm_memory_slot *memslot;
+-   pgd_t *pgdir = vcpu->arch.pgdir;
+-   pte_t pte;
+-
+-   psize = hpte_page_size(v, r);
+-   gfn = ((r & HPTE_R_RPN) & ~(psize - 1)) >> PAGE_SHIFT;
+-   memslot = __gfn_to_memslot(kvm_memslots_raw(kvm), gfn);
+-   if (memslot) {
+-    hva = __gfn_to_hva_memslot(memslot, gfn);
+-    pte = lookup_linux_pte_and_update(pgdir, hva,
+-          1, &psize);
+-    if (pte_present(pte) && !pte_write(pte))
+-     r = hpte_make_readonly(r);
+-   }
++  pte = be64_to_cpu(hpte[1]);
++  r = (pte & ~mask) | bits;
++  if (hpte_is_writable(r) && kvm->arch.using_mmu_notifiers &&
++      !hpte_is_writable(pte))
++   r = hpte_make_readonly(r);
++  /* If the PTE is changing, invalidate it first */
++  if (r != pte) {
++   rb = compute_tlbie_rb(v, r, pte_index);
++   hpte[0] = cpu_to_be64((v & ~HPTE_V_VALID) |
++           HPTE_V_ABSENT);
++   do_tlbies(kvm, &rb, 1, global_invalidates(kvm, flags),
++      true);
++   hpte[1] = cpu_to_be64(r);
+   }
+  }
+- hpte[1] = r;
+- eieio();
+- hpte[0] = v & ~HPTE_V_HVLOCK;
++ unlock_hpte(hpte, v & ~HPTE_V_HVLOCK);
+  asm volatile("ptesync" : : : "memory");
+  return H_SUCCESS;
+ }
+-- 
+1.7.1

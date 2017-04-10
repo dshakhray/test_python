@@ -1,0 +1,122 @@
+From 44b865bd2d2dbc30b357ce01db16ba7e4827e6d9 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:25:27 -0400
+Subject: [net] libceph: return primary from ceph_calc_pg_acting()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-221-git-send-email-sweil@redhat.com>
+Patchwork-id: 89705
+O-Subject: [PATCH 220/303] libceph: return primary from ceph_calc_pg_acting()
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+In preparation for adding support for primary_temp, stop assuming
+primaryness: add a primary out parameter to ceph_calc_pg_acting() and
+change call sites accordingly.  Primary is now specified separately
+from the order of osds in the set.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+(cherry picked from commit 8008ab1080c1768b02d232dcfd9e161cd47cc9f7)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index b0c8f84..561ea89 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -212,7 +212,7 @@ extern int ceph_oloc_oid_to_pg(struct ceph_osdmap *osdmap,
+ 
+ extern int ceph_calc_pg_acting(struct ceph_osdmap *osdmap,
+           struct ceph_pg pgid,
+-          int *osds);
++          int *osds, int *primary);
+ extern int ceph_calc_pg_primary(struct ceph_osdmap *osdmap,
+     struct ceph_pg pgid);
+ 
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 6f64eec..b4157dc 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -1333,7 +1333,7 @@ static int __map_request(struct ceph_osd_client *osdc,
+ {
+  struct ceph_pg pgid;
+  int acting[CEPH_PG_MAX_SIZE];
+- int o = -1, num = 0;
++ int num, o;
+  int err;
+  bool was_paused;
+ 
+@@ -1346,11 +1346,9 @@ static int __map_request(struct ceph_osd_client *osdc,
+  }
+  req->r_pgid = pgid;
+ 
+- err = ceph_calc_pg_acting(osdc->osdmap, pgid, acting);
+- if (err > 0) {
+-  o = acting[0];
+-  num = err;
+- }
++ num = ceph_calc_pg_acting(osdc->osdmap, pgid, acting, &o);
++ if (num < 0)
++  num = 0;
+ 
+  was_paused = req->r_paused;
+  req->r_paused = __req_should_be_paused(osdc, req);
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index f1cad21..df9389d 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -1651,19 +1651,21 @@ static int apply_temps(struct ceph_osdmap *osdmap,
+ /*
+  * Calculate acting set for given pgid.
+  *
+- * Return acting set length, or error.
++ * Return acting set length, or error.  *primary is set to acting
++ * primary osd id, or -1 if acting set is empty or on error.
+  */
+ int ceph_calc_pg_acting(struct ceph_osdmap *osdmap, struct ceph_pg pgid,
+-   int *osds)
++   int *osds, int *primary)
+ {
+  struct ceph_pg_pool_info *pool;
+  u32 pps;
+  int len;
+- int primary;
+ 
+  pool = __lookup_pg_pool(&osdmap->pg_pools, pgid.pool);
+- if (!pool)
+-  return 0;
++ if (!pool) {
++  *primary = -1;
++  return -ENOENT;
++ }
+ 
+  if (pool->flags & CEPH_POOL_FLAG_HASHPSPOOL) {
+   /* hash pool id and seed so that pool PGs do not overlap */
+@@ -1684,12 +1686,14 @@ int ceph_calc_pg_acting(struct ceph_osdmap *osdmap, struct ceph_pg pgid,
+  }
+ 
+  len = pg_to_raw_osds(osdmap, pool, pgid, pps, osds);
+- if (len < 0)
++ if (len < 0) {
++  *primary = -1;
+   return len;
++ }
+ 
+- len = raw_to_up_osds(osdmap, pool, osds, len, &primary);
++ len = raw_to_up_osds(osdmap, pool, osds, len, primary);
+ 
+- len = apply_temps(osdmap, pool, pgid, osds, len, &primary);
++ len = apply_temps(osdmap, pool, pgid, osds, len, primary);
+ 
+  return len;
+ }
+-- 
+1.7.1

@@ -1,0 +1,141 @@
+From d6f1406216798fd9c276937dde6f5e47e8359909 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:05:18 -0400
+Subject: [tools] perf/probe: Support distro-style debuginfo for uprobe
+
+Message-id: <1410181752-25631-74-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91851
+O-Subject: [PATCH RHEL7.1 BZ1134356 073/307] perf probe: Support distro-style debuginfo for uprobe
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit a15ad2f5360c821f030c53266ebf467738249c68
+Author: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Date: Thu Feb 6 05:32:27 2014 +0000
+
+description
+===========
+Support distro-style debuginfo supported by dso for setting uprobes.
+Note that this tries to find a debuginfo file based on the real path of
+the target binary. If the debuginfo is not correctly installed on the
+system, this can not find it.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/probe-event.c b/tools/perf/util/probe-event.c
+index 42bec67..0d1542f 100644
+--- a/tools/perf/util/probe-event.c
++++ b/tools/perf/util/probe-event.c
+@@ -256,17 +256,14 @@ static void clear_probe_trace_events(struct probe_trace_event *tevs, int ntevs)
+ }
+ 
+ #ifdef HAVE_DWARF_SUPPORT
++
+ /* Open new debuginfo of given module */
+ static struct debuginfo *open_debuginfo(const char *module)
+ {
+- const char *path;
++ const char *path = module;
+ 
+- /* A file path -- this is an offline module */
+- if (module && strchr(module, '/'))
+-  path = module;
+- else {
++ if (!module || !strchr(module, '/')) {
+   path = kernel_get_module_path(module);
+-
+   if (!path) {
+    pr_err("Failed to find path of %s module.\n",
+           module ?: "kernel");
+diff --git a/tools/perf/util/probe-finder.c b/tools/perf/util/probe-finder.c
+index 4f6e277..df02386 100644
+--- a/tools/perf/util/probe-finder.c
++++ b/tools/perf/util/probe-finder.c
+@@ -34,6 +34,7 @@
+ 
+ #include <linux/bitops.h>
+ #include "event.h"
++#include "dso.h"
+ #include "debug.h"
+ #include "intlist.h"
+ #include "util.h"
+@@ -89,7 +90,7 @@ error:
+  return -ENOENT;
+ }
+ 
+-struct debuginfo *debuginfo__new(const char *path)
++static struct debuginfo *__debuginfo__new(const char *path)
+ {
+  struct debuginfo *dbg = zalloc(sizeof(*dbg));
+  if (!dbg)
+@@ -97,10 +98,46 @@ struct debuginfo *debuginfo__new(const char *path)
+ 
+  if (debuginfo__init_offline_dwarf(dbg, path) < 0)
+   zfree(&dbg);
+-
++ if (dbg)
++  pr_debug("Open Debuginfo file: %s\n", path);
+  return dbg;
+ }
+ 
++enum dso_binary_type distro_dwarf_types[] = {
++ DSO_BINARY_TYPE__FEDORA_DEBUGINFO,
++ DSO_BINARY_TYPE__UBUNTU_DEBUGINFO,
++ DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO,
++ DSO_BINARY_TYPE__BUILDID_DEBUGINFO,
++ DSO_BINARY_TYPE__NOT_FOUND,
++};
++
++struct debuginfo *debuginfo__new(const char *path)
++{
++ enum dso_binary_type *type;
++ char buf[PATH_MAX], nil = '\0';
++ struct dso *dso;
++ struct debuginfo *dinfo = NULL;
++
++ /* Try to open distro debuginfo files */
++ dso = dso__new(path);
++ if (!dso)
++  goto out;
++
++ for (type = distro_dwarf_types;
++      !dinfo && *type != DSO_BINARY_TYPE__NOT_FOUND;
++      type++) {
++  if (dso__read_binary_type_filename(dso, *type, &nil,
++         buf, PATH_MAX) < 0)
++   continue;
++  dinfo = __debuginfo__new(buf);
++ }
++ dso__delete(dso);
++
++out:
++ /* if failed to open all distro debuginfo, open given binary */
++ return dinfo ? : __debuginfo__new(path);
++}
++
+ void debuginfo__delete(struct debuginfo *dbg)
+ {
+  if (dbg) {
+diff --git a/tools/perf/util/probe-finder.h b/tools/perf/util/probe-finder.h
+index 3fc5973..92590b2 100644
+--- a/tools/perf/util/probe-finder.h
++++ b/tools/perf/util/probe-finder.h
+@@ -30,6 +30,7 @@ struct debuginfo {
+  Dwarf_Addr bias;
+ };
+ 
++/* This also tries to open distro debuginfo */
+ extern struct debuginfo *debuginfo__new(const char *path);
+ extern void debuginfo__delete(struct debuginfo *dbg);
+ 
+-- 
+1.7.1

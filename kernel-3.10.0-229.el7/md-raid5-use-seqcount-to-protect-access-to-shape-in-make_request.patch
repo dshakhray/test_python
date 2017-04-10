@@ -1,0 +1,106 @@
+From 77a0880827921e50c226892b0360717b1c6fdd77 Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:25:14 -0400
+Subject: [md] raid5: use seqcount to protect access to shape in make_request
+
+Message-id: <1409563584-9000-13-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 89947
+O-Subject: [RHEL7.1 PATCH 12/82] md/raid5: use seqcount to protect access to shape in make_request.
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: NeilBrown <neilb@suse.de>
+
+make_request() access various shape parameters (raid_disks, chunk_size
+etc) which might be changed by raid5_start_reshape().
+
+If the later is called at and awkward time during the form, the wrong
+stripe_head might be used.
+
+So introduce a 'seqcount' and after finding a stripe_head make sure
+there is no reason to expect that we got the wrong one.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit c46501b2deaa06efcaaf82917281941f02c6b307)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 2a1fea2..1be4941 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -4416,8 +4416,10 @@ static void make_request(struct mddev *mddev, struct bio * bi)
+  for (;logical_sector < last_sector; logical_sector += STRIPE_SECTORS) {
+   DEFINE_WAIT(w);
+   int previous;
++  int seq;
+ 
+  retry:
++  seq = read_seqcount_begin(&conf->gen_lock);
+   previous = 0;
+   prepare_to_wait(&conf->wait_for_overlap, &w, TASK_UNINTERRUPTIBLE);
+   if (unlikely(conf->reshape_progress != MaxSector)) {
+@@ -4450,7 +4452,7 @@ static void make_request(struct mddev *mddev, struct bio * bi)
+         previous,
+         &dd_idx, NULL);
+   pr_debug("raid456: make_request, sector %llu logical %llu\n",
+-   (unsigned long long)new_sector, 
++   (unsigned long long)new_sector,
+    (unsigned long long)logical_sector);
+ 
+   sh = get_active_stripe(conf, new_sector, previous,
+@@ -4479,6 +4481,13 @@ static void make_request(struct mddev *mddev, struct bio * bi)
+      goto retry;
+     }
+    }
++   if (read_seqcount_retry(&conf->gen_lock, seq)) {
++    /* Might have got the wrong stripe_head
++     * by accident
++     */
++    release_stripe(sh);
++    goto retry;
++   }
+ 
+    if (rw == WRITE &&
+        logical_sector >= mddev->suspend_lo &&
+@@ -5445,6 +5454,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
+  if (alloc_thread_groups(conf, 0))
+   goto abort;
+  spin_lock_init(&conf->device_lock);
++ seqcount_init(&conf->gen_lock);
+  init_waitqueue_head(&conf->wait_for_stripe);
+  init_waitqueue_head(&conf->wait_for_overlap);
+  INIT_LIST_HEAD(&conf->handle_list);
+@@ -6257,6 +6267,7 @@ static int raid5_start_reshape(struct mddev *mddev)
+ 
+  atomic_set(&conf->reshape_stripes, 0);
+  spin_lock_irq(&conf->device_lock);
++ write_seqcount_begin(&conf->gen_lock);
+  conf->previous_raid_disks = conf->raid_disks;
+  conf->raid_disks += mddev->delta_disks;
+  conf->prev_chunk_sectors = conf->chunk_sectors;
+@@ -6273,6 +6284,7 @@ static int raid5_start_reshape(struct mddev *mddev)
+  else
+   conf->reshape_progress = 0;
+  conf->reshape_safe = conf->reshape_progress;
++ write_seqcount_end(&conf->gen_lock);
+  spin_unlock_irq(&conf->device_lock);
+ 
+  /* Add some new drives, as many as will fit.
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 1053663..435b12d 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -400,6 +400,7 @@ struct r5conf {
+  int   prev_chunk_sectors;
+  int   prev_algo;
+  short   generation; /* increments with every reshape */
++ seqcount_t  gen_lock; /* lock against generation changes */
+  unsigned long  reshape_checkpoint; /* Time we last updated
+            * metadata */
+  long long  min_offset_diff; /* minimum difference between
+-- 
+1.7.1

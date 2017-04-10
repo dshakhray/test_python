@@ -1,0 +1,153 @@
+From 38c656c1a35b685627a88373cc8af349f4abf233 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:18:32 -0400
+Subject: [fs] nfsd: Cleanup nfs4svc_encode_compoundres
+
+Message-id: <1410898849-22126-29-git-send-email-bfields@redhat.com>
+Patchwork-id: 95830
+O-Subject: [Patch RHEL7 028/165] nfsd: Cleanup nfs4svc_encode_compoundres
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+Move the slot return, put session etc into a helper in fs/nfsd/nfs4state.c
+instead of open coding in nfs4svc_encode_compoundres.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: b607664ee74313c7f3f657a044eda572051e560e
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 71c442f..993da47 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -203,18 +203,6 @@ static void put_client_renew_locked(struct nfs4_client *clp)
+   renew_client_locked(clp);
+ }
+ 
+-void put_client_renew(struct nfs4_client *clp)
+-{
+- struct nfsd_net *nn = net_generic(clp->net, nfsd_net_id);
+-
+- if (!atomic_dec_and_lock(&clp->cl_refcount, &nn->client_lock))
+-  return;
+- if (!is_client_expired(clp))
+-  renew_client_locked(clp);
+- spin_unlock(&nn->client_lock);
+-}
+-
+-
+ static inline u32
+ opaque_hashval(const void *ptr, int nbytes)
+ {
+@@ -1646,7 +1634,7 @@ out_err:
+ /*
+  * Cache a reply. nfsd4_check_resp_size() has bounded the cache size.
+  */
+-void
++static void
+ nfsd4_store_cache_entry(struct nfsd4_compoundres *resp)
+ {
+  struct xdr_buf *buf = resp->xdr.buf;
+@@ -2418,6 +2406,27 @@ out_put_client:
+  goto out_no_session;
+ }
+ 
++void
++nfsd4_sequence_done(struct nfsd4_compoundres *resp)
++{
++ struct nfsd4_compound_state *cs = &resp->cstate;
++
++ if (nfsd4_has_session(cs)) {
++  struct nfs4_client *clp = cs->session->se_client;
++  struct nfsd_net *nn = net_generic(clp->net, nfsd_net_id);
++
++  if (cs->status != nfserr_replay_cache) {
++   nfsd4_store_cache_entry(resp);
++   cs->slot->sl_flags &= ~NFSD4_SLOT_INUSE;
++  }
++  /* Renew the clientid on success and on replay */
++  spin_lock(&nn->client_lock);
++  nfsd4_put_session(cs->session);
++  put_client_renew_locked(clp);
++  spin_unlock(&nn->client_lock);
++ }
++}
++
+ __be32
+ nfsd4_destroy_clientid(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate, struct nfsd4_destroy_clientid *dc)
+ {
+diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c
+index decf56f..7abaf6b 100644
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@ -4000,7 +4000,6 @@ nfs4svc_encode_compoundres(struct svc_rqst *rqstp, __be32 *p, struct nfsd4_compo
+  /*
+   * All that remains is to write the tag and operation count...
+   */
+- struct nfsd4_compound_state *cs = &resp->cstate;
+  struct xdr_buf *buf = resp->xdr.buf;
+ 
+  WARN_ON_ONCE(buf->len != buf->head[0].iov_len + buf->page_len +
+@@ -4014,19 +4013,7 @@ nfs4svc_encode_compoundres(struct svc_rqst *rqstp, __be32 *p, struct nfsd4_compo
+  p += XDR_QUADLEN(resp->taglen);
+  *p++ = htonl(resp->opcnt);
+ 
+- if (nfsd4_has_session(cs)) {
+-  struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+-  struct nfs4_client *clp = cs->session->se_client;
+-  if (cs->status != nfserr_replay_cache) {
+-   nfsd4_store_cache_entry(resp);
+-   cs->slot->sl_flags &= ~NFSD4_SLOT_INUSE;
+-  }
+-  /* Renew the clientid on success and on replay */
+-  spin_lock(&nn->client_lock);
+-  nfsd4_put_session(cs->session);
+-  spin_unlock(&nn->client_lock);
+-  put_client_renew(clp);
+- }
++ nfsd4_sequence_done(resp);
+  return 1;
+ }
+ 
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index 374c662..62f33b7 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -476,7 +476,6 @@ extern void nfs4_put_delegation(struct nfs4_delegation *dp);
+ extern struct nfs4_client_reclaim *nfs4_client_to_reclaim(const char *name,
+        struct nfsd_net *nn);
+ extern bool nfs4_has_reclaimed_state(const char *name, struct nfsd_net *nn);
+-extern void put_client_renew(struct nfs4_client *clp);
+ 
+ /* nfs4recover operations */
+ extern int nfsd4_client_tracking_init(struct net *net);
+diff --git a/fs/nfsd/xdr4.h b/fs/nfsd/xdr4.h
+index efce901..a30a741 100644
+--- a/fs/nfsd/xdr4.h
++++ b/fs/nfsd/xdr4.h
+@@ -578,7 +578,6 @@ extern __be32 nfsd4_setclientid(struct svc_rqst *rqstp,
+ extern __be32 nfsd4_setclientid_confirm(struct svc_rqst *rqstp,
+   struct nfsd4_compound_state *,
+   struct nfsd4_setclientid_confirm *setclientid_confirm);
+-extern void nfsd4_store_cache_entry(struct nfsd4_compoundres *resp);
+ extern __be32 nfsd4_exchange_id(struct svc_rqst *rqstp,
+   struct nfsd4_compound_state *, struct nfsd4_exchange_id *);
+ extern __be32 nfsd4_backchannel_ctl(struct svc_rqst *, struct nfsd4_compound_state *, struct nfsd4_backchannel_ctl *);
+@@ -589,6 +588,7 @@ extern __be32 nfsd4_create_session(struct svc_rqst *,
+ extern __be32 nfsd4_sequence(struct svc_rqst *,
+   struct nfsd4_compound_state *,
+   struct nfsd4_sequence *);
++extern void nfsd4_sequence_done(struct nfsd4_compoundres *resp);
+ extern __be32 nfsd4_destroy_session(struct svc_rqst *,
+   struct nfsd4_compound_state *,
+   struct nfsd4_destroy_session *);
+-- 
+1.7.1

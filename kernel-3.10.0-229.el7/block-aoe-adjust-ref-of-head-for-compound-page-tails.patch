@@ -1,0 +1,85 @@
+From 032ef7650e731efa402dcb4180119116ec8b73b4 Mon Sep 17 00:00:00 2001
+From: Andrea Arcangeli <aarcange@redhat.com>
+Date: Tue, 9 Sep 2014 01:16:25 -0400
+Subject: [block] aoe: adjust ref of head for compound page tails
+
+Message-id: <1410225399-8094-9-git-send-email-aarcange@redhat.com>
+Patchwork-id: 93373
+O-Subject: [RHEL7.1 PATCH 08/22] aoe: adjust ref of head for compound page tails
+Bugzilla: 1135506
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+
+From: Ed Cashin <ecashin@coraid.com>
+
+Fix a BUG which can trigger when direct-IO is used with AOE.
+
+As discussed previously, the fact that some users of the block layer
+provide bios that point to pages with a zero _count means that it is not
+OK for the network layer to do a put_page on the skb frags during an
+skb_linearize, so the aoe driver gets a reference to pages in bios and
+puts the reference before ending the bio.  And because it cannot use
+get_page on a page with a zero _count, it manipulates the value
+directly.
+
+It is not OK to increment the _count of a compound page tail, though,
+since the VM layer will VM_BUG_ON a non-zero _count.  Block users that
+do direct I/O can result in the aoe driver seeing compound page tails in
+bios.  In that case, the same logic works as long as the head of the
+compound page is used instead of the tails.  This patch handles compound
+pages and does not BUG.
+
+It relies on the block layer user leaving the relationship between the
+page tail and its head alone for the duration between the submission of
+the bio and its completion, whether successful or not.
+
+Signed-off-by: Ed Cashin <ecashin@coraid.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/aoe/aoecmd.c b/drivers/block/aoe/aoecmd.c
+index fc803ec..77d8fdf 100644
+--- a/drivers/block/aoe/aoecmd.c
++++ b/drivers/block/aoe/aoecmd.c
+@@ -893,16 +893,10 @@ bio_pageinc(struct bio *bio)
+  int i;
+ 
+  bio_for_each_segment(bv, bio, i) {
+-  page = bv->bv_page;
+   /* Non-zero page count for non-head members of
+-   * compound pages is no longer allowed by the kernel,
+-   * but this has never been seen here.
++   * compound pages is no longer allowed by the kernel.
+    */
+-  if (unlikely(PageCompound(page)))
+-   if (compound_trans_head(page) != page) {
+-    pr_crit("page tail used for block I/O\n");
+-    BUG();
+-   }
++  page = compound_trans_head(bv->bv_page);
+   atomic_inc(&page->_count);
+  }
+ }
+@@ -911,10 +905,13 @@ static void
+ bio_pagedec(struct bio *bio)
+ {
+  struct bio_vec *bv;
++ struct page *page;
+  int i;
+ 
+- bio_for_each_segment(bv, bio, i)
+-  atomic_dec(&bv->bv_page->_count);
++ bio_for_each_segment(bv, bio, i) {
++  page = compound_trans_head(bv->bv_page);
++  atomic_dec(&page->_count);
++ }
+ }
+ 
+ static void
+-- 
+1.7.1

@@ -1,0 +1,161 @@
+From 95b8063a29571c2e9bf75f071ffa819820619607 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:52 -0400
+Subject: [tools] perf: Add call-graph option support into .perfconfig
+
+Message-id: <1410181752-25631-48-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91729
+O-Subject: [PATCH RHEL7.1 BZ1134356 047/307] perf tools: Add call-graph option support into .perfconfig
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit eb853e80324fa87faf7ae7e1a763ad643f908f2d
+Author: Jiri Olsa <jolsa@redhat.com>
+Date: Mon Feb 3 12:44:42 2014 +0100
+
+description
+===========
+Adding call-graph option support into .perfconfig file, so it's now
+possible use call-graph option like:
+
+  [top]
+        call-graph = fp
+
+  [record]
+        call-graph = dwarf,8192
+
+Above options ONLY setup the unwind method. To enable perf record/top to
+actually use it the command line option -g/-G must be specified.
+
+The --call-graph option overloads .perfconfig setup.
+
+Assuming above configuration:
+
+  $ perf record -g ls
+  - enables dwarf unwind with user stack size dump 8192 bytes
+
+  $ perf top -G
+  - enables frame pointer unwind
+
+  $ perf record --call-graph=fp ls
+  - enables frame pointer unwind
+
+  $ perf top --call-graph=dwarf,4096 ls
+  - enables dwarf unwind with user stack size dump 4096 bytes
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index af47531..be9e8bc 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -749,6 +749,8 @@ int record_parse_callchain_opt(const struct option *opt,
+  struct record_opts *opts = opt->value;
+  int ret;
+ 
++ opts->call_graph_enabled = !unset;
++
+  /* --no-call-graph */
+  if (unset) {
+   opts->call_graph = CALLCHAIN_NONE;
+@@ -769,6 +771,8 @@ int record_callchain_opt(const struct option *opt,
+ {
+  struct record_opts *opts = opt->value;
+ 
++ opts->call_graph_enabled = !unset;
++
+  if (opts->call_graph == CALLCHAIN_NONE)
+   opts->call_graph = CALLCHAIN_FP;
+ 
+@@ -776,6 +780,16 @@ int record_callchain_opt(const struct option *opt,
+  return 0;
+ }
+ 
++static int perf_record_config(const char *var, const char *value, void *cb)
++{
++ struct record *rec = cb;
++
++ if (!strcmp(var, "record.call-graph"))
++  return record_parse_callchain(value, &rec->opts);
++
++ return perf_default_config(var, value, cb);
++}
++
+ static const char * const record_usage[] = {
+  "perf record [<options>] [<command>]",
+  "perf record [<options>] -- <command> [<options>]",
+@@ -907,6 +921,8 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
+  if (rec->evlist == NULL)
+   return -ENOMEM;
+ 
++ perf_config(perf_record_config, rec);
++
+  argc = parse_options(argc, argv, record_options, record_usage,
+        PARSE_OPT_STOP_AT_NON_OPTION);
+  if (!argc && target__none(&rec->opts.target))
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index 5f989a7..65aaa5b 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -993,6 +993,16 @@ parse_callchain_opt(const struct option *opt, const char *arg, int unset)
+  return record_parse_callchain_opt(opt, arg, unset);
+ }
+ 
++static int perf_top_config(const char *var, const char *value, void *cb)
++{
++ struct perf_top *top = cb;
++
++ if (!strcmp(var, "top.call-graph"))
++  return record_parse_callchain(value, &top->record_opts);
++
++ return perf_default_config(var, value, cb);
++}
++
+ static int
+ parse_percent_limit(const struct option *opt, const char *arg,
+       int unset __maybe_unused)
+@@ -1117,6 +1127,8 @@ int cmd_top(int argc, const char **argv, const char *prefix __maybe_unused)
+  if (top.evlist == NULL)
+   return -ENOMEM;
+ 
++ perf_config(perf_top_config, &top);
++
+  argc = parse_options(argc, argv, options, top_usage, 0);
+  if (argc)
+   usage_with_options(top_usage, options);
+diff --git a/tools/perf/perf.h b/tools/perf/perf.h
+index e84fa26..2078f33 100644
+--- a/tools/perf/perf.h
++++ b/tools/perf/perf.h
+@@ -257,6 +257,7 @@ enum perf_call_graph_mode {
+ struct record_opts {
+  struct target target;
+  int      call_graph;
++ bool         call_graph_enabled;
+  bool      group;
+  bool      inherit_stat;
+  bool      no_buffering;
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index c6f8ce9..8201abe 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -595,7 +595,7 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
+   attr->mmap_data = track;
+  }
+ 
+- if (opts->call_graph) {
++ if (opts->call_graph_enabled) {
+   perf_evsel__set_sample_bit(evsel, CALLCHAIN);
+ 
+   if (opts->call_graph == CALLCHAIN_DWARF) {
+-- 
+1.7.1

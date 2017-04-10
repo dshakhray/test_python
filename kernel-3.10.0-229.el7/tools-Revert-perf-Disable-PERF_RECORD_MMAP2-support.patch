@@ -1,0 +1,135 @@
+From 4ea1e59525691f75ee8ce9ce9e75a90e7d17633b Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:08:36 -0400
+Subject: [tools] Revert: perf: Disable PERF_RECORD_MMAP2 support
+
+Message-id: <1410181752-25631-272-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91958
+O-Subject: [PATCH RHEL7.1 BZ1134356 271/307] Revert "perf: Disable PERF_RECORD_MMAP2 support"
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit a5a5ba72843dd05f991184d6cb9a4471acce1005
+Author: Don Zickus <dzickus@redhat.com>
+Date: Fri May 30 10:49:42 2014 -0400
+
+description
+===========
+This reverts commit 3090ffb5a2515990182f3f55b0688a7817325488.
+
+Re-enable the mmap2 interface as we will have a user soon.
+
+Since things have changed since perf disabled mmap2, small tweaks
+to the revert had to be done:
+
+o commit 9d4ecc88 forced (n!=8) to become (n<7)
+o a new libunwind test needed updating to use mmap2 interface
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/tests/dwarf-unwind.c b/tools/perf/tests/dwarf-unwind.c
+index 108f0cd..96adb73 100644
+--- a/tools/perf/tests/dwarf-unwind.c
++++ b/tools/perf/tests/dwarf-unwind.c
+@@ -15,7 +15,7 @@ static int mmap_handler(struct perf_tool *tool __maybe_unused,
+    struct perf_sample *sample __maybe_unused,
+    struct machine *machine)
+ {
+- return machine__process_mmap_event(machine, event, NULL);
++ return machine__process_mmap2_event(machine, event, NULL);
+ }
+ 
+ static int init_live_machine(struct machine *machine)
+diff --git a/tools/perf/util/event.c b/tools/perf/util/event.c
+index 65795b8..0a594fd 100644
+--- a/tools/perf/util/event.c
++++ b/tools/perf/util/event.c
+@@ -178,13 +178,14 @@ int perf_event__synthesize_mmap_events(struct perf_tool *tool,
+   return -1;
+  }
+ 
+- event->header.type = PERF_RECORD_MMAP;
++ event->header.type = PERF_RECORD_MMAP2;
+ 
+  while (1) {
+   char bf[BUFSIZ];
+   char prot[5];
+   char execname[PATH_MAX];
+   char anonstr[] = "//anon";
++  unsigned int ino;
+   size_t size;
+   ssize_t n;
+ 
+@@ -195,15 +196,20 @@ int perf_event__synthesize_mmap_events(struct perf_tool *tool,
+   strcpy(execname, "");
+ 
+   /* 00400000-0040c000 r-xp 00000000 fd:01 41038  /bin/cat */
+-  n = sscanf(bf, "%"PRIx64"-%"PRIx64" %s %"PRIx64" %*x:%*x %*u %s\n",
+-         &event->mmap.start, &event->mmap.len, prot,
+-         &event->mmap.pgoff,
+-         execname);
++  n = sscanf(bf, "%"PRIx64"-%"PRIx64" %s %"PRIx64" %x:%x %u %s\n",
++         &event->mmap2.start, &event->mmap2.len, prot,
++         &event->mmap2.pgoff, &event->mmap2.maj,
++         &event->mmap2.min,
++         &ino, execname);
++
+   /*
+     * Anon maps don't have the execname.
+     */
+-  if (n < 4)
++  if (n < 7)
+    continue;
++
++  event->mmap2.ino = (u64)ino;
++
+   /*
+    * Just like the kernel, see __perf_event_mmap in kernel/perf_event.c
+    */
+@@ -223,15 +229,15 @@ int perf_event__synthesize_mmap_events(struct perf_tool *tool,
+    strcpy(execname, anonstr);
+ 
+   size = strlen(execname) + 1;
+-  memcpy(event->mmap.filename, execname, size);
++  memcpy(event->mmap2.filename, execname, size);
+   size = PERF_ALIGN(size, sizeof(u64));
+-  event->mmap.len -= event->mmap.start;
+-  event->mmap.header.size = (sizeof(event->mmap) -
+-     (sizeof(event->mmap.filename) - size));
+-  memset(event->mmap.filename + size, 0, machine->id_hdr_size);
+-  event->mmap.header.size += machine->id_hdr_size;
+-  event->mmap.pid = tgid;
+-  event->mmap.tid = pid;
++  event->mmap2.len -= event->mmap.start;
++  event->mmap2.header.size = (sizeof(event->mmap2) -
++     (sizeof(event->mmap2.filename) - size));
++  memset(event->mmap2.filename + size, 0, machine->id_hdr_size);
++  event->mmap2.header.size += machine->id_hdr_size;
++  event->mmap2.pid = tgid;
++  event->mmap2.tid = pid;
+ 
+   if (process(tool, event, &synth_sample, machine) != 0) {
+    rc = -1;
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 5c28d82..21154da 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -659,6 +659,7 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
+   perf_evsel__set_sample_bit(evsel, WEIGHT);
+ 
+  attr->mmap  = track;
++ attr->mmap2 = track && !perf_missing_features.mmap2;
+  attr->comm  = track;
+ 
+  if (opts->sample_transaction)
+-- 
+1.7.1

@@ -1,0 +1,126 @@
+From a1cb51d0b298b3af25d3b08c2cfcb5a5dcb5e58d Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 15 Sep 2014 11:44:42 -0400
+Subject: [dma] ioatdma: disable RAID on non-Atom platforms and reenable unaligned copies
+
+Message-id: <1410781482-24552-1-git-send-email-prarit@redhat.com>
+Patchwork-id: 94794
+O-Subject: [RHEL7.1 PATCH BZ 1069441] ioatdma: disable RAID on non-Atom platforms and reenable unaligned copies
+Bugzilla: 1069441
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1069441
+Build info:
+Date: Mon Sep 15 07:40:08 EDT 2014
+Build OS: Red Hat Enterprise Linux Server release 7.0 (Maipo)
+System name: ibm-x3650m4-01.rhts.eng.bos.redhat.com with -j8
+Built on: kernel-3.10.0-154.el7
+Arch built: x86_64
+
+Here's the situation ... when ioatdma loads it spits out a tonne of warnings
+that are not seen in the upstream kernel.  The kernel only supports the executed
+code on Atom systems configured with RAID and the patch below removes that
+support from RHEL7.
+
+IOW, only Atom systems with RAID should be running the test code.  For those
+systems we will see an error.  I have pushed a patch upstream
+
+http://marc.info/?l=linux-kernel&m=141078083431108&w=2
+
+to fix those warnings but IMO they are out of scope for this BZ.
+
+commit c4dcf0e2dd7e06db0c5c3f396b2e2b9ce1f6d19f
+Author: Brice Goglin <Brice.Goglin@inria.fr>
+Date:   Fri Aug 2 21:18:03 2013 +0200
+
+    ioatdma: disable RAID on non-Atom platforms and reenable unaligned copies
+
+    Disable RAID on non-Atom platform and remove related fixups such as the
+    64-byte alignement restriction on legacy DMA operations (introduced in
+    commit f26df1a1 as a workaround for silicon errata).
+
+    Signed-off-by: Brice Goglin <Brice.Goglin@inria.fr>
+    Acked-by: Dave Jiang <dave.jiang@intel.com>
+    Acked-by: Jon Mason <jon.mason@intel.com>
+    Signed-off-by: Dan Williams <djbw@fb.com>
+
+Successfully tested by me on ibm-x3650m4-01.rhts.eng.bos.redhat.com.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/dma/ioat/dma_v3.c b/drivers/dma/ioat/dma_v3.c
+index fa43a42..5b9ae34 100644
+--- a/drivers/dma/ioat/dma_v3.c
++++ b/drivers/dma/ioat/dma_v3.c
+@@ -1865,15 +1865,12 @@ int ioat3_dma_probe(struct ioatdma_device *device, int dca)
+  dma->device_alloc_chan_resources = ioat2_alloc_chan_resources;
+  dma->device_free_chan_resources = ioat2_free_chan_resources;
+ 
+- if (is_xeon_cb32(pdev))
+-  dma->copy_align = 6;
+-
+  dma_cap_set(DMA_INTERRUPT, dma->cap_mask);
+  dma->device_prep_dma_interrupt = ioat3_prep_interrupt_lock;
+ 
+  device->cap = readl(device->reg_base + IOAT_DMA_CAP_OFFSET);
+ 
+- if (is_bwd_noraid(pdev))
++ if (is_xeon_cb32(pdev) || is_bwd_noraid(pdev))
+   device->cap &= ~(IOAT_CAP_XOR | IOAT_CAP_PQ | IOAT_CAP_RAID16SS);
+ 
+  /* dca is incompatible with raid operations */
+@@ -1883,7 +1880,6 @@ int ioat3_dma_probe(struct ioatdma_device *device, int dca)
+  if (device->cap & IOAT_CAP_XOR) {
+   is_raid_device = true;
+   dma->max_xor = 8;
+-  dma->xor_align = 6;
+ 
+   dma_cap_set(DMA_XOR, dma->cap_mask);
+   dma->device_prep_dma_xor = ioat3_prep_xor;
+@@ -1902,13 +1898,8 @@ int ioat3_dma_probe(struct ioatdma_device *device, int dca)
+ 
+   if (device->cap & IOAT_CAP_RAID16SS) {
+    dma_set_maxpq(dma, 16, 0);
+-   dma->pq_align = 0;
+   } else {
+    dma_set_maxpq(dma, 8, 0);
+-   if (is_xeon_cb32(pdev))
+-    dma->pq_align = 6;
+-   else
+-    dma->pq_align = 0;
+   }
+ 
+   if (!(device->cap & IOAT_CAP_XOR)) {
+@@ -1919,13 +1910,8 @@ int ioat3_dma_probe(struct ioatdma_device *device, int dca)
+ 
+    if (device->cap & IOAT_CAP_RAID16SS) {
+     dma->max_xor = 16;
+-    dma->xor_align = 0;
+    } else {
+     dma->max_xor = 8;
+-    if (is_xeon_cb32(pdev))
+-     dma->xor_align = 6;
+-    else
+-     dma->xor_align = 0;
+    }
+   }
+  }
+@@ -1940,14 +1926,6 @@ int ioat3_dma_probe(struct ioatdma_device *device, int dca)
+  device->cleanup_fn = ioat3_cleanup_event;
+  device->timer_fn = ioat3_timer_event;
+ 
+- if (is_xeon_cb32(pdev)) {
+-  dma_cap_clear(DMA_XOR_VAL, dma->cap_mask);
+-  dma->device_prep_dma_xor_val = NULL;
+-
+-  dma_cap_clear(DMA_PQ_VAL, dma->cap_mask);
+-  dma->device_prep_dma_pq_val = NULL;
+- }
+-
+  /* starting with CB3.3 super extended descriptors are supported */
+  if (device->cap & IOAT_CAP_RAID16SS) {
+   char pool_name[14];
+-- 
+1.7.1

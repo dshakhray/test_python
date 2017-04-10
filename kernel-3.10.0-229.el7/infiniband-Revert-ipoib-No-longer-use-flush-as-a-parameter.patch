@@ -1,0 +1,144 @@
+From 38249eb399e9ac80863df7590914c48fbff41f60 Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 28 Jan 2015 23:10:30 -0500
+Subject: [infiniband] Revert: ipoib: No longer use flush as a parameter
+
+Message-id: <212dbbd05097523fca66752b8741785b29f1a9b8.1422486318.git.dledford@redhat.com>
+Patchwork-id: 103870
+O-Subject: [Patch RHEL7 1/8] Revert "[infiniband] ipoib: No longer use flush as a parameter"
+Bugzilla: 1179740
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+This reverts commit 9fd9902b0871bf196fd424215e307f00829fe441.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 8ba80a6..28dc927 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -484,10 +484,10 @@ void ipoib_ib_dev_flush_heavy(struct work_struct *work);
+ void ipoib_pkey_event(struct work_struct *work);
+ void ipoib_ib_dev_cleanup(struct net_device *dev);
+ 
+-int ipoib_ib_dev_open(struct net_device *dev);
++int ipoib_ib_dev_open(struct net_device *dev, int flush);
+ int ipoib_ib_dev_up(struct net_device *dev);
+-int ipoib_ib_dev_down(struct net_device *dev);
+-int ipoib_ib_dev_stop(struct net_device *dev);
++int ipoib_ib_dev_down(struct net_device *dev, int flush);
++int ipoib_ib_dev_stop(struct net_device *dev, int flush);
+ void ipoib_pkey_dev_check_presence(struct net_device *dev);
+ 
+ int ipoib_dev_init(struct net_device *dev, struct ib_device *ca, int port);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_ib.c b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+index fe65abb..6609678 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@ -664,7 +664,7 @@ static void ipoib_ib_tx_timer_func(unsigned long ctx)
+  drain_tx_cq((struct net_device *)ctx);
+ }
+ 
+-int ipoib_ib_dev_open(struct net_device *dev)
++int ipoib_ib_dev_open(struct net_device *dev, int flush)
+ {
+  struct ipoib_dev_priv *priv = netdev_priv(dev);
+  int ret;
+@@ -706,7 +706,7 @@ int ipoib_ib_dev_open(struct net_device *dev)
+ dev_stop:
+  if (!test_and_set_bit(IPOIB_FLAG_INITIALIZED, &priv->flags))
+   napi_enable(&priv->napi);
+- ipoib_ib_dev_stop(dev);
++ ipoib_ib_dev_stop(dev, flush);
+  return -1;
+ }
+ 
+@@ -738,7 +738,7 @@ int ipoib_ib_dev_up(struct net_device *dev)
+  return ipoib_mcast_start_thread(dev);
+ }
+ 
+-int ipoib_ib_dev_down(struct net_device *dev)
++int ipoib_ib_dev_down(struct net_device *dev, int flush)
+ {
+  struct ipoib_dev_priv *priv = netdev_priv(dev);
+ 
+@@ -807,7 +807,7 @@ void ipoib_drain_cq(struct net_device *dev)
+  local_bh_enable();
+ }
+ 
+-int ipoib_ib_dev_stop(struct net_device *dev)
++int ipoib_ib_dev_stop(struct net_device *dev, int flush)
+ {
+  struct ipoib_dev_priv *priv = netdev_priv(dev);
+  struct ib_qp_attr qp_attr;
+@@ -880,7 +880,8 @@ timeout:
+  /* Wait for all AHs to be reaped */
+  set_bit(IPOIB_STOP_REAPER, &priv->flags);
+  cancel_delayed_work(&priv->ah_reap_task);
+- flush_workqueue(priv->wq);
++ if (flush)
++  flush_workqueue(priv->wq);
+ 
+  begin = jiffies;
+ 
+@@ -917,7 +918,7 @@ int ipoib_ib_dev_init(struct net_device *dev, struct ib_device *ca, int port)
+       (unsigned long) dev);
+ 
+  if (dev->flags & IFF_UP) {
+-  if (ipoib_ib_dev_open(dev)) {
++  if (ipoib_ib_dev_open(dev, 1)) {
+    ipoib_transport_dev_cleanup(dev);
+    return -ENODEV;
+   }
+@@ -1039,12 +1040,12 @@ static void __ipoib_ib_dev_flush(struct ipoib_dev_priv *priv,
+  }
+ 
+  if (level >= IPOIB_FLUSH_NORMAL)
+-  ipoib_ib_dev_down(dev);
++  ipoib_ib_dev_down(dev, 0);
+ 
+  if (level == IPOIB_FLUSH_HEAVY) {
+   if (test_bit(IPOIB_FLAG_INITIALIZED, &priv->flags))
+-   ipoib_ib_dev_stop(dev);
+-  if (ipoib_ib_dev_open(dev) != 0)
++   ipoib_ib_dev_stop(dev, 0);
++  if (ipoib_ib_dev_open(dev, 0) != 0)
+    return;
+   if (netif_queue_stopped(dev))
+    netif_start_queue(dev);
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 162a136..bdc07c5 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -108,7 +108,7 @@ int ipoib_open(struct net_device *dev)
+ 
+  set_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags);
+ 
+- if (ipoib_ib_dev_open(dev)) {
++ if (ipoib_ib_dev_open(dev, 1)) {
+   if (!test_bit(IPOIB_PKEY_ASSIGNED, &priv->flags))
+    return 0;
+   goto err_disable;
+@@ -139,7 +139,7 @@ int ipoib_open(struct net_device *dev)
+  return 0;
+ 
+ err_stop:
+- ipoib_ib_dev_stop(dev);
++ ipoib_ib_dev_stop(dev, 1);
+ 
+ err_disable:
+  clear_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags);
+@@ -157,8 +157,8 @@ static int ipoib_stop(struct net_device *dev)
+ 
+  netif_stop_queue(dev);
+ 
+- ipoib_ib_dev_down(dev);
+- ipoib_ib_dev_stop(dev);
++ ipoib_ib_dev_down(dev, 1);
++ ipoib_ib_dev_stop(dev, 0);
+ 
+  if (!test_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags)) {
+   struct ipoib_dev_priv *cpriv;
+-- 
+1.7.1

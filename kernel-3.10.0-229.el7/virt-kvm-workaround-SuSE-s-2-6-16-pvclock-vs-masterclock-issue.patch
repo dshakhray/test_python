@@ -1,0 +1,90 @@
+From 1161514c0b7297a807f84ba179c60b2d2dd45dab Mon Sep 17 00:00:00 2001
+From: Marcelo Tosatti <mtosatti@redhat.com>
+Date: Wed, 21 Jan 2015 11:17:59 -0500
+Subject: [virt] kvm: workaround SuSE's 2.6.16 pvclock vs masterclock issue
+
+Message-id: <20150121111759.GA29754@amt.cnet>
+Patchwork-id: 103228
+O-Subject: [RHEL 7.1 PATCH] KVM: x86: workaround SuSE's 2.6.16 pvclock vs masterclock issue
+Bugzilla: 1177718
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Andrew Jones <drjones@redhat.com>
+
+(upstream commit 54750f2cf042c42b4223d67b1bd20138464bde0e of kvm.git queue branch)
+
+SuSE's 2.6.16 kernel fails to boot if the delta between tsc_timestamp
+and rdtsc is larger than a given threshold:
+
+ * If we get more than the below threshold into the future, we rerequest
+ * the real time from the host again which has only little offset then
+ * that we need to adjust using the TSC.
+ *
+ * For now that threshold is 1/5th of a jiffie. That should be good
+ * enough accuracy for completely broken systems, but also give us swing
+ * to not call out to the host all the time.
+ */
+#define PVCLOCK_DELTA_MAX ((1000000000ULL / HZ) / 5)
+
+Disable masterclock support (which increases said delta) in case the
+boot vcpu does not use MSR_KVM_SYSTEM_TIME_NEW.
+
+Upstreams kernels which support pvclock vsyscalls (and therefore make
+use of PVCLOCK_STABLE_BIT) use MSR_KVM_SYSTEM_TIME_NEW.
+
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+BZ: 1177718
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 06a8c9a..150e96b 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -610,6 +610,8 @@ struct kvm_arch {
+  #ifdef CONFIG_KVM_MMU_AUDIT
+  int audit_point;
+  #endif
++
++ bool boot_vcpu_runs_old_kvmclock;
+ };
+ 
+ struct kvm_vm_stat {
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index c33d648..c20fd97 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1479,7 +1479,8 @@ static void pvclock_update_vm_gtod_copy(struct kvm *kvm)
+      &ka->master_cycle_now);
+ 
+  ka->use_master_clock = host_tsc_clocksource && vcpus_matched
+-    && !backwards_tsc_observed;
++    && !backwards_tsc_observed
++    && !ka->boot_vcpu_runs_old_kvmclock;
+ 
+  if (ka->use_master_clock)
+   atomic_set(&kvm_guest_has_master_clock, 1);
+@@ -2090,8 +2091,20 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+  case MSR_KVM_SYSTEM_TIME_NEW:
+  case MSR_KVM_SYSTEM_TIME: {
+   u64 gpa_offset;
++  struct kvm_arch *ka = &vcpu->kvm->arch;
++
+   kvmclock_reset(vcpu);
+ 
++  if (vcpu->vcpu_id == 0 && !msr_info->host_initiated) {
++   bool tmp = (msr == MSR_KVM_SYSTEM_TIME);
++
++   if (ka->boot_vcpu_runs_old_kvmclock != tmp)
++    set_bit(KVM_REQ_MASTERCLOCK_UPDATE,
++     &vcpu->requests);
++
++   ka->boot_vcpu_runs_old_kvmclock = tmp;
++  }
++
+   vcpu->arch.time = data;
+   kvm_make_request(KVM_REQ_GLOBAL_CLOCK_UPDATE, vcpu);
+ 
+-- 
+1.7.1

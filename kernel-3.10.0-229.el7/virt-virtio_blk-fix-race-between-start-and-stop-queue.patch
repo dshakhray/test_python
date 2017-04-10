@@ -1,0 +1,71 @@
+From effcbeb50d56579bb64d638da52a6c1d7f501828 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Thu, 28 Aug 2014 19:16:06 -0400
+Subject: [virt] virtio_blk: fix race between start and stop queue
+
+Message-id: <1409253371-23161-17-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 89863
+O-Subject: [RHEL7 PATCH 16/21] virtio_blk: fix race between start and stop queue
+Bugzilla: 1105698
+RH-Acked-by: Fam Zheng <famz@redhat.com>
+
+This is a backport of the following upstream commit.
+Related to bug 1105698.
+
+  commit 0c29e93eae8a7f703e463c7b38ebc85d8718cae2
+  Author: Ming Lei <tom.leiming@gmail.com>
+  Date:   Fri May 16 23:31:21 2014 +0800
+
+    virtio_blk: fix race between start and stop queue
+
+    When there isn't enough vring descriptor for adding to vq,
+    blk-mq will be put as stopped state until some of pending
+    descriptors are completed & freed.
+
+    Unfortunately, the vq's interrupt may come just before
+    blk-mq's BLK_MQ_S_STOPPED flag is set, so the blk-mq will
+    still be kept as stopped even though lots of descriptors
+    are completed and freed in the interrupt handler. The worst
+    case is that all pending descriptors are freed in the
+    interrupt handler, and the queue is kept as stopped forever.
+
+    This patch fixes the problem by starting/stopping blk-mq
+    with holding vq_lock.
+
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: Rusty Russell <rusty@rustcorp.com.au>
+    Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 7a51f06..9f340fa 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -147,11 +147,11 @@ static void virtblk_done(struct virtqueue *vq)
+   if (unlikely(virtqueue_is_broken(vq)))
+    break;
+  } while (!virtqueue_enable_cb(vq));
+- spin_unlock_irqrestore(&vblk->vq_lock, flags);
+ 
+  /* In case queue is stopped waiting for more buffers. */
+  if (req_done)
+   blk_mq_start_stopped_hw_queues(vblk->disk->queue, true);
++ spin_unlock_irqrestore(&vblk->vq_lock, flags);
+ }
+ 
+ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
+@@ -205,8 +205,8 @@ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
+  err = __virtblk_add_req(vblk->vq, vbr, vbr->sg, num);
+  if (err) {
+   virtqueue_kick(vblk->vq);
+-  spin_unlock_irqrestore(&vblk->vq_lock, flags);
+   blk_mq_stop_hw_queue(hctx);
++  spin_unlock_irqrestore(&vblk->vq_lock, flags);
+   /* Out of mem doesn't actually happen, since we fall back
+    * to direct descriptors */
+   if (err == -ENOMEM || err == -ENOSPC)
+-- 
+1.7.1

@@ -1,0 +1,99 @@
+From fa92454dcbc9e15c3abf064b3985a12d0ef53e01 Mon Sep 17 00:00:00 2001
+From: Jacob Tanenbaum <jtanenba@redhat.com>
+Date: Fri, 16 Jan 2015 14:47:48 -0500
+Subject: [virt] kvm/vmx: invalid host cr4 handling across vm entries
+
+Message-id: <1421419668-15571-1-git-send-email-jtanenba@redhat.com>
+Patchwork-id: 103135
+O-Subject: [RHEL7 PATCH BZ1153329] CVE-2014-3690 kernel: kvm: vmx: invalid host cr4 handling across vm entries
+Bugzilla: 1153329
+CVE: CVE-2014-3690
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Andrew Jones <drjones@redhat.com>
+
+the host cr4 value can change across vm entries on the same vcpu and yet it was
+being treated as being constant. This can interfere with, for example,
+PR_SET_TSC settings (cr4/TSD bit), leading to inconsistent state.
+
+A local, unprivileged user could use this flaw to cause denial of service on
+the system.
+
+Backport of the following:
+commit d974baa398f34393db76be45f7d4d04fbdbb4a0a
+Author: Andy Lutomirski <luto@amacapital.net>
+Date:   Wed Oct 8 09:02:13 2014 -0700
+
+x86,kvm,vmx: Preserve CR4 across VM entry
+
+TBH, treating CR0 and CR3 as constant scares me a bit, too, but it looks
+like it's correct.
+
+This adds a branch and a read from cr4 to each vm entry.  Because it is
+extremely likely that consecutive entries into the same vcpu will have
+the same host cr4 value, this fixes up the vmcs instead of restoring cr4
+after the fact.  A subsequent patch will add a kernel-wide cr4 shadow,
+reducing the overhead in the common case to just two memory reads and a
+branch.
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1153329
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8541417
+Beaker: https://beaker.engineering.redhat.com/jobs/850189
+
+No issues seen in Brew build or Beaker testing
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index b782d06..f1e0a02 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -468,6 +468,7 @@ struct vcpu_vmx {
+   int           gs_ldt_reload_needed;
+   int           fs_reload_needed;
+   u64           msr_host_bndcfgs;
++  unsigned long vmcs_host_cr4; /* May not match real cr4 */
+  } host_state;
+  struct {
+   int vm86_active;
+@@ -4251,11 +4252,16 @@ static void vmx_set_constant_host_state(struct vcpu_vmx *vmx)
+  u32 low32, high32;
+  unsigned long tmpl;
+  struct desc_ptr dt;
++ unsigned long cr4;
+ 
+  vmcs_writel(HOST_CR0, read_cr0() & ~X86_CR0_TS);  /* 22.2.3 */
+- vmcs_writel(HOST_CR4, read_cr4());  /* 22.2.3, 22.2.5 */
+  vmcs_writel(HOST_CR3, read_cr3());  /* 22.2.3  FIXME: shadow tables */
+ 
++ /* Save the most likely value for this task's CR4 in the VMCS. */
++ cr4 = read_cr4();
++ vmcs_writel(HOST_CR4, cr4);   /* 22.2.3, 22.2.5 */
++ vmx->host_state.vmcs_host_cr4 = cr4;
++
+  vmcs_write16(HOST_CS_SELECTOR, __KERNEL_CS);  /* 22.2.4 */
+ #ifdef CONFIG_X86_64
+  /*
+@@ -7473,7 +7479,7 @@ static void atomic_switch_perf_msrs(struct vcpu_vmx *vmx)
+ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ {
+  struct vcpu_vmx *vmx = to_vmx(vcpu);
+- unsigned long debugctlmsr;
++ unsigned long debugctlmsr, cr4;
+ 
+  /* Record the guest's net vcpu time for enforced NMI injections. */
+  if (unlikely(!cpu_has_virtual_nmis() && vmx->soft_vnmi_blocked))
+@@ -7499,6 +7505,12 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+  if (test_bit(VCPU_REGS_RIP, (unsigned long *)&vcpu->arch.regs_dirty))
+   vmcs_writel(GUEST_RIP, vcpu->arch.regs[VCPU_REGS_RIP]);
+ 
++ cr4 = read_cr4();
++ if (unlikely(cr4 != vmx->host_state.vmcs_host_cr4)) {
++  vmcs_writel(HOST_CR4, cr4);
++  vmx->host_state.vmcs_host_cr4 = cr4;
++ }
++
+  /* When single-stepping over STI and MOV SS, we must clear the
+   * corresponding interruptibility bits in the guest state. Otherwise
+   * vmentry fails as it then expects bit 14 (BS) in pending debug
+-- 
+1.7.1

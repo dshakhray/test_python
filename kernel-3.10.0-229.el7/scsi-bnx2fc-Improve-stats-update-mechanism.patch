@@ -1,0 +1,129 @@
+From 7f7d4b4e3548793051c311130ed3477086b5d3be Mon Sep 17 00:00:00 2001
+From: Neil Horman <nhorman@redhat.com>
+Date: Thu, 14 Aug 2014 18:44:34 -0400
+Subject: [scsi] bnx2fc: Improve stats update mechanism
+
+Message-id: <1408041874-29378-3-git-send-email-nhorman@redhat.com>
+Patchwork-id: 87764
+O-Subject: [RHEL7.1 PATCH 2/2] bnx2fc: Improve stats update mechanism
+Bugzilla: 1096023
+RH-Acked-by: Jarod Wilson <jarod@redhat.com>
+RH-Acked-by: Maurizio Lombardi <mlombard@redhat.com>
+
+From: Neil Horman <nhorman@tuxdriver.com>
+
+Recently had this warning reported:
+
+[  290.489047] Call Trace:
+[  290.489053]  [<ffffffff8169efec>] dump_stack+0x19/0x1b
+[  290.489055]  [<ffffffff810ac7a9>] __might_sleep+0x179/0x230
+[  290.489057]  [<ffffffff816a4ad5>] mutex_lock_nested+0x55/0x520
+[  290.489061]  [<ffffffffa01b9905>] ? bnx2fc_l2_rcv_thread+0xc5/0x4c0 [bnx2fc]
+[  290.489065]  [<ffffffffa0174c1a>] fc_vport_id_lookup+0x3a/0xa0 [libfc]
+[  290.489068]  [<ffffffffa01b9a6c>] bnx2fc_l2_rcv_thread+0x22c/0x4c0 [bnx2fc]
+[  290.489070]  [<ffffffffa01b9840>] ? bnx2fc_vport_destroy+0x110/0x110 [bnx2fc]
+[  290.489073]  [<ffffffff8109e0cd>] kthread+0xed/0x100
+[  290.489075]  [<ffffffff8109dfe0>] ? insert_kthread_work+0x80/0x80
+[  290.489077]  [<ffffffff816b2fec>] ret_from_fork+0x7c/0xb0
+[  290.489078]  [<ffffffff8109dfe0>] ? insert_kthread_work+0x80/0x80
+
+Its due to the fact that we call a potentially sleeping function from the bnx2fc
+rcv path with preemption disabled (via the get_cpu call embedded in the per-cpu
+variable stats lookup in bnx2fc_l2_rcv_thread.
+
+Easy enough fix, we can just move the stats collection later in the function
+where we are sure we won't preempt or sleep.  This also allows us to not have to
+enable pre-emption when doing a per-cpu lookup, since we're certain not to get
+rescheduled.
+
+Signed-off-by: Neil Horman <nhorman@tuxdriver.com>
+Acked-by:  Eddie Wai <eddie.wai@broadcom.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit d576a5e80cd07ea7049f8fd7b303c14df7b5d7d2)
+
+BZ: 1096023
+Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=7833014
+Testing: tested by QE and observed to solve the problem as reported
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/bnx2fc/bnx2fc_fcoe.c b/drivers/scsi/bnx2fc/bnx2fc_fcoe.c
+index 0471798..91011b1 100644
+--- a/drivers/scsi/bnx2fc/bnx2fc_fcoe.c
++++ b/drivers/scsi/bnx2fc/bnx2fc_fcoe.c
+@@ -517,23 +517,17 @@ static void bnx2fc_recv_frame(struct sk_buff *skb)
+  skb_pull(skb, sizeof(struct fcoe_hdr));
+  fr_len = skb->len - sizeof(struct fcoe_crc_eof);
+ 
+- stats = per_cpu_ptr(lport->stats, get_cpu());
+- stats->RxFrames++;
+- stats->RxWords += fr_len / FCOE_WORD_TO_BYTE;
+-
+  fp = (struct fc_frame *)skb;
+  fc_frame_init(fp);
+  fr_dev(fp) = lport;
+  fr_sof(fp) = hp->fcoe_sof;
+  if (skb_copy_bits(skb, fr_len, &crc_eof, sizeof(crc_eof))) {
+-  put_cpu();
+   kfree_skb(skb);
+   return;
+  }
+  fr_eof(fp) = crc_eof.fcoe_eof;
+  fr_crc(fp) = crc_eof.fcoe_crc32;
+  if (pskb_trim(skb, fr_len)) {
+-  put_cpu();
+   kfree_skb(skb);
+   return;
+  }
+@@ -546,7 +540,6 @@ static void bnx2fc_recv_frame(struct sk_buff *skb)
+   if (compare_ether_addr(port->data_src_addr, dest_mac)
+       != 0) {
+    BNX2FC_HBA_DBG(lport, "fpma mismatch\n");
+-   put_cpu();
+    kfree_skb(skb);
+    return;
+   }
+@@ -554,7 +547,6 @@ static void bnx2fc_recv_frame(struct sk_buff *skb)
+  if (fh->fh_r_ctl == FC_RCTL_DD_SOL_DATA &&
+      fh->fh_type == FC_TYPE_FCP) {
+   /* Drop FCP data. We dont this in L2 path */
+-  put_cpu();
+   kfree_skb(skb);
+   return;
+  }
+@@ -564,7 +556,6 @@ static void bnx2fc_recv_frame(struct sk_buff *skb)
+   case ELS_LOGO:
+    if (ntoh24(fh->fh_s_id) == FC_FID_FLOGI) {
+     /* drop non-FIP LOGO */
+-    put_cpu();
+     kfree_skb(skb);
+     return;
+    }
+@@ -574,22 +565,23 @@ static void bnx2fc_recv_frame(struct sk_buff *skb)
+ 
+  if (fh->fh_r_ctl == FC_RCTL_BA_ABTS) {
+   /* Drop incoming ABTS */
+-  put_cpu();
+   kfree_skb(skb);
+   return;
+  }
+ 
++ stats = per_cpu_ptr(lport->stats, smp_processor_id());
++ stats->RxFrames++;
++ stats->RxWords += fr_len / FCOE_WORD_TO_BYTE;
++
+  if (le32_to_cpu(fr_crc(fp)) !=
+    ~crc32(~0, skb->data, fr_len)) {
+   if (stats->InvalidCRCCount < 5)
+    printk(KERN_WARNING PFX "dropping frame with "
+           "CRC error\n");
+   stats->InvalidCRCCount++;
+-  put_cpu();
+   kfree_skb(skb);
+   return;
+  }
+- put_cpu();
+  fc_exch_recv(lport, fp);
+ }
+ 
+-- 
+1.7.1

@@ -1,0 +1,132 @@
+From 4222b2aa2b586be4bdbdb37cd1c14daaa8bbf57c Mon Sep 17 00:00:00 2001
+From: David Gibson <dgibson@redhat.com>
+Date: Mon, 15 Sep 2014 07:12:30 -0400
+Subject: [virt] kvm/ppc: book3s/hv - Fix physical address calculations
+
+Message-id: <1410765214-16377-15-git-send-email-dgibson@redhat.com>
+Patchwork-id: 94707
+O-Subject: [PATCH 14/78] KVM: PPC: Book3S HV: Fix physical address calculations
+Bugzilla: 1123145 1123133 1123367
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1123145
+
+Signed-off-by: David Gibson <dgibson@redhat.com>
+
+commit caaa4c804fae7bb654f7d00b35b8583280a9c52c
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Sat Nov 16 17:46:02 2013 +1100
+
+    KVM: PPC: Book3S HV: Fix physical address calculations
+
+    This fixes a bug in kvmppc_do_h_enter() where the physical address
+    for a page can be calculated incorrectly if transparent huge pages
+    (THP) are active.  Until THP came along, it was true that if we
+    encountered a large (16M) page in kvmppc_do_h_enter(), then the
+    associated memslot must be 16M aligned for both its guest physical
+    address and the userspace address, and the physical address
+    calculations in kvmppc_do_h_enter() assumed that.  With THP, that
+    is no longer true.
+
+    In the case where we are using MMU notifiers and the page size that
+    we get from the Linux page tables is larger than the page being mapped
+    by the guest, we need to fill in some low-order bits of the physical
+    address.  Without THP, these bits would be the same in the guest
+    physical address (gpa) and the host virtual address (hva).  With THP,
+    they can be different, and we need to use the bits from hva rather
+    than gpa.
+
+    In the case where we are not using MMU notifiers, the host physical
+    address we get from the memslot->arch.slot_phys[] array already
+    includes the low-order bits down to the PAGE_SIZE level, even if
+    we are using large pages.  Thus we can simplify the calculation in
+    this case to just add in the remaining bits in the case where
+    PAGE_SIZE is 64k and the guest is mapping a 4k page.
+
+    The same bug exists in kvmppc_book3s_hv_page_fault().  The basic fix
+    is to use psize (the page size from the HPTE) rather than pte_size
+    (the page size from the Linux PTE) when updating the HPTE low word
+    in r.  That means that pfn needs to be computed to PAGE_SIZE
+    granularity even if the Linux PTE is a huge page PTE.  That can be
+    arranged simply by doing the page_to_pfn() before setting page to
+    the head of the compound page.  If psize is less than PAGE_SIZE,
+    then we need to make sure we only update the bits from PAGE_SIZE
+    upwards, in order not to lose any sub-page offset bits in r.
+    On the other hand, if psize is greater than PAGE_SIZE, we need to
+    make sure we don't bring in non-zero low order bits in pfn, hence
+    we mask (pfn << PAGE_SHIFT) with ~(psize - 1).
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 7e63139..45e495f 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -665,6 +665,7 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+    return -EFAULT;
+  } else {
+   page = pages[0];
++  pfn = page_to_pfn(page);
+   if (PageHuge(page)) {
+    page = compound_head(page);
+    pte_size <<= compound_order(page);
+@@ -689,7 +690,6 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+    }
+    rcu_read_unlock_sched();
+   }
+-  pfn = page_to_pfn(page);
+  }
+ 
+  ret = -EFAULT;
+@@ -707,8 +707,14 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+   r = (r & ~(HPTE_R_W|HPTE_R_I|HPTE_R_G)) | HPTE_R_M;
+  }
+ 
+- /* Set the HPTE to point to pfn */
+- r = (r & ~(HPTE_R_PP0 - pte_size)) | (pfn << PAGE_SHIFT);
++ /*
++  * Set the HPTE to point to pfn.
++  * Since the pfn is at PAGE_SIZE granularity, make sure we
++  * don't mask out lower-order bits if psize < PAGE_SIZE.
++  */
++ if (psize < PAGE_SIZE)
++  psize = PAGE_SIZE;
++ r = (r & ~(HPTE_R_PP0 - psize)) | ((pfn << PAGE_SHIFT) & ~(psize - 1));
+  if (hpte_is_writable(r) && !write_ok)
+   r = hpte_make_readonly(r);
+  ret = RESUME_GUEST;
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_mmu.c b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index ece99a9..941c21c 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@ -226,6 +226,7 @@ long kvmppc_do_h_enter(struct kvm *kvm, unsigned long flags,
+   is_io = pa & (HPTE_R_I | HPTE_R_W);
+   pte_size = PAGE_SIZE << (pa & KVMPPC_PAGE_ORDER_MASK);
+   pa &= PAGE_MASK;
++  pa |= gpa & ~PAGE_MASK;
+  } else {
+   /* Translate to host virtual address */
+   hva = __gfn_to_hva_memslot(memslot, gfn);
+@@ -239,13 +240,12 @@ long kvmppc_do_h_enter(struct kvm *kvm, unsigned long flags,
+     ptel = hpte_make_readonly(ptel);
+    is_io = hpte_cache_bits(pte_val(pte));
+    pa = pte_pfn(pte) << PAGE_SHIFT;
++   pa |= hva & (pte_size - 1);
+   }
+  }
+ 
+  if (pte_size < psize)
+   return H_PARAMETER;
+- if (pa && pte_size > psize)
+-  pa |= gpa & (pte_size - 1);
+ 
+  ptel &= ~(HPTE_R_PP0 - psize);
+  ptel |= pa;
+-- 
+1.7.1

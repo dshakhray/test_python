@@ -1,0 +1,108 @@
+From 2f149fd6eda6852ba4482a407c67f55ade5b6c9c Mon Sep 17 00:00:00 2001
+From: Rob Clark <rclark@redhat.com>
+Date: Wed, 17 Dec 2014 21:39:03 -0500
+Subject: [drm] nouveau: punt fbcon resume out to a workqueue
+
+Message-id: <1418852380-13061-53-git-send-email-rclark@redhat.com>
+Patchwork-id: 102189
+O-Subject: [RHEL7 drm 52/89] drm/nouveau: punt fbcon resume out to a workqueue
+Bugzilla: 1173317
+RH-Acked-by: Jerome Glisse <jglisse@redhat.com>
+RH-Acked-by: Dave Airlie <airlied@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1173317
+Upstream: 3.17
+
+commit ecff9563f2c30d9ff6cbbed2df10324904f779e8
+
+Author:     Ben Skeggs <bskeggs@redhat.com>
+AuthorDate: Wed Oct 1 11:11:25 2014 +1000
+Commit:     Rob Clark <rclark@redhat.com>
+CommitDate: Wed Dec 10 17:45:25 2014 -0500
+
+    drm/nouveau: punt fbcon resume out to a workqueue
+
+    commit 634ffcccfbe59d77652804e1beb415d3329b1bc6 upstream
+
+    Preparation for some runtime pm fixes.  Currently we skip over fbcon
+    suspend/resume in the runtime path, which causes issues on resume if
+    fbcon tries to write to the framebuffer before the BAR subdev has
+    been resumed to restore the BAR1 VM setup.
+
+    As we might be woken up via a sysfs connector, we are unable to call
+    fb_set_suspend() in the resume path as it could make its way down to
+    a modeset and cause all sorts of locking hilarity.
+
+    To solve this, we'll just delay the fbcon resume to a workqueue.
+
+    Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+
+Signed-off-by: Rob Clark <rclark@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fbcon.c b/drivers/gpu/drm/nouveau/nouveau_fbcon.c
+index 2ef2842..f636139 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fbcon.c
++++ b/drivers/gpu/drm/nouveau/nouveau_fbcon.c
+@@ -484,6 +484,16 @@ static struct drm_fb_helper_funcs nouveau_fbcon_helper_funcs = {
+  .fb_probe = nouveau_fbcon_create,
+ };
+ 
++static void
++nouveau_fbcon_set_suspend_work(struct work_struct *work)
++{
++ struct nouveau_fbdev *fbcon = container_of(work, typeof(*fbcon), work);
++ console_lock();
++ nouveau_fbcon_accel_restore(fbcon->dev);
++ nouveau_fbcon_zfill(fbcon->dev, fbcon);
++ fb_set_suspend(fbcon->helper.fbdev, FBINFO_STATE_RUNNING);
++ console_unlock();
++}
+ 
+ int
+ nouveau_fbcon_init(struct drm_device *dev)
+@@ -502,6 +512,7 @@ nouveau_fbcon_init(struct drm_device *dev)
+  if (!fbcon)
+   return -ENOMEM;
+ 
++ INIT_WORK(&fbcon->work, nouveau_fbcon_set_suspend_work);
+  fbcon->dev = dev;
+  drm->fbcon = fbcon;
+  fbcon->helper.funcs = &nouveau_fbcon_helper_funcs;
+@@ -549,14 +560,14 @@ nouveau_fbcon_set_suspend(struct drm_device *dev, int state)
+ {
+  struct nouveau_drm *drm = nouveau_drm(dev);
+  if (drm->fbcon) {
+-  console_lock();
+-  if (state == 0) {
+-   nouveau_fbcon_accel_restore(dev);
+-   nouveau_fbcon_zfill(dev, drm->fbcon);
++  if (state == FBINFO_STATE_RUNNING) {
++   schedule_work(&drm->fbcon->work);
++   return;
+   }
++  flush_work(&drm->fbcon->work);
++  console_lock();
+   fb_set_suspend(drm->fbcon->helper.fbdev, state);
+-  if (state == 1)
+-   nouveau_fbcon_accel_save_disable(dev);
++  nouveau_fbcon_accel_save_disable(dev);
+   console_unlock();
+  }
+ }
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fbcon.h b/drivers/gpu/drm/nouveau/nouveau_fbcon.h
+index 6d857e2..2c8e846 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fbcon.h
++++ b/drivers/gpu/drm/nouveau/nouveau_fbcon.h
+@@ -36,6 +36,7 @@ struct nouveau_fbdev {
+  struct nouveau_framebuffer nouveau_fb;
+  struct list_head fbdev_list;
+  struct drm_device *dev;
++ struct work_struct work;
+  unsigned int saved_flags;
+ };
+ 
+-- 
+1.7.1

@@ -1,0 +1,198 @@
+From f036412541de1ee23512a450236eed05c8d0715b Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 19 Sep 2014 12:28:52 -0400
+Subject: [acpi] acpiphp: Fix radeon/nouveau VGA switcheroo problem related to hotplug
+
+Message-id: <1411129776-21656-18-git-send-email-prarit@redhat.com>
+Patchwork-id: 96369
+O-Subject: [RHEL7.1 PATCH BZ 1141846 17/61] ACPIPHP / radeon / nouveau: Fix VGA switcheroo problem related to hotplug
+Bugzilla: 1141846
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1141846
+
+commit f244d8b623dae7a7bc695b0336f67729b95a9736
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Tue Dec 31 13:39:42 2013 +0100
+
+    ACPIPHP / radeon / nouveau: Fix VGA switcheroo problem related to hotplug
+
+    The changes in the ACPI-based PCI hotplug (ACPIPHP) subsystem made
+    during the 3.12 development cycle uncovered a problem with VGA
+    switcheroo that on some systems, when the device-specific method
+    (ATPX in the radeon case, _DSM in the nouveau case) is used to turn
+    off the discrete graphics, the BIOS generates ACPI hotplug events for
+    that device and those events cause ACPIPHP to attempt to remove the
+    device from the system (they are events for a device that was present
+    previously and is not present any more, so that's what should be done
+    according to the spec).  Then, the system stops functioning correctly.
+
+    Since the hotplug events in question were simply silently ignored
+    previously, the least intrusive way to address that problem is to
+    make ACPIPHP ignore them again.  For this purpose, introduce a new
+    ACPI device flag, no_hotplug, and modify ACPIPHP to ignore hotplug
+    events for PCI devices whose ACPI companions have that flag set.
+    Next, make the radeon and nouveau switcheroo detection code set the
+    no_hotplug flag for the discrete graphics' ACPI companion.
+
+    Fixes: bbd34fcdd1b2 (ACPI / hotplug / PCI: Register all devices under the given bridge)
+    References: https://bugzilla.kernel.org/show_bug.cgi?id=61891
+    References: https://bugzilla.kernel.org/show_bug.cgi?id=64891
+    Reported-and-tested-by: Mike Lothian <mike@fireburn.co.uk>
+    Reported-and-tested-by: <madcatx@atlas.cz>
+    Reported-and-tested-by: Joaquin Aramendia <samsagax@gmail.com>
+    Cc: Alex Deucher <alexdeucher@gmail.com>
+    Cc: Dave Airlie <airlied@linux.ie>
+    Cc: Takashi Iwai <tiwai@suse.de>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Cc: 3.12+ <stable@vger.kernel.org> # 3.12+
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+Cc: Stefan Assmann <sassmann@redhat.com>
+Cc: David Airlie <airlied@redhat.com>
+Cc: Adam Jackson <ajax@redhat.com>
+Cc: Rob Clark <rclark@redhat.com>
+Cc: Myron Stowe <mstowe@redhat.com>
+Cc: Andy Gospodarek <agospoda@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/bus.c b/drivers/acpi/bus.c
+index 3efbb17..1fcc7f6 100644
+--- a/drivers/acpi/bus.c
++++ b/drivers/acpi/bus.c
+@@ -151,6 +151,16 @@ int acpi_bus_get_private_data(acpi_handle handle, void **data)
+ }
+ EXPORT_SYMBOL(acpi_bus_get_private_data);
+ 
++void acpi_bus_no_hotplug(acpi_handle handle)
++{
++ struct acpi_device *adev = NULL;
++
++ acpi_bus_get_device(handle, &adev);
++ if (adev)
++  adev->flags.no_hotplug = true;
++}
++EXPORT_SYMBOL_GPL(acpi_bus_no_hotplug);
++
+ static void acpi_print_osc_error(acpi_handle handle,
+  struct acpi_osc_context *context, char *error)
+ {
+diff --git a/drivers/gpu/drm/nouveau/nouveau_acpi.c b/drivers/gpu/drm/nouveau/nouveau_acpi.c
+index 53942c0..3465ccf 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_acpi.c
++++ b/drivers/gpu/drm/nouveau/nouveau_acpi.c
+@@ -51,6 +51,7 @@ static struct nouveau_dsm_priv {
+  bool dsm_detected;
+  bool optimus_detected;
+  acpi_handle dhandle;
++ acpi_handle other_handle;
+  acpi_handle rom_handle;
+ } nouveau_dsm_priv;
+ 
+@@ -260,9 +261,10 @@ static int nouveau_dsm_pci_probe(struct pci_dev *pdev)
+  if (!dhandle)
+   return false;
+ 
+- if (!acpi_has_method(dhandle, "_DSM"))
++ if (!acpi_has_method(dhandle, "_DSM")) {
++  nouveau_dsm_priv.other_handle = dhandle;
+   return false;
+-
++ }
+  if (nouveau_test_dsm(dhandle, nouveau_dsm, NOUVEAU_DSM_POWER))
+   retval |= NOUVEAU_DSM_HAS_MUX;
+ 
+@@ -338,6 +340,16 @@ static bool nouveau_dsm_detect(void)
+   printk(KERN_INFO "VGA switcheroo: detected DSM switching method %s handle\n",
+    acpi_method_name);
+   nouveau_dsm_priv.dsm_detected = true;
++  /*
++   * On some systems hotplug events are generated for the device
++   * being switched off when _DSM is executed.  They cause ACPI
++   * hotplug to trigger and attempt to remove the device from
++   * the system, which causes it to break down.  Prevent that from
++   * happening by setting the no_hotplug flag for the involved
++   * ACPI device objects.
++   */
++  acpi_bus_no_hotplug(nouveau_dsm_priv.dhandle);
++  acpi_bus_no_hotplug(nouveau_dsm_priv.other_handle);
+   ret = true;
+  }
+ 
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index 9e08242..b121440 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -648,6 +648,24 @@ static void disable_slot(struct acpiphp_slot *slot)
+  slot->flags &= (~SLOT_ENABLED);
+ }
+ 
++static bool acpiphp_no_hotplug(acpi_handle handle)
++{
++ struct acpi_device *adev = NULL;
++
++ acpi_bus_get_device(handle, &adev);
++ return adev && adev->flags.no_hotplug;
++}
++
++static bool slot_no_hotplug(struct acpiphp_slot *slot)
++{
++ struct acpiphp_func *func;
++
++ list_for_each_entry(func, &slot->funcs, sibling)
++  if (acpiphp_no_hotplug(func_to_handle(func)))
++   return true;
++
++ return false;
++}
+ 
+ /**
+  * get_slot_status - get ACPI slot status
+@@ -706,7 +724,8 @@ static void trim_stale_devices(struct pci_dev *dev)
+   unsigned long long sta;
+ 
+   status = acpi_evaluate_integer(handle, "_STA", NULL, &sta);
+-  alive = ACPI_SUCCESS(status) && sta == ACPI_STA_ALL;
++  alive = (ACPI_SUCCESS(status) && sta == ACPI_STA_ALL)
++   || acpiphp_no_hotplug(handle);
+  }
+  if (!alive) {
+   u32 v;
+@@ -750,8 +769,9 @@ static void acpiphp_check_bridge(struct acpiphp_bridge *bridge)
+   struct pci_dev *dev, *tmp;
+ 
+   mutex_lock(&slot->crit_sect);
+-  /* wake up all functions */
+-  if (get_slot_status(slot) == ACPI_STA_ALL) {
++  if (slot_no_hotplug(slot)) {
++   ; /* do nothing */
++  } else if (get_slot_status(slot) == ACPI_STA_ALL) {
+    /* remove stale devices if any */
+    list_for_each_entry_safe(dev, tmp, &bus->devices,
+        bus_list)
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index fdfc36c..398d62c 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -165,7 +165,8 @@ struct acpi_device_flags {
+  u32 match_driver:1;
+  u32 initialized:1;
+  u32 visited:1;
+- u32 reserved:25;
++ u32 no_hotplug:1;
++ u32 reserved:24;
+ };
+ 
+ /* File System */
+@@ -344,6 +345,7 @@ extern struct kobject *acpi_kobj;
+ extern int acpi_bus_generate_netlink_event(const char*, const char*, u8, int);
+ void acpi_bus_private_data_handler(acpi_handle, void *);
+ int acpi_bus_get_private_data(acpi_handle, void **);
++void acpi_bus_no_hotplug(acpi_handle handle);
+ extern int acpi_notifier_call_chain(struct acpi_device *, u32, u32);
+ extern int register_acpi_notifier(struct notifier_block *);
+ extern int unregister_acpi_notifier(struct notifier_block *);
+-- 
+1.7.1

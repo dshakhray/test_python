@@ -1,0 +1,89 @@
+From 946a018cd3817c838941688f889272e47330ee9e Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 21 Nov 2014 18:35:15 -0500
+Subject: [md] dm-thin: fix pool_io_hints to avoid looking at max_hw_sectors
+
+Message-id: <20141121183515.GE8944@redhat.com>
+Patchwork-id: 100758
+O-Subject: [RHEL7.2 PATCH 26/24 v2] dm thin: fix pool_io_hints to avoid looking at max_hw_sectors
+Bugzilla: 1156164
+RH-Acked-by: Vivek Goyal <vgoyal@redhat.com>
+
+BZ: 1156164
+
+Upstream linux-dm.git commit d200c30ef00dd03aec6f1aeaac1546c6e515cbc0
+Author: Mike Snitzer <snitzer@redhat.com>
+Date:   Thu Nov 20 18:07:43 2014 -0500
+
+    dm thin: fix pool_io_hints to avoid looking at max_hw_sectors
+
+    Simplify the pool_io_hints code that works to establish a max_sectors
+    value that is a power-of-2 factor of the thin-pool's blocksize.  The
+    biggest associated improvement is that the DM thin-pool is no longer
+    concerning itself with the data device's max_hw_sectors when adjusting
+    max_sectors.
+
+    This fixes the relative fragility of the original "dm thin: adjust
+    max_sectors_kb based on thinp blocksize" commit that only became
+    apparent when testing was performed using a DM thin-pool ontop of a
+    virtio_blk device.  One proposed upstream patch detailed the problems
+    inherent in virtio_blk: https://lkml.org/lkml/2014/11/20/611
+
+    So even though virtio_blk incorrectly set its max_hw_sectors it actually
+    helped make it clear that we need DM thinp to be tolerant of any future
+    Linux driver that incorrectly sets max_hw_sectors.
+
+    We only need to be concerned with modifying the thin-pool device's
+    max_sectors limit if it is smaller than the thin-pool's blocksize.  In
+    this case the value of max_sectors does become a limiting factor when
+    upper layers (e.g. filesystems) construct their bios.  But if the
+    hardware can support IOs larger than the thin-pool's blocksize the user
+    is encouraged to adjust the thin-pool's data device's max_sectors
+    accordingly -- doing so will enable the thin-pool to inherit the
+    established user-defined max_sectors.
+
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index 2a02d40..d3dcd0e 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -3521,27 +3521,20 @@ static void pool_io_hints(struct dm_target *ti, struct queue_limits *limits)
+  sector_t io_opt_sectors = limits->io_opt >> SECTOR_SHIFT;
+ 
+  /*
+-  * Adjust max_sectors_kb to highest possible power-of-2
+-  * factor of pool->sectors_per_block.
++  * If max_sectors is smaller than pool->sectors_per_block adjust it
++  * to the highest possible power-of-2 factor of pool->sectors_per_block.
++  * This is especially beneficial when the pool's data device is a RAID
++  * device that has a full stripe width that matches pool->sectors_per_block
++  * -- because even though partial RAID stripe-sized IOs will be issued to a
++  *    single RAID stripe; when aggregated they will end on a full RAID stripe
++  *    boundary.. which avoids additional partial RAID stripe writes cascading
+   */
+- if (limits->max_hw_sectors & (limits->max_hw_sectors - 1))
+-  limits->max_sectors = rounddown_pow_of_two(limits->max_hw_sectors);
+- else
+-  limits->max_sectors = limits->max_hw_sectors;
+-
+  if (limits->max_sectors < pool->sectors_per_block) {
+   while (!is_factor(pool->sectors_per_block, limits->max_sectors)) {
+    if ((limits->max_sectors & (limits->max_sectors - 1)) == 0)
+     limits->max_sectors--;
+    limits->max_sectors = rounddown_pow_of_two(limits->max_sectors);
+   }
+- } else if (block_size_is_power_of_two(pool)) {
+-  /* max_sectors_kb is >= power-of-2 thinp blocksize */
+-  while (!is_factor(limits->max_sectors, pool->sectors_per_block)) {
+-   if ((limits->max_sectors & (limits->max_sectors - 1)) == 0)
+-    limits->max_sectors--;
+-   limits->max_sectors = rounddown_pow_of_two(limits->max_sectors);
+-  }
+  }
+ 
+  /*
+-- 
+1.7.1

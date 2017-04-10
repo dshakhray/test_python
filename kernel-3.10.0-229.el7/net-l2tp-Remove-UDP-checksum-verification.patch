@@ -1,0 +1,122 @@
+From 1ea21f633b4143a7d937222ea2f4c9a69f5be572 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:14:40 -0400
+Subject: [net] l2tp: Remove UDP checksum verification
+
+Message-id: <1409652920-431-18-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90143
+O-Subject: [PATCH 17/57] [RHEL7.1 net] l2tp: Remove UDP checksum verification
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+minor conflicts due to missing L2TP commits:
+a0dbd82, l2tp: make datapath resilient to packet loss when sequence numbers enabled
+8a1631d, l2tp: make datapath sequence number support RFC-compliant
+
+commit 58d6085c14f5db61c092c90b59813397bc771417
+Author: Tom Herbert <therbert@google.com>
+Date:   Wed May 7 16:52:48 2014 -0700
+
+    l2tp: Remove UDP checksum verification
+
+    Validating the UDP checksum is now done in UDP before handing
+    packets to the encapsulation layer. Note that this also eliminates
+    the "feature" where L2TP can ignore a non-zero UDP checksum (doing
+    this was contrary to RFC 1122).
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/l2tp/l2tp_core.c b/net/l2tp/l2tp_core.c
+index bc5c815..142c59d 100644
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@ -501,52 +501,6 @@ out:
+  spin_unlock_bh(&session->reorder_q.lock);
+ }
+ 
+-static inline int l2tp_verify_udp_checksum(struct sock *sk,
+-        struct sk_buff *skb)
+-{
+- struct udphdr *uh = udp_hdr(skb);
+- u16 ulen = ntohs(uh->len);
+- __wsum psum;
+-
+- if (sk->sk_no_check || skb_csum_unnecessary(skb))
+-  return 0;
+-
+-#if IS_ENABLED(CONFIG_IPV6)
+- if (sk->sk_family == PF_INET6 && !l2tp_tunnel(sk)->v4mapped) {
+-  if (!uh->check) {
+-   LIMIT_NETDEBUG(KERN_INFO "L2TP: IPv6: checksum is 0\n");
+-   return 1;
+-  }
+-  if ((skb->ip_summed == CHECKSUM_COMPLETE) &&
+-      !csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
+-         &ipv6_hdr(skb)->daddr, ulen,
+-         IPPROTO_UDP, skb->csum)) {
+-   skb->ip_summed = CHECKSUM_UNNECESSARY;
+-   return 0;
+-  }
+-  skb->csum = ~csum_unfold(csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
+-        &ipv6_hdr(skb)->daddr,
+-        skb->len, IPPROTO_UDP,
+-        0));
+- } else
+-#endif
+- {
+-  struct inet_sock *inet;
+-  if (!uh->check)
+-   return 0;
+-  inet = inet_sk(sk);
+-  psum = csum_tcpudp_nofold(inet->inet_saddr, inet->inet_daddr,
+-       ulen, IPPROTO_UDP, 0);
+-
+-  if ((skb->ip_summed == CHECKSUM_COMPLETE) &&
+-      !csum_fold(csum_add(psum, skb->csum)))
+-   return 0;
+-  skb->csum = psum;
+- }
+-
+- return __skb_checksum_complete(skb);
+-}
+-
+ /* Do receive processing of L2TP data frames. We handle both L2TPv2
+  * and L2TPv3 data frames here.
+  *
+@@ -841,8 +795,7 @@ static int l2tp_udp_recv_core(struct l2tp_tunnel *tunnel, struct sk_buff *skb,
+  u16 version;
+  int length;
+ 
+- if (tunnel->sock && l2tp_verify_udp_checksum(tunnel->sock, skb))
+-  goto discard_bad_csum;
++ /* UDP has verifed checksum */
+ 
+  /* UDP always verifies the packet length. */
+  __skb_pull(skb, sizeof(struct udphdr));
+@@ -925,14 +878,6 @@ static int l2tp_udp_recv_core(struct l2tp_tunnel *tunnel, struct sk_buff *skb,
+ 
+  return 0;
+ 
+-discard_bad_csum:
+- LIMIT_NETDEBUG("%s: UDP: bad checksum\n", tunnel->name);
+- UDP_INC_STATS_USER(tunnel->l2tp_net, UDP_MIB_INERRORS, 0);
+- atomic_long_inc(&tunnel->stats.rx_errors);
+- kfree_skb(skb);
+-
+- return 0;
+-
+ error:
+  /* Put UDP header back */
+  __skb_push(skb, sizeof(struct udphdr));
+-- 
+1.7.1

@@ -1,0 +1,82 @@
+From d4ccb7c44135d41fc7dfb4a604eee3dd41d64f19 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:55:20 -0400
+Subject: [fs] ext4: update i_disksize coherently with block allocation on error path
+
+Message-id: <1414058125-4183-167-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98245
+O-Subject: [RHEL 7.1 PATCH v2 166/171] ext4: update i_disksize coherently with block allocation on error path
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Dmitry Monakhov <dmonakhov@openvz.org>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit 6603120e96eae9a5d6228681ae55c7fdc998d1bb
+
+ In case of delalloc block i_disksize may be less than i_size. So we
+ have to update i_disksize each time we allocated and submitted some
+ blocks beyond i_disksize.  We weren't doing this on the error paths,
+ so fix this.
+
+ testcase: xfstest generic/019
+
+ Signed-off-by: Dmitry Monakhov <dmonakhov@openvz.org>
+ Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+ Cc: stable@vger.kernel.org
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 61a4353..d49415f 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2198,6 +2198,7 @@ static int mpage_map_and_submit_extent(handle_t *handle,
+  struct ext4_map_blocks *map = &mpd->map;
+  int err;
+  loff_t disksize;
++ int progress = 0;
+ 
+  mpd->io_submit.io_end->offset =
+     ((loff_t)map->m_lblk) << inode->i_blkbits;
+@@ -2214,8 +2215,11 @@ static int mpage_map_and_submit_extent(handle_t *handle,
+     * is non-zero, a commit should free up blocks.
+     */
+    if ((err == -ENOMEM) ||
+-       (err == -ENOSPC && ext4_count_free_clusters(sb)))
++       (err == -ENOSPC && ext4_count_free_clusters(sb))) {
++    if (progress)
++     goto update_disksize;
+     return err;
++   }
+    ext4_msg(sb, KERN_CRIT,
+      "Delayed block allocation failed for "
+      "inode %lu at logical offset %llu with"
+@@ -2232,15 +2236,17 @@ static int mpage_map_and_submit_extent(handle_t *handle,
+    *give_up_on_write = true;
+    return err;
+   }
++  progress = 1;
+   /*
+    * Update buffer state, submit mapped pages, and get us new
+    * extent to map
+    */
+   err = mpage_map_and_submit_buffers(mpd);
+   if (err < 0)
+-   return err;
++   goto update_disksize;
+  } while (map->m_len);
+ 
++update_disksize:
+  /*
+   * Update on-disk size after IO is submitted.  Races with
+   * truncate are avoided by checking i_size under i_data_sem.
+-- 
+1.7.1

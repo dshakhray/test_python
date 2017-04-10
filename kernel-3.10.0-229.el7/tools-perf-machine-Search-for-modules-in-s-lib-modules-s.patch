@@ -1,0 +1,88 @@
+From 3c7ad8ecbfb3cf95a93c9e782b9de8a64b3134e8 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:06:25 -0400
+Subject: [tools] perf/machine: Search for modules in %s/lib/modules/%s
+
+Message-id: <1410181752-25631-141-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91843
+O-Subject: [PATCH RHEL7.1 BZ1134356 140/307] perf machine: Search for modules in %s/lib/modules/%s
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 61d4290cc1f10588147b76b385875f06827d47ff
+Author: Richard Yao <ryao@gentoo.org>
+Date: Sat Apr 26 13:17:55 2014 -0400
+
+description
+===========
+Modules installed outside of the kernel's build system should go into
+"%s/lib/modules/%s/extra", but at present, perf will only look at them
+when they are in "%s/lib/modules/%s/kernel". Lets encourage good
+citizenship by relaxing this requirement to "%s/lib/modules/%s". This
+way open source modules that are out-of-tree have no incentive to start
+populating a directory reserved for in-kernel modules and I can stop
+hex-editing my system's perf binary when profiling OSS out-of-tree
+modules.
+
+Feedback from Namhyung Kim correctly revealed that the hex-edits that I
+had been doing meant that perf was also traversing the build and source
+symlinks in %s/lib/modules/%s. That is undesireable, so we explicitly
+exclude them from traversal with a minor tweak to the traversal routine.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index a53cd0b..27c2a5e 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -717,7 +717,7 @@ static char *get_kernel_version(const char *root_dir)
+ }
+ 
+ static int map_groups__set_modules_path_dir(struct map_groups *mg,
+-    const char *dir_name)
++    const char *dir_name, int depth)
+ {
+  struct dirent *dent;
+  DIR *dir = opendir(dir_name);
+@@ -742,7 +742,15 @@ static int map_groups__set_modules_path_dir(struct map_groups *mg,
+        !strcmp(dent->d_name, ".."))
+     continue;
+ 
+-   ret = map_groups__set_modules_path_dir(mg, path);
++   /* Do not follow top-level source and build symlinks */
++   if (depth == 0) {
++    if (!strcmp(dent->d_name, "source") ||
++        !strcmp(dent->d_name, "build"))
++     continue;
++   }
++
++   ret = map_groups__set_modules_path_dir(mg, path,
++              depth + 1);
+    if (ret < 0)
+     goto out;
+   } else {
+@@ -786,11 +794,11 @@ static int machine__set_modules_path(struct machine *machine)
+  if (!version)
+   return -1;
+ 
+- snprintf(modules_path, sizeof(modules_path), "%s/lib/modules/%s/kernel",
++ snprintf(modules_path, sizeof(modules_path), "%s/lib/modules/%s",
+    machine->root_dir, version);
+  free(version);
+ 
+- return map_groups__set_modules_path_dir(&machine->kmaps, modules_path);
++ return map_groups__set_modules_path_dir(&machine->kmaps, modules_path, 0);
+ }
+ 
+ static int machine__create_module(void *arg, const char *name, u64 start)
+-- 
+1.7.1

@@ -1,0 +1,165 @@
+From c0116781c25cc6b7b13aef1c152be048e00ee0ca Mon Sep 17 00:00:00 2001
+From: Tomas Henzl <thenzl@redhat.com>
+Date: Thu, 16 Oct 2014 16:01:55 -0400
+Subject: [scsi] mpt2sas: Avoid type casting for direct I/O commands
+
+Message-id: <1413475335-14737-13-git-send-email-thenzl@redhat.com>
+Patchwork-id: 97597
+O-Subject: [RHEL7.1 e-stor PATCH 12/32] mpt2sas: Avoid type casting for direct I/O commands
+Bugzilla: 1088524
+RH-Acked-by: Maurizio Lombardi <mlombard@redhat.com>
+RH-Acked-by: Rob Evers <revers@redhat.com>
+
+A type casting error caused the max volume LBA to be truncated from 64
+to 32 bits. The virtual LBA would also get truncated to 32 bits in the
+case of a 16-byte READ/WRITE command.
+
+Rewrite entire function to get rid of code duplication and type casts.
+Use get/put_unaligned wrappers to extract and replace the LBA field in
+the MPI request CDB.
+
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Tested-by: Sreekanth Reddy <Sreekanth.Reddy@avagotech.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit daeaa9df92bd742f4e6d4d6039d689277a8e31bd)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/mpt2sas/mpt2sas_scsih.c b/drivers/scsi/mpt2sas/mpt2sas_scsih.c
+index e7303ed..231ec34 100644
+--- a/drivers/scsi/mpt2sas/mpt2sas_scsih.c
++++ b/drivers/scsi/mpt2sas/mpt2sas_scsih.c
+@@ -55,6 +55,8 @@
+ #include <linux/raid_class.h>
+ #include <linux/slab.h>
+ 
++#include <asm/unaligned.h>
++
+ #include "mpt2sas_base.h"
+ 
+ MODULE_AUTHOR(MPT2SAS_AUTHOR);
+@@ -3858,85 +3860,46 @@ _scsih_setup_direct_io(struct MPT2SAS_ADAPTER *ioc, struct scsi_cmnd *scmd,
+  struct _raid_device *raid_device, Mpi2SCSIIORequest_t *mpi_request,
+  u16 smid)
+ {
+- u32 v_lba, p_lba, stripe_off, stripe_unit, column, io_size;
++ sector_t v_lba, p_lba, stripe_off, stripe_unit, column, io_size;
+  u32 stripe_sz, stripe_exp;
+- u8 num_pds, *cdb_ptr, i;
+- u8 cdb0 = scmd->cmnd[0];
+- u64 v_llba;
++ u8 num_pds, cmd = scmd->cmnd[0];
+ 
+- /*
+-  * Try Direct I/O to RAID memeber disks
+-  */
+- if (cdb0 == READ_16 || cdb0 == READ_10 ||
+-     cdb0 == WRITE_16 || cdb0 == WRITE_10) {
+-  cdb_ptr = mpi_request->CDB.CDB32;
+-
+-  if ((cdb0 < READ_16) || !(cdb_ptr[2] | cdb_ptr[3] | cdb_ptr[4]
+-   | cdb_ptr[5])) {
+-   io_size = scsi_bufflen(scmd) >>
+-       raid_device->block_exponent;
+-   i = (cdb0 < READ_16) ? 2 : 6;
+-   /* get virtual lba */
+-   v_lba = be32_to_cpu(*(__be32 *)(&cdb_ptr[i]));
+-
+-   if (((u64)v_lba + (u64)io_size - 1) <=
+-       (u32)raid_device->max_lba) {
+-    stripe_sz = raid_device->stripe_sz;
+-    stripe_exp = raid_device->stripe_exponent;
+-    stripe_off = v_lba & (stripe_sz - 1);
+-
+-    /* Check whether IO falls within a stripe */
+-    if ((stripe_off + io_size) <= stripe_sz) {
+-     num_pds = raid_device->num_pds;
+-     p_lba = v_lba >> stripe_exp;
+-     stripe_unit = p_lba / num_pds;
+-     column = p_lba % num_pds;
+-     p_lba = (stripe_unit << stripe_exp) +
+-         stripe_off;
+-     mpi_request->DevHandle =
+-      cpu_to_le16(raid_device->
+-          pd_handle[column]);
+-     (*(__be32 *)(&cdb_ptr[i])) =
+-      cpu_to_be32(p_lba);
+-     /*
+-     * WD: To indicate this I/O is directI/O
+-     */
+-     _scsih_scsi_direct_io_set(ioc, smid, 1);
+-    }
+-   }
+-  } else {
+-   io_size = scsi_bufflen(scmd) >>
+-       raid_device->block_exponent;
+-   /* get virtual lba */
+-   v_llba = be64_to_cpu(*(__be64 *)(&cdb_ptr[2]));
+-
+-   if ((v_llba + (u64)io_size - 1) <=
+-       raid_device->max_lba) {
+-    stripe_sz = raid_device->stripe_sz;
+-    stripe_exp = raid_device->stripe_exponent;
+-    stripe_off = (u32) (v_llba & (stripe_sz - 1));
+-
+-    /* Check whether IO falls within a stripe */
+-    if ((stripe_off + io_size) <= stripe_sz) {
+-     num_pds = raid_device->num_pds;
+-     p_lba = (u32)(v_llba >> stripe_exp);
+-     stripe_unit = p_lba / num_pds;
+-     column = p_lba % num_pds;
+-     p_lba = (stripe_unit << stripe_exp) +
+-         stripe_off;
+-     mpi_request->DevHandle =
+-      cpu_to_le16(raid_device->
+-          pd_handle[column]);
+-     (*(__be64 *)(&cdb_ptr[2])) =
+-         cpu_to_be64((u64)p_lba);
+-     /*
+-     * WD: To indicate this I/O is directI/O
+-     */
+-     _scsih_scsi_direct_io_set(ioc, smid, 1);
+-    }
+-   }
+-  }
+- }
++ if (cmd != READ_10 && cmd != WRITE_10 &&
++     cmd != READ_16 && cmd != WRITE_16)
++  return;
++
++ if (cmd == READ_10 || cmd == WRITE_10)
++  v_lba = get_unaligned_be32(&mpi_request->CDB.CDB32[2]);
++ else
++  v_lba = get_unaligned_be64(&mpi_request->CDB.CDB32[2]);
++
++ io_size = scsi_bufflen(scmd) >> raid_device->block_exponent;
++
++ if (v_lba + io_size - 1 > raid_device->max_lba)
++  return;
++
++ stripe_sz = raid_device->stripe_sz;
++ stripe_exp = raid_device->stripe_exponent;
++ stripe_off = v_lba & (stripe_sz - 1);
++
++ /* Return unless IO falls within a stripe */
++ if (stripe_off + io_size > stripe_sz)
++  return;
++
++ num_pds = raid_device->num_pds;
++ p_lba = v_lba >> stripe_exp;
++ stripe_unit = p_lba / num_pds;
++ column = p_lba % num_pds;
++ p_lba = (stripe_unit << stripe_exp) + stripe_off;
++ mpi_request->DevHandle = cpu_to_le16(raid_device->pd_handle[column]);
++
++ if (cmd == READ_10 || cmd == WRITE_10)
++  put_unaligned_be32(lower_32_bits(p_lba),
++       &mpi_request->CDB.CDB32[2]);
++ else
++  put_unaligned_be64(p_lba, &mpi_request->CDB.CDB32[2]);
++
++ _scsih_scsi_direct_io_set(ioc, smid, 1);
+ }
+ 
+ /**
+-- 
+1.7.1

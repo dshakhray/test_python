@@ -1,0 +1,85 @@
+From 5da979eccad90258233261d76fbdf386e024d8ca Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:20:48 -0400
+Subject: [fs] nfs: disallow duplicate pages in pgio page vectors
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1411050057-12417-86-git-send-email-steved@redhat.com>
+Patchwork-id: 96247
+O-Subject: [RHEL7.1 PATCH 85/94] nfs: disallow duplicate pages in pgio page vectors
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+Adjacent requests that share the same page are allowed, but should only
+use one entry in the page vector. This avoids overruning the page
+vector - it is sized based on how many bytes there are, not by
+request count.
+
+This fixes issues that manifest as "Redzone overwritten" bugs (the
+vector overrun) and hangs waiting on page read / write, as it waits on
+the same page more than once.
+
+This also adds bounds checking to the page vector with a graceful failure
+(WARN_ON_ONCE and pgio error returned to application).
+
+Reported-by: Toralf FÃÂ¶rster <toralf.foerster@gmx.de>
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: bba5c1887a925a9945d22217d38d58d8b3ba1043
+Bugzilla: 1111708
+---
+ fs/nfs/pagelist.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 4479c29..e243cf5 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -723,10 +723,11 @@ int nfs_generic_pgio(struct nfs_pageio_descriptor *desc,
+        struct nfs_pgio_header *hdr)
+ {
+  struct nfs_page  *req;
+- struct page  **pages;
++ struct page  **pages,
++    *last_page;
+  struct list_head *head = &desc->pg_list;
+  struct nfs_commit_info cinfo;
+- unsigned int pagecount;
++ unsigned int pagecount, pageused;
+ 
+  pagecount = nfs_page_array_len(desc->pg_base, desc->pg_count);
+  if (!nfs_pgarray_set(&hdr->page_array, pagecount))
+@@ -734,12 +735,23 @@ int nfs_generic_pgio(struct nfs_pageio_descriptor *desc,
+ 
+  nfs_init_cinfo(&cinfo, desc->pg_inode, desc->pg_dreq);
+  pages = hdr->page_array.pagevec;
++ last_page = NULL;
++ pageused = 0;
+  while (!list_empty(head)) {
+   req = nfs_list_entry(head->next);
+   nfs_list_remove_request(req);
+   nfs_list_add_request(req, &hdr->pages);
+-  *pages++ = req->wb_page;
++
++  if (WARN_ON_ONCE(pageused >= pagecount))
++   return nfs_pgio_error(desc, hdr);
++
++  if (!last_page || last_page != req->wb_page) {
++   *pages++ = last_page = req->wb_page;
++   pageused++;
++  }
+  }
++ if (WARN_ON_ONCE(pageused != pagecount))
++  return nfs_pgio_error(desc, hdr);
+ 
+  if ((desc->pg_ioflags & FLUSH_COND_STABLE) &&
+      (desc->pg_moreio || nfs_reqs_to_commit(&cinfo)))
+-- 
+1.7.1

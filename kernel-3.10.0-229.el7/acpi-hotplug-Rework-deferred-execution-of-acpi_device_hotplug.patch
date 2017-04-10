@@ -1,0 +1,157 @@
+From 8f27c2100bd59ca42bb80b37f42c98308daf9e49 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Fri, 19 Sep 2014 12:29:30 -0400
+Subject: [acpi] hotplug: Rework deferred execution of acpi_device_hotplug()
+
+Message-id: <1411129776-21656-56-git-send-email-prarit@redhat.com>
+Patchwork-id: 96372
+O-Subject: [RHEL7.1 PATCH BZ 1141846 55/61] ACPI / hotplug: Rework deferred execution of acpi_device_hotplug()
+Bugzilla: 1141846
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1141846
+
+commit 1e3bcb596c6b1cf6db93f8f506e2de260e771bad
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Mon Mar 3 00:40:38 2014 +0100
+
+    ACPI / hotplug: Rework deferred execution of acpi_device_hotplug()
+
+    Since the only function executed by acpi_hotplug_execute() is
+    acpi_device_hotplug() and it only is called by the ACPI core,
+    simplify its definition so that it only takes two arguments, the
+    ACPI device object pointer and event code, rename it to
+    acpi_hotplug_schedule() and move its header from acpi_bus.h to
+    the ACPI core's internal header file internal.h.  Modify the
+    definition of acpi_device_hotplug() so that its first argument is
+    an ACPI device object pointer and modify the definition of
+    struct acpi_hp_work accordingly.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Acked-by: Toshi Kani <toshi.kani@hp.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+Cc: Stefan Assmann <sassmann@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Cc: Don Zickus <dzickus@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/bus.c b/drivers/acpi/bus.c
+index 9fa67c7..2b13b24 100644
+--- a/drivers/acpi/bus.c
++++ b/drivers/acpi/bus.c
+@@ -497,7 +497,7 @@ static void acpi_bus_notify(acpi_handle handle, u32 type, void *data)
+  case ACPI_NOTIFY_BUS_CHECK:
+  case ACPI_NOTIFY_DEVICE_CHECK:
+  case ACPI_NOTIFY_EJECT_REQUEST:
+-  status = acpi_hotplug_execute(acpi_device_hotplug, adev, type);
++  status = acpi_hotplug_schedule(adev, type);
+   if (ACPI_SUCCESS(status))
+    return;
+  default:
+diff --git a/drivers/acpi/internal.h b/drivers/acpi/internal.h
+index 6b951c9..8179ef4 100644
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -78,8 +78,9 @@ void acpi_lpss_init(void);
+ static inline void acpi_lpss_init(void) {}
+ #endif
+ 
++acpi_status acpi_hotplug_schedule(struct acpi_device *adev, u32 src);
+ bool acpi_queue_hotplug_work(struct work_struct *work);
+-void acpi_device_hotplug(void *data, u32 src);
++void acpi_device_hotplug(struct acpi_device *adev, u32 src);
+ bool acpi_scan_is_offline(struct acpi_device *adev, bool uevent);
+ 
+ /* --------------------------------------------------------------------------
+diff --git a/drivers/acpi/osl.c b/drivers/acpi/osl.c
+index 96d7944..1679331 100644
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@ -1148,8 +1148,7 @@ void acpi_os_wait_events_complete(void)
+ 
+ struct acpi_hp_work {
+  struct work_struct work;
+- acpi_hp_callback func;
+- void *data;
++ struct acpi_device *adev;
+  u32 src;
+ };
+ 
+@@ -1158,25 +1157,24 @@ static void acpi_hotplug_work_fn(struct work_struct *work)
+  struct acpi_hp_work *hpw = container_of(work, struct acpi_hp_work, work);
+ 
+  acpi_os_wait_events_complete();
+- hpw->func(hpw->data, hpw->src);
++ acpi_device_hotplug(hpw->adev, hpw->src);
+  kfree(hpw);
+ }
+ 
+-acpi_status acpi_hotplug_execute(acpi_hp_callback func, void *data, u32 src)
++acpi_status acpi_hotplug_schedule(struct acpi_device *adev, u32 src)
+ {
+  struct acpi_hp_work *hpw;
+ 
+  ACPI_DEBUG_PRINT((ACPI_DB_EXEC,
+-    "Scheduling function [%p(%p, %u)] for deferred execution.\n",
+-    func, data, src));
++    "Scheduling hotplug event (%p, %u) for deferred execution.\n",
++    adev, src));
+ 
+  hpw = kmalloc(sizeof(*hpw), GFP_KERNEL);
+  if (!hpw)
+   return AE_NO_MEMORY;
+ 
+  INIT_WORK(&hpw->work, acpi_hotplug_work_fn);
+- hpw->func = func;
+- hpw->data = data;
++ hpw->adev = adev;
+  hpw->src = src;
+  /*
+   * We can't run hotplug code in kacpid_wq/kacpid_notify_wq etc., because
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index 36fa17f..e719ed9 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -422,10 +422,9 @@ static int acpi_generic_hotplug_event(struct acpi_device *adev, u32 type)
+  return -EINVAL;
+ }
+ 
+-void acpi_device_hotplug(void *data, u32 src)
++void acpi_device_hotplug(struct acpi_device *adev, u32 src)
+ {
+  u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+- struct acpi_device *adev = data;
+  int error = -ENODEV;
+ 
+  lock_device_hotplug();
+@@ -520,8 +519,7 @@ acpi_eject_store(struct device *d, struct device_attribute *attr,
+   return -ENODEV;
+ 
+  get_device(&acpi_device->dev);
+- status = acpi_hotplug_execute(acpi_device_hotplug, acpi_device,
+-          ACPI_OST_EC_OSPM_EJECT);
++ status = acpi_hotplug_schedule(acpi_device, ACPI_OST_EC_OSPM_EJECT);
+  if (ACPI_SUCCESS(status))
+   return count;
+ 
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index ac4a38d..839c1e1 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -438,10 +438,6 @@ static inline bool acpi_device_enumerated(struct acpi_device *adev)
+  return adev && adev->flags.initialized && adev->flags.visited;
+ }
+ 
+-typedef void (*acpi_hp_callback)(void *data, u32 src);
+-
+-acpi_status acpi_hotplug_execute(acpi_hp_callback func, void *data, u32 src);
+-
+ /**
+  * module_acpi_driver(acpi_driver) - Helper macro for registering an ACPI driver
+  * @__acpi_driver: acpi_driver struct
+-- 
+1.7.1

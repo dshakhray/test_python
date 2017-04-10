@@ -1,0 +1,89 @@
+From 58b26bb512beff21f629b0b3adc514abdb0399d7 Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 24 Sep 2014 17:32:56 -0400
+Subject: [infiniband] qib: Fix potential buffer overrun in sending diag packet routine
+
+Message-id: <02f8d0fb74415e5445d64e53fa75e01caddceb48.1411579814.git.dledford@redhat.com>
+Patchwork-id: 96693
+O-Subject: [Patch RHEL7 03/19] IB/qib: Fix potential buffer overrun in sending diag packet routine
+Bugzilla: 1085961
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: Dennis Dalessandro <dennis.dalessandro@intel.com>
+
+Guard against a potential buffer overrun.  Right now the qib driver is
+protected by the fact that the data structure in question is only 16
+bits.  Should that ever change the problem will be exposed. There is a
+similar defect in the ipath driver and this brings the two code paths
+into sync.
+
+Reported-by: Nico Golde <nico@ngolde.de>
+Reported-by: Fabian Yamaguchi <fabs@goesec.de>
+Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 1c20c81909455f64f2df6107cb099ee5569d9f62)
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/hw/qib/qib_diag.c b/drivers/infiniband/hw/qib/qib_diag.c
+index 1686fd4..07f9030 100644
+--- a/drivers/infiniband/hw/qib/qib_diag.c
++++ b/drivers/infiniband/hw/qib/qib_diag.c
+@@ -546,7 +546,7 @@ static ssize_t qib_diagpkt_write(struct file *fp,
+      size_t count, loff_t *off)
+ {
+  u32 __iomem *piobuf;
+- u32 plen, clen, pbufn;
++ u32 plen, pbufn, maxlen_reserve;
+  struct qib_diag_xpkt dp;
+  u32 *tmpbuf = NULL;
+  struct qib_devdata *dd;
+@@ -590,15 +590,20 @@ static ssize_t qib_diagpkt_write(struct file *fp,
+  }
+  ppd = &dd->pport[dp.port - 1];
+ 
+- /* need total length before first word written */
+- /* +1 word is for the qword padding */
+- plen = sizeof(u32) + dp.len;
+- clen = dp.len >> 2;
+-
+- if ((plen + 4) > ppd->ibmaxlen) {
++ /*
++  * need total length before first word written, plus 2 Dwords. One Dword
++  * is for padding so we get the full user data when not aligned on
++  * a word boundary. The other Dword is to make sure we have room for the
++  * ICRC which gets tacked on later.
++  */
++ maxlen_reserve = 2 * sizeof(u32);
++ if (dp.len > ppd->ibmaxlen - maxlen_reserve) {
+   ret = -EINVAL;
+-  goto bail;      /* before writing pbc */
++  goto bail;
+  }
++
++ plen = sizeof(u32) + dp.len;
++
+  tmpbuf = vmalloc(plen);
+  if (!tmpbuf) {
+   qib_devinfo(dd->pcidev,
+@@ -638,11 +643,11 @@ static ssize_t qib_diagpkt_write(struct file *fp,
+   */
+  if (dd->flags & QIB_PIO_FLUSH_WC) {
+   qib_flush_wc();
+-  qib_pio_copy(piobuf + 2, tmpbuf, clen - 1);
++  qib_pio_copy(piobuf + 2, tmpbuf, plen - 1);
+   qib_flush_wc();
+-  __raw_writel(tmpbuf[clen - 1], piobuf + clen + 1);
++  __raw_writel(tmpbuf[plen - 1], piobuf + plen + 1);
+  } else
+-  qib_pio_copy(piobuf + 2, tmpbuf, clen);
++  qib_pio_copy(piobuf + 2, tmpbuf, plen);
+ 
+  if (dd->flags & QIB_USE_SPCL_TRIG) {
+   u32 spcl_off = (pbufn >= dd->piobcnt2k) ? 2047 : 1023;
+-- 
+1.7.1

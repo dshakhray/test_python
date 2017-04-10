@@ -1,0 +1,73 @@
+From 8419a7632b0b4e46e5e7ccfbe7d03c349c749f28 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:08:33 -0400
+Subject: [tools] perf/record: Fix poll return value propagation
+
+Message-id: <1410181752-25631-269-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91914
+O-Subject: [PATCH RHEL7.1 BZ1134356 268/307] perf record: Fix poll return value propagation
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit a515114fa3cff8f1da10cd68914d55c10879c3e0
+Author: Jiri Olsa <jolsa@kernel.org>
+Date: Mon Jun 2 13:44:23 2014 -0400
+
+description
+===========
+If the perf record command is interrupted in record__mmap_read_all
+function, the 'done' is set and err has the latest poll return
+value, which is most likely positive number (= number of pollfds
+ready to read).
+
+This 'positive err' is then propagated to the exit code, resulting
+in not finishing the perf.data header properly, causing following
+error in report:
+
+  # perf record -F 50000 -a
+
+  ---
+  make the system real busy, so there's more chance
+  to interrupt perf in event writing code
+  ---
+
+  ^C[ perf record: Woken up 16 times to write data ]
+  [ perf record: Captured and wrote 30.292 MB perf.data (~1323468 samples) ]
+
+  # perf report --stdio > /dev/null
+  WARNING: The perf.data file's data size field is 0 which is unexpected.
+  Was the 'perf record' command properly terminated?
+
+Fixing this by checking for positive poll return value
+and setting err to 0.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index e4c85b8..ce2cfec 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -454,7 +454,11 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
+    if (done)
+     break;
+    err = poll(rec->evlist->pollfd, rec->evlist->nr_fds, -1);
+-   if (err < 0 && errno == EINTR)
++   /*
++    * Propagate error, only if there's any. Ignore positive
++    * number of returned events and interrupt error.
++    */
++   if (err > 0 || (err < 0 && errno == EINTR))
+     err = 0;
+    waking++;
+   }
+-- 
+1.7.1

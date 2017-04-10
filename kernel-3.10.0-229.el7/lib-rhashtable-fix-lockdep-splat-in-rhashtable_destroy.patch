@@ -1,0 +1,92 @@
+From 818d2e538c411b9d647b7f5b80041038b9bec509 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 24 Oct 2014 17:32:25 -0400
+Subject: [lib] rhashtable: fix lockdep splat in rhashtable_destroy()
+
+Message-id: <68cc7d66279b1a2bebaf19718fde2f1ee4c3321f.1414171887.git.jbenc@redhat.com>
+Patchwork-id: 98439
+O-Subject: [RHEL7.1 net PATCH 16/19] rhashtable: fix lockdep splat in rhashtable_destroy()
+Bugzilla: 1140661
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1140661
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8158749
+
+commit ae82ddcf8e8239bdd06e6830d450cf9e785b8024
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Tue Sep 2 00:26:05 2014 +0200
+
+    rhashtable: fix lockdep splat in rhashtable_destroy()
+
+    No need for rht_dereference() from rhashtable_destroy() since the
+    existing callers don't hold the mutex when invoking this function
+    from:
+
+    1) Netlink, this is called in case of memory allocation errors in the
+       initialization path, no nl_sk_hash_lock is held.
+    2) Netfilter, this is called from the rcu callback, no nfnl_lock is
+       held either.
+
+    I think it's reasonable to assume that the caller has to make sure
+    that no hash resizing may happen before releasing the bucket array.
+    Therefore, the caller should be responsible for releasing this in a
+    safe way, document this to make people aware of it.
+
+    This resolves a rcu lockdep splat in nft_hash:
+
+    ===============================
+    [ INFO: suspicious RCU usage. ]
+    3.16.0+ #178 Not tainted
+    -------------------------------
+    lib/rhashtable.c:596 suspicious rcu_dereference_protected() usage!
+
+    other info that might help us debug this:
+
+    rcu_scheduler_active = 1, debug_locks = 1
+    1 lock held by ksoftirqd/2/18:
+     #0:  (rcu_callback){......}, at: [<ffffffff810918fd>] rcu_process_callbacks+0x27e/0x4c7
+
+    stack backtrace:
+    CPU: 2 PID: 18 Comm: ksoftirqd/2 Not tainted 3.16.0+ #178
+    Hardware name: LENOVO 23259H1/23259H1, BIOS G2ET32WW (1.12 ) 05/30/2012
+     0000000000000001 ffff88011706bb68 ffffffff8143debc 0000000000000000
+     ffff880117062610 ffff88011706bb98 ffffffff81077515 ffff8800ca041a50
+     0000000000000004 ffff8800ca386480 ffff8800ca041a00 ffff88011706bbb8
+    Call Trace:
+     [<ffffffff8143debc>] dump_stack+0x4e/0x68
+     [<ffffffff81077515>] lockdep_rcu_suspicious+0xfa/0x103
+     [<ffffffff81228b1b>] rhashtable_destroy+0x46/0x52
+     [<ffffffffa06f21a7>] nft_hash_destroy+0x73/0x82 [nft_hash]
+
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Acked-by: Thomas Graf <tgraf@suug.ch>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/lib/rhashtable.c b/lib/rhashtable.c
+index 7a381e2..15444d2 100644
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@ -589,13 +589,13 @@ EXPORT_SYMBOL_GPL(rhashtable_init);
+  * rhashtable_destroy - destroy hash table
+  * @ht:  the hash table to destroy
+  *
+- * Frees the bucket array.
++ * Frees the bucket array. This function is not rcu safe, therefore the caller
++ * has to make sure that no resizing may happen by unpublishing the hashtable
++ * and waiting for the quiescent cycle before releasing the bucket array.
+  */
+ void rhashtable_destroy(const struct rhashtable *ht)
+ {
+- const struct bucket_table *tbl = rht_dereference(ht->tbl, ht);
+-
+- bucket_table_free(tbl);
++ bucket_table_free(ht->tbl);
+ }
+ EXPORT_SYMBOL_GPL(rhashtable_destroy);
+ 
+-- 
+1.7.1

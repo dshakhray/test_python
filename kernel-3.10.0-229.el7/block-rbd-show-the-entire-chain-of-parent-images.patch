@@ -1,0 +1,118 @@
+From ad3491c8cac77f64ecde8a88d5bc343fb1c25f71 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:26:35 -0400
+Subject: [block] rbd: show the entire chain of parent images
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-289-git-send-email-sweil@redhat.com>
+Patchwork-id: 89603
+O-Subject: [PATCH 288/303] rbd: show the entire chain of parent images
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+Make /sys/bus/rbd/devices/<id>/parent show the entire chain of parent
+images.  While at it, kernel sprintf() doesn't return negative values,
+casting to unsigned long long is no longer necessary and there is no
+good reason to split into multiple sprintf() calls.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+(cherry picked from commit ff96128fb020e26e7b32e12e887013956d840f08)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-rbd b/Documentation/ABI/testing/sysfs-bus-rbd
+index 501adc2..2ddd680 100644
+--- a/Documentation/ABI/testing/sysfs-bus-rbd
++++ b/Documentation/ABI/testing/sysfs-bus-rbd
+@@ -94,5 +94,5 @@ current_snap
+ 
+ parent
+ 
+- Information identifying the pool, image, and snapshot id for
+- the parent image in a layered rbd image (format 2 only).
++ Information identifying the chain of parent images in a layered rbd
++ image.  Entries are separated by empty lines.
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 5fe3baf..8b6473f 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -3728,46 +3728,36 @@ static ssize_t rbd_snap_show(struct device *dev,
+ }
+ 
+ /*
+- * For an rbd v2 image, shows the pool id, image id, and snapshot id
+- * for the parent image.  If there is no parent, simply shows
+- * "(no parent image)".
++ * For a v2 image, shows the chain of parent images, separated by empty
++ * lines.  For v1 images or if there is no parent, shows "(no parent
++ * image)".
+  */
+ static ssize_t rbd_parent_show(struct device *dev,
+-        struct device_attribute *attr,
+-        char *buf)
++          struct device_attribute *attr,
++          char *buf)
+ {
+  struct rbd_device *rbd_dev = dev_to_rbd_dev(dev);
+- struct rbd_spec *spec = rbd_dev->parent_spec;
+- int count;
+- char *bufp = buf;
++ ssize_t count = 0;
+ 
+- if (!spec)
++ if (!rbd_dev->parent)
+   return sprintf(buf, "(no parent image)\n");
+ 
+- count = sprintf(bufp, "pool_id %llu\npool_name %s\n",
+-   (unsigned long long) spec->pool_id, spec->pool_name);
+- if (count < 0)
+-  return count;
+- bufp += count;
+-
+- count = sprintf(bufp, "image_id %s\nimage_name %s\n", spec->image_id,
+-   spec->image_name ? spec->image_name : "(unknown)");
+- if (count < 0)
+-  return count;
+- bufp += count;
+-
+- count = sprintf(bufp, "snap_id %llu\nsnap_name %s\n",
+-   (unsigned long long) spec->snap_id, spec->snap_name);
+- if (count < 0)
+-  return count;
+- bufp += count;
+-
+- count = sprintf(bufp, "overlap %llu\n", rbd_dev->parent_overlap);
+- if (count < 0)
+-  return count;
+- bufp += count;
+-
+- return (ssize_t) (bufp - buf);
++ for ( ; rbd_dev->parent; rbd_dev = rbd_dev->parent) {
++  struct rbd_spec *spec = rbd_dev->parent_spec;
++
++  count += sprintf(&buf[count], "%s"
++       "pool_id %llu\npool_name %s\n"
++       "image_id %s\nimage_name %s\n"
++       "snap_id %llu\nsnap_name %s\n"
++       "overlap %llu\n",
++       !count ? "" : "\n", /* first? */
++       spec->pool_id, spec->pool_name,
++       spec->image_id, spec->image_name ?: "(unknown)",
++       spec->snap_id, spec->snap_name,
++       rbd_dev->parent_overlap);
++ }
++
++ return count;
+ }
+ 
+ static ssize_t rbd_image_refresh(struct device *dev,
+-- 
+1.7.1

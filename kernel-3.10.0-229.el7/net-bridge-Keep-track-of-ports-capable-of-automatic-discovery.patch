@@ -1,0 +1,181 @@
+From 58c29f117f5bdc0695c7180c63c5ae2b00b292cc Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Fri, 29 Aug 2014 19:01:16 -0400
+Subject: [net] bridge: Keep track of ports capable of automatic discovery
+
+Message-id: <1409338885-30414-5-git-send-email-vyasevic@redhat.com>
+Patchwork-id: 89900
+O-Subject: [RHEL7 PATCH 04/13] bridge: Keep track of ports capable of automatic discovery.
+Bugzilla: 896669
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+
+From: Vlad Yasevich <vyasevic@redhat.com>
+
+By default, ports on the bridge are capable of automatic
+discovery of nodes located behind the port.  This is accomplished
+via flooding of unknown traffic (BR_FLOOD) and learning the
+mac addresses from these packets (BR_LEARNING).
+If the above functionality is disabled by turning off these
+flags, the port requires static configuration in the form
+of static FDB entries to function properly.
+
+This patch adds functionality to keep track of all ports
+capable of automatic discovery.  This will later be used
+to control promiscuity settings.
+
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e028e4b8dc93be7bc3ff9e0b94cb68d7f104883b)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ net/bridge/br_if.c
+ net/bridge/br_private.h
+ - Minor conflicts regarding usage of externs and a moved function.
+
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+index 2f236b5..5ccbe7e 100644
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -85,6 +85,18 @@ void br_port_carrier_check(struct net_bridge_port *p)
+  spin_unlock_bh(&br->lock);
+ }
+ 
++static void nbp_update_port_count(struct net_bridge *br)
++{
++ struct net_bridge_port *p;
++ u32 cnt = 0;
++
++ list_for_each_entry(p, &br->port_list, list) {
++  if (br_auto_port(p))
++   cnt++;
++ }
++ br->auto_cnt = cnt;
++}
++
+ static void release_nbp(struct kobject *kobj)
+ {
+  struct net_bridge_port *p
+@@ -146,6 +158,8 @@ static void del_nbp(struct net_bridge_port *p)
+ 
+  list_del_rcu(&p->list);
+ 
++ nbp_update_port_count(br);
++
+  dev->priv_flags &= ~IFF_BRIDGE_PORT;
+ 
+  netdev_rx_handler_unregister(dev);
+@@ -383,6 +397,8 @@ int br_add_if(struct net_bridge *br, struct net_device *dev)
+ 
+  list_add_rcu(&p->list, &br->port_list);
+ 
++ nbp_update_port_count(br);
++
+  netdev_update_features(br->dev);
+ 
+  spin_lock_bh(&br->lock);
+@@ -452,6 +468,14 @@ int br_del_if(struct net_bridge *br, struct net_device *dev)
+  return 0;
+ }
+ 
++void br_port_flags_change(struct net_bridge_port *p, unsigned long mask)
++{
++ struct net_bridge *br = p->br;
++
++ if (mask & BR_AUTO_MASK)
++  nbp_update_port_count(br);
++}
++
+ void __net_exit br_net_exit(struct net *net)
+ {
+  struct net_device *dev;
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index f75d92e..12e6d5e 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -329,6 +329,7 @@ static void br_set_port_flag(struct net_bridge_port *p, struct nlattr *tb[],
+ static int br_setport(struct net_bridge_port *p, struct nlattr *tb[])
+ {
+  int err;
++ unsigned long old_flags = p->flags;
+ 
+  br_set_port_flag(p, tb, IFLA_BRPORT_MODE, BR_HAIRPIN_MODE);
+  br_set_port_flag(p, tb, IFLA_BRPORT_GUARD, BR_BPDU_GUARD);
+@@ -354,6 +355,8 @@ static int br_setport(struct net_bridge_port *p, struct nlattr *tb[])
+   if (err)
+    return err;
+  }
++
++ br_port_flags_change(p, old_flags ^ p->flags);
+  return 0;
+ }
+ 
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 10b5654..c6f75d1 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -173,6 +173,7 @@ struct net_bridge_port
+ #define BR_ADMIN_COST  0x00000010
+ #define BR_LEARNING  0x00000020
+ #define BR_FLOOD  0x00000040
++#define BR_AUTO_MASK (BR_FLOOD | BR_LEARNING)
+ 
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+  struct bridge_mcast_query ip4_query;
+@@ -197,6 +198,8 @@ struct net_bridge_port
+ #endif
+ };
+ 
++#define br_auto_port(p) ((p)->flags & BR_AUTO_MASK)
++
+ #define br_port_exists(dev) (dev->priv_flags & IFF_BRIDGE_PORT)
+ 
+ static inline struct net_bridge_port *br_port_get_rcu(const struct net_device *dev)
+@@ -296,6 +299,7 @@ struct net_bridge
+  struct timer_list  topology_change_timer;
+  struct timer_list  gc_timer;
+  struct kobject   *ifobj;
++ u32    auto_cnt;
+ #ifdef CONFIG_BRIDGE_VLAN_FILTERING
+  u8    vlan_enabled;
+  struct net_port_vlans __rcu *vlan_info;
+@@ -446,6 +450,8 @@ extern int br_del_if(struct net_bridge *br,
+ extern int br_min_mtu(const struct net_bridge *br);
+ extern netdev_features_t br_features_recompute(struct net_bridge *br,
+  netdev_features_t features);
++extern void br_port_flags_change(struct net_bridge_port *port,
++     unsigned long mask);
+ 
+ /* br_input.c */
+ extern int br_handle_frame_finish(struct sk_buff *skb);
+diff --git a/net/bridge/br_sysfs_if.c b/net/bridge/br_sysfs_if.c
+index 265a878..2f4a01d 100644
+--- a/net/bridge/br_sysfs_if.c
++++ b/net/bridge/br_sysfs_if.c
+@@ -49,7 +49,9 @@ static BRPORT_ATTR(_name, S_IRUGO | S_IWUSR,   \
+ static int store_flag(struct net_bridge_port *p, unsigned long v,
+         unsigned long mask)
+ {
+- unsigned long flags = p->flags;
++ unsigned long flags;
++
++ flags = p->flags;
+ 
+  if (v)
+   flags |= mask;
+@@ -58,6 +60,7 @@ static int store_flag(struct net_bridge_port *p, unsigned long v,
+ 
+  if (flags != p->flags) {
+   p->flags = flags;
++  br_port_flags_change(p, mask);
+   br_ifinfo_notify(RTM_NEWLINK, p);
+  }
+  return 0;
+-- 
+1.7.1

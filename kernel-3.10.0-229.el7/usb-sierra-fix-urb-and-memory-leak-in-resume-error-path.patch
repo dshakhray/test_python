@@ -1,0 +1,64 @@
+From 09e53aedd0fb25668d3441c9c0de71e5b0464a05 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:08:15 -0400
+Subject: [usb] sierra: fix urb and memory leak in resume error path
+
+Message-id: <1410887463-20674-424-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95335
+O-Subject: [RHEL7 PATCH 423/591] USB: sierra: fix urb and memory leak in resume error path
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 7fdd26a01eb7b6cb6855ff8f69ef4a720720dfcb
+Author: Johan Hovold <jhovold@gmail.com>
+Date:   Mon May 26 19:22:52 2014 +0200
+
+    USB: sierra: fix urb and memory leak in resume error path
+
+    Neither the transfer buffer or the urb itself were released in the
+    resume error path for delayed writes. Also on errors, the remainder of
+    the queue was not even processed, which leads to further urb and buffer
+    leaks.
+
+    The same error path also failed to balance the outstanding-urb counter,
+    something which results in degraded throughput or completely blocked
+    writes.
+
+    Fix this by releasing urb and buffer and balancing counters on errors,
+    and by always processing the whole queue even when submission of one urb
+    fails.
+
+    Fixes: e6929a9020ac ("USB: support for autosuspend in sierra while
+    online")
+
+    Cc: <stable@vger.kernel.org> # v2.6.32
+    Signed-off-by: Johan Hovold <jhovold@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/serial/sierra.c b/drivers/usb/serial/sierra.c
+index 2c5c5a9..dd9820d 100644
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -1004,8 +1004,12 @@ static int sierra_resume(struct usb_serial *serial)
+    if (err < 0) {
+     intfdata->in_flight--;
+     usb_unanchor_urb(urb);
+-    usb_scuttle_anchored_urbs(&portdata->delayed);
+-    break;
++    kfree(urb->transfer_buffer);
++    usb_free_urb(urb);
++    spin_lock(&portdata->lock);
++    portdata->outstanding_urbs--;
++    spin_unlock(&portdata->lock);
++    continue;
+    }
+   }
+ 
+-- 
+1.7.1

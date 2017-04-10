@@ -1,0 +1,461 @@
+From 12732387972a4b3d003aee9d4744147141b71b8a Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 25 Nov 2014 16:32:56 -0500
+Subject: [fs] vfs: Put a small type field into struct dentry::d_flags
+
+Message-id: <20141125163256.18115.13698.stgit@warthog.procyon.org.uk>
+Patchwork-id: 100901
+O-Subject: [PATCH 01/47] VFS: Put a small type field into struct dentry::d_flags
+Bugzilla: 985875
+RH-Acked-by: Ian Kent <ikent@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Put a type field into struct dentry::d_flags to indicate if the dentry is one
+of the following types that relate particularly to pathwalk:
+
+ Miss (negative dentry)
+ Directory
+ "Automount" directory (defective - no i_op->lookup())
+ Symlink
+ Other (regular, socket, fifo, device)
+
+The type field is set to one of the first five types on a dentry by calls to
+__d_instantiate() and d_obtain_alias() from information in the inode (if one is
+given).
+
+The type is cleared by dentry_unlink_inode() when it reconstitutes an existing
+dentry as a negative dentry.
+
+Accessors provided are:
+
+ d_set_type(dentry, type)
+ d_is_directory(dentry)
+ d_is_autodir(dentry)
+ d_is_symlink(dentry)
+ d_is_file(dentry)
+ d_is_negative(dentry)
+ d_is_positive(dentry)
+
+A bunch of checks in pathname resolution switched to those.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Original-commit: b18825a7c8e37a7cf6abb97a12a6ad71af160de7
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index babbfc2..e2d1fe0 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -290,6 +290,7 @@ static void dentry_unlink_inode(struct dentry * dentry)
+  __releases(dentry->d_inode->i_lock)
+ {
+  struct inode *inode = dentry->d_inode;
++ __d_clear_type(dentry);
+  dentry->d_inode = NULL;
+  hlist_del_init(&dentry->d_alias);
+  dentry_rcuwalk_barrier(dentry);
+@@ -1502,14 +1503,42 @@ void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op)
+ }
+ EXPORT_SYMBOL(d_set_d_op);
+ 
++static unsigned d_flags_for_inode(struct inode *inode)
++{
++ unsigned add_flags = DCACHE_FILE_TYPE;
++
++ if (!inode)
++  return DCACHE_MISS_TYPE;
++
++ if (S_ISDIR(inode->i_mode)) {
++  add_flags = DCACHE_DIRECTORY_TYPE;
++  if (unlikely(!(inode->i_opflags & IOP_LOOKUP))) {
++   if (unlikely(!inode->i_op->lookup))
++    add_flags = DCACHE_AUTODIR_TYPE;
++   else
++    inode->i_opflags |= IOP_LOOKUP;
++  }
++ } else if (unlikely(!(inode->i_opflags & IOP_NOFOLLOW))) {
++  if (unlikely(inode->i_op->follow_link))
++   add_flags = DCACHE_SYMLINK_TYPE;
++  else
++   inode->i_opflags |= IOP_NOFOLLOW;
++ }
++
++ if (unlikely(IS_AUTOMOUNT(inode)))
++  add_flags |= DCACHE_NEED_AUTOMOUNT;
++ return add_flags;
++}
++
+ static void __d_instantiate(struct dentry *dentry, struct inode *inode)
+ {
++ unsigned add_flags = d_flags_for_inode(inode);
++
+  spin_lock(&dentry->d_lock);
+- if (inode) {
+-  if (unlikely(IS_AUTOMOUNT(inode)))
+-   dentry->d_flags |= DCACHE_NEED_AUTOMOUNT;
++ dentry->d_flags &= ~DCACHE_ENTRY_TYPE;
++ dentry->d_flags |= add_flags;
++ if (inode)
+   hlist_add_head(&dentry->d_alias, &inode->i_dentry);
+- }
+  dentry->d_inode = inode;
+  dentry_rcuwalk_barrier(dentry);
+  spin_unlock(&dentry->d_lock);
+@@ -1687,6 +1716,7 @@ struct dentry *d_obtain_alias(struct inode *inode)
+  static const struct qstr anonstring = QSTR_INIT("/", 1);
+  struct dentry *tmp;
+  struct dentry *res;
++ unsigned add_flags;
+ 
+  if (!inode)
+   return ERR_PTR(-ESTALE);
+@@ -1712,9 +1742,11 @@ struct dentry *d_obtain_alias(struct inode *inode)
+  }
+ 
+  /* attach a disconnected dentry */
++ add_flags = d_flags_for_inode(inode) | DCACHE_DISCONNECTED;
++
+  spin_lock(&tmp->d_lock);
+  tmp->d_inode = inode;
+- tmp->d_flags |= DCACHE_DISCONNECTED;
++ tmp->d_flags |= add_flags;
+  hlist_add_head(&tmp->d_alias, &inode->i_dentry);
+  hlist_bl_lock(&tmp->d_sb->s_anon);
+  hlist_bl_add_head(&tmp->d_hash, &tmp->d_sb->s_anon);
+diff --git a/fs/namei.c b/fs/namei.c
+index ca9a5c1..298988c 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1520,18 +1520,9 @@ static void terminate_walk(struct nameidata *nd)
+  * so we keep a cache of "no, this doesn't need follow_link"
+  * for the common case.
+  */
+-static inline int should_follow_link(struct inode *inode, int follow)
++static inline int should_follow_link(struct dentry *dentry, int follow)
+ {
+- if (unlikely(!(inode->i_opflags & IOP_NOFOLLOW))) {
+-  if (likely(inode->i_op->follow_link))
+-   return follow;
+-
+-  /* This gets set once for the inode lifetime */
+-  spin_lock(&inode->i_lock);
+-  inode->i_opflags |= IOP_NOFOLLOW;
+-  spin_unlock(&inode->i_lock);
+- }
+- return 0;
++ return unlikely(d_is_symlink(dentry)) ? follow : 0;
+ }
+ 
+ static inline int walk_component(struct nameidata *nd, struct path *path,
+@@ -1561,7 +1552,7 @@ static inline int walk_component(struct nameidata *nd, struct path *path,
+  if (!inode)
+   goto out_path_put;
+ 
+- if (should_follow_link(inode, follow)) {
++ if (should_follow_link(path->dentry, follow)) {
+   if (nd->flags & LOOKUP_RCU) {
+    if (unlikely(unlazy_walk(nd, path->dentry))) {
+     err = -ECHILD;
+@@ -1620,26 +1611,6 @@ static inline int nested_symlink(struct path *path, struct nameidata *nd)
+ }
+ 
+ /*
+- * We really don't want to look at inode->i_op->lookup
+- * when we don't have to. So we keep a cache bit in
+- * the inode ->i_opflags field that says "yes, we can
+- * do lookup on this inode".
+- */
+-static inline int can_lookup(struct inode *inode)
+-{
+- if (likely(inode->i_opflags & IOP_LOOKUP))
+-  return 1;
+- if (likely(!inode->i_op->lookup))
+-  return 0;
+-
+- /* We do this once for the lifetime of the inode */
+- spin_lock(&inode->i_lock);
+- inode->i_opflags |= IOP_LOOKUP;
+- spin_unlock(&inode->i_lock);
+- return 1;
+-}
+-
+-/*
+  * We can do the critical dentry name comparison and hashing
+  * operations one word at a time, but we are limited to:
+  *
+@@ -1842,7 +1813,7 @@ static int link_path_walk(const char *name, struct nameidata *nd)
+    if (err)
+     return err;
+   }
+-  if (!can_lookup(nd->inode)) {
++  if (!d_is_directory(nd->path.dentry)) {
+    err = -ENOTDIR; 
+    break;
+   }
+@@ -1860,9 +1831,10 @@ static int path_init(int dfd, const char *name, unsigned int flags,
+  nd->flags = flags | LOOKUP_JUMPED;
+  nd->depth = 0;
+  if (flags & LOOKUP_ROOT) {
+-  struct inode *inode = nd->root.dentry->d_inode;
++  struct dentry *root = nd->root.dentry;
++  struct inode *inode = root->d_inode;
+   if (*name) {
+-   if (!can_lookup(inode))
++   if (!d_is_directory(root))
+     return -ENOTDIR;
+    retval = inode_permission(inode, MAY_EXEC);
+    if (retval)
+@@ -1916,7 +1888,7 @@ static int path_init(int dfd, const char *name, unsigned int flags,
+   dentry = f.file->f_path.dentry;
+ 
+   if (*name) {
+-   if (!can_lookup(dentry->d_inode)) {
++   if (!d_is_directory(dentry)) {
+     fdput(f);
+     return -ENOTDIR;
+    }
+@@ -1998,7 +1970,7 @@ static int path_lookupat(int dfd, const char *name,
+   err = complete_walk(nd);
+ 
+  if (!err && nd->flags & LOOKUP_DIRECTORY) {
+-  if (!can_lookup(nd->inode)) {
++  if (!d_is_directory(nd->path.dentry)) {
+    path_put(&nd->path);
+    err = -ENOTDIR;
+   }
+@@ -2290,7 +2262,7 @@ done:
+  }
+  path->dentry = dentry;
+  path->mnt = nd->path.mnt;
+- if (should_follow_link(dentry->d_inode, nd->flags & LOOKUP_FOLLOW))
++ if (should_follow_link(dentry, nd->flags & LOOKUP_FOLLOW))
+   return 1;
+  mntget(path->mnt);
+  follow_mount(path);
+@@ -2435,12 +2407,14 @@ static inline int check_sticky(struct inode *dir, struct inode *inode)
+  * 10. We don't allow removal of NFS sillyrenamed files; it's handled by
+  *     nfs_async_unlink().
+  */
+-static int may_delete(struct inode *dir,struct dentry *victim,int isdir)
++static int may_delete(struct inode *dir, struct dentry *victim, bool isdir)
+ {
++ struct inode *inode = victim->d_inode;
+  int error;
+ 
+- if (!victim->d_inode)
++ if (d_is_negative(victim))
+   return -ENOENT;
++ BUG_ON(!inode);
+ 
+  BUG_ON(victim->d_parent->d_inode != dir);
+  audit_inode_child(dir, victim, AUDIT_TYPE_CHILD_DELETE);
+@@ -2450,15 +2424,16 @@ static int may_delete(struct inode *dir,struct dentry *victim,int isdir)
+   return error;
+  if (IS_APPEND(dir))
+   return -EPERM;
+- if (check_sticky(dir, victim->d_inode)||IS_APPEND(victim->d_inode)||
+-     IS_IMMUTABLE(victim->d_inode) || IS_SWAPFILE(victim->d_inode))
++
++ if (check_sticky(dir, inode) || IS_APPEND(inode) ||
++     IS_IMMUTABLE(inode) || IS_SWAPFILE(inode))
+   return -EPERM;
+  if (isdir) {
+-  if (!S_ISDIR(victim->d_inode->i_mode))
++  if (!d_is_directory(victim) && !d_is_autodir(victim))
+    return -ENOTDIR;
+   if (IS_ROOT(victim))
+    return -EBUSY;
+- } else if (S_ISDIR(victim->d_inode->i_mode))
++ } else if (d_is_directory(victim) || d_is_autodir(victim))
+   return -EISDIR;
+  if (IS_DEADDIR(dir))
+   return -ENOENT;
+@@ -3011,7 +2986,7 @@ retry_lookup:
+  /*
+   * create/update audit record if it already exists.
+   */
+- if (path->dentry->d_inode)
++ if (d_is_positive(path->dentry))
+   audit_inode(name, path->dentry, 0);
+ 
+  /*
+@@ -3040,12 +3015,12 @@ retry_lookup:
+ finish_lookup:
+  /* we _can_ be in RCU mode here */
+  error = -ENOENT;
+- if (!inode) {
++ if (d_is_negative(path->dentry)) {
+   path_to_nameidata(path, nd);
+   goto out;
+  }
+ 
+- if (should_follow_link(inode, !symlink_ok)) {
++ if (should_follow_link(path->dentry, !symlink_ok)) {
+   if (nd->flags & LOOKUP_RCU) {
+    if (unlikely(unlazy_walk(nd, path->dentry))) {
+     error = -ECHILD;
+@@ -3072,10 +3047,11 @@ finish_lookup:
+   return error;
+  }
+  error = -EISDIR;
+- if ((open_flag & O_CREAT) && S_ISDIR(nd->inode->i_mode))
++ if ((open_flag & O_CREAT) &&
++     (d_is_directory(nd->path.dentry) || d_is_autodir(nd->path.dentry)))
+   goto out;
+  error = -ENOTDIR;
+- if ((nd->flags & LOOKUP_DIRECTORY) && !can_lookup(nd->inode))
++ if ((nd->flags & LOOKUP_DIRECTORY) && !d_is_directory(nd->path.dentry))
+   goto out;
+  audit_inode(name, nd->path.dentry, 0);
+ finish_open:
+@@ -3237,7 +3213,7 @@ struct file *do_file_open_root(struct dentry *dentry, struct vfsmount *mnt,
+ 
+  flags |= LOOKUP_ROOT;
+ 
+- if (dentry->d_inode->i_op->follow_link && op->intent & LOOKUP_OPEN)
++ if (d_is_symlink(dentry) && op->intent & LOOKUP_OPEN)
+   return ERR_PTR(-ELOOP);
+ 
+  file = path_openat(-1, &filename, &nd, op, flags | LOOKUP_RCU);
+@@ -3287,8 +3263,9 @@ struct dentry *kern_path_create(int dfd, const char *pathname,
+   goto unlock;
+ 
+  error = -EEXIST;
+- if (dentry->d_inode)
++ if (d_is_positive(dentry))
+   goto fail;
++
+  /*
+   * Special case - lookup gave negative, but... we had foo/bar/
+   * From the vfs_mknod() POV we just have a negative dentry -
+@@ -3701,7 +3678,7 @@ retry_deleg:
+   if (nd.last.name[nd.last.len])
+    goto slashes;
+   inode = dentry->d_inode;
+-  if (!inode)
++  if (d_is_negative(dentry))
+    goto slashes;
+   ihold(inode);
+   error = security_path_unlink(&nd.path, dentry);
+@@ -3732,8 +3709,12 @@ exit1:
+  return error;
+ 
+ slashes:
+- error = !dentry->d_inode ? -ENOENT :
+-  S_ISDIR(dentry->d_inode->i_mode) ? -EISDIR : -ENOTDIR;
++ if (d_is_negative(dentry))
++  error = -ENOENT;
++ else if (d_is_directory(dentry) || d_is_autodir(dentry))
++  error = -EISDIR;
++ else
++  error = -ENOTDIR;
+  goto exit2;
+ }
+ 
+@@ -4103,7 +4084,7 @@ int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+         struct inode **delegated_inode)
+ {
+  int error;
+- int is_dir = S_ISDIR(old_dentry->d_inode->i_mode);
++ int is_dir = d_is_directory(old_dentry) || d_is_autodir(old_dentry);
+  const unsigned char *old_name;
+ 
+  if (old_dentry->d_inode == new_dentry->d_inode)
+@@ -4193,10 +4174,10 @@ retry_deleg:
+   goto exit3;
+  /* source must exist */
+  error = -ENOENT;
+- if (!old_dentry->d_inode)
++ if (d_is_negative(old_dentry))
+   goto exit4;
+  /* unless the source is a directory trailing slashes give -ENOTDIR */
+- if (!S_ISDIR(old_dentry->d_inode->i_mode)) {
++ if (!d_is_directory(old_dentry) && !d_is_autodir(old_dentry)) {
+   error = -ENOTDIR;
+   if (oldnd.last.name[oldnd.last.len])
+    goto exit4;
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index 472a2e1..5fab1f4 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -211,6 +211,13 @@ struct dentry_operations {
+ #define DCACHE_LRU_LIST  0x80000
+ #define DCACHE_DENTRY_KILLED 0x100000
+ 
++#define DCACHE_ENTRY_TYPE  0x07000000
++#define DCACHE_MISS_TYPE  0x00000000 /* Negative dentry */
++#define DCACHE_DIRECTORY_TYPE  0x01000000 /* Normal directory */
++#define DCACHE_AUTODIR_TYPE  0x02000000 /* Lookupless directory (presumed automount) */
++#define DCACHE_SYMLINK_TYPE  0x03000000 /* Symlink */
++#define DCACHE_FILE_TYPE  0x04000000 /* Other file type */
++
+ extern seqlock_t rename_lock;
+ 
+ static inline int dname_external(struct dentry *dentry)
+@@ -391,6 +398,61 @@ static inline bool d_mountpoint(struct dentry *dentry)
+  return dentry->d_flags & DCACHE_MOUNTED;
+ }
+ 
++/*
++ * Directory cache entry type accessor functions.
++ */
++static inline void __d_set_type(struct dentry *dentry, unsigned type)
++{
++ dentry->d_flags = (dentry->d_flags & ~DCACHE_ENTRY_TYPE) | type;
++}
++
++static inline void __d_clear_type(struct dentry *dentry)
++{
++ __d_set_type(dentry, DCACHE_MISS_TYPE);
++}
++
++static inline void d_set_type(struct dentry *dentry, unsigned type)
++{
++ spin_lock(&dentry->d_lock);
++ __d_set_type(dentry, type);
++ spin_unlock(&dentry->d_lock);
++}
++
++static inline unsigned __d_entry_type(const struct dentry *dentry)
++{
++ return dentry->d_flags & DCACHE_ENTRY_TYPE;
++}
++
++static inline bool d_is_directory(const struct dentry *dentry)
++{
++ return __d_entry_type(dentry) == DCACHE_DIRECTORY_TYPE;
++}
++
++static inline bool d_is_autodir(const struct dentry *dentry)
++{
++ return __d_entry_type(dentry) == DCACHE_AUTODIR_TYPE;
++}
++
++static inline bool d_is_symlink(const struct dentry *dentry)
++{
++ return __d_entry_type(dentry) == DCACHE_SYMLINK_TYPE;
++}
++
++static inline bool d_is_file(const struct dentry *dentry)
++{
++ return __d_entry_type(dentry) == DCACHE_FILE_TYPE;
++}
++
++static inline bool d_is_negative(const struct dentry *dentry)
++{
++ return __d_entry_type(dentry) == DCACHE_MISS_TYPE;
++}
++
++static inline bool d_is_positive(const struct dentry *dentry)
++{
++ return !d_is_negative(dentry);
++}
++
+ extern int sysctl_vfs_cache_pressure;
+ 
+ #endif /* __LINUX_DCACHE_H */
+-- 
+1.7.1

@@ -1,0 +1,97 @@
+From 5b54e5b9e6a91241308028f5b7b8ffa9afa9385a Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 10 Oct 2014 21:03:15 -0400
+Subject: [block] blk-merge: fix blk_recount_segments
+
+Message-id: <1412975015-5370-15-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 97467
+O-Subject: [RHEL7 PATCH 14/34] blk-merge: fix blk_recount_segments
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a backport of the following commit.  This resolves bug
+1146660.
+
+  commit 0738854939e6ec9b9111a8cfc0ca1dfa3cff6b2e
+  Author: Ming Lei <ming.lei@canonical.com>
+  Date:   Tue Sep 2 23:02:59 2014 +0800
+
+    blk-merge: fix blk_recount_segments
+
+    QUEUE_FLAG_NO_SG_MERGE is set at default for blk-mq devices,
+    so bio->bi_phys_segment computed may be bigger than
+    queue_max_segments(q) for blk-mq devices, then drivers will
+    fail to handle the case, for example, BUG_ON() in
+    virtio_queue_rq() can be triggerd for virtio-blk:
+
+     https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1359146
+
+    This patch fixes the issue by ignoring the QUEUE_FLAG_NO_SG_MERGE
+    flag if the computed bio->bi_phys_segment is bigger than
+    queue_max_segments(q), and the regression is caused by commit
+    05f1dd53152173(block: add queue flag for disabling SG merging).
+
+    Reported-by: Kick In <pierre-andre.morey@canonical.com>
+    Tested-by: Chris J Arges <chris.j.arges@canonical.com>
+    Signed-off-by: Ming Lei <ming.lei@canonical.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index f0aac59..8e1787f 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -10,10 +10,11 @@
+ #include "blk.h"
+ 
+ static unsigned int __blk_recalc_rq_segments(struct request_queue *q,
+-          struct bio *bio)
++          struct bio *bio,
++          bool no_sg_merge)
+ {
+  struct bio_vec *bv, *bvprv = NULL;
+- int cluster, i, high, highprv = 1, no_sg_merge;
++ int cluster, i, high, highprv = 1;
+  unsigned int seg_size, nr_phys_segs;
+  struct bio *fbio, *bbio;
+ 
+@@ -24,7 +25,6 @@ static unsigned int __blk_recalc_rq_segments(struct request_queue *q,
+  cluster = blk_queue_cluster(q);
+  seg_size = 0;
+  nr_phys_segs = 0;
+- no_sg_merge = test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
+  high = 0;
+  for_each_bio(bio) {
+   bio_for_each_segment(bv, bio, i) {
+@@ -79,18 +79,23 @@ new_segment:
+ 
+ void blk_recalc_rq_segments(struct request *rq)
+ {
+- rq->nr_phys_segments = __blk_recalc_rq_segments(rq->q, rq->bio);
++ bool no_sg_merge = !!test_bit(QUEUE_FLAG_NO_SG_MERGE,
++   &rq->q->queue_flags);
++
++ rq->nr_phys_segments = __blk_recalc_rq_segments(rq->q, rq->bio,
++   no_sg_merge);
+ }
+ 
+ void blk_recount_segments(struct request_queue *q, struct bio *bio)
+ {
+- if (test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags))
++ if (test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags) &&
++   bio->bi_vcnt < queue_max_segments(q))
+   bio->bi_phys_segments = bio->bi_vcnt;
+  else {
+   struct bio *nxt = bio->bi_next;
+ 
+   bio->bi_next = NULL;
+-  bio->bi_phys_segments = __blk_recalc_rq_segments(q, bio);
++  bio->bi_phys_segments = __blk_recalc_rq_segments(q, bio, false);
+   bio->bi_next = nxt;
+  }
+ 
+-- 
+1.7.1

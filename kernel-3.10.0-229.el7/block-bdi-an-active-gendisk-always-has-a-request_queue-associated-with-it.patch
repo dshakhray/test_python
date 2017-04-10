@@ -1,0 +1,168 @@
+From eb94552efd341553bf7713f292261dc16fd58fe5 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 10 Oct 2014 21:03:17 -0400
+Subject: [block] bdi: an active gendisk always has a request_queue associated with it
+
+Message-id: <1412975015-5370-17-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 97472
+O-Subject: [RHEL7 PATCH 16/34] block, bdi: an active gendisk always has a request_queue associated with it
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a backport of the following commit.  This resolves bug
+1146660.
+
+  commit ff9ea323816dc1c8ac7144afd4eab3ac97704430
+  Author: Tejun Heo <tj@kernel.org>
+  Date:   Mon Sep 8 08:03:56 2014 +0900
+
+    block, bdi: an active gendisk always has a request_queue associated with it
+
+    bdev_get_queue() returns the request_queue associated with the
+    specified block_device.  blk_get_backing_dev_info() makes use of
+    bdev_get_queue() to determine the associated bdi given a block_device.
+
+    All the callers of bdev_get_queue() including
+    blk_get_backing_dev_info() assume that bdev_get_queue() may return
+    NULL and implement NULL handling; however, bdev_get_queue() requires
+    the passed in block_device is opened and attached to its gendisk.
+    Because an active gendisk always has a valid request_queue associated
+    with it, bdev_get_queue() can never return NULL and neither can
+    blk_get_backing_dev_info().
+
+    Make it clear that neither of the two functions can return NULL and
+    remove NULL handling from all the callers.
+
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Dave Chinner <david@fromorbit.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 6c5b9df..6ce9db8 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -83,18 +83,14 @@ void blk_queue_congestion_threshold(struct request_queue *q)
+  * @bdev: device
+  *
+  * Locates the passed device's request queue and returns the address of its
+- * backing_dev_info
+- *
+- * Will return NULL if the request queue cannot be located.
++ * backing_dev_info.  This function can only be called if @bdev is opened
++ * and the return value is never NULL.
+  */
+ struct backing_dev_info *blk_get_backing_dev_info(struct block_device *bdev)
+ {
+- struct backing_dev_info *ret = NULL;
+  struct request_queue *q = bdev_get_queue(bdev);
+ 
+- if (q)
+-  ret = &q->backing_dev_info;
+- return ret;
++ return &q->backing_dev_info;
+ }
+ EXPORT_SYMBOL(blk_get_backing_dev_info);
+ 
+diff --git a/block/compat_ioctl.c b/block/compat_ioctl.c
+index e4fe4c8..ba8bd91 100644
+--- a/block/compat_ioctl.c
++++ b/block/compat_ioctl.c
+@@ -708,8 +708,6 @@ long compat_blkdev_ioctl(struct file *file, unsigned cmd, unsigned long arg)
+   if (!arg)
+    return -EINVAL;
+   bdi = blk_get_backing_dev_info(bdev);
+-  if (bdi == NULL)
+-   return -ENOTTY;
+   return compat_put_long(arg,
+            (bdi->ra_pages * PAGE_CACHE_SIZE) / 512);
+  case BLKROGET: /* compatible */
+@@ -730,8 +728,6 @@ long compat_blkdev_ioctl(struct file *file, unsigned cmd, unsigned long arg)
+   if (!capable(CAP_SYS_ADMIN))
+    return -EACCES;
+   bdi = blk_get_backing_dev_info(bdev);
+-  if (bdi == NULL)
+-   return -ENOTTY;
+   bdi->ra_pages = (arg * 512) / PAGE_CACHE_SIZE;
+   return 0;
+  case BLKGETSIZE:
+diff --git a/block/ioctl.c b/block/ioctl.c
+index 919c0a1..6ec4623 100644
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@ -356,8 +356,6 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
+   if (!arg)
+    return -EINVAL;
+   bdi = blk_get_backing_dev_info(bdev);
+-  if (bdi == NULL)
+-   return -ENOTTY;
+   return put_long(arg, (bdi->ra_pages * PAGE_CACHE_SIZE) / 512);
+  case BLKROGET:
+   return put_int(arg, bdev_read_only(bdev) != 0);
+@@ -386,8 +384,6 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
+   if(!capable(CAP_SYS_ADMIN))
+    return -EACCES;
+   bdi = blk_get_backing_dev_info(bdev);
+-  if (bdi == NULL)
+-   return -ENOTTY;
+   bdi->ra_pages = (arg * 512) / PAGE_CACHE_SIZE;
+   return 0;
+  case BLKBSZSET:
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 9064370..2d11011 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1131,8 +1131,6 @@ static int __blkdev_get(struct block_device *bdev, fmode_t mode, int for_part)
+    if (!ret) {
+     bd_set_size(bdev,(loff_t)get_capacity(disk)<<9);
+     bdi = blk_get_backing_dev_info(bdev);
+-    if (bdi == NULL)
+-     bdi = &default_backing_dev_info;
+     bdev_inode_switch_bdi(bdev->bd_inode, bdi);
+    }
+ 
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 7c748a0..91a3ae9 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -1698,7 +1698,7 @@ static int btrfs_congested_fn(void *congested_data, int bdi_bits)
+   if (!device->bdev)
+    continue;
+   bdi = blk_get_backing_dev_info(device->bdev);
+-  if (bdi && bdi_congested(bdi, bdi_bits)) {
++  if (bdi_congested(bdi, bdi_bits)) {
+    ret = 1;
+    break;
+   }
+diff --git a/fs/xfs/xfs_buf.c b/fs/xfs/xfs_buf.c
+index 9edc0e5..9bd308e 100644
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -1665,8 +1665,6 @@ xfs_alloc_buftarg(
+  btp->bt_dev =  bdev->bd_dev;
+  btp->bt_bdev = bdev;
+  btp->bt_bdi = blk_get_backing_dev_info(bdev);
+- if (!btp->bt_bdi)
+-  goto error;
+ 
+  INIT_LIST_HEAD(&btp->bt_lru);
+  spin_lock_init(&btp->bt_lru_lock);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 1fc038d..2b1eb29 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -910,7 +910,7 @@ extern void blk_execute_rq_nowait(struct request_queue *, struct gendisk *,
+ 
+ static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
+ {
+- return bdev->bd_disk->queue;
++ return bdev->bd_disk->queue; /* this is never NULL */
+ }
+ 
+ /*
+-- 
+1.7.1

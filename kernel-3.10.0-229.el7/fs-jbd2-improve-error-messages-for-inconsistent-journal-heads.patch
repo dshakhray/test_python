@@ -1,0 +1,112 @@
+From 0fe47977b3f3ad16edd5ae910749253a93550666 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:54:44 -0400
+Subject: [fs] jbd2: improve error messages for inconsistent journal heads
+
+Message-id: <1414058125-4183-131-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98215
+O-Subject: [RHEL 7.1 PATCH v2 130/171] jbd2: improve error messages for inconsistent journal heads
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Theodore Ts'o <tytso@mit.edu>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit 66a4cb187b92ca8663203fe8fda621e6585a2a00
+
+ Fix up error messages printed when the transaction pointers in a
+ journal head are inconsistent.  This improves the error messages which
+ are printed when running xfstests generic/068 in data=journal mode.
+ See the bug report at: https://bugzilla.kernel.org/show_bug.cgi?id=60786
+
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/ext4_jbd2.c b/fs/ext4/ext4_jbd2.c
+index 3fe29de..c3fb607 100644
+--- a/fs/ext4/ext4_jbd2.c
++++ b/fs/ext4/ext4_jbd2.c
+@@ -259,6 +259,16 @@ int __ext4_handle_dirty_metadata(const char *where, unsigned int line,
+   if (WARN_ON_ONCE(err)) {
+    ext4_journal_abort_handle(where, line, __func__, bh,
+         handle, err);
++   if (inode == NULL) {
++    pr_err("EXT4: jbd2_journal_dirty_metadata "
++           "failed: handle type %u started at "
++           "line %u, credits %u/%u, errcode %d",
++           handle->h_type,
++           handle->h_line_no,
++           handle->h_requested_credits,
++           handle->h_buffer_credits, err);
++    return err;
++   }
+    ext4_error_inode(inode, where, line,
+       bh->b_blocknr,
+       "journal_dirty_metadata failed: "
+diff --git a/fs/jbd2/transaction.c b/fs/jbd2/transaction.c
+index 563ef45..322f81e 100644
+--- a/fs/jbd2/transaction.c
++++ b/fs/jbd2/transaction.c
+@@ -1311,7 +1311,7 @@ int jbd2_journal_dirty_metadata(handle_t *handle, struct buffer_head *bh)
+         journal->j_running_transaction)) {
+    printk(KERN_ERR "JBD2: %s: "
+           "jh->b_transaction (%llu, %p, %u) != "
+-          "journal->j_running_transaction (%p, %u)",
++          "journal->j_running_transaction (%p, %u)\n",
+           journal->j_devname,
+           (unsigned long long) bh->b_blocknr,
+           jh->b_transaction,
+@@ -1334,30 +1334,25 @@ int jbd2_journal_dirty_metadata(handle_t *handle, struct buffer_head *bh)
+   */
+  if (jh->b_transaction != transaction) {
+   JBUFFER_TRACE(jh, "already on other transaction");
+-  if (unlikely(jh->b_transaction !=
+-        journal->j_committing_transaction)) {
+-   printk(KERN_ERR "JBD2: %s: "
+-          "jh->b_transaction (%llu, %p, %u) != "
+-          "journal->j_committing_transaction (%p, %u)",
++  if (unlikely(((jh->b_transaction !=
++          journal->j_committing_transaction)) ||
++        (jh->b_next_transaction != transaction))) {
++   printk(KERN_ERR "jbd2_journal_dirty_metadata: %s: "
++          "bad jh for block %llu: "
++          "transaction (%p, %u), "
++          "jh->b_transaction (%p, %u), "
++          "jh->b_next_transaction (%p, %u), jlist %u\n",
+           journal->j_devname,
+           (unsigned long long) bh->b_blocknr,
++          transaction, transaction->t_tid,
+           jh->b_transaction,
+-          jh->b_transaction ? jh->b_transaction->t_tid : 0,
+-          journal->j_committing_transaction,
+-          journal->j_committing_transaction ?
+-          journal->j_committing_transaction->t_tid : 0);
+-   ret = -EINVAL;
+-  }
+-  if (unlikely(jh->b_next_transaction != transaction)) {
+-   printk(KERN_ERR "JBD2: %s: "
+-          "jh->b_next_transaction (%llu, %p, %u) != "
+-          "transaction (%p, %u)",
+-          journal->j_devname,
+-          (unsigned long long) bh->b_blocknr,
++          jh->b_transaction ?
++          jh->b_transaction->t_tid : 0,
+           jh->b_next_transaction,
+           jh->b_next_transaction ?
+           jh->b_next_transaction->t_tid : 0,
+-          transaction, transaction->t_tid);
++          jh->b_jlist);
++   WARN_ON(1);
+    ret = -EINVAL;
+   }
+   /* And this case is illegal: we can't reuse another
+-- 
+1.7.1

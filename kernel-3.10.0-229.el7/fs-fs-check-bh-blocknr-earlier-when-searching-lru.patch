@@ -1,0 +1,81 @@
+From 6e4998eacb9889a633592bf3f509851bb936ef96 Mon Sep 17 00:00:00 2001
+From: Zach Brown <zab@redhat.com>
+Date: Fri, 17 Oct 2014 22:06:40 -0400
+Subject: [fs] fs: check bh blocknr earlier when searching lru
+
+Message-id: <1413583601-11165-2-git-send-email-zab@redhat.com>
+Patchwork-id: 97661
+O-Subject: [RHEL7.1 PATCH 1/2] fs: check bh blocknr earlier when searching lru
+Bugzilla: 1053108
+RH-Acked-by: Ian Kent <ikent@redhat.com>
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1053108
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8115844
+
+Signed-off-by: Zach Brown <zab@redhat.com>
+
+Backport of the following upstream commit:
+
+commit 9470dd5d352985ba907df7554845f87a4b8f9ea5
+Author: Zach Brown <zab@zabbo.net>
+Date:   Mon Oct 13 15:55:05 2014 -0700
+
+    fs: check bh blocknr earlier when searching lru
+
+    It's very common for the buffer heads in the lru to have different block
+    numbers.  By comparing the blocknr before the bdev and size we can
+    reduce the cost of searching in the very common case where all the
+    entries have the same bdev and size.
+
+    In quick hot cache cycle counting tests on a single fs workstation this
+    cut the cost of a miss by about 20%.
+
+    A diff of the disassembly shows the reordering of the bdev and blocknr
+    comparisons.  This is in such a tiny loop that skipping one comparison
+    is a meaningful portion of the total work being done:
+
+         1628:      83 c1 01                add    $0x1,%ecx
+         162b:      83 f9 08                cmp    $0x8,%ecx
+         162e:      74 60                   je     1690 <__find_get_block+0xa0>
+         1630:      89 c8                   mov    %ecx,%eax
+         1632:      65 4c 8b 04 c5 00 00    mov    %gs:0x0(,%rax,8),%r8
+         1639:      00 00
+         163b:      4d 85 c0                test   %r8,%r8
+         163e:      4c 89 c3                mov    %r8,%rbx
+         1641:      74 e5                   je     1628 <__find_get_block+0x38>
+    -    1643:      4d 3b 68 30             cmp    0x30(%r8),%r13
+    +    1643:      4d 3b 68 18             cmp    0x18(%r8),%r13
+         1647:      75 df                   jne    1628 <__find_get_block+0x38>
+    -    1649:      4d 3b 60 18             cmp    0x18(%r8),%r12
+    +    1649:      4d 3b 60 30             cmp    0x30(%r8),%r12
+         164d:      75 d9                   jne    1628 <__find_get_block+0x38>
+         164f:      49 39 50 20             cmp    %rdx,0x20(%r8)
+         1653:      75 d3                   jne    1628 <__find_get_block+0x38>
+
+    Signed-off-by: Zach Brown <zab@zabbo.net>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/buffer.c b/fs/buffer.c
+index 53ae192..25de151 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -1326,8 +1326,8 @@ lookup_bh_lru(struct block_device *bdev, sector_t block, unsigned size)
+  for (i = 0; i < BH_LRU_SIZE; i++) {
+   struct buffer_head *bh = __this_cpu_read(bh_lrus.bhs[i]);
+ 
+-  if (bh && bh->b_bdev == bdev &&
+-    bh->b_blocknr == block && bh->b_size == size) {
++  if (bh && bh->b_blocknr == block && bh->b_bdev == bdev &&
++      bh->b_size == size) {
+    if (i) {
+     while (i) {
+      __this_cpu_write(bh_lrus.bhs[i],
+-- 
+1.7.1

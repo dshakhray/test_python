@@ -1,0 +1,186 @@
+From b5f88a52f48b558ed425342d066ff309beb0c63f Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Tue, 19 Aug 2014 22:02:58 -0400
+Subject: [security] ima: define '.ima' as a builtin 'trusted' keyring
+
+Message-id: <1408485785-777-27-git-send-email-vgoyal@redhat.com>
+Patchwork-id: 88389
+O-Subject: [RHEL7.1 PATCH 26/33] ima: define '.ima' as a builtin 'trusted' keyring
+Bugzilla: 1129779
+RH-Acked-by: David Howells <dhowells@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+BZ:1129779
+
+commit 7d2ce2320e8efdc4a6dcbae7b329ed3f0d1cd778
+Author: Mimi Zohar <zohar@linux.vnet.ibm.com>
+Date: Tue, 13 Aug 2013 08:47:43 -0400
+
+Require all keys added to the IMA keyring be signed by an
+existing trusted key on the system trusted keyring.
+
+Changelog v6:
+- remove ifdef CONFIG_IMA_TRUSTED_KEYRING in C code - Dmitry
+- update Kconfig dependency and help
+- select KEYS_DEBUG_PROC_KEYS - Dmitry
+
+Changelog v5:
+- Move integrity_init_keyring() to init_ima() - Dmitry
+- reset keyring[id] on failure - Dmitry
+
+Changelog v1:
+- don't link IMA trusted keyring to user keyring
+
+Changelog:
+- define stub integrity_init_keyring() function (reported-by Fengguang Wu)
+- differentiate between regular and trusted keyring names.
+- replace printk with pr_info (D. Kasatkin)
+- only make the IMA keyring a trusted keyring (reported-by D. Kastatkin)
+- define stub integrity_init_keyring() definition based on
+  CONFIG_INTEGRITY_SIGNATURE, not CONFIG_INTEGRITY_ASYMMETRIC_KEYS.
+  (reported-by Jim Davis)
+
+Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+Signed-off-by: Dmitry Kasatkin <d.kasatkin@samsung.com>
+Acked-by: David Howells <dhowells@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/security/integrity/digsig.c b/security/integrity/digsig.c
+index 0b759e1..7f5a980 100644
+--- a/security/integrity/digsig.c
++++ b/security/integrity/digsig.c
+@@ -13,7 +13,9 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/err.h>
++#include <linux/sched.h>
+ #include <linux/rbtree.h>
++#include <linux/cred.h>
+ #include <linux/key-type.h>
+ #include <linux/digsig.h>
+ 
+@@ -24,7 +26,11 @@ static struct key *keyring[INTEGRITY_KEYRING_MAX];
+ static const char *keyring_name[INTEGRITY_KEYRING_MAX] = {
+  "_evm",
+  "_module",
++#ifndef CONFIG_IMA_TRUSTED_KEYRING
+  "_ima",
++#else
++ ".ima",
++#endif
+ };
+ 
+ int integrity_digsig_verify(const unsigned int id, const char *sig, int siglen,
+@@ -55,3 +61,25 @@ int integrity_digsig_verify(const unsigned int id, const char *sig, int siglen,
+ 
+  return -EOPNOTSUPP;
+ }
++
++int integrity_init_keyring(const unsigned int id)
++{
++ const struct cred *cred = current_cred();
++ int err = 0;
++
++ keyring[id] = keyring_alloc(keyring_name[id], KUIDT_INIT(0),
++        KGIDT_INIT(0), cred,
++        ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
++         KEY_USR_VIEW | KEY_USR_READ |
++         KEY_USR_WRITE | KEY_USR_SEARCH),
++        KEY_ALLOC_NOT_IN_QUOTA, NULL);
++ if (!IS_ERR(keyring[id]))
++  set_bit(KEY_FLAG_TRUSTED_ONLY, &keyring[id]->flags);
++ else {
++  err = PTR_ERR(keyring[id]);
++  pr_info("Can't allocate %s keyring (%d)\n",
++   keyring_name[id], err);
++  keyring[id] = NULL;
++ }
++ return err;
++}
+diff --git a/security/integrity/ima/Kconfig b/security/integrity/ima/Kconfig
+index d232c73..4f9f31c 100644
+--- a/security/integrity/ima/Kconfig
++++ b/security/integrity/ima/Kconfig
+@@ -71,3 +71,13 @@ config IMA_APPRAISE
+    For more information on integrity appraisal refer to:
+    <http://linux-ima.sourceforge.net>
+    If unsure, say N.
++
++config IMA_TRUSTED_KEYRING
++ bool "Require all keys on the .ima keyring be signed"
++ depends on IMA_APPRAISE && SYSTEM_TRUSTED_KEYRING
++ depends on INTEGRITY_ASYMMETRIC_KEYS
++ select KEYS_DEBUG_PROC_KEYS
++ default y
++ help
++    This option requires that all keys added to the .ima
++    keyring be signed by a key on the system trusted keyring.
+diff --git a/security/integrity/ima/ima.h b/security/integrity/ima/ima.h
+index a41c9c1..0353f60 100644
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -199,4 +199,16 @@ static inline int security_filter_rule_match(u32 secid, u32 field, u32 op,
+  return -EINVAL;
+ }
+ #endif /* CONFIG_IMA_LSM_RULES */
++
++#ifdef CONFIG_IMA_TRUSTED_KEYRING
++static inline int ima_init_keyring(const unsigned int id)
++{
++ return integrity_init_keyring(id);
++}
++#else
++static inline int ima_init_keyring(const unsigned int id)
++{
++ return 0;
++}
++#endif /* CONFIG_IMA_TRUSTED_KEYRING */
+ #endif
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index 6c491a6..7f40f68 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -295,8 +295,14 @@ static int __init init_ima(void)
+  int error;
+ 
+  error = ima_init();
+- if (!error)
+-  ima_initialized = 1;
++ if (error)
++  goto out;
++
++ error = ima_init_keyring(INTEGRITY_KEYRING_IMA);
++ if (error)
++  goto out;
++ ima_initialized = 1;
++out:
+  return error;
+ }
+ 
+diff --git a/security/integrity/integrity.h b/security/integrity/integrity.h
+index 84c37c4..6eb655e 100644
+--- a/security/integrity/integrity.h
++++ b/security/integrity/integrity.h
+@@ -91,6 +91,7 @@ struct integrity_iint_cache *integrity_iint_find(struct inode *inode);
+ int integrity_digsig_verify(const unsigned int id, const char *sig, int siglen,
+      const char *digest, int digestlen);
+ 
++int integrity_init_keyring(const unsigned int id);
+ #else
+ 
+ static inline int integrity_digsig_verify(const unsigned int id,
+@@ -100,6 +101,10 @@ static inline int integrity_digsig_verify(const unsigned int id,
+  return -EOPNOTSUPP;
+ }
+ 
++static inline int integrity_init_keyring(const unsigned int id)
++{
++ return 0;
++}
+ #endif /* CONFIG_INTEGRITY_SIGNATURE */
+ 
+ #ifdef CONFIG_INTEGRITY_ASYMMETRIC_KEYS
+-- 
+1.7.1

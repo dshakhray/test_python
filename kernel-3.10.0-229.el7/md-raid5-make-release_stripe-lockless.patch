@@ -1,0 +1,168 @@
+From 7319e3895875118e5b7650014db988b88319741c Mon Sep 17 00:00:00 2001
+From: Jes Sorensen <Jes.Sorensen@redhat.com>
+Date: Mon, 1 Sep 2014 09:25:10 -0400
+Subject: [md] raid5: make release_stripe lockless
+
+Message-id: <1409563584-9000-9-git-send-email-Jes.Sorensen@redhat.com>
+Patchwork-id: 89944
+O-Subject: [RHEL7.1 PATCH 08/82] raid5: make release_stripe lockless
+Bugzilla: 1085530
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+From: Shaohua Li <shli@kernel.org>
+
+release_stripe still has big lock contention. We just add the stripe to a llist
+without taking device_lock. We let the raid5d thread to do the real stripe
+release, which must hold device_lock anyway. In this way, release_stripe
+doesn't hold any locks.
+
+The side effect is the released stripes order is changed. But sounds not a big
+deal, stripes are never handled in order. And I thought block layer can already
+do nice request merge, which means order isn't that important.
+
+I kept the unplug release batch, which is unnecessary with this patch from lock
+contention avoid point of view, and actually if we delete it, the stripe_head
+release_list and lru can share storage. But the unplug release batch is also
+helpful for request merge. We probably can delay wakeup raid5d till unplug, but
+I'm still afraid of the case which raid5d is running.
+
+Signed-off-by: Shaohua Li <shli@fusionio.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+(cherry picked from commit 773ca82fa1ee58dd1bf88b6a5ca385ec83a2cac6)
+Signed-off-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index fe42c3b..d38b076 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -239,12 +239,47 @@ static void __release_stripe(struct r5conf *conf, struct stripe_head *sh)
+   do_release_stripe(conf, sh);
+ }
+ 
++/* should hold conf->device_lock already */
++static int release_stripe_list(struct r5conf *conf)
++{
++ struct stripe_head *sh;
++ int count = 0;
++ struct llist_node *head;
++
++ head = llist_del_all(&conf->released_stripes);
++ while (head) {
++  sh = llist_entry(head, struct stripe_head, release_list);
++  head = llist_next(head);
++  /* sh could be readded after STRIPE_ON_RELEASE_LIST is cleard */
++  smp_mb();
++  clear_bit(STRIPE_ON_RELEASE_LIST, &sh->state);
++  /*
++   * Don't worry the bit is set here, because if the bit is set
++   * again, the count is always > 1. This is true for
++   * STRIPE_ON_UNPLUG_LIST bit too.
++   */
++  __release_stripe(conf, sh);
++  count++;
++ }
++
++ return count;
++}
++
+ static void release_stripe(struct stripe_head *sh)
+ {
+  struct r5conf *conf = sh->raid_conf;
+  unsigned long flags;
++ bool wakeup;
+ 
++ if (test_and_set_bit(STRIPE_ON_RELEASE_LIST, &sh->state))
++  goto slow_path;
++ wakeup = llist_add(&sh->release_list, &conf->released_stripes);
++ if (wakeup)
++  md_wakeup_thread(conf->mddev->thread);
++ return;
++slow_path:
+  local_irq_save(flags);
++ /* we are ok here if STRIPE_ON_RELEASE_LIST is set or not */
+  if (atomic_dec_and_lock(&sh->count, &conf->device_lock)) {
+   do_release_stripe(conf, sh);
+   spin_unlock(&conf->device_lock);
+@@ -491,7 +526,8 @@ get_active_stripe(struct r5conf *conf, sector_t sector,
+    if (atomic_read(&sh->count)) {
+     BUG_ON(!list_empty(&sh->lru)
+         && !test_bit(STRIPE_EXPANDING, &sh->state)
+-        && !test_bit(STRIPE_ON_UNPLUG_LIST, &sh->state));
++        && !test_bit(STRIPE_ON_UNPLUG_LIST, &sh->state)
++        && !test_bit(STRIPE_ON_RELEASE_LIST, &sh->state));
+    } else {
+     if (!test_bit(STRIPE_HANDLE, &sh->state))
+      atomic_inc(&conf->active_stripes);
+@@ -4149,6 +4185,10 @@ static void raid5_unplug(struct blk_plug_cb *blk_cb, bool from_schedule)
+     */
+    smp_mb__before_clear_bit();
+    clear_bit(STRIPE_ON_UNPLUG_LIST, &sh->state);
++   /*
++    * STRIPE_ON_RELEASE_LIST could be set here. In that
++    * case, the count is always > 1 here
++    */
+    __release_stripe(conf, sh);
+    cnt++;
+   }
+@@ -4858,7 +4898,9 @@ static void raid5d(struct md_thread *thread)
+  spin_lock_irq(&conf->device_lock);
+  while (1) {
+   struct bio *bio;
+-  int batch_size;
++  int batch_size, released;
++
++  released = release_stripe_list(conf);
+ 
+   if (
+       !list_empty(&conf->bitmap_list)) {
+@@ -4883,7 +4925,7 @@ static void raid5d(struct md_thread *thread)
+   }
+ 
+   batch_size = handle_active_stripes(conf);
+-  if (!batch_size)
++  if (!batch_size && !released)
+    break;
+   handled += batch_size;
+ 
+@@ -5198,6 +5240,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
+  INIT_LIST_HEAD(&conf->delayed_list);
+  INIT_LIST_HEAD(&conf->bitmap_list);
+  INIT_LIST_HEAD(&conf->inactive_list);
++ init_llist_head(&conf->released_stripes);
+  atomic_set(&conf->active_stripes, 0);
+  atomic_set(&conf->preread_active_stripes, 0);
+  atomic_set(&conf->active_aligned_reads, 0);
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 70c4932..a98f99d 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -197,6 +197,7 @@ enum reconstruct_states {
+ struct stripe_head {
+  struct hlist_node hash;
+  struct list_head lru;       /* inactive_list or handle_list */
++ struct llist_node release_list;
+  struct r5conf  *raid_conf;
+  short   generation; /* increments with every
+        * reshape */
+@@ -321,6 +322,7 @@ enum {
+  STRIPE_OPS_REQ_PENDING,
+  STRIPE_ON_UNPLUG_LIST,
+  STRIPE_DISCARD,
++ STRIPE_ON_RELEASE_LIST,
+ };
+ 
+ /*
+@@ -445,6 +447,7 @@ struct r5conf {
+   */
+  atomic_t  active_stripes;
+  struct list_head inactive_list;
++ struct llist_head released_stripes;
+  wait_queue_head_t wait_for_stripe;
+  wait_queue_head_t wait_for_overlap;
+  int   inactive_blocked; /* release of inactive stripes blocked,
+-- 
+1.7.1

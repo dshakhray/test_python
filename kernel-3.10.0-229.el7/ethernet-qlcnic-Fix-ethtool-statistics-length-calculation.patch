@@ -1,0 +1,121 @@
+From 8cae63f21c6ab5d8e136b3a42344a6c7891bad32 Mon Sep 17 00:00:00 2001
+From: Michal Schmidt <mschmidt@redhat.com>
+Date: Wed, 4 Jun 2014 09:38:14 -0400
+Subject: [ethernet] qlcnic: Fix ethtool statistics length calculation
+
+Message-id: <1401874694-24286-1-git-send-email-mschmidt@redhat.com>
+Patchwork-id: 82416
+O-Subject: [RHEL7.1 PATCH] qlcnic: Fix ethtool statistics length calculation
+Bugzilla: 1099634
+RH-Acked-by: Andy Gospodarek <gospo@redhat.com>
+RH-Acked-by: Bryn M. Reeves <bmr@redhat.com>
+
+BZ: https://bugzilla.redhat.com/show_bug.cgi?id=1099634
+
+This fixes a memory corrupting bug in qlcnic triggered simply by running
+"ethtool -S ethX". This is especially troublesome, because the command
+is run by the sosreport tool.
+Thanks to Bryn M. Reeves for his excellent vmcore analysis and pointing
+to this upstream fix:
+
+Upstream commit:
+commit d6e9c89a8d3cf0a5184badbcd50169179af27721
+Author: Shahed Shaikh <shahed.shaikh@qlogic.com>
+Date:   Thu Jan 9 12:41:05 2014 -0500
+
+    qlcnic: Fix ethtool statistics length calculation
+
+    o Consider number of Tx queues while calculating the length of
+      Tx statistics as part of ethtool stats.
+    o Calculate statistics lenght properly for 82xx and 83xx adapter
+
+    Signed-off-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+RHEL: The difference is due to missing backport of f27c75b3903a
+("qlcnic: Enhance ethtool Statistics for Multiple Tx queue.").
+
+Brew:
+https://brewweb.devel.redhat.com/taskinfo?taskID=7532045
+
+Testing:
+I reproduced the bug on dell-per720-07.klab.eng.bos.redhat.com by
+running sosreport a few times (less than 10). No crash anymore with
+this patch.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+index 84023b8..468c0ae 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_ethtool.c
+@@ -164,27 +164,35 @@ static const char qlcnic_gstrings_test[][ETH_GSTRING_LEN] = {
+ 
+ #define QLCNIC_TEST_LEN ARRAY_SIZE(qlcnic_gstrings_test)
+ 
+-static inline int qlcnic_82xx_statistics(void)
++static inline int qlcnic_82xx_statistics(struct qlcnic_adapter *adapter)
+ {
+- return ARRAY_SIZE(qlcnic_device_gstrings_stats) +
+-        ARRAY_SIZE(qlcnic_83xx_mac_stats_strings);
++ return ARRAY_SIZE(qlcnic_gstrings_stats) +
++        ARRAY_SIZE(qlcnic_83xx_mac_stats_strings) +
++        ARRAY_SIZE(qlcnic_tx_ring_stats_strings) * adapter->max_drv_tx_rings;
+ }
+ 
+-static inline int qlcnic_83xx_statistics(void)
++static inline int qlcnic_83xx_statistics(struct qlcnic_adapter *adapter)
+ {
+- return ARRAY_SIZE(qlcnic_83xx_tx_stats_strings) +
++ return ARRAY_SIZE(qlcnic_gstrings_stats) +
++        ARRAY_SIZE(qlcnic_83xx_tx_stats_strings) +
+         ARRAY_SIZE(qlcnic_83xx_mac_stats_strings) +
+-        ARRAY_SIZE(qlcnic_83xx_rx_stats_strings);
++        ARRAY_SIZE(qlcnic_83xx_rx_stats_strings) +
++        ARRAY_SIZE(qlcnic_tx_ring_stats_strings) * adapter->max_drv_tx_rings;
+ }
+ 
+ static int qlcnic_dev_statistics_len(struct qlcnic_adapter *adapter)
+ {
+- if (qlcnic_82xx_check(adapter))
+-  return qlcnic_82xx_statistics();
+- else if (qlcnic_83xx_check(adapter))
+-  return qlcnic_83xx_statistics();
+- else
+-  return -1;
++ int len = -1;
++
++ if (qlcnic_82xx_check(adapter)) {
++  len = qlcnic_82xx_statistics(adapter);
++  if (adapter->flags & QLCNIC_ESWITCH_ENABLED)
++   len += ARRAY_SIZE(qlcnic_device_gstrings_stats);
++ } else if (qlcnic_83xx_check(adapter)) {
++  len = qlcnic_83xx_statistics(adapter);
++ }
++
++ return len;
+ }
+ 
+ #define QLCNIC_RING_REGS_COUNT 20
+@@ -854,18 +862,13 @@ static int qlcnic_eeprom_test(struct net_device *dev)
+ 
+ static int qlcnic_get_sset_count(struct net_device *dev, int sset)
+ {
+- int len;
+ 
+  struct qlcnic_adapter *adapter = netdev_priv(dev);
+  switch (sset) {
+  case ETH_SS_TEST:
+   return QLCNIC_TEST_LEN;
+  case ETH_SS_STATS:
+-  len = qlcnic_dev_statistics_len(adapter) + QLCNIC_STATS_LEN;
+-  if ((adapter->flags & QLCNIC_ESWITCH_ENABLED) ||
+-      qlcnic_83xx_check(adapter))
+-   return len;
+-  return qlcnic_82xx_statistics();
++  return qlcnic_dev_statistics_len(adapter);
+  default:
+   return -EOPNOTSUPP;
+  }
+-- 
+1.7.1

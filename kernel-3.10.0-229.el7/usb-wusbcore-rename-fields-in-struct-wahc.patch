@@ -1,0 +1,158 @@
+From acc4074238bd3cee6cf5fc17f9402495afc9e5b1 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:02:48 -0400
+Subject: [usb] wusbcore: rename fields in struct wahc
+
+Message-id: <1410887463-20674-97-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95671
+O-Subject: [RHEL7 PATCH 096/591] usb: wusbcore: rename fields in struct wahc
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 0367eef281006923bd35ee323cdc5d21179afe5a
+Author: Thomas Pugliese <thomas.pugliese@gmail.com>
+Date:   Thu Sep 26 10:49:41 2013 -0500
+
+    usb: wusbcore: rename fields in struct wahc
+
+    Rename xfer_result to dti_buf and xfer_result_size to dti_buf_size in
+    struct wahc.  The dti buffer will also be used for isochronous status
+    packets once isochronous transfers are supported.
+
+    Signed-off-by: Thomas Pugliese <thomas.pugliese@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/wusbcore/wa-hc.c b/drivers/usb/wusbcore/wa-hc.c
+index a09b65e..6c09b0e 100644
+--- a/drivers/usb/wusbcore/wa-hc.c
++++ b/drivers/usb/wusbcore/wa-hc.c
+@@ -44,11 +44,11 @@ int wa_create(struct wahc *wa, struct usb_interface *iface)
+  /* Fill up Data Transfer EP pointers */
+  wa->dti_epd = &iface->cur_altsetting->endpoint[1].desc;
+  wa->dto_epd = &iface->cur_altsetting->endpoint[2].desc;
+- wa->xfer_result_size = usb_endpoint_maxp(wa->dti_epd);
+- wa->xfer_result = kmalloc(wa->xfer_result_size, GFP_KERNEL);
+- if (wa->xfer_result == NULL) {
++ wa->dti_buf_size = usb_endpoint_maxp(wa->dti_epd);
++ wa->dti_buf = kmalloc(wa->dti_buf_size, GFP_KERNEL);
++ if (wa->dti_buf == NULL) {
+   result = -ENOMEM;
+-  goto error_xfer_result_alloc;
++  goto error_dti_buf_alloc;
+  }
+  result = wa_nep_create(wa, iface);
+  if (result < 0) {
+@@ -59,8 +59,8 @@ int wa_create(struct wahc *wa, struct usb_interface *iface)
+  return 0;
+ 
+ error_nep_create:
+- kfree(wa->xfer_result);
+-error_xfer_result_alloc:
++ kfree(wa->dti_buf);
++error_dti_buf_alloc:
+  wa_rpipes_destroy(wa);
+ error_rpipes_create:
+  return result;
+@@ -76,7 +76,7 @@ void __wa_destroy(struct wahc *wa)
+   usb_kill_urb(wa->buf_in_urb);
+   usb_put_urb(wa->buf_in_urb);
+  }
+- kfree(wa->xfer_result);
++ kfree(wa->dti_buf);
+  wa_nep_destroy(wa);
+  wa_rpipes_destroy(wa);
+ }
+diff --git a/drivers/usb/wusbcore/wa-hc.h b/drivers/usb/wusbcore/wa-hc.h
+index cf250c2..ab39934 100644
+--- a/drivers/usb/wusbcore/wa-hc.h
++++ b/drivers/usb/wusbcore/wa-hc.h
+@@ -184,8 +184,8 @@ struct wahc {
+  struct urb *dti_urb;  /* URB for reading xfer results */
+  struct urb *buf_in_urb;  /* URB for reading data in */
+  struct edc dti_edc;  /* DTI error density counter */
+- struct wa_xfer_result *xfer_result; /* real size = dti_ep maxpktsize */
+- size_t xfer_result_size;
++ void *dti_buf;
++ size_t dti_buf_size;
+ 
+  s32 status;   /* For reading status */
+ 
+diff --git a/drivers/usb/wusbcore/wa-xfer.c b/drivers/usb/wusbcore/wa-xfer.c
+index 0b1cb65..47cbfdd 100644
+--- a/drivers/usb/wusbcore/wa-xfer.c
++++ b/drivers/usb/wusbcore/wa-xfer.c
+@@ -1418,7 +1418,8 @@ static int wa_xfer_status_to_errno(u8 status)
+  *
+  * FIXME: this function needs to be broken up in parts
+  */
+-static void wa_xfer_result_chew(struct wahc *wa, struct wa_xfer *xfer)
++static void wa_xfer_result_chew(struct wahc *wa, struct wa_xfer *xfer,
++  struct wa_xfer_result *xfer_result)
+ {
+  int result;
+  struct device *dev = &wa->usb_iface->dev;
+@@ -1426,8 +1427,7 @@ static void wa_xfer_result_chew(struct wahc *wa, struct wa_xfer *xfer)
+  u8 seg_idx;
+  struct wa_seg *seg;
+  struct wa_rpipe *rpipe;
+- struct wa_xfer_result *xfer_result = wa->xfer_result;
+- u8 done = 0;
++ unsigned done = 0;
+  u8 usb_status;
+  unsigned rpipe_ready = 0;
+ 
+@@ -1687,7 +1687,7 @@ static void wa_buf_in_cb(struct urb *urb)
+  * We go back to OFF when we detect a ENOENT or ESHUTDOWN (or too many
+  * errors) in the URBs.
+  */
+-static void wa_xfer_result_cb(struct urb *urb)
++static void wa_dti_cb(struct urb *urb)
+ {
+  int result;
+  struct wahc *wa = urb->context;
+@@ -1709,7 +1709,7 @@ static void wa_xfer_result_cb(struct urb *urb)
+     urb->actual_length, sizeof(*xfer_result));
+    break;
+   }
+-  xfer_result = wa->xfer_result;
++  xfer_result = (struct wa_xfer_result *)(wa->dti_buf);
+   if (xfer_result->hdr.bLength != sizeof(*xfer_result)) {
+    dev_err(dev, "DTI Error: xfer result--"
+     "bad header length %u\n",
+@@ -1735,7 +1735,7 @@ static void wa_xfer_result_cb(struct urb *urb)
+     xfer_id, usb_status);
+    break;
+   }
+-  wa_xfer_result_chew(wa, xfer);
++  wa_xfer_result_chew(wa, xfer, xfer_result);
+   wa_xfer_put(xfer);
+   break;
+  case -ENOENT:  /* (we killed the URB)...so, no broadcast */
+@@ -1777,7 +1777,7 @@ out:
+  * don't really set it up and start it until the first xfer complete
+  * notification arrives, which is what we do here.
+  *
+- * Follow up in wa_xfer_result_cb(), as that's where the whole state
++ * Follow up in wa_dti_cb(), as that's where the whole state
+  * machine starts.
+  *
+  * So here we just initialize the DTI URB for reading transfer result
+@@ -1813,8 +1813,8 @@ void wa_handle_notif_xfer(struct wahc *wa, struct wa_notif_hdr *notif_hdr)
+  usb_fill_bulk_urb(
+   wa->dti_urb, wa->usb_dev,
+   usb_rcvbulkpipe(wa->usb_dev, 0x80 | notif_xfer->bEndpoint),
+-  wa->xfer_result, wa->xfer_result_size,
+-  wa_xfer_result_cb, wa);
++  wa->dti_buf, wa->dti_buf_size,
++  wa_dti_cb, wa);
+ 
+  wa->buf_in_urb = usb_alloc_urb(0, GFP_KERNEL);
+  if (wa->buf_in_urb == NULL) {
+-- 
+1.7.1

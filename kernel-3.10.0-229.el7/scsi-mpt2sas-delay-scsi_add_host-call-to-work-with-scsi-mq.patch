@@ -1,0 +1,123 @@
+From 3469853509808fcd90724d4613fce54f9988c9a5 Mon Sep 17 00:00:00 2001
+From: Tomas Henzl <thenzl@redhat.com>
+Date: Thu, 16 Oct 2014 16:01:49 -0400
+Subject: [scsi] mpt2sas: delay scsi_add_host call to work with scsi-mq
+
+Message-id: <1413475335-14737-7-git-send-email-thenzl@redhat.com>
+Patchwork-id: 97590
+O-Subject: [RHEL7.1 e-stor PATCH 06/32] mpt2sas: delay scsi_add_host call to work with scsi-mq
+Bugzilla: 1088524
+RH-Acked-by: Maurizio Lombardi <mlombard@redhat.com>
+RH-Acked-by: Rob Evers <revers@redhat.com>
+
+In _scsih_probe, delay the call to scsi_add_host until the host has been
+fully set up.
+
+Otherwise, the default .can_queue value of 1 causes scsi-mq to set the block
+layer request queue size to its minimum size, resulting in awful performance.
+
+In _scsih_probe error handling, call mpt3sas_base_detach rather than
+scsi_remove_host to properly clean up in reverse order.
+
+In _scsih_remove, call scsi_remove_host earlier to clean up in reverse order.
+
+Signed-off-by: Robert Elliott <elliott@hp.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Nagalakshmi Nandigama <Nagalakshmi.Nandigama@avagotech.com>
+Signed-off-by: Sreekanth Reddy <Sreekanth.Reddy@avagotech.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 02b7708134037f85656d15992912226134b10250)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/mpt2sas/mpt2sas_base.c b/drivers/scsi/mpt2sas/mpt2sas_base.c
+index 92a1f19..2f262be 100644
+--- a/drivers/scsi/mpt2sas/mpt2sas_base.c
++++ b/drivers/scsi/mpt2sas/mpt2sas_base.c
+@@ -277,7 +277,7 @@ mpt2sas_base_stop_watchdog(struct MPT2SAS_ADAPTER *ioc)
+  ioc->fault_reset_work_q = NULL;
+  spin_unlock_irqrestore(&ioc->ioc_reset_in_progress_lock, flags);
+  if (wq) {
+-  if (!cancel_delayed_work(&ioc->fault_reset_work))
++  if (!cancel_delayed_work_sync(&ioc->fault_reset_work))
+    flush_workqueue(wq);
+   destroy_workqueue(wq);
+  }
+diff --git a/drivers/scsi/mpt2sas/mpt2sas_scsih.c b/drivers/scsi/mpt2sas/mpt2sas_scsih.c
+index e7801ff..dd46101 100644
+--- a/drivers/scsi/mpt2sas/mpt2sas_scsih.c
++++ b/drivers/scsi/mpt2sas/mpt2sas_scsih.c
+@@ -2900,11 +2900,10 @@ _scsih_fw_event_cleanup_queue(struct MPT2SAS_ADAPTER *ioc)
+   return;
+ 
+  list_for_each_entry_safe(fw_event, next, &ioc->fw_event_list, list) {
+-  if (cancel_delayed_work(&fw_event->delayed_work)) {
++  if (cancel_delayed_work_sync(&fw_event->delayed_work)) {
+    _scsih_fw_event_free(ioc, fw_event);
+    continue;
+   }
+-  fw_event->cancel_pending_work = 1;
+  }
+ }
+ 
+@@ -7419,7 +7418,7 @@ _firmware_event_work(struct work_struct *work)
+  struct MPT2SAS_ADAPTER *ioc = fw_event->ioc;
+ 
+  /* the queue is being flushed so ignore this event */
+- if (ioc->remove_host || fw_event->cancel_pending_work ||
++ if (ioc->remove_host ||
+      ioc->pci_error_recovery) {
+   _scsih_fw_event_free(ioc, fw_event);
+   return;
+@@ -7867,9 +7866,9 @@ _scsih_remove(struct pci_dev *pdev)
+  }
+ 
+  sas_remove_host(shost);
++ scsi_remove_host(shost);
+  mpt2sas_base_detach(ioc);
+  list_del(&ioc->list);
+- scsi_remove_host(shost);
+  scsi_host_put(shost);
+ }
+ 
+@@ -8210,13 +8209,6 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+   }
+  }
+ 
+- if ((scsi_add_host(shost, &pdev->dev))) {
+-  printk(MPT2SAS_ERR_FMT "failure at %s:%d/%s()!\n",
+-      ioc->name, __FILE__, __LINE__, __func__);
+-  list_del(&ioc->list);
+-  goto out_add_shost_fail;
+- }
+-
+  /* register EEDP capabilities with SCSI layer */
+  if (prot_mask)
+   scsi_host_set_prot(shost, prot_mask);
+@@ -8258,16 +8250,23 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+   }
+  } else
+   ioc->hide_drives = 0;
++
++ if ((scsi_add_host(shost, &pdev->dev))) {
++  printk(MPT2SAS_ERR_FMT "failure at %s:%d/%s()!\n",
++      ioc->name, __FILE__, __LINE__, __func__);
++  goto out_add_shost_fail;
++ }
++
+  scsi_scan_host(shost);
+ 
+  return 0;
+ 
++ out_add_shost_fail:
++ mpt2sas_base_detach(ioc);
+  out_attach_fail:
+  destroy_workqueue(ioc->firmware_event_thread);
+  out_thread_fail:
+  list_del(&ioc->list);
+- scsi_remove_host(shost);
+- out_add_shost_fail:
+  scsi_host_put(shost);
+  return -ENODEV;
+ }
+-- 
+1.7.1

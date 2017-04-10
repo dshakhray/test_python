@@ -1,0 +1,119 @@
+From 7e555e039289deaf4bff8b7b916ee4471e6a5c45 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 12 Sep 2014 14:26:55 -0400
+Subject: [net] drop_monitor: use proper genetlink multicast APIs
+
+Message-id: <1a6e3df4d77cebf30bde24b7d78631a68da38052.1410528958.git.jbenc@redhat.com>
+Patchwork-id: 93950
+O-Subject: [RHEL7.1 net PATCH 13/23] drop_monitor/genetlink: use proper genetlink multicast APIs
+Bugzilla: 1140656
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1140656
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7948291
+
+commit e5dcecba015f9774a402ba559b80b16999747e3b
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Tue Nov 19 15:19:32 2013 +0100
+
+    drop_monitor/genetlink: use proper genetlink multicast APIs
+
+    The drop monitor code is abusing the genetlink API and is
+    statically using the generic netlink multicast group 1, even
+    if that group belongs to somebody else (which it invariably
+    will, since it's not reserved.)
+
+    Make the drop monitor code use the proper APIs to reserve a
+    group ID, but also reserve the group id 1 in generic netlink
+    code to preserve the userspace API. Since drop monitor can
+    be a module, don't clear the bit for it on unregistration.
+
+    Acked-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/core/drop_monitor.c b/net/core/drop_monitor.c
+index 73d93b5..63b8bd4 100644
+--- a/net/core/drop_monitor.c
++++ b/net/core/drop_monitor.c
+@@ -106,6 +106,10 @@ static struct sk_buff *reset_per_cpu_data(struct per_cpu_dm_data *data)
+  return skb;
+ }
+ 
++static struct genl_multicast_group dm_mcgrp = {
++ .name = "events",
++};
++
+ static void send_dm_alert(struct work_struct *work)
+ {
+  struct sk_buff *skb;
+@@ -116,7 +120,7 @@ static void send_dm_alert(struct work_struct *work)
+  skb = reset_per_cpu_data(data);
+ 
+  if (skb)
+-  genlmsg_multicast(skb, 0, NET_DM_GRP_ALERT, GFP_KERNEL);
++  genlmsg_multicast(skb, 0, dm_mcgrp.id, GFP_KERNEL);
+ }
+ 
+ /*
+@@ -371,6 +375,13 @@ static int __init init_net_drop_monitor(void)
+   return rc;
+  }
+ 
++ rc = genl_register_mc_group(&net_drop_monitor_family, &dm_mcgrp);
++ if (rc) {
++  pr_err("Failed to register drop monitor mcast group\n");
++  goto out_unreg;
++ }
++ WARN_ON(dm_mcgrp.id != NET_DM_GRP_ALERT);
++
+  rc = register_netdevice_notifier(&dropmon_net_notifier);
+  if (rc < 0) {
+   pr_crit("Failed to register netdevice notifier\n");
+diff --git a/net/netlink/genetlink.c b/net/netlink/genetlink.c
+index b1eab17..d714def 100644
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@ -65,8 +65,12 @@ static struct list_head family_ht[GENL_FAM_TAB_SIZE];
+  * To avoid an allocation at boot of just one unsigned long,
+  * declare it global instead.
+  * Bit 0 is marked as already used since group 0 is invalid.
++ * Bit 1 is marked as already used since the drop-monitor code
++ * abuses the API and thinks it can statically use group 1.
++ * That group will typically conflict with other groups that
++ * any proper users use.
+  */
+-static unsigned long mc_group_start = 0x1;
++static unsigned long mc_group_start = 0x3;
+ static unsigned long *mc_groups = &mc_group_start;
+ static unsigned long mc_groups_longs = 1;
+ 
+@@ -160,9 +164,11 @@ int genl_register_mc_group(struct genl_family *family,
+ 
+  genl_lock_all();
+ 
+- /* special-case our own group */
++ /* special-case our own group and hacks */
+  if (grp == &notify_grp)
+   id = GENL_ID_CTRL;
++ else if (strcmp(family->name, "NET_DM") == 0)
++  id = 1;
+  else
+   id = find_first_zero_bit(mc_groups,
+       mc_groups_longs * BITS_PER_LONG);
+@@ -245,7 +251,8 @@ static void __genl_unregister_mc_group(struct genl_family *family,
+  rcu_read_unlock();
+  netlink_table_ungrab();
+ 
+- clear_bit(grp->id, mc_groups);
++ if (grp->id != 1)
++  clear_bit(grp->id, mc_groups);
+  list_del(&grp->list);
+  genl_ctrl_event(CTRL_CMD_DELMCAST_GRP, grp);
+  grp->id = 0;
+-- 
+1.7.1

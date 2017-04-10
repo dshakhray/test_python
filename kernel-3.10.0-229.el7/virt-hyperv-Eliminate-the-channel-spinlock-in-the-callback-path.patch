@@ -1,0 +1,153 @@
+From b7cba43f91fd98e392100208a5b639bf1f5b1020 Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Thu, 9 Oct 2014 06:13:21 -0400
+Subject: [virt] hyperv: Eliminate the channel spinlock in the callback path
+
+Message-id: <1412835210-22435-3-git-send-email-jasowang@redhat.com>
+Patchwork-id: 97284
+O-Subject: [RHEL7.1 PATCH V2 02/11] Drivers: hv: Eliminate the channel spinlock in the callback path
+Bugzilla: 1146358
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+
+From: K. Y. Srinivasan <kys@microsoft.com>
+
+Bugzilla: 1146358
+
+By ensuring that we set the callback handler to NULL in the channel close
+path on the same CPU that the channel is bound to, we can eliminate this lock
+acquisition and release in a performance critical path.
+
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d3ba720dd58cdf6630fee4b89482c465d5ad0d0f)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/hv/channel.c b/drivers/hv/channel.c
+index 9cd973c..d90849c 100644
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@ -514,18 +514,26 @@ int vmbus_teardown_gpadl(struct vmbus_channel *channel, u32 gpadl_handle)
+ }
+ EXPORT_SYMBOL_GPL(vmbus_teardown_gpadl);
+ 
++static void reset_channel_cb(void *arg)
++{
++ struct vmbus_channel *channel = arg;
++
++ channel->onchannel_callback = NULL;
++}
++
+ static void vmbus_close_internal(struct vmbus_channel *channel)
+ {
+  struct vmbus_channel_close_channel *msg;
+  int ret;
+- unsigned long flags;
+ 
+  channel->state = CHANNEL_OPEN_STATE;
+  channel->sc_creation_callback = NULL;
+  /* Stop callback and cancel the timer asap */
+- spin_lock_irqsave(&channel->inbound_lock, flags);
+- channel->onchannel_callback = NULL;
+- spin_unlock_irqrestore(&channel->inbound_lock, flags);
++ if (channel->target_cpu != smp_processor_id())
++  smp_call_function_single(channel->target_cpu, reset_channel_cb,
++      channel, true);
++ else
++  reset_channel_cb(channel);
+ 
+  /* Send a closing message */
+ 
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index fa92046..6f7fdd9 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -365,7 +365,7 @@ static u32  next_vp;
+  * performance critical channels (IDE, SCSI and Network) will be uniformly
+  * distributed across all available CPUs.
+  */
+-static u32 get_vp_index(uuid_le *type_guid)
++static void init_vp_index(struct vmbus_channel *channel, uuid_le *type_guid)
+ {
+  u32 cur_cpu;
+  int i;
+@@ -387,10 +387,13 @@ static u32 get_vp_index(uuid_le *type_guid)
+    * Also if the channel is not a performance critical
+    * channel, bind it to cpu 0.
+    */
+-  return 0;
++  channel->target_cpu = 0;
++  channel->target_vp = 0;
++  return;
+  }
+  cur_cpu = (++next_vp % max_cpus);
+- return hv_context.vp_index[cur_cpu];
++ channel->target_cpu = cur_cpu;
++ channel->target_vp = hv_context.vp_index[cur_cpu];
+ }
+ 
+ /*
+@@ -438,7 +441,7 @@ static void vmbus_onoffer(struct vmbus_channel_message_header *hdr)
+     offer->connection_id;
+  }
+ 
+- newchannel->target_vp = get_vp_index(&offer->offer.if_type);
++ init_vp_index(newchannel, &offer->offer.if_type);
+ 
+  memcpy(&newchannel->offermsg, offer,
+         sizeof(struct vmbus_channel_offer_channel));
+diff --git a/drivers/hv/connection.c b/drivers/hv/connection.c
+index 8dd98d4..e8dcc71 100644
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@ -278,7 +278,6 @@ struct vmbus_channel *relid2channel(u32 relid)
+ static void process_chn_event(u32 relid)
+ {
+  struct vmbus_channel *channel;
+- unsigned long flags;
+  void *arg;
+  bool read_state;
+  u32 bytes_to_read;
+@@ -297,13 +296,12 @@ static void process_chn_event(u32 relid)
+  /*
+   * A channel once created is persistent even when there
+   * is no driver handling the device. An unloading driver
+-  * sets the onchannel_callback to NULL under the
+-  * protection of the channel inbound_lock. Thus, checking
+-  * and invoking the driver specific callback takes care of
+-  * orderly unloading of the driver.
++  * sets the onchannel_callback to NULL on the same CPU
++  * as where this interrupt is handled (in an interrupt context).
++  * Thus, checking and invoking the driver specific callback takes
++  * care of orderly unloading of the driver.
+   */
+ 
+- spin_lock_irqsave(&channel->inbound_lock, flags);
+  if (channel->onchannel_callback != NULL) {
+   arg = channel->channel_callback_context;
+   read_state = channel->batched_reading;
+@@ -328,7 +326,6 @@ static void process_chn_event(u32 relid)
+   pr_err("no channel callback for relid - %u\n", relid);
+  }
+ 
+- spin_unlock_irqrestore(&channel->inbound_lock, flags);
+ }
+ 
+ /*
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index 4fcd38d..46b0bb1 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -1039,6 +1039,8 @@ struct vmbus_channel {
+   * preserve the earlier behavior.
+   */
+  u32 target_vp;
++ /* The corresponding CPUID in the guest */
++ u32 target_cpu;
+  /*
+   * Support for sub-channels. For high performance devices,
+   * it will be useful to have multiple sub-channels to support
+-- 
+1.7.1

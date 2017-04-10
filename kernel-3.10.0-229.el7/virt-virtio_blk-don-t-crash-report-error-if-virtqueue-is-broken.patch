@@ -1,0 +1,68 @@
+From 124e93af229fe8fc9aaef833d365c8adf7645cc1 Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Thu, 28 Aug 2014 19:15:59 -0400
+Subject: [virt] virtio_blk: don't crash, report error if virtqueue is broken
+
+Message-id: <1409253371-23161-10-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 89855
+O-Subject: [RHEL7 PATCH 09/21] virtio_blk: don't crash, report error if virtqueue is broken.
+Bugzilla: 1105698
+RH-Acked-by: Fam Zheng <famz@redhat.com>
+
+This is a backport of the following upstream commit.
+Related to bug 1105698.
+
+  commit 5261b85e586afe6ebe54e16e0a8acc32fc6d4902
+  Author: Rusty Russell <rusty@rustcorp.com.au>
+  Date:   Thu Mar 13 11:23:39 2014 +1030
+
+    virtio_blk: don't crash, report error if virtqueue is broken.
+
+    A bad implementation of virtio might cause us to mark the virtqueue
+    broken: we'll dev_err() in that case, and the device is useless, but
+    let's not BUG_ON().
+
+    ENOMEM or ENOSPC implies the ring is full, and we should try again
+    later (-ENOMEM is documented to happen, but doesn't, as we fall
+    through to ENOSPC).
+
+    EIO means it's broken.
+
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index b1cb3f4..a2db9ed 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -158,6 +158,7 @@ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
+  unsigned long flags;
+  unsigned int num;
+  const bool last = (req->cmd_flags & REQ_END) != 0;
++ int err;
+ 
+  BUG_ON(req->nr_phys_segments + 2 > vblk->sg_elems);
+ 
+@@ -198,11 +199,16 @@ static int virtio_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
+  }
+ 
+  spin_lock_irqsave(&vblk->vq_lock, flags);
+- if (__virtblk_add_req(vblk->vq, vbr, vbr->sg, num) < 0) {
++ err = __virtblk_add_req(vblk->vq, vbr, vbr->sg, num);
++ if (err) {
+   virtqueue_kick(vblk->vq);
+   spin_unlock_irqrestore(&vblk->vq_lock, flags);
+   blk_mq_stop_hw_queue(hctx);
+-  return BLK_MQ_RQ_QUEUE_BUSY;
++  /* Out of mem doesn't actually happen, since we fall back
++   * to direct descriptors */
++  if (err == -ENOMEM || err == -ENOSPC)
++   return BLK_MQ_RQ_QUEUE_BUSY;
++  return BLK_MQ_RQ_QUEUE_ERROR;
+  }
+ 
+  if (last)
+-- 
+1.7.1

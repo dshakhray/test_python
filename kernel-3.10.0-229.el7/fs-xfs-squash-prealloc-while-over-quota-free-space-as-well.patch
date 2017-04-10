@@ -1,0 +1,101 @@
+From fedbd31fac6241a6149e7d05c55c135bd6d70e0d Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Thu, 9 Oct 2014 21:00:24 -0400
+Subject: [fs] xfs: squash prealloc while over quota free space as well
+
+Message-id: <1412888441-4181-31-git-send-email-sandeen@redhat.com>
+Patchwork-id: 97336
+O-Subject: [RHEL7.1 PATCH 30/47] [fs] xfs: squash prealloc while over quota free space as well
+Bugzilla: 1145837
+RH-Acked-by: Brian Foster <bfoster@redhat.com>
+RH-Acked-by: Dave Chinner <dchinner@redhat.com>
+
+Bugzilla: 1145837
+Upstream Status: Committed upstream
+Build Info: https://brewweb.devel.redhat.com/taskinfo?taskID=8082426
+Tested: locally using xfstests
+
+Thanks,
+-Eric
+
+    commit f074051ff550f9f1f1a8ab4868277d049a7fd7aa
+    Author: Brian Foster <bfoster@redhat.com>
+    Date:   Thu Jul 24 19:56:08 2014 +1000
+
+    xfs: squash prealloc while over quota free space as well
+
+    From: Brian Foster <bfoster@redhat.com>
+
+    Commit 4d559a3b introduced heavy prealloc. squashing to catch the case
+    of requesting too large a prealloc on smaller filesystems, leading to
+    repeated flush and retry cycles that occur on ENOSPC. Now that we issue
+    eofblocks scans on EDQUOT/ENOSPC, squash the prealloc against the
+    minimum available free space across all applicable quotas as well to
+    avoid a similar problem of repeated eofblocks scans.
+
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 4244f76..c7b59cb 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -401,7 +401,8 @@ xfs_quota_calc_throttle(
+  struct xfs_inode *ip,
+  int type,
+  xfs_fsblock_t *qblocks,
+- int *qshift)
++ int *qshift,
++ int64_t *qfreesp)
+ {
+  int64_t freesp;
+  int shift = 0;
+@@ -410,6 +411,7 @@ xfs_quota_calc_throttle(
+  /* over hi wmark, squash the prealloc completely */
+  if (dq->q_res_bcount >= dq->q_prealloc_hi_wmark) {
+   *qblocks = 0;
++  *qfreesp = 0;
+   return;
+  }
+ 
+@@ -422,6 +424,9 @@ xfs_quota_calc_throttle(
+    shift += 2;
+  }
+ 
++ if (freesp < *qfreesp)
++  *qfreesp = freesp;
++
+  /* only overwrite the throttle values if we are more aggressive */
+  if ((freesp >> shift) < (*qblocks >> *qshift)) {
+   *qblocks = freesp;
+@@ -480,15 +485,18 @@ xfs_iomap_prealloc_size(
+  }
+ 
+  /*
+-  * Check each quota to cap the prealloc size and provide a shift
+-  * value to throttle with.
++  * Check each quota to cap the prealloc size, provide a shift value to
++  * throttle with and adjust amount of available space.
+   */
+  if (xfs_quota_need_throttle(ip, XFS_DQ_USER, alloc_blocks))
+-  xfs_quota_calc_throttle(ip, XFS_DQ_USER, &qblocks, &qshift);
++  xfs_quota_calc_throttle(ip, XFS_DQ_USER, &qblocks, &qshift,
++     &freesp);
+  if (xfs_quota_need_throttle(ip, XFS_DQ_GROUP, alloc_blocks))
+-  xfs_quota_calc_throttle(ip, XFS_DQ_GROUP, &qblocks, &qshift);
++  xfs_quota_calc_throttle(ip, XFS_DQ_GROUP, &qblocks, &qshift,
++     &freesp);
+  if (xfs_quota_need_throttle(ip, XFS_DQ_PROJ, alloc_blocks))
+-  xfs_quota_calc_throttle(ip, XFS_DQ_PROJ, &qblocks, &qshift);
++  xfs_quota_calc_throttle(ip, XFS_DQ_PROJ, &qblocks, &qshift,
++     &freesp);
+ 
+  /*
+   * The final prealloc size is set to the minimum of free space available
+-- 
+1.7.1

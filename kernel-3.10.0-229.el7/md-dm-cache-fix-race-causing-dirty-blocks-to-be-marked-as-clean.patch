@@ -1,0 +1,111 @@
+From 5a9bfee9bc37105b3918e27dd75f1d6d7fb40da4 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Wed, 10 Sep 2014 18:38:45 -0400
+Subject: [md] dm-cache: fix race causing dirty blocks to be marked as clean
+
+Message-id: <1410374325-6729-1-git-send-email-snitzer@redhat.com>
+Patchwork-id: 93562
+O-Subject: [RHEL7.1 PATCH] dm cache: fix race causing dirty blocks to be marked as clean
+Bugzilla: 1140362
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1140362
+
+Upstream linux-dm.git commit 40aa978eccec61347cd47b97c598df49acde8be5
+Author: Anssi Hannula <anssi.hannula@iki.fi>
+Date:   Fri Sep 5 03:11:28 2014 +0300
+
+    dm cache: fix race causing dirty blocks to be marked as clean
+
+    When a writeback or a promotion of a block is completed, the cell of
+    that block is removed from the prison, the block is marked as clean, and
+    the clear_dirty() callback of the cache policy is called.
+
+    Unfortunately, performing those actions in this order allows an incoming
+    new write bio for that block to come in before clearing the dirty status
+    is completed and therefore possibly causing one of these two scenarios:
+
+    Scenario A:
+
+    Thread 1                      Thread 2
+    cell_defer()                  .
+    - cell removed from prison    .
+    - detained bios queued        .
+    .                             incoming write bio
+    .                             remapped to cache
+    .                             set_dirty() called,
+    .                               but block already dirty
+    .                               => it does nothing
+    clear_dirty()                 .
+    - block marked clean          .
+    - policy clear_dirty() called .
+
+    Result: Block is marked clean even though it is actually dirty. No
+    writeback will occur.
+
+    Scenario B:
+
+    Thread 1                      Thread 2
+    cell_defer()                  .
+    - cell removed from prison    .
+    - detained bios queued        .
+    clear_dirty()                 .
+    - block marked clean          .
+    .                             incoming write bio
+    .                             remapped to cache
+    .                             set_dirty() called
+    .                             - block marked dirty
+    .                             - policy set_dirty() called
+    - policy clear_dirty() called .
+
+    Result: Block is properly marked as dirty, but policy thinks it is clean
+    and therefore never asks us to writeback it.
+    This case is visible in "dmsetup status" dirty block count (which
+    normally decreases to 0 on a quiet device).
+
+    Fix these issues by calling clear_dirty() before calling cell_defer().
+    Incoming bios for that block will then be detained in the cell and
+    released only after clear_dirty() has completed, so the race will not
+    occur.
+
+    Found by inspecting the code after noticing spurious dirty counts
+    (scenario B).
+
+    Signed-off-by: Anssi Hannula <anssi.hannula@iki.fi>
+    Acked-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Cc: stable@vger.kernel.org
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-cache-target.c b/drivers/md/dm-cache-target.c
+index ff60ab6..41a2e40 100644
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@ -890,8 +890,8 @@ static void migration_success_pre_commit(struct dm_cache_migration *mg)
+  struct cache *cache = mg->cache;
+ 
+  if (mg->writeback) {
+-  cell_defer(cache, mg->old_ocell, false);
+   clear_dirty(cache, mg->old_oblock, mg->cblock);
++  cell_defer(cache, mg->old_ocell, false);
+   cleanup_migration(mg);
+   return;
+ 
+@@ -946,13 +946,13 @@ static void migration_success_post_commit(struct dm_cache_migration *mg)
+   }
+ 
+  } else {
++  clear_dirty(cache, mg->new_oblock, mg->cblock);
+   if (mg->requeue_holder)
+    cell_defer(cache, mg->new_ocell, true);
+   else {
+    bio_endio(mg->new_ocell->holder, 0);
+    cell_defer(cache, mg->new_ocell, false);
+   }
+-  clear_dirty(cache, mg->new_oblock, mg->cblock);
+   cleanup_migration(mg);
+  }
+ }
+-- 
+1.7.1

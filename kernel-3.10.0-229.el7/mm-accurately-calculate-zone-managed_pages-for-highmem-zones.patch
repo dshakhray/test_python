@@ -1,0 +1,253 @@
+From ff37757dc4ec27bcbbb88454b73233a4109b4aba Mon Sep 17 00:00:00 2001
+From: Motohiro Kosaki <mkosaki@redhat.com>
+Date: Tue, 2 Dec 2014 17:48:59 -0500
+Subject: [mm] accurately calculate zone->managed_pages for highmem zones
+
+Message-id: <1417542543-1642-2-git-send-email-mkosaki@redhat.com>
+Patchwork-id: 101078
+O-Subject: [RHEL7 PATCH 1/5] mm: accurately calculate zone->managed_pages for highmem zones
+Bugzilla: 1156396
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+
+From: KOSAKI Motohiro <mkosaki@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1156396
+Upstream-tree: linus
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=8243943
+Changes-from-upstream: none
+
+commit 7b4b2a0d6c8500350784beb83a6a55e60ea3bea3
+Author: Jiang Liu <liuj97@gmail.com>
+Date:   Wed Jul 3 15:03:11 2013 -0700
+
+    mm: accurately calculate zone->managed_pages for highmem zones
+
+    Commit "mm: introduce new field 'managed_pages' to struct zone" assumes
+    that all highmem pages will be freed into the buddy system by function
+    mem_init().  But that's not always true, some architectures may reserve
+    some highmem pages during boot.  For example PPC may allocate highmem
+    pages for giagant HugeTLB pages, and several architectures have code to
+    check PageReserved flag to exclude highmem pages allocated during boot
+    when freeing highmem pages into the buddy system.
+
+    So treat highmem pages in the same way as normal pages, that is to:
+    1) reset zone->managed_pages to zero in mem_init().
+    2) recalculate managed_pages when freeing pages into the buddy system.
+
+    Signed-off-by: Jiang Liu <jiang.liu@huawei.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: Joonsoo Kim <js1304@gmail.com>
+    Cc: Yinghai Lu <yinghai@kernel.org>
+    Cc: Mel Gorman <mel@csn.ul.ie>
+    Cc: Minchan Kim <minchan@kernel.org>
+    Cc: Kamezawa Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+    Cc: "Michael S. Tsirkin" <mst@redhat.com>
+    Cc: <sworddragon2@aol.com>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Metcalf <cmetcalf@tilera.com>
+    Cc: David Howells <dhowells@redhat.com>
+    Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jeremy Fitzhardinge <jeremy@goop.org>
+    Cc: Jianguo Wu <wujianguo@huawei.com>
+    Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Cc: Michel Lespinasse <walken@google.com>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Rusty Russell <rusty@rustcorp.com.au>
+    Cc: Tang Chen <tangchen@cn.fujitsu.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Wen Congyang <wency@cn.fujitsu.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+    Cc: Russell King <rmk@arm.linux.org.uk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: KOSAKI Motohiro <mkosaki@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/metag/mm/init.c b/arch/metag/mm/init.c
+index 438f81b..c4ccfac 100644
+--- a/arch/metag/mm/init.c
++++ b/arch/metag/mm/init.c
+@@ -381,6 +381,12 @@ void __init mem_init(void)
+ 
+ #ifdef CONFIG_HIGHMEM
+  unsigned long tmp;
++
++ /*
++  * Explicitly reset zone->managed_pages because highmem pages are
++  * freed before calling free_all_bootmem_node();
++  */
++ reset_all_zones_managed_pages();
+  for (tmp = highstart_pfn; tmp < highend_pfn; tmp++)
+   free_highmem_page(pfn_to_page(tmp));
+  num_physpages += totalhigh_pages;
+diff --git a/arch/x86/mm/highmem_32.c b/arch/x86/mm/highmem_32.c
+index 252b8f5..4500142 100644
+--- a/arch/x86/mm/highmem_32.c
++++ b/arch/x86/mm/highmem_32.c
+@@ -1,6 +1,7 @@
+ #include <linux/highmem.h>
+ #include <linux/module.h>
+ #include <linux/swap.h> /* for totalram_pages */
++#include <linux/bootmem.h>
+ 
+ void *kmap(struct page *page)
+ {
+@@ -121,6 +122,11 @@ void __init set_highmem_pages_init(void)
+  struct zone *zone;
+  int nid;
+ 
++ /*
++  * Explicitly reset zone->managed_pages because set_highmem_pages_init()
++  * is invoked before free_all_bootmem()
++  */
++ reset_all_zones_managed_pages();
+  for_each_zone(zone) {
+   unsigned long zone_start_pfn, zone_end_pfn;
+ 
+diff --git a/include/linux/bootmem.h b/include/linux/bootmem.h
+index 5f0b0e1..0e48c32 100644
+--- a/include/linux/bootmem.h
++++ b/include/linux/bootmem.h
+@@ -46,6 +46,7 @@ extern unsigned long init_bootmem(unsigned long addr, unsigned long memend);
+ 
+ extern unsigned long free_all_bootmem_node(pg_data_t *pgdat);
+ extern unsigned long free_all_bootmem(void);
++extern void reset_all_zones_managed_pages(void);
+ 
+ extern void free_bootmem_node(pg_data_t *pgdat,
+          unsigned long addr,
+diff --git a/mm/bootmem.c b/mm/bootmem.c
+index 2b0bcb0..eb79232 100644
+--- a/mm/bootmem.c
++++ b/mm/bootmem.c
+@@ -241,20 +241,26 @@ static unsigned long __init free_all_bootmem_core(bootmem_data_t *bdata)
+  return count;
+ }
+ 
+-static void reset_node_lowmem_managed_pages(pg_data_t *pgdat)
++static int reset_managed_pages_done __initdata;
++
++static inline void __init reset_node_managed_pages(pg_data_t *pgdat)
+ {
+  struct zone *z;
+ 
+- /*
+-  * In free_area_init_core(), highmem zone's managed_pages is set to
+-  * present_pages, and bootmem allocator doesn't allocate from highmem
+-  * zones. So there's no need to recalculate managed_pages because all
+-  * highmem pages will be managed by the buddy system. Here highmem
+-  * zone also includes highmem movable zone.
+-  */
++ if (reset_managed_pages_done)
++  return;
++
+  for (z = pgdat->node_zones; z < pgdat->node_zones + MAX_NR_ZONES; z++)
+-  if (!is_highmem(z))
+-   z->managed_pages = 0;
++  z->managed_pages = 0;
++}
++
++void __init reset_all_zones_managed_pages(void)
++{
++ struct pglist_data *pgdat;
++
++ for_each_online_pgdat(pgdat)
++  reset_node_managed_pages(pgdat);
++ reset_managed_pages_done = 1;
+ }
+ 
+ /**
+@@ -266,7 +272,7 @@ static void reset_node_lowmem_managed_pages(pg_data_t *pgdat)
+ unsigned long __init free_all_bootmem_node(pg_data_t *pgdat)
+ {
+  register_page_bootmem_info_node(pgdat);
+- reset_node_lowmem_managed_pages(pgdat);
++ reset_node_managed_pages(pgdat);
+  return free_all_bootmem_core(pgdat->bdata);
+ }
+ 
+@@ -279,10 +285,8 @@ unsigned long __init free_all_bootmem(void)
+ {
+  unsigned long total_pages = 0;
+  bootmem_data_t *bdata;
+- struct pglist_data *pgdat;
+ 
+- for_each_online_pgdat(pgdat)
+-  reset_node_lowmem_managed_pages(pgdat);
++ reset_all_zones_managed_pages();
+ 
+  list_for_each_entry(bdata, &bdata_list, list)
+   total_pages += free_all_bootmem_core(bdata);
+diff --git a/mm/nobootmem.c b/mm/nobootmem.c
+index bdd3fa2..0ae8d91 100644
+--- a/mm/nobootmem.c
++++ b/mm/nobootmem.c
+@@ -137,20 +137,25 @@ static unsigned long __init free_low_memory_core_early(void)
+  return count;
+ }
+ 
+-static void reset_node_lowmem_managed_pages(pg_data_t *pgdat)
++static int reset_managed_pages_done __initdata;
++
++static inline void __init reset_node_managed_pages(pg_data_t *pgdat)
+ {
+  struct zone *z;
+ 
+- /*
+-  * In free_area_init_core(), highmem zone's managed_pages is set to
+-  * present_pages, and bootmem allocator doesn't allocate from highmem
+-  * zones. So there's no need to recalculate managed_pages because all
+-  * highmem pages will be managed by the buddy system. Here highmem
+-  * zone also includes highmem movable zone.
+-  */
++ if (reset_managed_pages_done)
++  return;
+  for (z = pgdat->node_zones; z < pgdat->node_zones + MAX_NR_ZONES; z++)
+-  if (!is_highmem(z))
+-   z->managed_pages = 0;
++  z->managed_pages = 0;
++}
++
++void __init reset_all_zones_managed_pages(void)
++{
++ struct pglist_data *pgdat;
++
++ for_each_online_pgdat(pgdat)
++  reset_node_managed_pages(pgdat);
++ reset_managed_pages_done = 1;
+ }
+ 
+ /**
+@@ -160,10 +165,7 @@ static void reset_node_lowmem_managed_pages(pg_data_t *pgdat)
+  */
+ unsigned long __init free_all_bootmem(void)
+ {
+- struct pglist_data *pgdat;
+-
+- for_each_online_pgdat(pgdat)
+-  reset_node_lowmem_managed_pages(pgdat);
++ reset_all_zones_managed_pages();
+ 
+  /*
+   * We need to use MAX_NUMNODES instead of NODE_DATA(0)->node_id
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 5e2d1e6..6adf43d 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -5298,6 +5298,7 @@ void free_highmem_page(struct page *page)
+ {
+  __free_reserved_page(page);
+  totalram_pages++;
++ page_zone(page)->managed_pages++;
+  totalhigh_pages++;
+ }
+ #endif
+-- 
+1.7.1

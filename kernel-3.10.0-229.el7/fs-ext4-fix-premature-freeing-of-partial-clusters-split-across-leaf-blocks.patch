@@ -1,0 +1,74 @@
+From 0287eeb1668882d370aa906f5cba0df85e7fd9d1 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 23 Oct 2014 09:54:54 -0400
+Subject: [fs] ext4: fix premature freeing of partial clusters split across leaf blocks
+
+Message-id: <1414058125-4183-141-git-send-email-lczerner@redhat.com>
+Patchwork-id: 98167
+O-Subject: [RHEL 7.1 PATCH v2 140/171] ext4: fix premature freeing of partial clusters split across leaf blocks
+Bugzilla: 1150139
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Eric Whitney <enwlinux@gmail.com>
+
+BZ 1150139
+https://bugzilla.redhat.com/show_bug.cgi?id=1150139
+
+BREW 8142710
+https://brewweb.devel.redhat.com/taskinfo?taskID=8142710
+
+Upstream commit ad6599ab3ac98a4474544086e048ce86ec15a4d1
+
+ Xfstests generic/311 and shared/298 fail when run on a bigalloc file
+ system.  Kernel error messages produced during the tests report that
+ blocks to be freed are already on the to-be-freed list.  When e2fsck
+ is run at the end of the tests, it typically reports bad i_blocks and
+ bad free blocks counts.
+
+ The bug that causes these failures is located in ext4_ext_rm_leaf().
+ Code at the end of the function frees a partial cluster if it's not
+ shared with an extent remaining in the leaf.  However, if all the
+ extents in the leaf have been removed, the code dereferences an
+ invalid extent pointer (off the front of the leaf) when the check for
+ sharing is made.  This generally has the effect of unconditionally
+ freeing the partial cluster, which leads to the observed failures
+ when the partial cluster is shared with the last extent in the next
+ leaf.
+
+ Fix this by attempting to free the cluster only if extents remain in
+ the leaf.  Any remaining partial cluster will be freed if possible
+ when the next leaf is processed or when leaf removal is complete.
+
+ Signed-off-by: Eric Whitney <enwlinux@gmail.com>
+ Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+ Cc: stable@vger.kernel.org
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 7727ade..87d3d89 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -2743,10 +2743,15 @@ ext4_ext_rm_leaf(handle_t *handle, struct inode *inode,
+   err = ext4_ext_correct_indexes(handle, inode, path);
+ 
+  /*
+-  * Free the partial cluster only if the current extent does not
+-  * reference it. Otherwise we might free used cluster.
++  * If there's a partial cluster and at least one extent remains in
++  * the leaf, free the partial cluster if it isn't shared with the
++  * current extent.  If there's a partial cluster and no extents
++  * remain in the leaf, it can't be freed here.  It can only be
++  * freed when it's possible to determine if it's not shared with
++  * any other extent - when the next leaf is processed or when space
++  * removal is complete.
+   */
+- if (*partial_cluster > 0 &&
++ if (*partial_cluster > 0 && eh->eh_entries &&
+      (EXT4_B2C(sbi, ext4_ext_pblock(ex) + ex_ee_len - 1) !=
+       *partial_cluster)) {
+   int flags = get_default_free_blocks_flags(inode);
+-- 
+1.7.1

@@ -1,0 +1,106 @@
+From 6f3e3746c8aacbf6a7e7339511dbd35c4e4524be Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:19:08 -0400
+Subject: [fs] svcrdma: Select NFSv4.1 backchannel transport based on forward channel
+
+Message-id: <1410898849-22126-65-git-send-email-bfields@redhat.com>
+Patchwork-id: 95756
+O-Subject: [Patch RHEL7 064/165] svcrdma: Select NFSv4.1 backchannel transport based on forward channel
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Chuck Lever <chuck.lever@oracle.com>
+
+The current code always selects XPRT_TRANSPORT_BC_TCP for the back
+channel, even when the forward channel was not TCP (eg, RDMA). When
+a 4.1 mount is attempted with RDMA, the server panics in the TCP BC
+code when trying to send CB_NULL.
+
+Instead, construct the transport protocol number from the forward
+channel transport or'd with XPRT_TRANSPORT_BC. Transports that do
+not support bi-directional RPC will not have registered a "BC"
+transport, causing create_backchannel_client() to fail immediately.
+
+Fixes: https://bugzilla.linux-nfs.org/show_bug.cgi?id=265
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 3c45ddf823d679a820adddd53b52c6699c9a05ac
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4callback.c b/fs/nfsd/nfs4callback.c
+index a88a93e..564d723 100644
+--- a/fs/nfsd/nfs4callback.c
++++ b/fs/nfsd/nfs4callback.c
+@@ -689,7 +689,8 @@ static int setup_callback_client(struct nfs4_client *clp, struct nfs4_cb_conn *c
+   clp->cl_cb_session = ses;
+   args.bc_xprt = conn->cb_xprt;
+   args.prognumber = clp->cl_cb_session->se_cb_prog;
+-  args.protocol = XPRT_TRANSPORT_BC_TCP;
++  args.protocol = conn->cb_xprt->xpt_class->xcl_ident |
++    XPRT_TRANSPORT_BC;
+   args.authflavor = ses->se_cb_sec.flavor;
+  }
+  /* Create RPC client */
+diff --git a/include/linux/sunrpc/svc_xprt.h b/include/linux/sunrpc/svc_xprt.h
+index 7235040..5d9d6f8 100644
+--- a/include/linux/sunrpc/svc_xprt.h
++++ b/include/linux/sunrpc/svc_xprt.h
+@@ -33,6 +33,7 @@ struct svc_xprt_class {
+  struct svc_xprt_ops *xcl_ops;
+  struct list_head xcl_list;
+  u32   xcl_max_payload;
++ int   xcl_ident;
+ };
+ 
+ /*
+diff --git a/net/sunrpc/svcsock.c b/net/sunrpc/svcsock.c
+index 92957de..2cfe7d4 100644
+--- a/net/sunrpc/svcsock.c
++++ b/net/sunrpc/svcsock.c
+@@ -692,6 +692,7 @@ static struct svc_xprt_class svc_udp_class = {
+  .xcl_owner = THIS_MODULE,
+  .xcl_ops = &svc_udp_ops,
+  .xcl_max_payload = RPCSVC_MAXPAYLOAD_UDP,
++ .xcl_ident = XPRT_TRANSPORT_UDP,
+ };
+ 
+ static void svc_udp_init(struct svc_sock *svsk, struct svc_serv *serv)
+@@ -1292,6 +1293,7 @@ static struct svc_xprt_class svc_tcp_class = {
+  .xcl_owner = THIS_MODULE,
+  .xcl_ops = &svc_tcp_ops,
+  .xcl_max_payload = RPCSVC_MAXPAYLOAD_TCP,
++ .xcl_ident = XPRT_TRANSPORT_TCP,
+ };
+ 
+ void svc_init_xprt_sock(void)
+diff --git a/net/sunrpc/xprt.c b/net/sunrpc/xprt.c
+index 5be25bb..dc83880 100644
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@ -1307,7 +1307,7 @@ struct rpc_xprt *xprt_create_transport(struct xprt_create *args)
+   }
+  }
+  spin_unlock(&xprt_list_lock);
+- printk(KERN_ERR "RPC: transport (%d) not supported\n", args->ident);
++ dprintk("RPC: transport (%d) not supported\n", args->ident);
+  return ERR_PTR(-EIO);
+ 
+ found:
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_transport.c b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+index 3cbe008..941b140 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_transport.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+@@ -91,6 +91,7 @@ struct svc_xprt_class svc_rdma_class = {
+  .xcl_owner = THIS_MODULE,
+  .xcl_ops = &svc_rdma_ops,
+  .xcl_max_payload = RPCSVC_MAXPAYLOAD_TCP,
++ .xcl_ident = XPRT_TRANSPORT_RDMA,
+ };
+ 
+ struct svc_rdma_op_ctxt *svc_rdma_get_context(struct svcxprt_rdma *xprt)
+-- 
+1.7.1

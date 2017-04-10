@@ -1,0 +1,81 @@
+From ead2ac5d4fbdbd85725cf51f478395521fb15785 Mon Sep 17 00:00:00 2001
+From: Marcelo Leitner <mleitner@redhat.com>
+Date: Tue, 21 Oct 2014 16:19:43 -0400
+Subject: [net] netfilter: nf_tables: uninitialize element key/data from the commit path
+
+Message-id: <20141021161943.22888.53705.stgit@localhost.localdomain>
+Patchwork-id: 97984
+O-Subject: [RHEL7 net PATCH 087/124] netfilter: nf_tables: uninitialize element key/data from the commit path
+Bugzilla: 1148041 1155088
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+
+Backport of upstream commit: a3716e70e1def691ad39e0f908fea0870ce010d9
+
+ commit a3716e70e1def691ad39e0f908fea0870ce010d9
+ Author: Pablo Neira Ayuso <pablo@netfilter.org>
+ Date:   Fri Aug 1 19:32:41 2014 +0200
+
+    netfilter: nf_tables: uninitialize element key/data from the commit path
+
+    This should happen once the element has been effectively released in
+    the commit path, not before. This fixes a possible chain refcount leak
+    if the transaction is aborted.
+
+    Reported-by: Thomas Graf <tgraf@suug.ch>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 1b0fdf9..d7d327d 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -3139,11 +3139,6 @@ static int nft_del_setelem(struct nft_ctx *ctx, struct nft_set *set,
+ 
+  nft_trans_elem(trans) = elem;
+  list_add_tail(&trans->list, &ctx->net->nft.commit_list);
+-
+- nft_data_uninit(&elem.key, NFT_DATA_VALUE);
+- if (set->flags & NFT_SET_MAP)
+-  nft_data_uninit(&elem.data, set->dtype);
+-
+  return 0;
+ err2:
+  nft_data_uninit(&elem.key, desc.type);
+@@ -3310,7 +3305,7 @@ static int nf_tables_commit(struct sk_buff *skb)
+ {
+  struct net *net = sock_net(skb->sk);
+  struct nft_trans *trans, *next;
+- struct nft_set *set;
++ struct nft_trans_elem *te;
+ 
+  /* Bump generation counter, invalidate any dump in progress */
+  while (++net->nft.base_seq == 0);
+@@ -3396,13 +3391,17 @@ static int nf_tables_commit(struct sk_buff *skb)
+    nft_trans_destroy(trans);
+    break;
+   case NFT_MSG_DELSETELEM:
+-   nf_tables_setelem_notify(&trans->ctx,
+-       nft_trans_elem_set(trans),
+-       &nft_trans_elem(trans),
++   te = (struct nft_trans_elem *)trans->data;
++   nf_tables_setelem_notify(&trans->ctx, te->set,
++       &te->elem,
+        NFT_MSG_DELSETELEM, 0);
+-   set = nft_trans_elem_set(trans);
+-   set->ops->get(set, &nft_trans_elem(trans));
+-   set->ops->remove(set, &nft_trans_elem(trans));
++   te->set->ops->get(te->set, &te->elem);
++   te->set->ops->remove(te->set, &te->elem);
++   nft_data_uninit(&te->elem.key, NFT_DATA_VALUE);
++   if (te->elem.flags & NFT_SET_MAP) {
++    nft_data_uninit(&te->elem.data,
++      te->set->dtype);
++   }
+    nft_trans_destroy(trans);
+    break;
+   }
+-- 
+1.7.1

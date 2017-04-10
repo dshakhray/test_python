@@ -1,0 +1,89 @@
+From d153ca9591a0266fe825f7de1164ac9f8a1d671a Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:10:03 -0400
+Subject: [usb] quiet peer failure warning, disable poweroff
+
+Message-id: <1410887463-20674-532-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95532
+O-Subject: [RHEL7 PATCH 531/591] usb: quiet peer failure warning, disable poweroff
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 6c79fe4afcb0450bd638f6e959e512aad270ff2f
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue Jun 17 16:16:27 2014 -0700
+
+    usb: quiet peer failure warning, disable poweroff
+
+    In the case where platform firmware has specified conflicting values for
+    port locations it is confusing and otherwise not helpful to throw a
+    backtrace.  Instead, include enough information to determine that
+    firmware has done something wrong and globally disable port poweroff.
+
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/core/port.c b/drivers/usb/core/port.c
+index 62036fa..9347ade 100644
+--- a/drivers/usb/core/port.c
++++ b/drivers/usb/core/port.c
+@@ -21,6 +21,8 @@
+ 
+ #include "hub.h"
+ 
++static int usb_port_block_power_off;
++
+ static const struct attribute_group *port_dev_group[];
+ 
+ static ssize_t connect_type_show(struct device *dev,
+@@ -142,6 +144,9 @@ static int usb_port_runtime_suspend(struct device *dev)
+    == PM_QOS_FLAGS_ALL)
+   return -EAGAIN;
+ 
++ if (usb_port_block_power_off)
++  return -EBUSY;
++
+  usb_autopm_get_interface(intf);
+  retval = usb_hub_set_port_power(hdev, hub, port1, false);
+  usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_CONNECTION);
+@@ -190,11 +195,19 @@ static int link_peers(struct usb_port *left, struct usb_port *right)
+  if (left->peer || right->peer) {
+   struct usb_port *lpeer = left->peer;
+   struct usb_port *rpeer = right->peer;
+-
+-  WARN(1, "failed to peer %s and %s (%s -> %p) (%s -> %p)\n",
+-   dev_name(&left->dev), dev_name(&right->dev),
+-   dev_name(&left->dev), lpeer,
+-   dev_name(&right->dev), rpeer);
++  char *method;
++
++  if (left->location && left->location == right->location)
++   method = "location";
++  else
++   method = "default";
++
++  pr_warn("usb: failed to peer %s and %s by %s (%s:%s) (%s:%s)\n",
++   dev_name(&left->dev), dev_name(&right->dev), method,
++   dev_name(&left->dev),
++   lpeer ? dev_name(&lpeer->dev) : "none",
++   dev_name(&right->dev),
++   rpeer ? dev_name(&rpeer->dev) : "none");
+   return -EBUSY;
+  }
+ 
+@@ -251,6 +264,7 @@ static void link_peers_report(struct usb_port *left, struct usb_port *right)
+   dev_warn(&left->dev, "failed to peer to %s (%d)\n",
+     dev_name(&right->dev), rc);
+   pr_warn_once("usb: port power management may be unreliable\n");
++  usb_port_block_power_off = 1;
+  }
+ }
+ 
+-- 
+1.7.1

@@ -1,0 +1,127 @@
+From 41180d9dba22d976120f71777fed2b49bacf4fb9 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:23:40 -0400
+Subject: [net] crush: generalize descend_once
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-114-git-send-email-sweil@redhat.com>
+Patchwork-id: 89834
+O-Subject: [PATCH 113/303] crush: generalize descend_once
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+The legacy behavior is to make the normal number of tries for the
+recursive chooseleaf call.  The descend_once tunable changed this to
+making a single try and bail if we get a reject (note that it is
+impossible to collide in the recursive case).
+
+The new set_chooseleaf_tries lets you select the number of recursive
+chooseleaf attempts for indep mode, or default to 1.  Use the same
+behavior for firstn, except default to total_tries when the legacy
+tunables are set (for compatibility).  This makes the rule step
+override the (new) default of 1 recursive attempt, keeping behavior
+consistent with indep mode.
+
+Reflects ceph.git commit 685c6950ef3df325ef04ce7c986e36ca2514c5f1.
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit d390bb2a83086f2b79c152e2c1734813bd257d9b)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ceph/crush/mapper.c b/net/ceph/crush/mapper.c
+index e9256a3..0613dd2 100644
+--- a/net/ceph/crush/mapper.c
++++ b/net/ceph/crush/mapper.c
+@@ -291,7 +291,6 @@ static int is_out(const struct crush_map *map,
+  * @out: pointer to output vector
+  * @outpos: our position in that vector
+  * @recurse_to_leaf: true if we want one device under each item of given type
+- * @descend_once: true if we should only try one descent before giving up
+  * @out2: second output vector for leaf items (if @recurse_to_leaf)
+  */
+ static int crush_choose_firstn(const struct crush_map *map,
+@@ -302,7 +301,7 @@ static int crush_choose_firstn(const struct crush_map *map,
+           unsigned int attempts,
+           unsigned int recurse_attempts,
+           int recurse_to_leaf,
+-          int descend_once, int *out2)
++          int *out2)
+ {
+  int rep;
+  unsigned int ftotal, flocal;
+@@ -389,7 +388,6 @@ static int crush_choose_firstn(const struct crush_map *map,
+         out2, outpos,
+         recurse_attempts, 0,
+         0,
+-        map->chooseleaf_descend_once,
+         NULL) <= outpos)
+        /* didn't get leaf */
+        reject = 1;
+@@ -414,10 +412,7 @@ reject:
+      ftotal++;
+      flocal++;
+ 
+-     if (reject && descend_once)
+-      /* let outer call try again */
+-      skip_rep = 1;
+-     else if (collide && flocal <= map->choose_local_tries)
++     if (collide && flocal <= map->choose_local_tries)
+       /* retry locally a few times */
+       retry_bucket = 1;
+      else if (map->choose_local_fallback_tries > 0 &&
+@@ -639,7 +634,6 @@ int crush_do_rule(const struct crush_map *map,
+  int numrep;
+  int choose_tries = map->choose_total_tries;
+  int choose_leaf_tries = 0;
+- const int descend_once = 0;
+ 
+  if ((__u32)ruleno >= map->max_rules) {
+   dprintk(" bad ruleno %d\n", ruleno);
+@@ -703,6 +697,14 @@ int crush_do_rule(const struct crush_map *map,
+     }
+     j = 0;
+     if (firstn) {
++     int recurse_tries;
++     if (choose_leaf_tries)
++      recurse_tries =
++       choose_leaf_tries;
++     else if (map->chooseleaf_descend_once)
++      recurse_tries = 1;
++     else
++      recurse_tries = choose_tries;
+      osize += crush_choose_firstn(
+       map,
+       map->buckets[-1-w[i]],
+@@ -711,9 +713,9 @@ int crush_do_rule(const struct crush_map *map,
+       curstep->arg2,
+       o+osize, j,
+       choose_tries,
+-      choose_leaf_tries ? choose_leaf_tries : choose_tries,
++      recurse_tries,
+       recurse_to_leaf,
+-      descend_once, c+osize);
++      c+osize);
+     } else {
+      crush_choose_indep(
+       map,
+@@ -723,7 +725,8 @@ int crush_do_rule(const struct crush_map *map,
+       curstep->arg2,
+       o+osize, j,
+       choose_tries,
+-      choose_leaf_tries ? choose_leaf_tries : 1,
++      choose_leaf_tries ?
++         choose_leaf_tries : 1,
+       recurse_to_leaf,
+       c+osize,
+       0);
+-- 
+1.7.1

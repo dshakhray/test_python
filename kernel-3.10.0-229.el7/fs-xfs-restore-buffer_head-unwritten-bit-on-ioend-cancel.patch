@@ -1,0 +1,81 @@
+From 8b84a95362d07e8c5504da730c7a41874996a87f Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Wed, 12 Nov 2014 21:07:48 -0500
+Subject: [fs] xfs: restore buffer_head unwritten bit on ioend cancel
+
+Message-id: <1415826468-53155-1-git-send-email-bfoster@redhat.com>
+Patchwork-id: 99878
+O-Subject: [RHEL7 PATCH] xfs: restore buffer_head unwritten bit on ioend cancel
+Bugzilla: 1162953
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+RH-Acked-by: Carlos Maiolino <cmaiolino@redhat.com>
+
+commit 07d08681d26e99d8ba3bc4e56380f2cc04d3ff3b
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Thu Oct 2 09:42:06 2014 +1000
+
+    xfs: restore buffer_head unwritten bit on ioend cancel
+
+    xfs_vm_writepage() walks each buffer_head on the page, maps to the block
+    on disk and attaches to a running ioend structure that represents the
+    I/O submission. A new ioend is created when the type of I/O (unwritten,
+    delayed allocation or overwrite) required for a particular buffer_head
+    differs from the previous. If a buffer_head is a delalloc or unwritten
+    buffer, the associated bits are cleared by xfs_map_at_offset() once the
+    buffer_head is added to the ioend.
+
+    The process of mapping each buffer_head occurs in xfs_map_blocks() and
+    acquires the ilock in blocking or non-blocking mode, depending on the
+    type of writeback in progress. If the lock cannot be acquired for
+    non-blocking writeback, we cancel the ioend, redirty the page and
+    return. Writeback will revisit the page at some later point.
+
+    Note that we acquire the ilock for each buffer on the page. Therefore
+    during non-blocking writeback, it is possible to add an unwritten buffer
+    to the ioend, clear the unwritten state, fail to acquire the ilock when
+    mapping a subsequent buffer and cancel the ioend. If this occurs, the
+    unwritten status of the buffer sitting in the ioend has been lost. The
+    page will eventually hit writeback again, but xfs_vm_writepage() submits
+    overwrite I/O instead of unwritten I/O and does not perform unwritten
+    extent conversion at I/O completion. This leads to data corruption
+    because unwritten extents are treated as holes on reads and zeroes are
+    returned instead of reading from disk.
+
+    Modify xfs_cancel_ioend() to restore the buffer unwritten bit for ioends
+    of type XFS_IO_UNWRITTEN. This ensures that unwritten extent conversion
+    occurs once the page is eventually written back.
+
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+---
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1162953
+Upstream Status: Merged
+Build Info: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=8233939
+Tested: via xfstests reproducer.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 69d462e..a509bce 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -559,6 +559,13 @@ xfs_cancel_ioend(
+   do {
+    next_bh = bh->b_private;
+    clear_buffer_async_write(bh);
++   /*
++    * The unwritten flag is cleared when added to the
++    * ioend. We're not submitting for I/O so mark the
++    * buffer unwritten again for next time around.
++    */
++   if (ioend->io_type == XFS_IO_UNWRITTEN)
++    set_buffer_unwritten(bh);
+    unlock_buffer(bh);
+   } while ((bh = next_bh) != NULL);
+ 
+-- 
+1.7.1

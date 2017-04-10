@@ -1,0 +1,125 @@
+From c45b0d995f617c275700d977d9342f34bdf0142d Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Thu, 27 Nov 2014 11:46:44 -0500
+Subject: [fs] ovl: fix remove/copy-up race
+
+Message-id: <20141127114644.9170.7119.stgit@warthog.procyon.org.uk>
+Patchwork-id: 100985
+O-Subject: [RHEL7 PATCH 2/7] ovl: fix remove/copy-up race
+Bugzilla: 985875
+RH-Acked-by: Alexander Viro <aviro@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+From: Miklos Szeredi <mszeredi@suse.cz>
+
+ovl_remove_and_whiteout() needs to check if upper dentry exists or not
+after having locked upper parent directory.
+
+Previously we used a "type" value computed before locking the upper parent
+directory, which is susceptible to racing with copy-up.
+
+There's a similar check in ovl_check_empty_and_clear().  This one is not
+actually racy, since copy-up doesn't change the "emptyness" property of a
+directory.  Add a comment to this effect, and check the existence of upper
+dentry locally to make the code cleaner.
+
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+Original-commit: a105d685a8483985a01776411de191a726b48132
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/overlayfs/dir.c b/fs/overlayfs/dir.c
+index 011aa76..4c38037 100644
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@ -284,8 +284,7 @@ out:
+  return ERR_PTR(err);
+ }
+ 
+-static struct dentry *ovl_check_empty_and_clear(struct dentry *dentry,
+-      enum ovl_path_type type)
++static struct dentry *ovl_check_empty_and_clear(struct dentry *dentry)
+ {
+  int err;
+  struct dentry *ret = NULL;
+@@ -294,8 +293,17 @@ static struct dentry *ovl_check_empty_and_clear(struct dentry *dentry,
+  err = ovl_check_empty_dir(dentry, &list);
+  if (err)
+   ret = ERR_PTR(err);
+- else if (type == OVL_PATH_MERGE)
+-  ret = ovl_clear_empty(dentry, &list);
++ else {
++  /*
++   * If no upperdentry then skip clearing whiteouts.
++   *
++   * Can race with copy-up, since we don't hold the upperdir
++   * mutex.  Doesn't matter, since copy-up can't create a
++   * non-empty directory from an empty one.
++   */
++  if (ovl_dentry_upper(dentry))
++   ret = ovl_clear_empty(dentry, &list);
++ }
+ 
+  ovl_cache_free(&list);
+ 
+@@ -487,8 +495,7 @@ out:
+  return err;
+ }
+ 
+-static int ovl_remove_and_whiteout(struct dentry *dentry,
+-       enum ovl_path_type type, bool is_dir)
++static int ovl_remove_and_whiteout(struct dentry *dentry, bool is_dir)
+ {
+  struct dentry *workdir = ovl_workdir(dentry);
+  struct inode *wdir = workdir->d_inode;
+@@ -500,7 +507,7 @@ static int ovl_remove_and_whiteout(struct dentry *dentry,
+  int err;
+ 
+  if (is_dir) {
+-  opaquedir = ovl_check_empty_and_clear(dentry, type);
++  opaquedir = ovl_check_empty_and_clear(dentry);
+   err = PTR_ERR(opaquedir);
+   if (IS_ERR(opaquedir))
+    goto out;
+@@ -515,9 +522,10 @@ static int ovl_remove_and_whiteout(struct dentry *dentry,
+  if (IS_ERR(whiteout))
+   goto out_unlock;
+ 
+- if (type == OVL_PATH_LOWER) {
++ upper = ovl_dentry_upper(dentry);
++ if (!upper) {
+   upper = lookup_one_len(dentry->d_name.name, upperdir,
+-        dentry->d_name.len);
++           dentry->d_name.len);
+   err = PTR_ERR(upper);
+   if (IS_ERR(upper))
+    goto kill_whiteout;
+@@ -529,7 +537,6 @@ static int ovl_remove_and_whiteout(struct dentry *dentry,
+  } else {
+   int flags = 0;
+ 
+-  upper = ovl_dentry_upper(dentry);
+   if (opaquedir)
+    upper = opaquedir;
+   err = -ESTALE;
+@@ -648,7 +655,7 @@ static int ovl_do_remove(struct dentry *dentry, bool is_dir)
+   cap_raise(override_cred->cap_effective, CAP_CHOWN);
+   old_cred = override_creds(override_cred);
+ 
+-  err = ovl_remove_and_whiteout(dentry, type, is_dir);
++  err = ovl_remove_and_whiteout(dentry, is_dir);
+ 
+   revert_creds(old_cred);
+   put_cred(override_cred);
+@@ -781,7 +788,7 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
+  }
+ 
+  if (overwrite && (new_type == OVL_PATH_LOWER || new_type == OVL_PATH_MERGE) && new_is_dir) {
+-  opaquedir = ovl_check_empty_and_clear(new, new_type);
++  opaquedir = ovl_check_empty_and_clear(new);
+   err = PTR_ERR(opaquedir);
+   if (IS_ERR(opaquedir)) {
+    opaquedir = NULL;
+-- 
+1.7.1

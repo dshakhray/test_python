@@ -1,0 +1,863 @@
+From 1124334da72df572ff975e2a823db67c3d9c7331 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Thu, 6 Nov 2014 21:43:04 -0500
+Subject: [mfd] rtsx: Read vendor setting from config space
+
+Message-id: <1415310189-75445-3-git-send-email-dzickus@redhat.com>
+Patchwork-id: 99776
+O-Subject: [RHEL7 PATCH 2/7] mfd: rtsx: Read vendor setting from config space
+Bugzilla: 1106204
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1106204
+
+commit 773ccdfd9cc6f9bf8ec75a59fa742d7a663a5903
+Author: Wei WANG <wei_wang@realsil.com.cn>
+Date:   Tue Aug 20 14:18:51 2013 +0800
+
+    mfd: rtsx: Read vendor setting from config space
+
+    Normally OEMs will set vendor setting to the config space of Realtek
+    card reader in BIOS stage. This patch reads the setting at the first,
+    and configure the internal registers according to it, to improve card
+    reader's compatibility condition.
+
+    Signed-off-by: Wei WANG <wei_wang@realsil.com.cn>
+    Signed-off-by: Samuel Ortiz <sameo@linux.intel.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/mfd/rtl8411.c b/drivers/mfd/rtl8411.c
+index c436bf2..5a68c9b 100644
+--- a/drivers/mfd/rtl8411.c
++++ b/drivers/mfd/rtl8411.c
+@@ -47,19 +47,70 @@ static int rtl8411b_is_qfn48(struct rtsx_pcr *pcr)
+   return 0;
+ }
+ 
++static void rtl8411_fetch_vendor_settings(struct rtsx_pcr *pcr)
++{
++ u32 reg1;
++ u8 reg3;
++
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG1, &reg1);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG1, reg1);
++
++ if (!rtsx_vendor_setting_valid(reg1))
++  return;
++
++ pcr->aspm_en = rtsx_reg_to_aspm(reg1);
++ pcr->sd30_drive_sel_1v8 =
++  map_sd_drive(rtsx_reg_to_sd30_drive_sel_1v8(reg1));
++ pcr->card_drive_sel &= 0x3F;
++ pcr->card_drive_sel |= rtsx_reg_to_card_drive_sel(reg1);
++
++ rtsx_pci_read_config_byte(pcr, PCR_SETTING_REG3, &reg3);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG3, reg3);
++ pcr->sd30_drive_sel_3v3 = rtl8411_reg_to_sd30_drive_sel_3v3(reg3);
++}
++
++static void rtl8411b_fetch_vendor_settings(struct rtsx_pcr *pcr)
++{
++ u32 reg;
++
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG1, &reg);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG1, reg);
++
++ if (!rtsx_vendor_setting_valid(reg))
++  return;
++
++ pcr->aspm_en = rtsx_reg_to_aspm(reg);
++ pcr->sd30_drive_sel_1v8 =
++  map_sd_drive(rtsx_reg_to_sd30_drive_sel_1v8(reg));
++ pcr->sd30_drive_sel_3v3 =
++  map_sd_drive(rtl8411b_reg_to_sd30_drive_sel_3v3(reg));
++}
++
+ static int rtl8411_extra_init_hw(struct rtsx_pcr *pcr)
+ {
+- return rtsx_pci_write_register(pcr, CD_PAD_CTL,
++ rtsx_pci_init_cmd(pcr);
++
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DRIVE_SEL,
++   0xFF, pcr->sd30_drive_sel_3v3);
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CD_PAD_CTL,
+    CD_DISABLE_MASK | CD_AUTO_DISABLE, CD_ENABLE);
++
++ return rtsx_pci_send_cmd(pcr, 100);
+ }
+ 
+ static int rtl8411b_extra_init_hw(struct rtsx_pcr *pcr)
+ {
+- if (rtl8411b_is_qfn48(pcr))
+-  rtsx_pci_write_register(pcr, CARD_PULL_CTL3, 0xFF, 0xF5);
++ rtsx_pci_init_cmd(pcr);
+ 
+- return rtsx_pci_write_register(pcr, CD_PAD_CTL,
++ if (rtl8411b_is_qfn48(pcr))
++  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
++    CARD_PULL_CTL3, 0xFF, 0xF5);
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DRIVE_SEL,
++   0xFF, pcr->sd30_drive_sel_3v3);
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CD_PAD_CTL,
+    CD_DISABLE_MASK | CD_AUTO_DISABLE, CD_ENABLE);
++
++ return rtsx_pci_send_cmd(pcr, 100);
+ }
+ 
+ static int rtl8411_turn_on_led(struct rtsx_pcr *pcr)
+@@ -141,13 +192,13 @@ static int rtl8411_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+  mask = (BPP_REG_TUNED18 << BPP_TUNED18_SHIFT_8411) | BPP_PAD_MASK;
+  if (voltage == OUTPUT_3V3) {
+   err = rtsx_pci_write_register(pcr,
+-    SD30_DRIVE_SEL, 0x07, DRIVER_TYPE_D);
++    SD30_DRIVE_SEL, 0x07, pcr->sd30_drive_sel_3v3);
+   if (err < 0)
+    return err;
+   val = (BPP_ASIC_3V3 << BPP_TUNED18_SHIFT_8411) | BPP_PAD_3V3;
+  } else if (voltage == OUTPUT_1V8) {
+   err = rtsx_pci_write_register(pcr,
+-    SD30_DRIVE_SEL, 0x07, DRIVER_TYPE_B);
++    SD30_DRIVE_SEL, 0x07, pcr->sd30_drive_sel_1v8);
+   if (err < 0)
+    return err;
+   val = (BPP_ASIC_1V8 << BPP_TUNED18_SHIFT_8411) | BPP_PAD_1V8;
+@@ -222,6 +273,7 @@ static int rtl8411_conv_clk_and_div_n(int input, int dir)
+ }
+ 
+ static const struct pcr_ops rtl8411_pcr_ops = {
++ .fetch_vendor_settings = rtl8411_fetch_vendor_settings,
+  .extra_init_hw = rtl8411_extra_init_hw,
+  .optimize_phy = NULL,
+  .turn_on_led = rtl8411_turn_on_led,
+@@ -236,6 +288,7 @@ static const struct pcr_ops rtl8411_pcr_ops = {
+ };
+ 
+ static const struct pcr_ops rtl8411b_pcr_ops = {
++ .fetch_vendor_settings = rtl8411b_fetch_vendor_settings,
+  .extra_init_hw = rtl8411b_extra_init_hw,
+  .optimize_phy = NULL,
+  .turn_on_led = rtl8411_turn_on_led,
+@@ -385,6 +438,12 @@ void rtl8411_init_params(struct rtsx_pcr *pcr)
+  pcr->num_slots = 2;
+  pcr->ops = &rtl8411_pcr_ops;
+ 
++ pcr->flags = 0;
++ pcr->card_drive_sel = RTL8411_CARD_DRIVE_DEFAULT;
++ pcr->sd30_drive_sel_1v8 = DRIVER_TYPE_B;
++ pcr->sd30_drive_sel_3v3 = DRIVER_TYPE_D;
++ pcr->aspm_en = ASPM_L1_EN;
++
+  pcr->ic_version = rtl8411_get_ic_version(pcr);
+  pcr->sd_pull_ctl_enable_tbl = rtl8411_sd_pull_ctl_enable_tbl;
+  pcr->sd_pull_ctl_disable_tbl = rtl8411_sd_pull_ctl_disable_tbl;
+@@ -398,6 +457,12 @@ void rtl8411b_init_params(struct rtsx_pcr *pcr)
+  pcr->num_slots = 2;
+  pcr->ops = &rtl8411b_pcr_ops;
+ 
++ pcr->flags = 0;
++ pcr->card_drive_sel = RTL8411_CARD_DRIVE_DEFAULT;
++ pcr->sd30_drive_sel_1v8 = DRIVER_TYPE_B;
++ pcr->sd30_drive_sel_3v3 = DRIVER_TYPE_D;
++ pcr->aspm_en = ASPM_L1_EN;
++
+  pcr->ic_version = rtl8411_get_ic_version(pcr);
+ 
+  if (rtl8411b_is_qfn48(pcr)) {
+diff --git a/drivers/mfd/rts5209.c b/drivers/mfd/rts5209.c
+index ec78d9f..2170449 100644
+--- a/drivers/mfd/rts5209.c
++++ b/drivers/mfd/rts5209.c
+@@ -34,18 +34,28 @@ static u8 rts5209_get_ic_version(struct rtsx_pcr *pcr)
+  return val & 0x0F;
+ }
+ 
+-static void rts5209_init_vendor_cfg(struct rtsx_pcr *pcr)
++static void rts5209_fetch_vendor_settings(struct rtsx_pcr *pcr)
+ {
+- u32 val;
++ u32 reg;
+ 
+- rtsx_pci_read_config_dword(pcr, 0x724, &val);
+- dev_dbg(&(pcr->pci->dev), "Cfg 0x724: 0x%x\n", val);
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG1, &reg);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG1, reg);
+ 
+- if (!(val & 0x80)) {
+-  if (val & 0x08)
+-   pcr->ms_pmos = false;
+-  else
+-   pcr->ms_pmos = true;
++ if (rts5209_vendor_setting1_valid(reg)) {
++  if (rts5209_reg_check_ms_pmos(reg))
++   pcr->flags |= PCR_MS_PMOS;
++  pcr->aspm_en = rts5209_reg_to_aspm(reg);
++ }
++
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG2, &reg);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG2, reg);
++
++ if (rts5209_vendor_setting2_valid(reg)) {
++  pcr->sd30_drive_sel_1v8 =
++   rts5209_reg_to_sd30_drive_sel_1v8(reg);
++  pcr->sd30_drive_sel_3v3 =
++   rts5209_reg_to_sd30_drive_sel_3v3(reg);
++  pcr->card_drive_sel = rts5209_reg_to_card_drive_sel(reg);
+  }
+ }
+ 
+@@ -57,6 +67,9 @@ static int rts5209_extra_init_hw(struct rtsx_pcr *pcr)
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_GPIO, 0xFF, 0x03);
+  /* Configure GPIO as output */
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_GPIO_DIR, 0xFF, 0x03);
++ /* Configure driving */
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DRIVE_SEL,
++   0xFF, pcr->sd30_drive_sel_3v3);
+ 
+  return rtsx_pci_send_cmd(pcr, 100);
+ }
+@@ -95,7 +108,7 @@ static int rts5209_card_power_on(struct rtsx_pcr *pcr, int card)
+  partial_pwr_on = SD_PARTIAL_POWER_ON;
+  pwr_on = SD_POWER_ON;
+ 
+- if (pcr->ms_pmos && (card == RTSX_MS_CARD)) {
++ if ((pcr->flags & PCR_MS_PMOS) && (card == RTSX_MS_CARD)) {
+   pwr_mask = MS_POWER_MASK;
+   partial_pwr_on = MS_PARTIAL_POWER_ON;
+   pwr_on = MS_POWER_ON;
+@@ -131,7 +144,7 @@ static int rts5209_card_power_off(struct rtsx_pcr *pcr, int card)
+  pwr_mask = SD_POWER_MASK;
+  pwr_off = SD_POWER_OFF;
+ 
+- if (pcr->ms_pmos && (card == RTSX_MS_CARD)) {
++ if ((pcr->flags & PCR_MS_PMOS) && (card == RTSX_MS_CARD)) {
+   pwr_mask = MS_POWER_MASK;
+   pwr_off = MS_POWER_OFF;
+  }
+@@ -140,7 +153,7 @@ static int rts5209_card_power_off(struct rtsx_pcr *pcr, int card)
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_PWR_CTL,
+    pwr_mask | PMOS_STRG_MASK, pwr_off | PMOS_STRG_400mA);
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, PWR_GATE_CTRL,
+-   LDO3318_PWR_MASK, 0X06);
++   LDO3318_PWR_MASK, 0x06);
+  return rtsx_pci_send_cmd(pcr, 100);
+ }
+ 
+@@ -150,7 +163,7 @@ static int rts5209_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+ 
+  if (voltage == OUTPUT_3V3) {
+   err = rtsx_pci_write_register(pcr,
+-    SD30_DRIVE_SEL, 0x07, DRIVER_TYPE_D);
++    SD30_DRIVE_SEL, 0x07, pcr->sd30_drive_sel_3v3);
+   if (err < 0)
+    return err;
+   err = rtsx_pci_write_phy_register(pcr, 0x08, 0x4FC0 | 0x24);
+@@ -158,7 +171,7 @@ static int rts5209_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+    return err;
+  } else if (voltage == OUTPUT_1V8) {
+   err = rtsx_pci_write_register(pcr,
+-    SD30_DRIVE_SEL, 0x07, DRIVER_TYPE_B);
++    SD30_DRIVE_SEL, 0x07, pcr->sd30_drive_sel_1v8);
+   if (err < 0)
+    return err;
+   err = rtsx_pci_write_phy_register(pcr, 0x08, 0x4C40 | 0x24);
+@@ -172,6 +185,7 @@ static int rts5209_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+ }
+ 
+ static const struct pcr_ops rts5209_pcr_ops = {
++ .fetch_vendor_settings = rts5209_fetch_vendor_settings,
+  .extra_init_hw = rts5209_extra_init_hw,
+  .optimize_phy = rts5209_optimize_phy,
+  .turn_on_led = rts5209_turn_on_led,
+@@ -242,7 +256,11 @@ void rts5209_init_params(struct rtsx_pcr *pcr)
+  pcr->num_slots = 2;
+  pcr->ops = &rts5209_pcr_ops;
+ 
+- rts5209_init_vendor_cfg(pcr);
++ pcr->flags = 0;
++ pcr->card_drive_sel = RTS5209_CARD_DRIVE_DEFAULT;
++ pcr->sd30_drive_sel_1v8 = DRIVER_TYPE_B;
++ pcr->sd30_drive_sel_3v3 = DRIVER_TYPE_D;
++ pcr->aspm_en = ASPM_L1_EN;
+ 
+  pcr->ic_version = rts5209_get_ic_version(pcr);
+  pcr->sd_pull_ctl_enable_tbl = rts5209_sd_pull_ctl_enable_tbl;
+diff --git a/drivers/mfd/rts5227.c b/drivers/mfd/rts5227.c
+index 164b7fa..e649dda 100644
+--- a/drivers/mfd/rts5227.c
++++ b/drivers/mfd/rts5227.c
+@@ -29,6 +29,60 @@
+ 
+ #include "rtsx_pcr.h"
+ 
++static void rts5227_fill_driving(struct rtsx_pcr *pcr, u8 voltage)
++{
++ u8 driving_3v3[4][3] = {
++  {0x13, 0x13, 0x13},
++  {0x96, 0x96, 0x96},
++  {0x7F, 0x7F, 0x7F},
++  {0x96, 0x96, 0x96},
++ };
++ u8 driving_1v8[4][3] = {
++  {0x99, 0x99, 0x99},
++  {0xAA, 0xAA, 0xAA},
++  {0xFE, 0xFE, 0xFE},
++  {0xB3, 0xB3, 0xB3},
++ };
++ u8 (*driving)[3], drive_sel;
++
++ if (voltage == OUTPUT_3V3) {
++  driving = driving_3v3;
++  drive_sel = pcr->sd30_drive_sel_3v3;
++ } else {
++  driving = driving_1v8;
++  drive_sel = pcr->sd30_drive_sel_1v8;
++ }
++
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CLK_DRIVE_SEL,
++   0xFF, driving[drive_sel][0]);
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CMD_DRIVE_SEL,
++   0xFF, driving[drive_sel][1]);
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DAT_DRIVE_SEL,
++   0xFF, driving[drive_sel][2]);
++}
++
++static void rts5227_fetch_vendor_settings(struct rtsx_pcr *pcr)
++{
++ u32 reg;
++
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG1, &reg);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG1, reg);
++
++ if (!rtsx_vendor_setting_valid(reg))
++  return;
++
++ pcr->aspm_en = rtsx_reg_to_aspm(reg);
++ pcr->sd30_drive_sel_1v8 = rtsx_reg_to_sd30_drive_sel_1v8(reg);
++ pcr->card_drive_sel &= 0x3F;
++ pcr->card_drive_sel |= rtsx_reg_to_card_drive_sel(reg);
++
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG2, &reg);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG2, reg);
++ pcr->sd30_drive_sel_3v3 = rtsx_reg_to_sd30_drive_sel_3v3(reg);
++ if (rtsx_reg_check_reverse_socket(reg))
++  pcr->flags |= PCR_REVERSE_SOCKET;
++}
++
+ static int rts5227_extra_init_hw(struct rtsx_pcr *pcr)
+ {
+  u16 cap;
+@@ -48,17 +102,15 @@ static int rts5227_extra_init_hw(struct rtsx_pcr *pcr)
+   rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, LTR_CTL, 0xFF, 0xA3);
+  /* Configure OBFF */
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, OBFF_CFG, 0x03, 0x03);
+- /* Configure force_clock_req
+-  * Maybe We should define 0xFF03 as some name
+-  */
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, 0xFF03, 0x08, 0x08);
+- /* Correct driving */
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+-   SD30_CLK_DRIVE_SEL, 0xFF, 0x96);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+-   SD30_CMD_DRIVE_SEL, 0xFF, 0x96);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+-   SD30_DAT_DRIVE_SEL, 0xFF, 0x96);
++ /* Configure driving */
++ rts5227_fill_driving(pcr, OUTPUT_3V3);
++ /* Configure force_clock_req */
++ if (pcr->flags & PCR_REVERSE_SOCKET)
++  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
++    AUTOLOAD_CFG_BASE + 3, 0xB8, 0xB8);
++ else
++  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
++    AUTOLOAD_CFG_BASE + 3, 0xB8, 0x88);
+ 
+  return rtsx_pci_send_cmd(pcr, 100);
+ }
+@@ -131,13 +183,11 @@ static int rts5227_card_power_off(struct rtsx_pcr *pcr, int card)
+ static int rts5227_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+ {
+  int err;
+- u8 drive_sel;
+ 
+  if (voltage == OUTPUT_3V3) {
+   err = rtsx_pci_write_phy_register(pcr, 0x08, 0x4FC0 | 0x24);
+   if (err < 0)
+    return err;
+-  drive_sel = 0x96;
+  } else if (voltage == OUTPUT_1V8) {
+   err = rtsx_pci_write_phy_register(pcr, 0x11, 0x3C02);
+   if (err < 0)
+@@ -145,23 +195,18 @@ static int rts5227_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+   err = rtsx_pci_write_phy_register(pcr, 0x08, 0x4C80 | 0x24);
+   if (err < 0)
+    return err;
+-  drive_sel = 0xB3;
+  } else {
+   return -EINVAL;
+  }
+ 
+  /* set pad drive */
+  rtsx_pci_init_cmd(pcr);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CLK_DRIVE_SEL,
+-   0xFF, drive_sel);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CMD_DRIVE_SEL,
+-   0xFF, drive_sel);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DAT_DRIVE_SEL,
+-   0xFF, drive_sel);
++ rts5227_fill_driving(pcr, voltage);
+  return rtsx_pci_send_cmd(pcr, 100);
+ }
+ 
+ static const struct pcr_ops rts5227_pcr_ops = {
++ .fetch_vendor_settings = rts5227_fetch_vendor_settings,
+  .extra_init_hw = rts5227_extra_init_hw,
+  .optimize_phy = rts5227_optimize_phy,
+  .turn_on_led = rts5227_turn_on_led,
+@@ -227,6 +272,12 @@ void rts5227_init_params(struct rtsx_pcr *pcr)
+  pcr->num_slots = 2;
+  pcr->ops = &rts5227_pcr_ops;
+ 
++ pcr->flags = 0;
++ pcr->card_drive_sel = RTSX_CARD_DRIVE_DEFAULT;
++ pcr->sd30_drive_sel_1v8 = CFG_DRIVER_TYPE_B;
++ pcr->sd30_drive_sel_3v3 = CFG_DRIVER_TYPE_B;
++ pcr->aspm_en = ASPM_L1_EN;
++
+  pcr->sd_pull_ctl_enable_tbl = rts5227_sd_pull_ctl_enable_tbl;
+  pcr->sd_pull_ctl_disable_tbl = rts5227_sd_pull_ctl_disable_tbl;
+  pcr->ms_pull_ctl_enable_tbl = rts5227_ms_pull_ctl_enable_tbl;
+diff --git a/drivers/mfd/rts5229.c b/drivers/mfd/rts5229.c
+index 58af4db..7a1ad6d 100644
+--- a/drivers/mfd/rts5229.c
++++ b/drivers/mfd/rts5229.c
+@@ -34,6 +34,28 @@ static u8 rts5229_get_ic_version(struct rtsx_pcr *pcr)
+  return val & 0x0F;
+ }
+ 
++static void rts5229_fetch_vendor_settings(struct rtsx_pcr *pcr)
++{
++ u32 reg;
++
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG1, &reg);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG1, reg);
++
++ if (!rtsx_vendor_setting_valid(reg))
++  return;
++
++ pcr->aspm_en = rtsx_reg_to_aspm(reg);
++ pcr->sd30_drive_sel_1v8 =
++  map_sd_drive(rtsx_reg_to_sd30_drive_sel_1v8(reg));
++ pcr->card_drive_sel &= 0x3F;
++ pcr->card_drive_sel |= rtsx_reg_to_card_drive_sel(reg);
++
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG2, &reg);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG2, reg);
++ pcr->sd30_drive_sel_3v3 =
++  map_sd_drive(rtsx_reg_to_sd30_drive_sel_3v3(reg));
++}
++
+ static int rts5229_extra_init_hw(struct rtsx_pcr *pcr)
+ {
+  rtsx_pci_init_cmd(pcr);
+@@ -45,6 +67,9 @@ static int rts5229_extra_init_hw(struct rtsx_pcr *pcr)
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, LDO_PWR_SEL, 0x03, 0x01);
+  /* LED shine disabled, set initial shine cycle period */
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, OLT_LED_CTL, 0x0F, 0x02);
++ /* Configure driving */
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DRIVE_SEL,
++   0xFF, pcr->sd30_drive_sel_3v3);
+ 
+  return rtsx_pci_send_cmd(pcr, 100);
+ }
+@@ -110,7 +135,7 @@ static int rts5229_card_power_off(struct rtsx_pcr *pcr, int card)
+    SD_POWER_MASK | PMOS_STRG_MASK,
+    SD_POWER_OFF | PMOS_STRG_400mA);
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, PWR_GATE_CTRL,
+-   LDO3318_PWR_MASK, 0X00);
++   LDO3318_PWR_MASK, 0x00);
+  return rtsx_pci_send_cmd(pcr, 100);
+ }
+ 
+@@ -120,7 +145,7 @@ static int rts5229_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+ 
+  if (voltage == OUTPUT_3V3) {
+   err = rtsx_pci_write_register(pcr,
+-    SD30_DRIVE_SEL, 0x07, DRIVER_TYPE_D);
++    SD30_DRIVE_SEL, 0x07, pcr->sd30_drive_sel_3v3);
+   if (err < 0)
+    return err;
+   err = rtsx_pci_write_phy_register(pcr, 0x08, 0x4FC0 | 0x24);
+@@ -128,7 +153,7 @@ static int rts5229_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+    return err;
+  } else if (voltage == OUTPUT_1V8) {
+   err = rtsx_pci_write_register(pcr,
+-    SD30_DRIVE_SEL, 0x07, DRIVER_TYPE_B);
++    SD30_DRIVE_SEL, 0x07, pcr->sd30_drive_sel_1v8);
+   if (err < 0)
+    return err;
+   err = rtsx_pci_write_phy_register(pcr, 0x08, 0x4C40 | 0x24);
+@@ -142,6 +167,7 @@ static int rts5229_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+ }
+ 
+ static const struct pcr_ops rts5229_pcr_ops = {
++ .fetch_vendor_settings = rts5229_fetch_vendor_settings,
+  .extra_init_hw = rts5229_extra_init_hw,
+  .optimize_phy = rts5229_optimize_phy,
+  .turn_on_led = rts5229_turn_on_led,
+@@ -221,6 +247,12 @@ void rts5229_init_params(struct rtsx_pcr *pcr)
+  pcr->num_slots = 2;
+  pcr->ops = &rts5229_pcr_ops;
+ 
++ pcr->flags = 0;
++ pcr->card_drive_sel = RTSX_CARD_DRIVE_DEFAULT;
++ pcr->sd30_drive_sel_1v8 = DRIVER_TYPE_B;
++ pcr->sd30_drive_sel_3v3 = DRIVER_TYPE_D;
++ pcr->aspm_en = ASPM_L1_EN;
++
+  pcr->ic_version = rts5229_get_ic_version(pcr);
+  if (pcr->ic_version == IC_VER_C) {
+   pcr->sd_pull_ctl_enable_tbl = rts5229_sd_pull_ctl_enable_tbl2;
+diff --git a/drivers/mfd/rts5249.c b/drivers/mfd/rts5249.c
+index 15dc848..d5db182 100644
+--- a/drivers/mfd/rts5249.c
++++ b/drivers/mfd/rts5249.c
+@@ -34,6 +34,60 @@ static u8 rts5249_get_ic_version(struct rtsx_pcr *pcr)
+  return val & 0x0F;
+ }
+ 
++static void rts5249_fill_driving(struct rtsx_pcr *pcr, u8 voltage)
++{
++ u8 driving_3v3[4][3] = {
++  {0x11, 0x11, 0x11},
++  {0x55, 0x55, 0x5C},
++  {0x99, 0x99, 0x92},
++  {0x99, 0x99, 0x92},
++ };
++ u8 driving_1v8[4][3] = {
++  {0x3C, 0x3C, 0x3C},
++  {0xB3, 0xB3, 0xB3},
++  {0xFE, 0xFE, 0xFE},
++  {0xC4, 0xC4, 0xC4},
++ };
++ u8 (*driving)[3], drive_sel;
++
++ if (voltage == OUTPUT_3V3) {
++  driving = driving_3v3;
++  drive_sel = pcr->sd30_drive_sel_3v3;
++ } else {
++  driving = driving_1v8;
++  drive_sel = pcr->sd30_drive_sel_1v8;
++ }
++
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CLK_DRIVE_SEL,
++   0xFF, driving[drive_sel][0]);
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CMD_DRIVE_SEL,
++   0xFF, driving[drive_sel][1]);
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DAT_DRIVE_SEL,
++   0xFF, driving[drive_sel][2]);
++}
++
++static void rts5249_fetch_vendor_settings(struct rtsx_pcr *pcr)
++{
++ u32 reg;
++
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG1, &reg);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG1, reg);
++
++ if (!rtsx_vendor_setting_valid(reg))
++  return;
++
++ pcr->aspm_en = rtsx_reg_to_aspm(reg);
++ pcr->sd30_drive_sel_1v8 = rtsx_reg_to_sd30_drive_sel_1v8(reg);
++ pcr->card_drive_sel &= 0x3F;
++ pcr->card_drive_sel |= rtsx_reg_to_card_drive_sel(reg);
++
++ rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG2, &reg);
++ dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG2, reg);
++ pcr->sd30_drive_sel_3v3 = rtsx_reg_to_sd30_drive_sel_3v3(reg);
++ if (rtsx_reg_check_reverse_socket(reg))
++  pcr->flags |= PCR_REVERSE_SOCKET;
++}
++
+ static int rts5249_extra_init_hw(struct rtsx_pcr *pcr)
+ {
+  rtsx_pci_init_cmd(pcr);
+@@ -45,13 +99,14 @@ static int rts5249_extra_init_hw(struct rtsx_pcr *pcr)
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, LDO_PWR_SEL, 0x03, 0x01);
+  /* LED shine disabled, set initial shine cycle period */
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, OLT_LED_CTL, 0x0F, 0x02);
+- /* Correct driving */
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+-   SD30_CLK_DRIVE_SEL, 0xFF, 0x99);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+-   SD30_CMD_DRIVE_SEL, 0xFF, 0x99);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+-   SD30_DAT_DRIVE_SEL, 0xFF, 0x92);
++ /* Configure driving */
++ rts5249_fill_driving(pcr, OUTPUT_3V3);
++ if (pcr->flags & PCR_REVERSE_SOCKET)
++  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
++    AUTOLOAD_CFG_BASE + 3, 0xB0, 0xB0);
++ else
++  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
++    AUTOLOAD_CFG_BASE + 3, 0xB0, 0x80);
+ 
+  return rtsx_pci_send_cmd(pcr, 100);
+ }
+@@ -129,15 +184,11 @@ static int rts5249_card_power_off(struct rtsx_pcr *pcr, int card)
+ static int rts5249_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+ {
+  int err;
+- u8 clk_drive, cmd_drive, dat_drive;
+ 
+  if (voltage == OUTPUT_3V3) {
+   err = rtsx_pci_write_phy_register(pcr, PHY_TUNE, 0x4FC0 | 0x24);
+   if (err < 0)
+    return err;
+-  clk_drive = 0x99;
+-  cmd_drive = 0x99;
+-  dat_drive = 0x92;
+  } else if (voltage == OUTPUT_1V8) {
+   err = rtsx_pci_write_phy_register(pcr, PHY_BACR, 0x3C02);
+   if (err < 0)
+@@ -145,25 +196,18 @@ static int rts5249_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
+   err = rtsx_pci_write_phy_register(pcr, PHY_TUNE, 0x4C40 | 0x24);
+   if (err < 0)
+    return err;
+-  clk_drive = 0xb3;
+-  cmd_drive = 0xb3;
+-  dat_drive = 0xb3;
+  } else {
+   return -EINVAL;
+  }
+ 
+  /* set pad drive */
+  rtsx_pci_init_cmd(pcr);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CLK_DRIVE_SEL,
+-   0xFF, clk_drive);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CMD_DRIVE_SEL,
+-   0xFF, cmd_drive);
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DAT_DRIVE_SEL,
+-   0xFF, dat_drive);
++ rts5249_fill_driving(pcr, voltage);
+  return rtsx_pci_send_cmd(pcr, 100);
+ }
+ 
+ static const struct pcr_ops rts5249_pcr_ops = {
++ .fetch_vendor_settings = rts5249_fetch_vendor_settings,
+  .extra_init_hw = rts5249_extra_init_hw,
+  .optimize_phy = rts5249_optimize_phy,
+  .turn_on_led = rts5249_turn_on_led,
+@@ -233,6 +277,12 @@ void rts5249_init_params(struct rtsx_pcr *pcr)
+  pcr->num_slots = 2;
+  pcr->ops = &rts5249_pcr_ops;
+ 
++ pcr->flags = 0;
++ pcr->card_drive_sel = RTSX_CARD_DRIVE_DEFAULT;
++ pcr->sd30_drive_sel_1v8 = CFG_DRIVER_TYPE_C;
++ pcr->sd30_drive_sel_3v3 = CFG_DRIVER_TYPE_B;
++ pcr->aspm_en = ASPM_L1_EN;
++
+  pcr->ic_version = rts5249_get_ic_version(pcr);
+  pcr->sd_pull_ctl_enable_tbl = rts5249_sd_pull_ctl_enable_tbl;
+  pcr->sd_pull_ctl_disable_tbl = rts5249_sd_pull_ctl_disable_tbl;
+diff --git a/drivers/mfd/rtsx_pcr.c b/drivers/mfd/rtsx_pcr.c
+index dd186c4..e06d6b0 100644
+--- a/drivers/mfd/rtsx_pcr.c
++++ b/drivers/mfd/rtsx_pcr.c
+@@ -73,6 +73,9 @@ void rtsx_pci_start_run(struct rtsx_pcr *pcr)
+   pcr->state = PDEV_STAT_RUN;
+   if (pcr->ops->enable_auto_blink)
+    pcr->ops->enable_auto_blink(pcr);
++
++  if (pcr->aspm_en)
++   rtsx_pci_write_config_byte(pcr, LCTLR, 0);
+  }
+ 
+  mod_delayed_work(system_wq, &pcr->idle_work, msecs_to_jiffies(200));
+@@ -717,7 +720,7 @@ int rtsx_pci_card_exclusive_check(struct rtsx_pcr *pcr, int card)
+   [RTSX_MS_CARD] = MS_EXIST
+  };
+ 
+- if (!pcr->ms_pmos) {
++ if (!(pcr->flags & PCR_MS_PMOS)) {
+   /* When using single PMOS, accessing card is not permitted
+    * if the existing card is not the designated one.
+    */
+@@ -918,6 +921,9 @@ static void rtsx_pci_idle_work(struct work_struct *work)
+  if (pcr->ops->turn_off_led)
+   pcr->ops->turn_off_led(pcr);
+ 
++ if (pcr->aspm_en)
++  rtsx_pci_write_config_byte(pcr, LCTLR, pcr->aspm_en);
++
+  mutex_unlock(&pcr->pcr_mutex);
+ }
+ 
+@@ -956,8 +962,8 @@ static int rtsx_pci_init_hw(struct rtsx_pcr *pcr)
+  /* Reset delink mode */
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CHANGE_LINK_STATE, 0x0A, 0);
+  /* Card driving select */
+- rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DRIVE_SEL,
+-   0x07, DRIVER_TYPE_D);
++ rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_DRIVE_SEL,
++   0xFF, pcr->card_drive_sel);
+  /* Enable SSC Clock */
+  rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SSC_CTL1,
+    0xFF, SSC_8X_EN | SSC_SEL_4M);
+@@ -989,6 +995,8 @@ static int rtsx_pci_init_hw(struct rtsx_pcr *pcr)
+  if (err < 0)
+   return err;
+ 
++ rtsx_pci_write_config_byte(pcr, LCTLR, 0);
++
+  /* Enable clk_request_n to enable clock power management */
+  rtsx_pci_write_config_byte(pcr, 0x81, 1);
+  /* Enter L1 when host tx idle */
+@@ -1053,6 +1061,18 @@ static int rtsx_pci_init_chip(struct rtsx_pcr *pcr)
+  if (!pcr->slots)
+   return -ENOMEM;
+ 
++ if (pcr->ops->fetch_vendor_settings)
++  pcr->ops->fetch_vendor_settings(pcr);
++
++ dev_dbg(&(pcr->pci->dev), "pcr->aspm_en = 0x%x\n", pcr->aspm_en);
++ dev_dbg(&(pcr->pci->dev), "pcr->sd30_drive_sel_1v8 = 0x%x\n",
++   pcr->sd30_drive_sel_1v8);
++ dev_dbg(&(pcr->pci->dev), "pcr->sd30_drive_sel_3v3 = 0x%x\n",
++   pcr->sd30_drive_sel_3v3);
++ dev_dbg(&(pcr->pci->dev), "pcr->card_drive_sel = 0x%x\n",
++   pcr->card_drive_sel);
++ dev_dbg(&(pcr->pci->dev), "pcr->flags = 0x%x\n", pcr->flags);
++
+  pcr->state = PDEV_STAT_IDLE;
+  err = rtsx_pci_init_hw(pcr);
+  if (err < 0) {
+diff --git a/drivers/mfd/rtsx_pcr.h b/drivers/mfd/rtsx_pcr.h
+index c0cac7e..7a1b87a 100644
+--- a/drivers/mfd/rtsx_pcr.h
++++ b/drivers/mfd/rtsx_pcr.h
+@@ -35,4 +35,33 @@ void rts5227_init_params(struct rtsx_pcr *pcr);
+ void rts5249_init_params(struct rtsx_pcr *pcr);
+ void rtl8411b_init_params(struct rtsx_pcr *pcr);
+ 
++static inline u8 map_sd_drive(int idx)
++{
++ u8 sd_drive[4] = {
++  0x01, /* Type D */
++  0x02, /* Type C */
++  0x05, /* Type A */
++  0x03 /* Type B */
++ };
++
++ return sd_drive[idx];
++}
++
++#define rtsx_vendor_setting_valid(reg)  (!((reg) & 0x1000000))
++#define rts5209_vendor_setting1_valid(reg) (!((reg) & 0x80))
++#define rts5209_vendor_setting2_valid(reg) ((reg) & 0x80)
++
++#define rtsx_reg_to_aspm(reg)   (((reg) >> 28) & 0x03)
++#define rtsx_reg_to_sd30_drive_sel_1v8(reg) (((reg) >> 26) & 0x03)
++#define rtsx_reg_to_sd30_drive_sel_3v3(reg) (((reg) >> 5) & 0x03)
++#define rtsx_reg_to_card_drive_sel(reg)  ((((reg) >> 25) & 0x01) << 6)
++#define rtsx_reg_check_reverse_socket(reg) ((reg) & 0x4000)
++#define rts5209_reg_to_aspm(reg)  (((reg) >> 5) & 0x03)
++#define rts5209_reg_check_ms_pmos(reg)  (!((reg) & 0x08))
++#define rts5209_reg_to_sd30_drive_sel_1v8(reg) (((reg) >> 3) & 0x07)
++#define rts5209_reg_to_sd30_drive_sel_3v3(reg) ((reg) & 0x07)
++#define rts5209_reg_to_card_drive_sel(reg) ((reg) >> 8)
++#define rtl8411_reg_to_sd30_drive_sel_3v3(reg) (((reg) >> 5) & 0x07)
++#define rtl8411b_reg_to_sd30_drive_sel_3v3(reg) ((reg) & 0x03)
++
+ #endif
+diff --git a/include/linux/mfd/rtsx_pci.h b/include/linux/mfd/rtsx_pci.h
+index 7a9f708..9cba737 100644
+--- a/include/linux/mfd/rtsx_pci.h
++++ b/include/linux/mfd/rtsx_pci.h
+@@ -184,11 +184,26 @@
+ #define CARD_SHARE_BAROSSA_SD  0x01
+ #define CARD_SHARE_BAROSSA_MS  0x02
+ 
++/* CARD_DRIVE_SEL */
++#define MS_DRIVE_8mA   (0x01 << 6)
++#define MMC_DRIVE_8mA   (0x01 << 4)
++#define XD_DRIVE_8mA   (0x01 << 2)
++#define GPIO_DRIVE_8mA   0x01
++#define RTS5209_CARD_DRIVE_DEFAULT (MS_DRIVE_8mA | MMC_DRIVE_8mA |\
++      XD_DRIVE_8mA | GPIO_DRIVE_8mA)
++#define RTL8411_CARD_DRIVE_DEFAULT (MS_DRIVE_8mA | MMC_DRIVE_8mA |\
++      XD_DRIVE_8mA)
++#define RTSX_CARD_DRIVE_DEFAULT  (MS_DRIVE_8mA | GPIO_DRIVE_8mA)
++
+ /* SD30_DRIVE_SEL */
+ #define DRIVER_TYPE_A   0x05
+ #define DRIVER_TYPE_B   0x03
+ #define DRIVER_TYPE_C   0x02
+ #define DRIVER_TYPE_D   0x01
++#define CFG_DRIVER_TYPE_A  0x02
++#define CFG_DRIVER_TYPE_B  0x03
++#define CFG_DRIVER_TYPE_C  0x01
++#define CFG_DRIVER_TYPE_D  0x00
+ 
+ /* FPDCTL */
+ #define SSC_POWER_DOWN   0x01
+@@ -684,6 +699,8 @@
+ 
+ #define DUMMY_REG_RESET_0  0xFE90
+ 
++#define AUTOLOAD_CFG_BASE  0xFF00
++
+ /* Memory mapping */
+ #define SRAM_BASE   0xE600
+ #define RBUF_BASE   0xF400
+@@ -726,6 +743,11 @@
+ #define PHY_FLD4   0x1E
+ #define PHY_DUM_REG   0x1F
+ 
++#define LCTLR    0x80
++#define PCR_SETTING_REG1  0x724
++#define PCR_SETTING_REG2  0x814
++#define PCR_SETTING_REG3  0x747
++
+ #define rtsx_pci_init_cmd(pcr)  ((pcr)->ci = 0)
+ 
+ struct rtsx_pcr;
+@@ -747,6 +769,7 @@ struct pcr_ops {
+       u8 voltage);
+  unsigned int (*cd_deglitch)(struct rtsx_pcr *pcr);
+  int  (*conv_clk_and_div_n)(int clk, int dir);
++ void  (*fetch_vendor_settings)(struct rtsx_pcr *pcr);
+ };
+ 
+ enum PDEV_STAT  {PDEV_STAT_IDLE, PDEV_STAT_RUN};
+@@ -788,7 +811,6 @@ struct rtsx_pcr {
+  struct completion  *finish_me;
+ 
+  unsigned int   cur_clock;
+- bool    ms_pmos;
+  bool    remove_pci;
+  bool    msi_en;
+ 
+@@ -806,6 +828,16 @@ struct rtsx_pcr {
+ #define IC_VER_D   3
+  u8    ic_version;
+ 
++ u8    sd30_drive_sel_1v8;
++ u8    sd30_drive_sel_3v3;
++ u8    card_drive_sel;
++#define ASPM_L1_EN   0x02
++ u8    aspm_en;
++
++#define PCR_MS_PMOS   (1 << 0)
++#define PCR_REVERSE_SOCKET  (1 << 1)
++ u32    flags;
++
+  const u32   *sd_pull_ctl_enable_tbl;
+  const u32   *sd_pull_ctl_disable_tbl;
+  const u32   *ms_pull_ctl_enable_tbl;
+-- 
+1.7.1

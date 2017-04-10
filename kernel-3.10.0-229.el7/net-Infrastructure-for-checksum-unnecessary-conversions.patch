@@ -1,0 +1,105 @@
+From 5cebe826d5e0c2c32a17aa3bac7a6ad239dd06fc Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Tue, 2 Sep 2014 10:15:16 -0400
+Subject: [net] Infrastructure for checksum unnecessary conversions
+
+Message-id: <1409652920-431-54-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 90164
+O-Subject: [PATCH 53/57] [RHEL7.1 net] net: Infrastructure for checksum unnecessary conversions
+Bugzilla: 1131999
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+
+BZ: 1131999
+
+commit d96535a17dbbafd567961d14c08c0984ddda9c3c
+Author: Tom Herbert <therbert@google.com>
+Date:   Sun Aug 31 15:12:42 2014 -0700
+
+    net: Infrastructure for checksum unnecessary conversions
+
+    For normal path, added skb_checksum_try_convert which is called
+    to attempt to convert CHECKSUM_UNNECESSARY to CHECKSUM_COMPLETE. The
+    primary condition to allow this is that ip_summed is CHECKSUM_NONE
+    and csum_valid is true, which will be the state after consuming
+    a CHECKSUM_UNNECESSARY.
+
+    For GRO path, added skb_gro_checksum_try_convert which is the GRO
+    analogue of skb_checksum_try_convert. The primary condition to allow
+    this is that NAPI_GRO_CB(skb)->csum_cnt == 0 and
+    NAPI_GRO_CB(skb)->csum_valid is set. This implies that we have consumed
+    all available CHECKSUM_UNNECESSARY checksums in the GRO path.
+
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 0a5830f..e6135aa 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1963,6 +1963,26 @@ static inline void skb_gro_incr_csum_unnecessary(struct sk_buff *skb)
+ #define skb_gro_checksum_simple_validate(skb)    \
+  __skb_gro_checksum_validate(skb, 0, false, 0, null_compute_pseudo)
+ 
++static inline bool __skb_gro_checksum_convert_check(struct sk_buff *skb)
++{
++ return (NAPI_GRO_CB(skb)->csum_cnt == 0 &&
++  !NAPI_GRO_CB(skb)->csum_valid);
++}
++
++static inline void __skb_gro_checksum_convert(struct sk_buff *skb,
++           __sum16 check, __wsum pseudo)
++{
++ NAPI_GRO_CB(skb)->csum = ~pseudo;
++ NAPI_GRO_CB(skb)->csum_valid = 1;
++}
++
++#define skb_gro_checksum_try_convert(skb, proto, check, compute_pseudo) \
++do {         \
++ if (__skb_gro_checksum_convert_check(skb))   \
++  __skb_gro_checksum_convert(skb, check,   \
++        compute_pseudo(skb, proto)); \
++} while (0)
++
+ static inline int dev_hard_header(struct sk_buff *skb, struct net_device *dev,
+       unsigned short type,
+       const void *daddr, const void *saddr,
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index f5e2f89..676244d 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -2855,6 +2855,26 @@ static inline __wsum null_compute_pseudo(struct sk_buff *skb, int proto)
+ #define skb_checksum_simple_validate(skb)    \
+  __skb_checksum_validate(skb, 0, true, false, 0, null_compute_pseudo)
+ 
++static inline bool __skb_checksum_convert_check(struct sk_buff *skb)
++{
++ return (skb->ip_summed == CHECKSUM_NONE &&
++  skb->csum_valid && !skb->csum_bad);
++}
++
++static inline void __skb_checksum_convert(struct sk_buff *skb,
++       __sum16 check, __wsum pseudo)
++{
++ skb->csum = ~pseudo;
++ skb->ip_summed = CHECKSUM_COMPLETE;
++}
++
++#define skb_checksum_try_convert(skb, proto, check, compute_pseudo) \
++do {         \
++ if (__skb_checksum_convert_check(skb))    \
++  __skb_checksum_convert(skb, check,   \
++           compute_pseudo(skb, proto)); \
++} while (0)
++
+ #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+ extern void nf_conntrack_destroy(struct nf_conntrack *nfct);
+ static inline void nf_conntrack_put(struct nf_conntrack *nfct)
+-- 
+1.7.1

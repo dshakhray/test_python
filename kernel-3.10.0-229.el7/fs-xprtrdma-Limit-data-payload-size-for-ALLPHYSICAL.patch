@@ -1,0 +1,118 @@
+From a900244564adfa9770e6272366cfc02a67c1578c Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 18 Sep 2014 14:19:58 -0400
+Subject: [fs] xprtrdma: Limit data payload size for ALLPHYSICAL
+
+Message-id: <1411050057-12417-36-git-send-email-steved@redhat.com>
+Patchwork-id: 96272
+O-Subject: [RHEL7.1 PATCH 35/94] xprtrdma: Limit data payload size for ALLPHYSICAL
+Bugzilla: 1111708
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+
+From: Chuck Lever <chuck.lever@oracle.com>
+
+When the client uses physical memory registration, each page in the
+payload gets its own array entry in the RPC/RDMA header's chunk list.
+
+Therefore, don't advertise a maximum payload size that would require
+more array entries than can fit in the RPC buffer where RPC/RDMA
+headers are built.
+
+BugLink: https://bugzilla.linux-nfs.org/show_bug.cgi?id=248
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Tested-by: Steve Wise <swise@opengridcomputing.com>
+Tested-by: Shirley Ma <shirley.ma@oracle.com>
+Tested-by: Devesh Sharma <devesh.sharma@emulex.com>
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+Upstream Id: 43e95988178ed70a878a5be6be9ad248342dbf7d
+Bugzilla: 1111708
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index 66f91f0..4185102 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -296,7 +296,6 @@ xprt_setup_rdma(struct xprt_create *args)
+ 
+  xprt->resvport = 0;  /* privileged port not needed */
+  xprt->tsh_size = 0;  /* RPC-RDMA handles framing */
+- xprt->max_payload = RPCRDMA_MAX_DATA_SEGS * PAGE_SIZE;
+  xprt->ops = &xprt_rdma_procs;
+ 
+  /*
+@@ -382,6 +381,9 @@ xprt_setup_rdma(struct xprt_create *args)
+  new_ep->rep_xprt = xprt;
+ 
+  xprt_rdma_format_addresses(xprt);
++ xprt->max_payload = rpcrdma_max_payload(new_xprt);
++ dprintk("RPC:       %s: transport data payload maximum: %zu bytes\n",
++  __func__, xprt->max_payload);
+ 
+  if (!try_module_get(THIS_MODULE))
+   goto out4;
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index aa08de8..13ff874 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -1825,3 +1825,44 @@ rpcrdma_ep_post_recv(struct rpcrdma_ia *ia,
+    rc);
+  return rc;
+ }
++
++/* Physical mapping means one Read/Write list entry per-page.
++ * All list entries must fit within an inline buffer
++ *
++ * NB: The server must return a Write list for NFS READ,
++ *     which has the same constraint. Factor in the inline
++ *     rsize as well.
++ */
++static size_t
++rpcrdma_physical_max_payload(struct rpcrdma_xprt *r_xprt)
++{
++ struct rpcrdma_create_data_internal *cdata = &r_xprt->rx_data;
++ unsigned int inline_size, pages;
++
++ inline_size = min_t(unsigned int,
++       cdata->inline_wsize, cdata->inline_rsize);
++ inline_size -= RPCRDMA_HDRLEN_MIN;
++ pages = inline_size / sizeof(struct rpcrdma_segment);
++ return pages << PAGE_SHIFT;
++}
++
++static size_t
++rpcrdma_mr_max_payload(struct rpcrdma_xprt *r_xprt)
++{
++ return RPCRDMA_MAX_DATA_SEGS << PAGE_SHIFT;
++}
++
++size_t
++rpcrdma_max_payload(struct rpcrdma_xprt *r_xprt)
++{
++ size_t result;
++
++ switch (r_xprt->rx_ia.ri_memreg_strategy) {
++ case RPCRDMA_ALLPHYSICAL:
++  result = rpcrdma_physical_max_payload(r_xprt);
++  break;
++ default:
++  result = rpcrdma_mr_max_payload(r_xprt);
++ }
++ return result;
++}
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index 97ca516..f3d86b2 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -348,6 +348,7 @@ void rpcrdma_reply_handler(struct rpcrdma_rep *);
+  * RPC/RDMA protocol calls - xprtrdma/rpc_rdma.c
+  */
+ int rpcrdma_marshal_req(struct rpc_rqst *);
++size_t rpcrdma_max_payload(struct rpcrdma_xprt *);
+ 
+ /* Temporary NFS request map cache. Created in svc_rdma.c  */
+ extern struct kmem_cache *svc_rdma_map_cachep;
+-- 
+1.7.1

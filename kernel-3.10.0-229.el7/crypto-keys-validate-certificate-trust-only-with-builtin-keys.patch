@@ -1,0 +1,126 @@
+From f3f8d42dfe4db7bf4d432436d6827be314765554 Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Tue, 19 Aug 2014 22:02:57 -0400
+Subject: [crypto] keys: validate certificate trust only with builtin keys
+
+Message-id: <1408485785-777-26-git-send-email-vgoyal@redhat.com>
+Patchwork-id: 88373
+O-Subject: [RHEL7.1 PATCH 25/33] KEYS: validate certificate trust only with builtin keys
+Bugzilla: 1129779
+RH-Acked-by: David Howells <dhowells@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+BZ:1129779
+
+Had to manually resolve conflicts in file include/linux/key.h as we
+put one change in rhel7 before upstream.
+
+Did following change to match upstream.
+-#define KEY_FLAG_ROOT_CAN_INVAL 10
++#define KEY_FLAG_ROOT_CAN_INVAL 11
+
+commit 32c4741cb66703a3c282f41d77deff4afd93342a
+Author: Dmitry Kasatkin <d.kasatkin@samsung.com>
+Date: Tue, 17 Jun 2014 11:56:59 +0300
+
+Instead of allowing public keys, with certificates signed by any
+key on the system trusted keyring, to be added to a trusted keyring,
+this patch further restricts the certificates to those signed only by
+builtin keys on the system keyring.
+
+This patch defines a new option 'builtin' for the kernel parameter
+'keys_ownerid' to allow trust validation using builtin keys.
+
+Simplified Mimi's "KEYS: define an owner trusted keyring" patch
+
+Changelog v7:
+- rename builtin_keys to use_builtin_keys
+
+Signed-off-by: Dmitry Kasatkin <d.kasatkin@samsung.com>
+Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index ed9893d..7dbc936 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -461,7 +461,7 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+  ca_keys= [KEYS] This parameter identifies a specific key(s) on
+    the system trusted keyring to be used for certificate
+    trust validation.
+-   format: id:<keyid>
++   format: { id:<keyid> | builtin }
+ 
+  ccw_timeout_log [S390]
+    See Documentation/s390/CommonIO for details.
+diff --git a/crypto/asymmetric_keys/x509_public_key.c b/crypto/asymmetric_keys/x509_public_key.c
+index 2b40eba..831a49a 100644
+--- a/crypto/asymmetric_keys/x509_public_key.c
++++ b/crypto/asymmetric_keys/x509_public_key.c
+@@ -24,6 +24,7 @@
+ #include "public_key.h"
+ #include "x509_parser.h"
+ 
++static bool use_builtin_keys;
+ static char *ca_keyid;
+ 
+ #ifndef MODULE
+@@ -34,6 +35,8 @@ static int __init ca_keys_setup(char *str)
+ 
+  if (strncmp(str, "id:", 3) == 0)
+   ca_keyid = str; /* owner key 'id:xxxxxx' */
++ else if (strcmp(str, "builtin") == 0)
++  use_builtin_keys = true;
+ 
+  return 1;
+ }
+@@ -180,7 +183,6 @@ EXPORT_SYMBOL_GPL(x509_check_signature);
+ static int x509_validate_trust(struct x509_certificate *cert,
+           struct key *trust_keyring)
+ {
+- const struct public_key *pk;
+  struct key *key;
+  int ret = 1;
+ 
+@@ -195,8 +197,9 @@ static int x509_validate_trust(struct x509_certificate *cert,
+        cert->authority,
+        strlen(cert->authority));
+  if (!IS_ERR(key))  {
+-  pk = key->payload.data;
+-  ret = x509_check_signature(pk, cert);
++  if (!use_builtin_keys
++      || test_bit(KEY_FLAG_BUILTIN, &key->flags))
++   ret = x509_check_signature(key->payload.data, cert);
+   key_put(key);
+  }
+  return ret;
+diff --git a/include/linux/key.h b/include/linux/key.h
+index 3993480..e5afa21 100644
+--- a/include/linux/key.h
++++ b/include/linux/key.h
+@@ -170,7 +170,8 @@ struct key {
+ #define KEY_FLAG_INVALIDATED 7 /* set if key has been invalidated */
+ #define KEY_FLAG_TRUSTED 8 /* set if key is trusted */
+ #define KEY_FLAG_TRUSTED_ONLY 9 /* set if keyring only accepts links to trusted keys */
+-#define KEY_FLAG_ROOT_CAN_INVAL 10 /* set if key can be invalidated by root without permission */
++#define KEY_FLAG_BUILTIN 10 /* set if key is builtin */
++#define KEY_FLAG_ROOT_CAN_INVAL 11 /* set if key can be invalidated by root without permission */
+ 
+  /* the key type and key description string
+   * - the desc is used to match a key against search criteria
+diff --git a/kernel/system_keyring.c b/kernel/system_keyring.c
+index 478c4f8..c15e93f 100644
+--- a/kernel/system_keyring.c
++++ b/kernel/system_keyring.c
+@@ -106,6 +106,7 @@ static __init int load_system_certificate_list(void)
+    pr_err("Problem loading in-kernel X.509 certificate (%ld)\n",
+           PTR_ERR(key));
+   } else {
++   set_bit(KEY_FLAG_BUILTIN, &key_ref_to_ptr(key)->flags);
+    pr_notice("Loaded X.509 cert '%s'\n",
+       key_ref_to_ptr(key)->description);
+    key_ref_put(key);
+-- 
+1.7.1

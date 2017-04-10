@@ -1,0 +1,86 @@
+From 50442312aa0fbc20ad8da8fc7357cdc238fc08e0 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Tue, 16 Sep 2014 20:19:49 -0400
+Subject: [fs] nfsd: Migrate the stateid reference into nfs4_lookup_stateid()
+
+Message-id: <1410898849-22126-106-git-send-email-bfields@redhat.com>
+Patchwork-id: 95834
+O-Subject: [Patch RHEL7 105/165] nfsd: Migrate the stateid reference into nfs4_lookup_stateid()
+Bugzilla: 1044798 1123721 1141932
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+Allow nfs4_lookup_stateid to take the stateid reference, instead
+of having all the callers do so.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: fd9110113c434562c287f222cb4e30befb15ecdd
+Bugzilla: 1044798
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index b0c0f4c..a4a49a3 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -4170,6 +4170,8 @@ nfsd4_lookup_stateid(struct nfsd4_compound_state *cstate,
+  *s = find_stateid_by_type(cstate->clp, stateid, typemask);
+  if (!*s)
+   return nfserr_bad_stateid;
++ /* FIXME: move into find_stateid_by_type */
++ atomic_inc(&(*s)->sc_count);
+  return nfs_ok;
+ }
+ 
+@@ -4204,7 +4206,7 @@ nfs4_preprocess_stateid_op(struct net *net, struct nfsd4_compound_state *cstate,
+     NFS4_DELEG_STID|NFS4_OPEN_STID|NFS4_LOCK_STID,
+     &s, nn);
+  if (status)
+-  goto out;
++  goto unlock_state;
+  status = check_stateid_generation(stateid, &s->sc_stateid, nfsd4_has_session(cstate));
+  if (status)
+   goto out;
+@@ -4253,6 +4255,8 @@ nfs4_preprocess_stateid_op(struct net *net, struct nfsd4_compound_state *cstate,
+  if (file)
+   *filpp = file;
+ out:
++ nfs4_put_stid(s);
++unlock_state:
+  nfs4_unlock_state();
+  return status;
+ }
+@@ -4390,11 +4394,10 @@ nfs4_preprocess_seqid_op(struct nfsd4_compound_state *cstate, u32 seqid,
+   cstate->replay_owner = stp->st_stateowner;
+ 
+  status = nfs4_seqid_op_checks(cstate, stateid, seqid, stp);
+- if (!status) {
+-  /* FIXME: move into find_stateid_by_type */
+-  atomic_inc(&stp->st_stid.sc_count);
++ if (!status)
+   *stpp = stp;
+- }
++ else
++  nfs4_put_stid(&stp->st_stid);
+  return status;
+ }
+ 
+@@ -4623,9 +4626,11 @@ nfsd4_delegreturn(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+  dp = delegstateid(s);
+  status = check_stateid_generation(stateid, &dp->dl_stid.sc_stateid, nfsd4_has_session(cstate));
+  if (status)
+-  goto out;
++  goto put_stateid;
+ 
+  destroy_delegation(dp);
++put_stateid:
++ nfs4_put_stid(&dp->dl_stid);
+ out:
+  nfs4_unlock_state();
+ 
+-- 
+1.7.1

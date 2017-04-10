@@ -1,0 +1,79 @@
+From 0bf2c93570769c9ed758a70ddd0cd82490642a6f Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Tue, 21 Oct 2014 13:26:39 -0400
+Subject: [fs] Revert "ext4: fix fsx truncate failure"
+
+Message-id: <1413898007-15450-8-git-send-email-lczerner@redhat.com>
+Patchwork-id: 97890
+O-Subject: [RHEL 7.1 PATCH v2 07/15] Revert "ext4: fix fsx truncate failure"
+Bugzilla: 1144326
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+BZ 1144326
+https://bugzilla.redhat.com/show_bug.cgi?id=1144326
+
+BREW 8095073
+https://brewweb.devel.redhat.com/taskinfo?taskID=8095073
+
+Upstream commit eb3544c6fc6642c9037817980d8a9dc9df44aa45
+
+ This reverts commit 189e868fa8fdca702eb9db9d8afc46b5cb9144c9.
+
+ This commit reintroduces the use of ext4_block_truncate_page() in ext4
+ truncate operation instead of ext4_discard_partial_page_buffers().
+
+ The statement in the commit description that the truncate operation only
+ zero block unaligned portion of the last page is not exactly right,
+ since truncate_pagecache_range() also zeroes and invalidate the unaligned
+ portion of the page. Then there is no need to zero and unmap it once more
+ and ext4_block_truncate_page() was doing the right job, although we
+ still need to update the buffer head containing the last block, which is
+ exactly what ext4_block_truncate_page() is doing.
+
+ Moreover the problem described in the commit is fixed more properly with
+ commit
+
+ 15291164b22a357cb211b618adfef4fa82fc0de3
+  jbd2: clear BH_Delay & BH_Unwritten in journal_unmap_buffer
+
+ This was tested on ppc64 machine with block size of 1024 bytes without
+ any problems.
+
+ Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+ Reviewed-by: Jan Kara <jack@suse.cz>
+ Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index d9a3acb..5fd17f7 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -3941,7 +3941,6 @@ void ext4_truncate(struct inode *inode)
+  unsigned int credits;
+  handle_t *handle;
+  struct address_space *mapping = inode->i_mapping;
+- loff_t page_len;
+ 
+  /*
+   * There is a possibility that we're either freeing the inode
+@@ -3985,14 +3984,8 @@ void ext4_truncate(struct inode *inode)
+   return;
+  }
+ 
+- if (inode->i_size % PAGE_CACHE_SIZE != 0) {
+-  page_len = PAGE_CACHE_SIZE -
+-   (inode->i_size & (PAGE_CACHE_SIZE - 1));
+-
+-  if (ext4_discard_partial_page_buffers(handle,
+-    mapping, inode->i_size, page_len, 0))
+-   goto out_stop;
+- }
++ if (inode->i_size & (inode->i_sb->s_blocksize - 1))
++  ext4_block_truncate_page(handle, mapping, inode->i_size);
+ 
+  /*
+   * We add the inode to the orphan list, so that if this
+-- 
+1.7.1

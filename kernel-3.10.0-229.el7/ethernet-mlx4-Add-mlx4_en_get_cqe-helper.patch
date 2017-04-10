@@ -1,0 +1,118 @@
+From a9df95ba249d68b0500f61b0daaf6a495c43aa8a Mon Sep 17 00:00:00 2001
+From: Doug Ledford <dledford@redhat.com>
+Date: Wed, 14 Jan 2015 06:35:12 -0500
+Subject: [ethernet] mlx4: Add mlx4_en_get_cqe helper
+
+Message-id: <8a5605ccfea476b97f73d65574051d103bdd75ed.1421216634.git.dledford@redhat.com>
+Patchwork-id: 102848
+O-Subject: [Patch RHEL7 2/3] net/mlx4_en: Add mlx4_en_get_cqe helper
+Bugzilla: 1088499 1173483
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Ido Shamay <idos@mellanox.com>
+
+This function derives the base address of the CQE from the CQE size,
+and calculates the real CQE context segment in it from the factor
+(this is like before). Before this change the code used the factor to
+calculate the base address of the CQE as well.
+
+The factor indicates in which segment of the cqe stride the cqe information
+is located. For 32-byte strides, the segment is 0, and for 64 byte strides,
+the segment is 1 (bytes 32..63). Using the factor was ok as long as we had
+only 32 and 64 byte strides. However, with larger strides, the factor is zero,
+and so cannot be used to calculate the base of the CQE.
+
+The helper uses the same method of CQE buffer pulling made by all other
+components that reads the CQE buffer (mlx4_ib driver and libmlx4).
+
+Signed-off-by: Ido Shamay <idos@mellanox.com>
+Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b1b6b4da7867d220f0da5f6686b869b304c5459b)
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index ab04be9..dacc15b 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -2476,6 +2476,7 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
+  }
+  priv->rx_ring_num = prof->rx_ring_num;
+  priv->cqe_factor = (mdev->dev->caps.cqe_size == 64) ? 1 : 0;
++ priv->cqe_size = mdev->dev->caps.cqe_size;
+  priv->mac_index = -1;
+  priv->msg_enable = MLX4_EN_MSG_LEVEL;
+  spin_lock_init(&priv->stats_lock);
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 6892512..36e2367 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -667,7 +667,7 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
+   * descriptor offset can be deduced from the CQE index instead of
+   * reading 'cqe->index' */
+  index = cq->mcq.cons_index & ring->size_mask;
+- cqe = &cq->buf[(index << factor) + factor];
++ cqe = mlx4_en_get_cqe(cq->buf, index, priv->cqe_size) + factor;
+ 
+  /* Process all completed CQEs */
+  while (XNOR(cqe->owner_sr_opcode & MLX4_CQE_OWNER_MASK,
+@@ -854,7 +854,7 @@ next:
+ 
+   ++cq->mcq.cons_index;
+   index = (cq->mcq.cons_index) & ring->size_mask;
+-  cqe = &cq->buf[(index << factor) + factor];
++  cqe = mlx4_en_get_cqe(cq->buf, index, priv->cqe_size) + factor;
+   if (++polled == budget)
+    goto out;
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index 9e26183..2ddc399 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -382,7 +382,7 @@ static bool mlx4_en_process_tx_cq(struct net_device *dev,
+   return true;
+ 
+  index = cons_index & size_mask;
+- cqe = &buf[(index << factor) + factor];
++ cqe = mlx4_en_get_cqe(buf, index, priv->cqe_size) + factor;
+  ring_index = ring->cons & size_mask;
+  stamp_index = ring_index;
+ 
+@@ -430,7 +430,7 @@ static bool mlx4_en_process_tx_cq(struct net_device *dev,
+ 
+   ++cons_index;
+   index = cons_index & size_mask;
+-  cqe = &buf[(index << factor) + factor];
++  cqe = mlx4_en_get_cqe(buf, index, priv->cqe_size) + factor;
+  }
+ 
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 0f2e2a7..d3726f1 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -548,6 +548,7 @@ struct mlx4_en_priv {
+  unsigned max_mtu;
+  int base_qpn;
+  int cqe_factor;
++ int cqe_size;
+ 
+  struct mlx4_en_rss_map rss_map;
+  __be32 ctrl_flags;
+@@ -618,6 +619,11 @@ struct mlx4_mac_entry {
+  struct rcu_head rcu;
+ };
+ 
++static inline struct mlx4_cqe *mlx4_en_get_cqe(void *buf, int idx, int cqe_sz)
++{
++ return buf + idx * cqe_sz;
++}
++
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ static inline void mlx4_en_cq_init_lock(struct mlx4_en_cq *cq)
+ {
+-- 
+1.7.1

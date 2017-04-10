@@ -1,0 +1,119 @@
+From 3830c707b8068eb5983795ed7222caf06023e77b Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:25:29 -0400
+Subject: [net] libceph: add support for osd primary affinity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-223-git-send-email-sweil@redhat.com>
+Patchwork-id: 89680
+O-Subject: [PATCH 222/303] libceph: add support for osd primary affinity
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Ilya Dryomov <ilya.dryomov@inktank.com>
+
+Respond to non-default primary_affinity values accordingly.  (Primary
+affinity allows the admin to shift 'primary responsibility' away from
+specific osds, effectively shifting around the read side of the
+workload and whatever overhead is incurred by peering and writes by
+virtue of being the primary).
+
+Signed-off-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+(cherry picked from commit 47ec1f3cc46dde00deb34922dbffdeda254ad76d)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index 20a38a3..ae8f367 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -1596,6 +1596,72 @@ static int raw_to_up_osds(struct ceph_osdmap *osdmap,
+  return len;
+ }
+ 
++static void apply_primary_affinity(struct ceph_osdmap *osdmap, u32 pps,
++       struct ceph_pg_pool_info *pool,
++       int *osds, int len, int *primary)
++{
++ int i;
++ int pos = -1;
++
++ /*
++  * Do we have any non-default primary_affinity values for these
++  * osds?
++  */
++ if (!osdmap->osd_primary_affinity)
++  return;
++
++ for (i = 0; i < len; i++) {
++  if (osds[i] != CRUSH_ITEM_NONE &&
++      osdmap->osd_primary_affinity[i] !=
++     CEPH_OSD_DEFAULT_PRIMARY_AFFINITY) {
++   break;
++  }
++ }
++ if (i == len)
++  return;
++
++ /*
++  * Pick the primary.  Feed both the seed (for the pg) and the
++  * osd into the hash/rng so that a proportional fraction of an
++  * osd's pgs get rejected as primary.
++  */
++ for (i = 0; i < len; i++) {
++  int osd;
++  u32 aff;
++
++  osd = osds[i];
++  if (osd == CRUSH_ITEM_NONE)
++   continue;
++
++  aff = osdmap->osd_primary_affinity[osd];
++  if (aff < CEPH_OSD_MAX_PRIMARY_AFFINITY &&
++      (crush_hash32_2(CRUSH_HASH_RJENKINS1,
++        pps, osd) >> 16) >= aff) {
++   /*
++    * We chose not to use this primary.  Note it
++    * anyway as a fallback in case we don't pick
++    * anyone else, but keep looking.
++    */
++   if (pos < 0)
++    pos = i;
++  } else {
++   pos = i;
++   break;
++  }
++ }
++ if (pos < 0)
++  return;
++
++ *primary = osds[pos];
++
++ if (ceph_can_shift_osds(pool) && pos > 0) {
++  /* move the new primary to the front */
++  for (i = pos; i > 0; i--)
++   osds[i] = osds[i - 1];
++  osds[0] = *primary;
++ }
++}
++
+ /*
+  * Given up set, apply pg_temp and primary_temp mappings.
+  *
+@@ -1698,6 +1764,8 @@ int ceph_calc_pg_acting(struct ceph_osdmap *osdmap, struct ceph_pg pgid,
+ 
+  len = raw_to_up_osds(osdmap, pool, osds, len, primary);
+ 
++ apply_primary_affinity(osdmap, pps, pool, osds, len, primary);
++
+  len = apply_temps(osdmap, pool, pgid, osds, len, primary);
+ 
+  return len;
+-- 
+1.7.1

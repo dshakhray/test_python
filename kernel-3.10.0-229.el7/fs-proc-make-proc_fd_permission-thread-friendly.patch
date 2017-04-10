@@ -1,0 +1,77 @@
+From 76997864890b9f88c3811f6f31cefd7e80409ad3 Mon Sep 17 00:00:00 2001
+From: Carlos Maiolino <cmaiolino@redhat.com>
+Date: Thu, 11 Dec 2014 17:36:40 -0500
+Subject: [fs] proc: make proc_fd_permission() thread-friendly
+
+Message-id: <1418319400-27370-1-git-send-email-cmaiolino@redhat.com>
+Patchwork-id: 101671
+O-Subject: [RHEL7 fs PATCH] proc: make proc_fd_permission() thread-friendly
+Bugzilla: 1171242
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Eric Sandeen <sandeen@redhat.com>
+
+From: Oleg Nesterov <oleg@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1171242
+Upstream: 96d0df79f2644fc823f26c06491e182d87a90c2a
+brew:     https://brewweb.devel.redhat.com/taskinfo?taskID=8351983
+
+Description:
+
+proc_fd_permission() says "process can still access /proc/self/fd after it
+has executed a setuid()", but the "task_pid() = proc_pid() check only
+helps if the task is group leader, /proc/self points to
+/proc/<leader-pid>.
+
+Change this check to use task_tgid() so that the whole thread group can
+access its /proc/self/fd or /proc/<tid-of-sub-thread>/fd.
+
+Notes:
+ - CLONE_THREAD does not require CLONE_FILES so task->files
+   can differ, but I don't think this can lead to any security
+   problem. And this matches same_thread_group() in
+   __ptrace_may_access().
+
+ - /proc/self should probably point to /proc/<thread-tid>, but
+   it is too late to change the rules. Perhaps it makes sense
+   to add /proc/thread though.
+
+Test-case:
+
+ void *tfunc(void *arg)
+ {
+  assert(opendir("/proc/self/fd"));
+  return NULL;
+ }
+
+ int main(void)
+ {
+  pthread_t t;
+  pthread_create(&t, NULL, tfunc, NULL);
+  pthread_join(t, NULL);
+  return 0;
+ }
+
+fails if, say, this executable is not readable and suid_dumpable = 0.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Carlos Maiolino <cmaiolino@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/proc/fd.c b/fs/proc/fd.c
+index d7a4a28..50ac26b 100644
+--- a/fs/proc/fd.c
++++ b/fs/proc/fd.c
+@@ -305,7 +305,7 @@ int proc_fd_permission(struct inode *inode, int mask)
+  int rv = generic_permission(inode, mask);
+  if (rv == 0)
+   return 0;
+- if (task_pid(current) == proc_pid(inode))
++ if (task_tgid(current) == proc_pid(inode))
+   rv = 0;
+  return rv;
+ }
+-- 
+1.7.1

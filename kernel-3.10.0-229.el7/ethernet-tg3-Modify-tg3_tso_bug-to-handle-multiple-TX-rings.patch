@@ -1,0 +1,101 @@
+From 5e0ca3c2b308cdff3d7d9145e10e7d63e4b2a434 Mon Sep 17 00:00:00 2001
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Mon, 8 Sep 2014 12:26:10 -0400
+Subject: [ethernet] tg3: Modify tg3_tso_bug() to handle multiple TX rings
+
+Message-id: <1410179173-14304-17-git-send-email-ivecera@redhat.com>
+Patchwork-id: 91676
+O-Subject: [RHEL7.1 PATCH 16/19] tg3: Modify tg3_tso_bug() to handle multiple TX rings
+Bugzilla: 1088637
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+BZ: #1088637
+
+Upstream commit(s):
+commit 4d8fdc95c60e90d84c8257a0067ff4b1729a3757
+Author: Prashant Sreedharan <prashant@broadcom.com>
+Date:   Tue Aug 5 16:02:02 2014 -0700
+
+    tg3: Modify tg3_tso_bug() to handle multiple TX rings
+
+    tg3_tso_bug() was originally designed to handle only HW TX ring 0, Commit
+    d3f6f3a1d818410c17445bce4f4caab52eb102f1 ("tg3: Prevent page allocation failure
+    during TSO workaround") changed the driver logic to use tg3_tso_bug() for all
+    HW TX rings that are enabled. This patch fixes the regression by modifying
+    tg3_tso_bug() to handle multiple HW TX rings.
+
+    Signed-off-by: Prashant Sreedharan <prashant@broadcom.com>
+    Signed-off-by: Michael Chan <mchan@broadcom.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/broadcom/tg3.c b/drivers/net/ethernet/broadcom/tg3.c
+index 424b90f..f839154 100644
+--- a/drivers/net/ethernet/broadcom/tg3.c
++++ b/drivers/net/ethernet/broadcom/tg3.c
+@@ -7829,17 +7829,18 @@ static int tigon3_dma_hwbug_workaround(struct tg3_napi *tnapi,
+ 
+ static netdev_tx_t tg3_start_xmit(struct sk_buff *, struct net_device *);
+ 
+-/* Use GSO to workaround a rare TSO bug that may be triggered when the
+- * TSO header is greater than 80 bytes.
++/* Use GSO to workaround all TSO packets that meet HW bug conditions
++ * indicated in tg3_tx_frag_set()
+  */
+-static int tg3_tso_bug(struct tg3 *tp, struct sk_buff *skb)
++static int tg3_tso_bug(struct tg3 *tp, struct tg3_napi *tnapi,
++         struct netdev_queue *txq, struct sk_buff *skb)
+ {
+  struct sk_buff *segs, *nskb;
+  u32 frag_cnt_est = skb_shinfo(skb)->gso_segs * 3;
+ 
+  /* Estimate the number of fragments in the worst case */
+- if (unlikely(tg3_tx_avail(&tp->napi[0]) <= frag_cnt_est)) {
+-  netif_stop_queue(tp->dev);
++ if (unlikely(tg3_tx_avail(tnapi) <= frag_cnt_est)) {
++  netif_tx_stop_queue(txq);
+ 
+   /* netif_tx_stop_queue() must be done before checking
+    * checking tx index in tg3_tx_avail() below, because in
+@@ -7847,13 +7848,14 @@ static int tg3_tso_bug(struct tg3 *tp, struct sk_buff *skb)
+    * netif_tx_queue_stopped().
+    */
+   smp_mb();
+-  if (tg3_tx_avail(&tp->napi[0]) <= frag_cnt_est)
++  if (tg3_tx_avail(tnapi) <= frag_cnt_est)
+    return NETDEV_TX_BUSY;
+ 
+-  netif_wake_queue(tp->dev);
++  netif_tx_wake_queue(txq);
+  }
+ 
+- segs = skb_gso_segment(skb, tp->dev->features & ~(NETIF_F_TSO | NETIF_F_TSO6));
++ segs = skb_gso_segment(skb, tp->dev->features &
++        ~(NETIF_F_TSO | NETIF_F_TSO6));
+  if (IS_ERR(segs) || !segs)
+   goto tg3_tso_bug_end;
+ 
+@@ -7929,7 +7931,7 @@ static netdev_tx_t tg3_start_xmit(struct sk_buff *skb, struct net_device *dev)
+   if (!skb_is_gso_v6(skb)) {
+    if (unlikely((ETH_HLEN + hdr_len) > 80) &&
+        tg3_flag(tp, TSO_BUG))
+-    return tg3_tso_bug(tp, skb);
++    return tg3_tso_bug(tp, tnapi, txq, skb);
+ 
+    ip_csum = iph->check;
+    ip_tot_len = iph->tot_len;
+@@ -8060,7 +8062,7 @@ static netdev_tx_t tg3_start_xmit(struct sk_buff *skb, struct net_device *dev)
+     iph->tot_len = ip_tot_len;
+    }
+    tcph->check = tcp_csum;
+-   return tg3_tso_bug(tp, skb);
++   return tg3_tso_bug(tp, tnapi, txq, skb);
+   }
+ 
+   /* If the workaround fails due to memory/mapping
+-- 
+1.7.1

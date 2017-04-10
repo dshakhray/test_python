@@ -1,0 +1,99 @@
+From 53a51f378c884b4c98dd62542c21e494485614fc Mon Sep 17 00:00:00 2001
+From: Luiz Capitulino <lcapitulino@redhat.com>
+Date: Wed, 29 Oct 2014 19:51:56 -0400
+Subject: [mm] hugetlb: initialize PG_reserved for tail pages of gigantic compound pages
+
+Message-id: <20141029155156.2a3c4541@redhat.com>
+Patchwork-id: 98582
+O-Subject: [RHEL7.1 PATCH] mm: hugetlb: initialize PG_reserved for tail pages of gigantic compound pages
+Bugzilla: 1158506
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+RH-Acked-by: Johannes Weiner <jweiner@redhat.com>
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1158506
+Brew-build: https://brewweb.devel.redhat.com/taskinfo?taskID=8166278
+Upstream-status: Merged
+
+Commit 11feeb498086 ("kvm: optimize away THP checks in
+kvm_is_mmio_pfn()") introduced a memory leak when KVM is run on gigantic
+compound pages.
+
+That commit depends on the assumption that PG_reserved is identical for
+all head and tail pages of a compound page.  So that if get_user_pages
+returns a tail page, we don't need to check the head page in order to
+know if we deal with a reserved page that requires different
+refcounting.
+
+The assumption that PG_reserved is the same for head and tail pages is
+certainly correct for THP and regular hugepages, but gigantic hugepages
+allocated through bootmem don't clear the PG_reserved on the tail pages
+(the clearing of PG_reserved is done later only if the gigantic hugepage
+is freed).
+
+This patch corrects the gigantic compound page initialization so that we
+can retain the optimization in 11feeb498086.  The cacheline was already
+modified in order to set PG_tail so this won't affect the boot time of
+large memory systems.
+
+[akpm@linux-foundation.org: tweak comment layout and grammar]
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Reported-by: andy123 <ajs124.ajs124@gmail.com>
+Acked-by: Rik van Riel <riel@redhat.com>
+Cc: Gleb Natapov <gleb@redhat.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Hugh Dickins <hughd@google.com>
+Acked-by: Rafael Aquini <aquini@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+RHEL-NOTE: We need this fix in RHEL because the upstream commit
+mentioned in the changelog, which is "kvm: optimize away THP
+checks in kvm_is_mmio_pfn()", has been backported to RHEL
+(commit 6a57bed358597e5eae6b9ecb1a2fbf12deaadf6c) and is causing
+KVM guests to misbehave when using gigantic pages.
+
+(cherry picked from commit ef5a22be2c525293b777ccd879a8017c41c7ed5a)
+Signed-off-by: Luiz Capitulino <lcapitulino@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 11e22c6..5e9f81b 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -871,8 +871,22 @@ static void prep_compound_gigantic_page(struct page *page, unsigned long order)
+  /* we rely on prep_new_huge_page to set the destructor */
+  set_compound_order(page, order);
+  __SetPageHead(page);
++ __ClearPageReserved(page);
+  for (i = 1; i < nr_pages; i++, p = mem_map_next(p, page, i)) {
+   __SetPageTail(p);
++  /*
++   * For gigantic hugepages allocated through bootmem at
++   * boot, it's safer to be consistent with the not-gigantic
++   * hugepages and clear the PG_reserved bit from all tail pages
++   * too.  Otherwse drivers using get_user_pages() to access tail
++   * pages may get the reference counting wrong if they see
++   * PG_reserved set on a tail page (despite the head page not
++   * having PG_reserved set).  Enforcing this consistency between
++   * head and tail pages allows drivers to optimize away a check
++   * on the head page when they need know if put_page() is needed
++   * after get_user_pages().
++   */
++  __ClearPageReserved(p);
+   set_page_count(p, 0);
+   p->first_page = page;
+  }
+@@ -1397,9 +1411,9 @@ static void __init gather_bootmem_prealloc(void)
+ #else
+   page = virt_to_page(m);
+ #endif
+-  __ClearPageReserved(page);
+   WARN_ON(page_count(page) != 1);
+   prep_compound_huge_page(page, h->order);
++  WARN_ON(PageReserved(page));
+   prep_new_huge_page(h, page, page_to_nid(page));
+   /*
+    * If we had gigantic hugepages allocated at boot time, we need
+-- 
+1.7.1

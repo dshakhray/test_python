@@ -1,0 +1,196 @@
+From 9ada2d09995d9aa244bc08fee75e4643915b77f1 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Tue, 16 Sep 2014 17:08:02 -0400
+Subject: [usb] Revert: xhci: replace xhci_write_64() with writeq()
+
+Message-id: <1410887463-20674-411-git-send-email-dzickus@redhat.com>
+Patchwork-id: 95449
+O-Subject: [RHEL7 PATCH 410/591] Revert "xhci: replace xhci_write_64() with writeq()"
+Bugzilla: 1110939
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1110939
+
+commit 477632dff5c7deaa165701f441e9a4bd33e22b18
+Author: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date:   Wed Jan 29 14:02:00 2014 -0800
+
+    Revert "xhci: replace xhci_write_64() with writeq()"
+
+    This reverts commit 7dd09a1af2c7150269350aaa567a11b06e831003.
+
+    Many xHCI host controllers can only handle 32-bit addresses, and writing
+    64-bits at a time causes them to fail.  Rafal reports that USB devices
+    simply do not enumerate, and reverting this patch helps.  Branimir
+    reports that his host controller doesn't respond to an Enable Slot
+    command and dies:
+
+    [   75.576160] xhci_hcd 0000:03:00.0: Timeout while waiting for a slot
+    [   88.991634] xhci_hcd 0000:03:00.0: Stopped the command ring failed, maybe the host is dead
+    [   88.991748] xhci_hcd 0000:03:00.0: Abort command ring failed
+    [   88.991845] xhci_hcd 0000:03:00.0: HC died; cleaning up
+    [   93.985489] xhci_hcd 0000:03:00.0: Timeout while waiting for a slot
+    [   93.985494] xhci_hcd 0000:03:00.0: Abort the command ring, but the xHCI is dead.
+    [   98.982586] xhci_hcd 0000:03:00.0: Timeout while waiting for a slot
+    [   98.982591] xhci_hcd 0000:03:00.0: Abort the command ring, but the xHCI is dead.
+    [  103.979696] xhci_hcd 0000:03:00.0: Timeout while waiting for a slot
+    [  103.979702] xhci_hcd 0000:03:00.0: Abort the command ring, but the xHCI is dead
+
+    Signed-off-by: Sarah Sharp <sarah.a.sharp@intel.com>
+    Reported-by: Rafal Milecki <zajec5@gmail.com>
+    Reported-by: Branimir Maksimovic <branimir.maksimovic@gmail.com>
+    Cc: Xenia Ragiadakou <burzalodowa@gmail.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index 2897b64..098dbc1 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -2068,7 +2068,7 @@ static void xhci_set_hc_event_deq(struct xhci_hcd *xhci)
+  xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+    "// Write event ring dequeue pointer, "
+    "preserving EHB bit");
+- writeq(((u64) deq & (u64) ~ERST_PTR_MASK) | temp,
++ xhci_write_64(xhci, ((u64) deq & (u64) ~ERST_PTR_MASK) | temp,
+    &xhci->ir_set->erst_dequeue);
+ }
+ 
+@@ -2371,7 +2371,7 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+  xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+    "// Device context base array address = 0x%llx (DMA), %p (virt)",
+    (unsigned long long)xhci->dcbaa->dma, xhci->dcbaa);
+- writeq(dma, &xhci->op_regs->dcbaa_ptr);
++ xhci_write_64(xhci, dma, &xhci->op_regs->dcbaa_ptr);
+ 
+  /*
+   * Initialize the ring segment pool.  The ring must be a contiguous
+@@ -2421,7 +2421,7 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+   xhci->cmd_ring->cycle_state;
+  xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+    "// Setting command ring address to 0x%x", val);
+- writeq(val_64, &xhci->op_regs->cmd_ring);
++ xhci_write_64(xhci, val_64, &xhci->op_regs->cmd_ring);
+  xhci_dbg_cmd_ptrs(xhci);
+ 
+  xhci->lpm_command = xhci_alloc_command(xhci, true, true, flags);
+@@ -2502,7 +2502,7 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+  val_64 = readq(&xhci->ir_set->erst_base);
+  val_64 &= ERST_PTR_MASK;
+  val_64 |= (xhci->erst.erst_dma_addr & (u64) ~ERST_PTR_MASK);
+- writeq(val_64, &xhci->ir_set->erst_base);
++ xhci_write_64(xhci, val_64, &xhci->ir_set->erst_base);
+ 
+  /* Set the event ring dequeue address */
+  xhci_set_hc_event_deq(xhci);
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index f0b003e..b1b0abe 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -299,7 +299,8 @@ static int xhci_abort_cmd_ring(struct xhci_hcd *xhci)
+   return 0;
+  }
+  xhci->cmd_ring_state = CMD_RING_STATE_ABORTED;
+- writeq(temp_64 | CMD_RING_ABORT, &xhci->op_regs->cmd_ring);
++ xhci_write_64(xhci, temp_64 | CMD_RING_ABORT,
++   &xhci->op_regs->cmd_ring);
+ 
+  /* Section 4.6.1.2 of xHCI 1.0 spec says software should
+   * time the completion od all xHCI commands, including
+@@ -2860,7 +2861,8 @@ hw_died:
+    * the event ring should be empty.
+    */
+   temp_64 = readq(&xhci->ir_set->erst_dequeue);
+-  writeq(temp_64 | ERST_EHB, &xhci->ir_set->erst_dequeue);
++  xhci_write_64(xhci, temp_64 | ERST_EHB,
++    &xhci->ir_set->erst_dequeue);
+   spin_unlock(&xhci->lock);
+ 
+   return IRQ_HANDLED;
+@@ -2887,7 +2889,7 @@ hw_died:
+ 
+  /* Clear the event handler busy flag (RW1C); event ring is empty. */
+  temp_64 |= ERST_EHB;
+- writeq(temp_64, &xhci->ir_set->erst_dequeue);
++ xhci_write_64(xhci, temp_64, &xhci->ir_set->erst_dequeue);
+ 
+  spin_unlock(&xhci->lock);
+ 
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 4ca853b..fb4af0d 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -777,11 +777,11 @@ static void xhci_restore_registers(struct xhci_hcd *xhci)
+ {
+  writel(xhci->s3.command, &xhci->op_regs->command);
+  writel(xhci->s3.dev_nt, &xhci->op_regs->dev_notification);
+- writeq(xhci->s3.dcbaa_ptr, &xhci->op_regs->dcbaa_ptr);
++ xhci_write_64(xhci, xhci->s3.dcbaa_ptr, &xhci->op_regs->dcbaa_ptr);
+  writel(xhci->s3.config_reg, &xhci->op_regs->config_reg);
+  writel(xhci->s3.erst_size, &xhci->ir_set->erst_size);
+- writeq(xhci->s3.erst_base, &xhci->ir_set->erst_base);
+- writeq(xhci->s3.erst_dequeue, &xhci->ir_set->erst_dequeue);
++ xhci_write_64(xhci, xhci->s3.erst_base, &xhci->ir_set->erst_base);
++ xhci_write_64(xhci, xhci->s3.erst_dequeue, &xhci->ir_set->erst_dequeue);
+  writel(xhci->s3.irq_pending, &xhci->ir_set->irq_pending);
+  writel(xhci->s3.irq_control, &xhci->ir_set->irq_control);
+ }
+@@ -800,7 +800,7 @@ static void xhci_set_cmd_ring_deq(struct xhci_hcd *xhci)
+  xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+    "// Setting command ring address to 0x%llx",
+    (long unsigned long) val_64);
+- writeq(val_64, &xhci->op_regs->cmd_ring);
++ xhci_write_64(xhci, val_64, &xhci->op_regs->cmd_ring);
+ }
+ 
+ /*
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 52619ec..a429039 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -28,15 +28,6 @@
+ #include <linux/kernel.h>
+ #include <linux/usb/hcd.h>
+ 
+-/*
+- * Registers should always be accessed with double word or quad word accesses.
+- *
+- * Some xHCI implementations may support 64-bit address pointers.  Registers
+- * with 64-bit address pointers should be written to with dword accesses by
+- * writing the low dword first (ptr[0]), then the high dword (ptr[1]) second.
+- * xHCI implementations that do not support 64-bit address pointers will ignore
+- * the high dword, and write order is irrelevant.
+- */
+ #include <asm-generic/io-64-nonatomic-lo-hi.h>
+ 
+ /* Code sharing between pci-quirks and xhci hcd */
+@@ -1613,6 +1604,26 @@ static inline struct usb_hcd *xhci_to_hcd(struct xhci_hcd *xhci)
+ #define xhci_warn_ratelimited(xhci, fmt, args...) \
+  dev_warn_ratelimited(xhci_to_hcd(xhci)->self.controller , fmt , ## args)
+ 
++/*
++ * Registers should always be accessed with double word or quad word accesses.
++ *
++ * Some xHCI implementations may support 64-bit address pointers.  Registers
++ * with 64-bit address pointers should be written to with dword accesses by
++ * writing the low dword first (ptr[0]), then the high dword (ptr[1]) second.
++ * xHCI implementations that do not support 64-bit address pointers will ignore
++ * the high dword, and write order is irrelevant.
++ */
++static inline void xhci_write_64(struct xhci_hcd *xhci,
++     const u64 val, __le64 __iomem *regs)
++{
++ __u32 __iomem *ptr = (__u32 __iomem *) regs;
++ u32 val_lo = lower_32_bits(val);
++ u32 val_hi = upper_32_bits(val);
++
++ writel(val_lo, ptr);
++ writel(val_hi, ptr + 1);
++}
++
+ static inline int xhci_link_trb_quirk(struct xhci_hcd *xhci)
+ {
+  return xhci->quirks & XHCI_LINK_TRB_QUIRK;
+-- 
+1.7.1

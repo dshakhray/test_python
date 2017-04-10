@@ -1,0 +1,173 @@
+From 2c898541f0d2b0be7de2763d88ed52f31b5a09d9 Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Thu, 22 Jan 2015 09:52:52 -0500
+Subject: [virt] Revert: hyperv: Add handler for RNDIS_STATUS_NETWORK_CHANGE event
+
+Message-id: <1421920372-24551-1-git-send-email-jasowang@redhat.com>
+Patchwork-id: 103343
+O-Subject: [RHEL7.1 PATCH] Revert "[virt] hyperv: Add handler for RNDIS_STATUS_NETWORK_CHANGE event"
+Bugzilla: 1164163
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+
+Bugzilla: 1164163
+Brew Build: https://brewweb.devel.redhat.com/taskinfo?taskID=8603324
+Upstream: N/A, waiting for MS to solve
+Test status: Tested by myself
+
+This reverts commit 386e76edab684e4143230c73c1016eeee04c1a67. Since it calls
+"/etc/init.d/network" directly from kernel which is not a proper method to
+handle DCHP renew in this case and may break setup of many users.
+
+Signed-off-by: Jason Wang <jasowang@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index 574e481..1d8e640 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -171,7 +171,6 @@ struct rndis_device {
+ 
+  enum rndis_device_state state;
+  bool link_state;
+- bool link_change;
+  atomic_t new_req_id;
+ 
+  spinlock_t request_lock;
+@@ -187,7 +186,7 @@ int netvsc_device_remove(struct hv_device *device);
+ int netvsc_send(struct hv_device *device,
+   struct hv_netvsc_packet *packet);
+ void netvsc_linkstatus_callback(struct hv_device *device_obj,
+-    struct rndis_message *resp);
++    unsigned int status);
+ int netvsc_recv_callback(struct hv_device *device_obj,
+    struct hv_netvsc_packet *packet,
+    struct ndis_tcp_ip_checksum_info *csum_info);
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index a7b6c09..c4e3acb 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -575,9 +575,8 @@ drop:
+  * netvsc_linkstatus_callback - Link up/down notification
+  */
+ void netvsc_linkstatus_callback(struct hv_device *device_obj,
+-    struct rndis_message *resp)
++           unsigned int status)
+ {
+- struct rndis_indicate_status *indicate = &resp->msg.indicate_status;
+  struct net_device *net;
+  struct net_device_context *ndev_ctx;
+  struct netvsc_device *net_device;
+@@ -586,19 +585,7 @@ void netvsc_linkstatus_callback(struct hv_device *device_obj,
+  net_device = hv_get_drvdata(device_obj);
+  rdev = net_device->extension;
+ 
+- switch (indicate->status) {
+- case RNDIS_STATUS_MEDIA_CONNECT:
+-  rdev->link_state = false;
+-  break;
+- case RNDIS_STATUS_MEDIA_DISCONNECT:
+-  rdev->link_state = true;
+-  break;
+- case RNDIS_STATUS_NETWORK_CHANGE:
+-  rdev->link_change = true;
+-  break;
+- default:
+-  return;
+- }
++ rdev->link_state = status != 1;
+ 
+  net = net_device->ndev;
+ 
+@@ -606,7 +593,7 @@ void netvsc_linkstatus_callback(struct hv_device *device_obj,
+   return;
+ 
+  ndev_ctx = netdev_priv(net);
+- if (!rdev->link_state) {
++ if (status == 1) {
+   schedule_delayed_work(&ndev_ctx->dwork, 0);
+   schedule_delayed_work(&ndev_ctx->dwork, msecs_to_jiffies(20));
+  } else {
+@@ -787,9 +774,7 @@ static void netvsc_link_change(struct work_struct *w)
+  struct net_device *net;
+  struct netvsc_device *net_device;
+  struct rndis_device *rdev;
+- bool notify, refresh = false;
+- char *argv[] = { "/etc/init.d/network", "restart", NULL };
+- char *envp[] = { "HOME=/", "PATH=/sbin:/usr/sbin:/bin:/usr/bin", NULL };
++ bool notify;
+ 
+  rtnl_lock();
+ 
+@@ -804,17 +789,10 @@ static void netvsc_link_change(struct work_struct *w)
+  } else {
+   netif_carrier_on(net);
+   notify = true;
+-  if (rdev->link_change) {
+-   rdev->link_change = false;
+-   refresh = true;
+-  }
+  }
+ 
+  rtnl_unlock();
+ 
+- if (refresh)
+-  call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+-
+  if (notify)
+   netdev_notify_peers(net);
+ }
+diff --git a/drivers/net/hyperv/rndis_filter.c b/drivers/net/hyperv/rndis_filter.c
+index eb98273..888539b 100644
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@ -321,6 +321,25 @@ static void rndis_filter_receive_response(struct rndis_device *dev,
+  }
+ }
+ 
++static void rndis_filter_receive_indicate_status(struct rndis_device *dev,
++          struct rndis_message *resp)
++{
++ struct rndis_indicate_status *indicate =
++   &resp->msg.indicate_status;
++
++ if (indicate->status == RNDIS_STATUS_MEDIA_CONNECT) {
++  netvsc_linkstatus_callback(
++   dev->net_dev->dev, 1);
++ } else if (indicate->status == RNDIS_STATUS_MEDIA_DISCONNECT) {
++  netvsc_linkstatus_callback(
++   dev->net_dev->dev, 0);
++ } else {
++  /*
++   * TODO:
++   */
++ }
++}
++
+ /*
+  * Get the Per-Packet-Info with the specified type
+  * return NULL if not found.
+@@ -446,7 +465,7 @@ int rndis_filter_receive(struct hv_device *dev,
+ 
+  case RNDIS_MSG_INDICATE:
+   /* notification msgs */
+-  netvsc_linkstatus_callback(dev, rndis_msg);
++  rndis_filter_receive_indicate_status(rndis_dev, rndis_msg);
+   break;
+  default:
+   netdev_err(ndev,
+diff --git a/include/linux/rndis.h b/include/linux/rndis.h
+index 93c0a64..0c8dc71 100644
+--- a/include/linux/rndis.h
++++ b/include/linux/rndis.h
+@@ -65,7 +65,6 @@
+ #define RNDIS_STATUS_MEDIA_SPECIFIC_INDICATION 0x40010012
+ #define RNDIS_STATUS_WW_INDICATION  RDIA_SPECIFIC_INDICATION
+ #define RNDIS_STATUS_LINK_SPEED_CHANGE  0x40010013L
+-#define RNDIS_STATUS_NETWORK_CHANGE  0x40010018
+ 
+ #define RNDIS_STATUS_NOT_RESETTABLE  0x80010001
+ #define RNDIS_STATUS_SOFT_ERRORS  0x80010003
+-- 
+1.7.1

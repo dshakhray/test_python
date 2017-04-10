@@ -1,0 +1,72 @@
+From 33ba3f3f1b3cfb79a9d1a8ab7d22fc9db82934ba Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 10 Oct 2014 21:03:23 -0400
+Subject: [block] blk-mq: avoid infinite recursion with the FUA flag
+
+Message-id: <1412975015-5370-23-git-send-email-jmoyer@redhat.com>
+Patchwork-id: 97471
+O-Subject: [RHEL7 PATCH 22/34] blk-mq: avoid infinite recursion with the FUA flag
+Bugzilla: 1146660
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a backport of the following commit.  This resolves bug
+1146660.
+
+  commit a57a178a490345c7236b0077b3de005754389ed6
+  Author: Christoph Hellwig <hch@lst.de>
+  Date:   Tue Sep 16 14:44:07 2014 -0700
+
+    blk-mq: avoid infinite recursion with the FUA flag
+
+    We should not insert requests into the flush state machine from
+    blk_mq_insert_request.  All incoming flush requests come through
+    blk_{m,s}q_make_request and are handled there, while blk_execute_rq_nowait
+    should only be called for BLOCK_PC requests.  All other callers
+    deal with requests that already went through the flush statemchine
+    and shouldn't be reinserted into it.
+
+    Reported-by: Robert Elliott  <Elliott@hp.com>
+    Debugged-by: Ming Lei <ming.lei@canonical.com>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-exec.c b/block/blk-exec.c
+index f4d27b1..9924725 100644
+--- a/block/blk-exec.c
++++ b/block/blk-exec.c
+@@ -56,6 +56,7 @@ void blk_execute_rq_nowait(struct request_queue *q, struct gendisk *bd_disk,
+  bool is_pm_resume;
+ 
+  WARN_ON(irqs_disabled());
++ WARN_ON(rq->cmd_type == REQ_TYPE_FS);
+ 
+  rq->rq_disk = bd_disk;
+  rq->end_io = done;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 1b4961e..149efb8 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -966,14 +966,9 @@ void blk_mq_insert_request(struct request *rq, bool at_head, bool run_queue,
+ 
+  hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ 
+- if (rq->cmd_flags & (REQ_FLUSH | REQ_FUA) &&
+-     !(rq->cmd_flags & (REQ_FLUSH_SEQ))) {
+-  blk_insert_flush(rq);
+- } else {
+-  spin_lock(&ctx->lock);
+-  __blk_mq_insert_request(hctx, rq, at_head);
+-  spin_unlock(&ctx->lock);
+- }
++ spin_lock(&ctx->lock);
++ __blk_mq_insert_request(hctx, rq, at_head);
++ spin_unlock(&ctx->lock);
+ 
+  if (run_queue)
+   blk_mq_run_hw_queue(hctx, async);
+-- 
+1.7.1

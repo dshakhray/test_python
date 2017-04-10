@@ -1,0 +1,113 @@
+From e99c393112d9d13a46b087455e65e510cb0472df Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Fri, 29 Aug 2014 19:01:17 -0400
+Subject: [net] bridge: Add functionality to sync static fdb entries to hw
+
+Message-id: <1409338885-30414-6-git-send-email-vyasevic@redhat.com>
+Patchwork-id: 89901
+O-Subject: [RHEL7 PATCH 05/13] bridge: Add functionality to sync static fdb entries to hw
+Bugzilla: 896669
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+
+From: Vlad Yasevich <vyasevic@redhat.com>
+
+Add code that allows static fdb entires to be synced to the
+hw list for a specified port.  This will be used later to
+program ports that can function in non-promiscuous mode.
+
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8db24af71b31690a30ad371b35936fa10e547ee7)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ net/bridge/br_private.h
+ - extern usage.
+
+Signed-off-by: Vladislav Yasevich <vyasevic@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index ee27e08..bf196bd 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -829,3 +829,59 @@ int br_fdb_delete(struct ndmsg *ndm, struct nlattr *tb[],
+ out:
+  return err;
+ }
++
++int br_fdb_sync_static(struct net_bridge *br, struct net_bridge_port *p)
++{
++ struct net_bridge_fdb_entry *fdb, *tmp;
++ int i;
++ int err;
++
++ ASSERT_RTNL();
++
++ for (i = 0; i < BR_HASH_SIZE; i++) {
++  hlist_for_each_entry(fdb, &br->hash[i], hlist) {
++   /* We only care for static entries */
++   if (!fdb->is_static)
++    continue;
++
++   err = dev_uc_add(p->dev, fdb->addr.addr);
++   if (err)
++    goto rollback;
++  }
++ }
++ return 0;
++
++rollback:
++ for (i = 0; i < BR_HASH_SIZE; i++) {
++  hlist_for_each_entry(tmp, &br->hash[i], hlist) {
++   /* If we reached the fdb that failed, we can stop */
++   if (tmp == fdb)
++    break;
++
++   /* We only care for static entries */
++   if (!tmp->is_static)
++    continue;
++
++   dev_uc_del(p->dev, tmp->addr.addr);
++  }
++ }
++ return err;
++}
++
++void br_fdb_unsync_static(struct net_bridge *br, struct net_bridge_port *p)
++{
++ struct net_bridge_fdb_entry *fdb;
++ int i;
++
++ ASSERT_RTNL();
++
++ for (i = 0; i < BR_HASH_SIZE; i++) {
++  hlist_for_each_entry_rcu(fdb, &br->hash[i], hlist) {
++   /* We only care for static entries */
++   if (!fdb->is_static)
++    continue;
++
++   dev_uc_del(p->dev, fdb->addr.addr);
++  }
++ }
++}
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index c6f75d1..7fb3048 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -425,6 +425,10 @@ extern int br_fdb_dump(struct sk_buff *skb,
+          struct netlink_callback *cb,
+          struct net_device *dev,
+          int idx);
++extern int br_fdb_sync_static(struct net_bridge *br,
++         struct net_bridge_port *p);
++extern void br_fdb_unsync_static(struct net_bridge *br,
++     struct net_bridge_port *p);
+ 
+ /* br_forward.c */
+ extern void br_deliver(const struct net_bridge_port *to,
+-- 
+1.7.1

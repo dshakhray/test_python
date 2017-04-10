@@ -1,0 +1,114 @@
+From 0ecb09432c3f15d538044399bd753898c9b31619 Mon Sep 17 00:00:00 2001
+From: Amir Vadai <avadai@redhat.com>
+Date: Mon, 3 Nov 2014 07:52:04 -0500
+Subject: [infiniband] iser: Move fast_reg_descriptor initialization to a function
+
+Message-id: <6f6d01466ebcd26dbb501e6931a2d12b9a075e65.1415000301.git.avadai@redhat.com>
+Patchwork-id: 98675
+O-Subject: [Patch RHEL7.1 06/37] IB/iser: Move fast_reg_descriptor initialization to a function
+Bugzilla: 1107622
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Doug Ledford <dledford@redhat.com>
+
+From: Sagi Grimberg <sagig@mellanox.com>
+
+fastreg descriptor will include protection information context.  In
+order to place the logic in one place we introduce iser_create_fr_desc
+function.
+
+This patch does not change any functionality.
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Alex Tabachnik <alext@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 310b347c6017ca5f00fa1e574c2d9c5b1088a786)
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index dc5a0b4..9569e40 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -279,6 +279,39 @@ void iser_free_fmr_pool(struct iser_conn *ib_conn)
+  ib_conn->fmr.page_vec = NULL;
+ }
+ 
++static int
++iser_create_fastreg_desc(struct ib_device *ib_device, struct ib_pd *pd,
++    struct fast_reg_descriptor *desc)
++{
++ int ret;
++
++ desc->data_frpl = ib_alloc_fast_reg_page_list(ib_device,
++            ISCSI_ISER_SG_TABLESIZE + 1);
++ if (IS_ERR(desc->data_frpl)) {
++  ret = PTR_ERR(desc->data_frpl);
++  iser_err("Failed to allocate ib_fast_reg_page_list err=%d\n",
++    ret);
++  return PTR_ERR(desc->data_frpl);
++ }
++
++ desc->data_mr = ib_alloc_fast_reg_mr(pd, ISCSI_ISER_SG_TABLESIZE + 1);
++ if (IS_ERR(desc->data_mr)) {
++  ret = PTR_ERR(desc->data_mr);
++  iser_err("Failed to allocate ib_fast_reg_mr err=%d\n", ret);
++  goto fast_reg_mr_failure;
++ }
++ iser_info("Create fr_desc %p page_list %p\n",
++    desc, desc->data_frpl->page_list);
++ desc->valid = true;
++
++ return 0;
++
++fast_reg_mr_failure:
++ ib_free_fast_reg_page_list(desc->data_frpl);
++
++ return ret;
++}
++
+ /**
+  * iser_create_fastreg_pool - Creates pool of fast_reg descriptors
+  * for fast registration work requests.
+@@ -300,32 +333,21 @@ int iser_create_fastreg_pool(struct iser_conn *ib_conn, unsigned cmds_max)
+    goto err;
+   }
+ 
+-  desc->data_frpl = ib_alloc_fast_reg_page_list(device->ib_device,
+-        ISCSI_ISER_SG_TABLESIZE + 1);
+-  if (IS_ERR(desc->data_frpl)) {
+-   ret = PTR_ERR(desc->data_frpl);
+-   iser_err("Failed to allocate ib_fast_reg_page_list err=%d\n", ret);
+-   goto fast_reg_page_failure;
++  ret = iser_create_fastreg_desc(device->ib_device,
++            device->pd, desc);
++  if (ret) {
++   iser_err("Failed to create fastreg descriptor err=%d\n",
++     ret);
++   kfree(desc);
++   goto err;
+   }
+ 
+-  desc->data_mr = ib_alloc_fast_reg_mr(device->pd,
+-           ISCSI_ISER_SG_TABLESIZE + 1);
+-  if (IS_ERR(desc->data_mr)) {
+-   ret = PTR_ERR(desc->data_mr);
+-   iser_err("Failed to allocate ib_fast_reg_mr err=%d\n", ret);
+-   goto fast_reg_mr_failure;
+-  }
+-  desc->valid = true;
+   list_add_tail(&desc->list, &ib_conn->fastreg.pool);
+   ib_conn->fastreg.pool_size++;
+  }
+ 
+  return 0;
+ 
+-fast_reg_mr_failure:
+- ib_free_fast_reg_page_list(desc->data_frpl);
+-fast_reg_page_failure:
+- kfree(desc);
+ err:
+  iser_free_fastreg_pool(ib_conn);
+  return ret;
+-- 
+1.7.1

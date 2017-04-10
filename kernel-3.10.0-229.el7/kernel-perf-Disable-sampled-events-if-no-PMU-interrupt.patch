@@ -1,0 +1,94 @@
+From 1ea54da5c5b2a400e0d2e54782209d6530cc4fd8 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 8 Sep 2014 13:04:33 -0400
+Subject: [kernel] perf: Disable sampled events if no PMU interrupt
+
+Message-id: <1410181752-25631-29-git-send-email-jolsa@redhat.com>
+Patchwork-id: 91704
+O-Subject: [PATCH RHEL7.1 BZ1134356 028/307] perf: Disable sampled events if no PMU interrupt
+Bugzilla: 1134356
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1134356
+https://bugzilla.redhat.com/show_bug.cgi?id=1134356
+
+upstream
+========
+commit 53b25335dd60981ad608da7890420898a34469a6
+Author: Vince Weaver <vincent.weaver@maine.edu>
+Date: Fri May 16 17:12:12 2014 -0400
+
+KABI
+=====
+The 'struct perf_event *' pointer is used within 'struct thread_struct',
+making 'struct perf_event' and all its members like 'struct pmu' KABI-broken
+any time we change it. At the moment we don't have any perf related function
+on KABI list, so masking the change with __GENKSYMS__ macro.
+
+description
+===========
+Add common code to generate -ENOTSUPP at event creation time if an
+architecture attempts to create a sampled event and
+PERF_PMU_NO_INTERRUPT is set.
+
+This adds a new pmu->capabilities flag.  Initially we only support
+PERF_PMU_NO_INTERRUPT (to indicate a PMU has no support for generating
+hardware interrupts) but there are other capabilities that can be
+added later.
+
+[peterz: rename to PERF_PMU_CAP_* and moved the pmu::capabilities word into a hole]
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 504b2ef..a614937 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -187,6 +187,11 @@ struct perf_event;
+ #define PERF_EVENT_TXN 0x1
+ 
+ /**
++ * pmu::capabilities flags
++ */
++#define PERF_PMU_CAP_NO_INTERRUPT  0x01
++
++/**
+  * struct pmu - generic performance monitoring unit
+  */
+ struct pmu {
+@@ -274,6 +279,11 @@ struct pmu {
+ 
+ #ifndef __GENKSYMS__
+  struct module   *module;
++
++ /*
++  * various common per-pmu feature flags
++  */
++ int    capabilities;
+ #endif
+ };
+ 
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 3e3baf6..de92bb2 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7136,6 +7136,13 @@ SYSCALL_DEFINE5(perf_event_open,
+   }
+  }
+ 
++ if (is_sampling_event(event)) {
++  if (event->pmu->capabilities & PERF_PMU_CAP_NO_INTERRUPT) {
++   err = -ENOTSUPP;
++   goto err_alloc;
++  }
++ }
++
+  account_event(event);
+ 
+  /*
+-- 
+1.7.1

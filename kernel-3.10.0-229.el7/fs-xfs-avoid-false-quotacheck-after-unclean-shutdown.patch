@@ -1,0 +1,117 @@
+From c79c836653f89de60f84c17a81b762a0c93ee6f5 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Thu, 9 Oct 2014 21:00:28 -0400
+Subject: [fs] xfs: avoid false quotacheck after unclean shutdown
+
+Message-id: <1412888441-4181-35-git-send-email-sandeen@redhat.com>
+Patchwork-id: 97343
+O-Subject: [RHEL7.1 PATCH 34/47] [fs] xfs: avoid false quotacheck after unclean shutdown
+Bugzilla: 1145837
+RH-Acked-by: Brian Foster <bfoster@redhat.com>
+RH-Acked-by: Dave Chinner <dchinner@redhat.com>
+
+Bugzilla: 1145837
+Upstream Status: Committed upstream
+Build Info: https://brewweb.devel.redhat.com/taskinfo?taskID=8082426
+Tested: locally using xfstests
+
+Thanks,
+-Eric
+
+    commit 5ef828c4152726f56751c78ea844f08d2b2a4fa3
+    Author: Eric Sandeen <sandeen@sandeen.net>
+    Date:   Mon Aug 4 11:35:44 2014 +1000
+
+    xfs: avoid false quotacheck after unclean shutdown
+
+    The commit
+
+    83e782e xfs: Remove incore use of XFS_OQUOTA_ENFD and XFS_OQUOTA_CHKD
+
+    added a new function xfs_sb_quota_from_disk() which swaps
+    on-disk XFS_OQUOTA_* flags for in-core XFS_GQUOTA_* and XFS_PQUOTA_*
+    flags after the superblock is read.
+
+    However, if log recovery is required, the superblock is read again,
+    and the modified in-core flags are re-read from disk, so we have
+    XFS_OQUOTA_* flags in memory again.  This causes the
+    XFS_QM_NEED_QUOTACHECK() test to be true, because the XFS_OQUOTA_CHKD
+    is still set, and not XFS_GQUOTA_CHKD or XFS_PQUOTA_CHKD.
+
+    Change xfs_sb_from_disk to call xfs_sb_quota_from disk and always
+    convert the disk flags to in-memory flags.
+
+    Add a lower-level function which can be called with "false" to
+    not convert the flags, so that the sb verifier can verify
+    exactly what was on disk, per Brian Foster's suggestion.
+
+    Reported-by: Cyril B. <cbay@excellency.fr>
+    Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index f6255c0..132e879 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -324,7 +324,6 @@ reread:
+   * Initialize the mount structure from the superblock.
+   */
+  xfs_sb_from_disk(sbp, XFS_BUF_TO_SBP(bp));
+- xfs_sb_quota_from_disk(sbp);
+ 
+  /*
+   * If we haven't validated the superblock, do so now before we try
+diff --git a/fs/xfs/xfs_sb.c b/fs/xfs/xfs_sb.c
+index cd13e9c..258d9b3 100644
+--- a/fs/xfs/xfs_sb.c
++++ b/fs/xfs/xfs_sb.c
+@@ -394,10 +394,11 @@ xfs_sb_quota_from_disk(struct xfs_sb *sbp)
+  }
+ }
+ 
+-void
+-xfs_sb_from_disk(
++static void
++__xfs_sb_from_disk(
+  struct xfs_sb *to,
+- xfs_dsb_t *from)
++ xfs_dsb_t *from,
++ bool  convert_xquota)
+ {
+  to->sb_magicnum = be32_to_cpu(from->sb_magicnum);
+  to->sb_blocksize = be32_to_cpu(from->sb_blocksize);
+@@ -453,6 +454,17 @@ xfs_sb_from_disk(
+  to->sb_pad = 0;
+  to->sb_pquotino = be64_to_cpu(from->sb_pquotino);
+  to->sb_lsn = be64_to_cpu(from->sb_lsn);
++ /* Convert on-disk flags to in-memory flags? */
++ if (convert_xquota)
++  xfs_sb_quota_from_disk(to);
++}
++
++void
++xfs_sb_from_disk(
++ struct xfs_sb *to,
++ xfs_dsb_t *from)
++{
++ __xfs_sb_from_disk(to, from, true);
+ }
+ 
+ static inline void
+@@ -585,7 +597,11 @@ xfs_sb_verify(
+  struct xfs_mount *mp = bp->b_target->bt_mount;
+  struct xfs_sb sb;
+ 
+- xfs_sb_from_disk(&sb, XFS_BUF_TO_SBP(bp));
++ /*
++  * Use call variant which doesn't convert quota flags from disk 
++  * format, because xfs_mount_validate_sb checks the on-disk flags.
++  */
++ __xfs_sb_from_disk(&sb, XFS_BUF_TO_SBP(bp), false);
+ 
+  /*
+   * Only check the in progress field for the primary superblock as
+-- 
+1.7.1

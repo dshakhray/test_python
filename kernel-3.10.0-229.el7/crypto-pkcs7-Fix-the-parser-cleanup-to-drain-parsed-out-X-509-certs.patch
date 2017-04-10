@@ -1,0 +1,103 @@
+From db2e4ff9191ac5f0ab9a0f08d35ccafce14935b5 Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Mon, 22 Sep 2014 19:41:37 -0400
+Subject: [crypto] pkcs7: Fix the parser cleanup to drain parsed out X.509 certs
+
+Message-id: <1411414897-26220-5-git-send-email-vgoyal@redhat.com>
+Patchwork-id: 96449
+O-Subject: [RHEL7.1 PATCH 4/4] PKCS#7: Fix the parser cleanup to drain parsed out X.509 certs
+Bugzilla: 1129779
+RH-Acked-by: David Howells <dhowells@redhat.com>
+
+BZ:1129779
+
+This commit id is in linux-security tree of James Morris.
+
+commit cecf5d2e1208da512a4c951c24acd66c54a4d06c
+Author: David Howells <dhowells@redhat.com>
+Date: Tue, 16 Sep 2014 17:29:03 +0100
+
+Fix the parser cleanup code to drain parsed out X.509 certs in the case that
+the decode fails and we jump to error_decode.
+
+The function is rearranged so that the same cleanup code is used in the success
+case as the error case - just that the message descriptor under construction is
+only released if it is still pointed to by the context struct at that point.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Acked-by: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/crypto/asymmetric_keys/pkcs7_parser.c b/crypto/asymmetric_keys/pkcs7_parser.c
+index 4c4ea35..1e9861d 100644
+--- a/crypto/asymmetric_keys/pkcs7_parser.c
++++ b/crypto/asymmetric_keys/pkcs7_parser.c
+@@ -81,47 +81,46 @@ EXPORT_SYMBOL_GPL(pkcs7_free_message);
+ struct pkcs7_message *pkcs7_parse_message(const void *data, size_t datalen)
+ {
+  struct pkcs7_parse_context *ctx;
+- struct pkcs7_message *msg;
+- long ret;
++ struct pkcs7_message *msg = ERR_PTR(-ENOMEM);
++ int ret;
+ 
+- ret = -ENOMEM;
+- msg = kzalloc(sizeof(struct pkcs7_message), GFP_KERNEL);
+- if (!msg)
+-  goto error_no_sig;
+  ctx = kzalloc(sizeof(struct pkcs7_parse_context), GFP_KERNEL);
+  if (!ctx)
+-  goto error_no_ctx;
++  goto out_no_ctx;
++ ctx->msg = kzalloc(sizeof(struct pkcs7_message), GFP_KERNEL);
++ if (!ctx->msg)
++  goto out_no_msg;
+  ctx->sinfo = kzalloc(sizeof(struct pkcs7_signed_info), GFP_KERNEL);
+  if (!ctx->sinfo)
+-  goto error_no_sinfo;
++  goto out_no_sinfo;
+ 
+- ctx->msg = msg;
+  ctx->data = (unsigned long)data;
+  ctx->ppcerts = &ctx->certs;
+  ctx->ppsinfo = &ctx->msg->signed_infos;
+ 
+  /* Attempt to decode the signature */
+  ret = asn1_ber_decoder(&pkcs7_decoder, ctx, data, datalen);
+- if (ret < 0)
+-  goto error_decode;
++ if (ret < 0) {
++  msg = ERR_PTR(ret);
++  goto out;
++ }
++
++ msg = ctx->msg;
++ ctx->msg = NULL;
+ 
++out:
+  while (ctx->certs) {
+   struct x509_certificate *cert = ctx->certs;
+   ctx->certs = cert->next;
+   x509_free_certificate(cert);
+  }
+  pkcs7_free_signed_info(ctx->sinfo);
++out_no_sinfo:
++ pkcs7_free_message(ctx->msg);
++out_no_msg:
+  kfree(ctx);
++out_no_ctx:
+  return msg;
+-
+-error_decode:
+- pkcs7_free_signed_info(ctx->sinfo);
+-error_no_sinfo:
+- kfree(ctx);
+-error_no_ctx:
+- pkcs7_free_message(msg);
+-error_no_sig:
+- return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL_GPL(pkcs7_parse_message);
+ 
+-- 
+1.7.1
