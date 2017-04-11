@@ -1,0 +1,128 @@
+From 3e5ef7a244bf012fff8df9eb8ad5cc62149f67b9 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:37:52 -0400
+Subject: [virt] kvm/mmu: allow page tables to be in read-only slots
+
+Message-id: <1406040016-3289-78-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86156
+O-Subject: [RHEL7 PATCH v2 077/221] KVM: mmu: allow page tables to be in read-only slots
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Page tables in a read-only memory slot will currently cause a triple
+fault because the page walker uses gfn_to_hva and it fails on such a slot.
+
+OVMF uses such a page table; however, real hardware seems to be fine with
+that as long as the accessed/dirty bits are set.  Save whether the slot
+is readonly, and later check it when updating the accessed and dirty bits.
+
+Reviewed-by: Xiao Guangrong <xiaoguangrong@linux.vnet.ibm.com>
+Reviewed-by: Gleb Natapov <gleb@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit ba6a3541545542721ce821d1e7e5ce35752e6fdf)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/paging_tmpl.h b/arch/x86/kvm/paging_tmpl.h
+index b3d7041..cba218a 100644
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -99,6 +99,7 @@ struct guest_walker {
+  pt_element_t prefetch_ptes[PTE_PREFETCH_NUM];
+  gpa_t pte_gpa[PT_MAX_FULL_LEVELS];
+  pt_element_t __user *ptep_user[PT_MAX_FULL_LEVELS];
++ bool pte_writable[PT_MAX_FULL_LEVELS];
+  unsigned pt_access;
+  unsigned pte_access;
+  gfn_t gfn;
+@@ -235,6 +236,22 @@ static int FNAME(update_accessed_dirty_bits)(struct kvm_vcpu *vcpu,
+   if (pte == orig_pte)
+    continue;
+ 
++  /*
++   * If the slot is read-only, simply do not process the accessed
++   * and dirty bits.  This is the correct thing to do if the slot
++   * is ROM, and page tables in read-as-ROM/write-as-MMIO slots
++   * are only supported if the accessed and dirty bits are already
++   * set in the ROM (so that MMIO writes are never needed).
++   *
++   * Note that NPT does not allow this at all and faults, since
++   * it always wants nested page table entries for the guest
++   * page tables to be writable.  And EPT works but will simply
++   * overwrite the read-only memory to set the accessed and dirty
++   * bits.
++   */
++  if (unlikely(!walker->pte_writable[level - 1]))
++   continue;
++
+   ret = FNAME(cmpxchg_gpte)(vcpu, mmu, ptep_user, index, orig_pte, pte);
+   if (ret)
+    return ret;
+@@ -309,7 +326,8 @@ retry_walk:
+    goto error;
+   real_gfn = gpa_to_gfn(real_gfn);
+ 
+-  host_addr = gfn_to_hva(vcpu->kvm, real_gfn);
++  host_addr = gfn_to_hva_prot(vcpu->kvm, real_gfn,
++         &walker->pte_writable[walker->level - 1]);
+   if (unlikely(kvm_is_error_hva(host_addr)))
+    goto error;
+ 
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 095b762..4892021 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -529,6 +529,7 @@ int gfn_to_page_many_atomic(struct kvm *kvm, gfn_t gfn, struct page **pages,
+ 
+ struct page *gfn_to_page(struct kvm *kvm, gfn_t gfn);
+ unsigned long gfn_to_hva(struct kvm *kvm, gfn_t gfn);
++unsigned long gfn_to_hva_prot(struct kvm *kvm, gfn_t gfn, bool *writable);
+ unsigned long gfn_to_hva_memslot(struct kvm_memory_slot *slot, gfn_t gfn);
+ void kvm_release_page_clean(struct page *page);
+ void kvm_release_page_dirty(struct page *page);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index f3cc4df..738bfd6 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -1069,11 +1069,15 @@ unsigned long gfn_to_hva(struct kvm *kvm, gfn_t gfn)
+ EXPORT_SYMBOL_GPL(gfn_to_hva);
+ 
+ /*
+- * The hva returned by this function is only allowed to be read.
+- * It should pair with kvm_read_hva() or kvm_read_hva_atomic().
++ * If writable is set to false, the hva returned by this function is only
++ * allowed to be read.
+  */
+-static unsigned long gfn_to_hva_read(struct kvm *kvm, gfn_t gfn)
++unsigned long gfn_to_hva_prot(struct kvm *kvm, gfn_t gfn, bool *writable)
+ {
++ struct kvm_memory_slot *slot = gfn_to_memslot(kvm, gfn);
++ if (writable)
++  *writable = !memslot_is_readonly(slot);
++
+  return __gfn_to_hva_many(gfn_to_memslot(kvm, gfn), gfn, NULL, false);
+ }
+ 
+@@ -1434,7 +1438,7 @@ int kvm_read_guest_page(struct kvm *kvm, gfn_t gfn, void *data, int offset,
+  int r;
+  unsigned long addr;
+ 
+- addr = gfn_to_hva_read(kvm, gfn);
++ addr = gfn_to_hva_prot(kvm, gfn, NULL);
+  if (kvm_is_error_hva(addr))
+   return -EFAULT;
+  r = kvm_read_hva(data, (void __user *)addr + offset, len);
+@@ -1472,7 +1476,7 @@ int kvm_read_guest_atomic(struct kvm *kvm, gpa_t gpa, void *data,
+  gfn_t gfn = gpa >> PAGE_SHIFT;
+  int offset = offset_in_page(gpa);
+ 
+- addr = gfn_to_hva_read(kvm, gfn);
++ addr = gfn_to_hva_prot(kvm, gfn, NULL);
+  if (kvm_is_error_hva(addr))
+   return -EFAULT;
+  pagefault_disable();
+-- 
+1.7.1

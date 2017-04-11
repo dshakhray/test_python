@@ -1,0 +1,70 @@
+From da56d7bd0ba62173445828cb9fd0415eee89f015 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:50 -0400
+Subject: [virt] kvm/ppc: book3s hv - Fix check for running inside guest in global_invalidates()
+
+Message-id: <1410545655-205645-362-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94269
+O-Subject: [RHEL7 PATCH 361/626] KVM: PPC: Book3S HV: Fix check for running inside guest in global_invalidates()
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 55765483e1df8135102ae9ca77dccbca9a7a6184
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Mon May 26 19:48:36 2014 +1000
+
+    KVM: PPC: Book3S HV: Fix check for running inside guest in global_invalidates()
+
+    The global_invalidates() function contains a check that is intended
+    to tell whether we are currently executing in the context of a hypercall
+    issued by the guest.  The reason is that the optimization of using a
+    local TLB invalidate instruction is only valid in that context.  The
+    check was testing local_paca->kvm_hstate.kvm_vcore, which gets set
+    when entering the guest but no longer gets cleared when exiting the
+    guest.  To fix this, we use the kvm_vcpu field instead, which does
+    get cleared when exiting the guest, by the kvmppc_release_hwthread()
+    calls inside kvmppc_run_core().
+
+    The effect of having the check wrong was that when kvmppc_do_h_remove()
+    got called from htab_write() on the destination machine during a
+    migration, it cleared the current cpu's bit in kvm->arch.need_tlb_flush.
+    This meant that when the guest started running in the destination VM,
+    it may miss out on doing a complete TLB flush, and therefore may end
+    up using stale TLB entries from a previous guest that used the same
+    LPID value.
+
+    This should make migration more reliable.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_mmu.c b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index 2805e0f..ece99a9 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@ -42,13 +42,14 @@ static int global_invalidates(struct kvm *kvm, unsigned long flags)
+ 
+  /*
+   * If there is only one vcore, and it's currently running,
++  * as indicated by local_paca->kvm_hstate.kvm_vcpu being set,
+   * we can use tlbiel as long as we mark all other physical
+   * cores as potentially having stale TLB entries for this lpid.
+   * If we're not using MMU notifiers, we never take pages away
+   * from the guest, so we can use tlbiel if requested.
+   * Otherwise, don't use tlbiel.
+   */
+- if (kvm->arch.online_vcores == 1 && local_paca->kvm_hstate.kvm_vcore)
++ if (kvm->arch.online_vcores == 1 && local_paca->kvm_hstate.kvm_vcpu)
+   global = 0;
+  else if (kvm->arch.using_mmu_notifiers)
+   global = 1;
+-- 
+1.7.1

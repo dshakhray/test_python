@@ -1,0 +1,152 @@
+From 69607ea94ef94e347939a66dd5d9c7bc4512a593 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:08:57 -0400
+Subject: [powerpc] Split timer_interrupt() into timer handling and interrupt handling routines
+
+Message-id: <1410545655-205645-309-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94256
+O-Subject: [RHEL7 PATCH 308/626] powerpc: Split timer_interrupt() into timer handling and interrupt handling routines
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 1b7839559b3f1c7a09ff94904788a732063ce2de
+Author: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+Date:   Wed Feb 26 05:38:01 2014 +0530
+
+    powerpc: Split timer_interrupt() into timer handling and interrupt handling routines
+
+    Split timer_interrupt(), which is the local timer interrupt handler on ppc
+    into routines called during regular interrupt handling and __timer_interrupt(),
+    which takes care of running local timers and collecting time related stats.
+
+    This will enable callers interested only in running expired local timers to
+    directly call into __timer_interupt(). One of the use cases of this is the
+    tick broadcast IPI handling in which the sleeping CPUs need to handle the local
+    timers that have expired.
+
+    Signed-off-by: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/time.c b/arch/powerpc/kernel/time.c
+index feeb2e8..38efb14 100644
+--- a/arch/powerpc/kernel/time.c
++++ b/arch/powerpc/kernel/time.c
+@@ -478,6 +478,47 @@ void arch_irq_work_raise(void)
+ 
+ #endif /* CONFIG_IRQ_WORK */
+ 
++void __timer_interrupt(void)
++{
++ struct pt_regs *regs = get_irq_regs();
++ u64 *next_tb = &__get_cpu_var(decrementers_next_tb);
++ struct clock_event_device *evt = &__get_cpu_var(decrementers);
++ u64 now;
++
++ trace_timer_interrupt_entry(regs);
++
++ if (test_irq_work_pending()) {
++  clear_irq_work_pending();
++  irq_work_run();
++ }
++
++ now = get_tb_or_rtc();
++ if (now >= *next_tb) {
++  *next_tb = ~(u64)0;
++  if (evt->event_handler)
++   evt->event_handler(evt);
++  __get_cpu_var(irq_stat).timer_irqs_event++;
++ } else {
++  now = *next_tb - now;
++  if (now <= DECREMENTER_MAX)
++   set_dec((int)now);
++  /* We may have raced with new irq work */
++  if (test_irq_work_pending())
++   set_dec(1);
++  __get_cpu_var(irq_stat).timer_irqs_others++;
++ }
++
++#ifdef CONFIG_PPC64
++ /* collect purr register values often, for accurate calculations */
++ if (firmware_has_feature(FW_FEATURE_SPLPAR)) {
++  struct cpu_usage *cu = &__get_cpu_var(cpu_usage_array);
++  cu->current_tb = mfspr(SPRN_PURR);
++ }
++#endif
++
++ trace_timer_interrupt_exit(regs);
++}
++
+ /*
+  * timer_interrupt - gets called when the decrementer overflows,
+  * with interrupts disabled.
+@@ -486,8 +527,6 @@ void timer_interrupt(struct pt_regs * regs)
+ {
+  struct pt_regs *old_regs;
+  u64 *next_tb = &__get_cpu_var(decrementers_next_tb);
+- struct clock_event_device *evt = &__get_cpu_var(decrementers);
+- u64 now;
+ 
+  /* Ensure a positive value is written to the decrementer, or else
+   * some CPUs will continue to take decrementer exceptions.
+@@ -519,39 +558,7 @@ void timer_interrupt(struct pt_regs * regs)
+  old_regs = set_irq_regs(regs);
+  irq_enter();
+ 
+- trace_timer_interrupt_entry(regs);
+-
+- if (test_irq_work_pending()) {
+-  clear_irq_work_pending();
+-  irq_work_run();
+- }
+-
+- now = get_tb_or_rtc();
+- if (now >= *next_tb) {
+-  *next_tb = ~(u64)0;
+-  if (evt->event_handler)
+-   evt->event_handler(evt);
+-  __get_cpu_var(irq_stat).timer_irqs_event++;
+- } else {
+-  now = *next_tb - now;
+-  if (now <= DECREMENTER_MAX)
+-   set_dec((int)now);
+-  /* We may have raced with new irq work */
+-  if (test_irq_work_pending())
+-   set_dec(1);
+-  __get_cpu_var(irq_stat).timer_irqs_others++;
+- }
+-
+-#ifdef CONFIG_PPC64
+- /* collect purr register values often, for accurate calculations */
+- if (firmware_has_feature(FW_FEATURE_SPLPAR)) {
+-  struct cpu_usage *cu = &__get_cpu_var(cpu_usage_array);
+-  cu->current_tb = mfspr(SPRN_PURR);
+- }
+-#endif
+-
+- trace_timer_interrupt_exit(regs);
+-
++ __timer_interrupt();
+  irq_exit();
+  set_irq_regs(old_regs);
+ }
+@@ -828,6 +835,10 @@ static void decrementer_set_mode(enum clock_event_mode mode,
+ /* Interrupt handler for the timer broadcast IPI */
+ void tick_broadcast_ipi_handler(void)
+ {
++ u64 *next_tb = &__get_cpu_var(decrementers_next_tb);
++
++ *next_tb = get_tb_or_rtc();
++ __timer_interrupt();
+ }
+ 
+ static void register_decrementer_clockevent(int cpu)
+-- 
+1.7.1

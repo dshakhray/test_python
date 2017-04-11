@@ -1,0 +1,244 @@
+From 445a838f3a45c5e4442ab0c9ec4322d49b304ba4 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Sat, 19 Jul 2014 04:27:14 -0400
+Subject: [pci] Enforce bus address limits in resource allocation
+
+Message-id: <20140719042714.19438.65021.stgit@gir.stowe>
+Patchwork-id: 86005
+O-Subject: [RHEL7.1 PATCH 43/81] PCI: Enforce bus address limits in resource allocation
+Bugzilla: 1110895
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110895
+Upstream Status: f75b99d5a77d63f20e07bd276d5a427808ac8ef6
+
+commit f75b99d5a77d63f20e07bd276d5a427808ac8ef6
+Author: Yinghai Lu <yinghai@kernel.org>
+Date:   Fri Dec 20 09:57:37 2013 -0700
+
+    PCI: Enforce bus address limits in resource allocation
+
+    When allocating space for 32-bit BARs, we previously limited RESOURCE
+    addresses so they would fit in 32 bits.  However, the BUS address need not
+    be the same as the resource address, and it's the bus address that must fit
+    in the 32-bit BAR.
+
+    This patch adds:
+
+      - pci_clip_resource_to_region(), which clips a resource so it
+        contains
+        only the range that maps to the specified bus address region, e.g., to
+        clip a resource to 32-bit bus addresses, and
+
+      - pci_bus_alloc_from_region(), which allocates space for a resource
+        from
+        the specified bus address region,
+
+    and changes pci_bus_alloc_resource() to allocate space for 64-bit BARs from
+    the entire bus address region, and space for 32-bit BARs from only the bus
+    address region below 4GB.
+
+    If we had this window:
+
+      pci_root HWP0002:0a: host bridge window [mem 0xf0180000000-0xf01fedfffff] (bus address [0x80000000-0xfedfffff])
+
+    we previously could not put a 32-bit BAR there, because the CPU addresses
+    don't fit in 32 bits.  This patch fixes this, so we can use this space for
+    32-bit BARs.
+
+    It's also possible (though unlikely) to have resources with 32-bit CPU
+    addresses but bus addresses above 4GB.  In this case the previous code
+    would allocate space that a 32-bit BAR could not map.
+
+    Remove PCIBIOS_MAX_MEM_32, which is no longer used.
+
+    [bhelgaas: reworked starting from http://lkml.kernel.org/r/1386658484-15774-3-git-send-email-yinghai@kernel.org]
+    Signed-off-by: Yinghai Lu <yinghai@kernel.org>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/pci.h b/arch/x86/include/asm/pci.h
+index d44baf4..f789d59 100644
+--- a/arch/x86/include/asm/pci.h
++++ b/arch/x86/include/asm/pci.h
+@@ -125,7 +125,6 @@ int setup_msi_irq(struct pci_dev *dev, struct msi_desc *msidesc,
+ 
+ /* generic pci stuff */
+ #include <asm-generic/pci.h>
+-#define PCIBIOS_MAX_MEM_32 0xffffffff
+ 
+ #ifdef CONFIG_NUMA
+ /* Returns the node based on pci bus */
+diff --git a/drivers/pci/bus.c b/drivers/pci/bus.c
+index e22a4a6..b6b4bc1 100644
+--- a/drivers/pci/bus.c
++++ b/drivers/pci/bus.c
+@@ -98,41 +98,52 @@ void pci_bus_remove_resources(struct pci_bus *bus)
+  }
+ }
+ 
+-/**
+- * pci_bus_alloc_resource - allocate a resource from a parent bus
+- * @bus: PCI bus
+- * @res: resource to allocate
+- * @size: size of resource to allocate
+- * @align: alignment of resource to allocate
+- * @min: minimum /proc/iomem address to allocate
+- * @type_mask: IORESOURCE_* type flags
+- * @alignf: resource alignment function
+- * @alignf_data: data argument for resource alignment function
+- *
+- * Given the PCI bus a device resides on, the size, minimum address,
+- * alignment and type, try to find an acceptable resource allocation
+- * for a specific device resource.
++static struct pci_bus_region pci_32_bit = {0, 0xffffffffULL};
++#ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
++static struct pci_bus_region pci_64_bit = {0,
++    (dma_addr_t) 0xffffffffffffffffULL};
++#endif
++
++/*
++ * @res contains CPU addresses.  Clip it so the corresponding bus addresses
++ * on @bus are entirely within @region.  This is used to control the bus
++ * addresses of resources we allocate, e.g., we may need a resource that
++ * can be mapped by a 32-bit BAR.
+  */
+-int
+-pci_bus_alloc_resource(struct pci_bus *bus, struct resource *res,
++static void pci_clip_resource_to_region(struct pci_bus *bus,
++     struct resource *res,
++     struct pci_bus_region *region)
++{
++ struct pci_bus_region r;
++
++ pcibios_resource_to_bus(bus, &r, res);
++ if (r.start < region->start)
++  r.start = region->start;
++ if (r.end > region->end)
++  r.end = region->end;
++
++ if (r.end < r.start)
++  res->end = res->start - 1;
++ else
++  pcibios_bus_to_resource(bus, res, &r);
++}
++
++static int pci_bus_alloc_from_region(struct pci_bus *bus, struct resource *res,
+   resource_size_t size, resource_size_t align,
+   resource_size_t min, unsigned int type_mask,
+   resource_size_t (*alignf)(void *,
+        const struct resource *,
+        resource_size_t,
+        resource_size_t),
+-  void *alignf_data)
++  void *alignf_data,
++  struct pci_bus_region *region)
+ {
+- int i, ret = -ENOMEM;
+- struct resource *r;
+- resource_size_t max = -1;
++ int i, ret;
++ struct resource *r, avail;
++ resource_size_t max;
+ 
+  type_mask |= IORESOURCE_IO | IORESOURCE_MEM;
+ 
+- /* don't allocate too high if the pref mem doesn't support 64bit*/
+- if (!(res->flags & IORESOURCE_MEM_64))
+-  max = PCIBIOS_MAX_MEM_32;
+-
+  pci_bus_for_each_resource(bus, r, i) {
+   if (!r)
+    continue;
+@@ -147,22 +158,66 @@ pci_bus_alloc_resource(struct pci_bus *bus, struct resource *res,
+       !(res->flags & IORESOURCE_PREFETCH))
+    continue;
+ 
++  avail = *r;
++  pci_clip_resource_to_region(bus, &avail, region);
++  if (!resource_size(&avail))
++   continue;
++
+   /*
+    * "min" is typically PCIBIOS_MIN_IO or PCIBIOS_MIN_MEM to
+    * protect badly documented motherboard resources, but if
+    * this is an already-configured bridge window, its start
+    * overrides "min".
+    */
+-  if (r->start)
+-   min = r->start;
++  if (avail.start)
++   min = avail.start;
++
++  max = avail.end;
+ 
+   /* Ok, try it out.. */
+   ret = allocate_resource(r, res, size, min, max,
+      align, alignf, alignf_data);
+   if (ret == 0)
+-   break;
++   return 0;
+  }
+- return ret;
++ return -ENOMEM;
++}
++
++/**
++ * pci_bus_alloc_resource - allocate a resource from a parent bus
++ * @bus: PCI bus
++ * @res: resource to allocate
++ * @size: size of resource to allocate
++ * @align: alignment of resource to allocate
++ * @min: minimum /proc/iomem address to allocate
++ * @type_mask: IORESOURCE_* type flags
++ * @alignf: resource alignment function
++ * @alignf_data: data argument for resource alignment function
++ *
++ * Given the PCI bus a device resides on, the size, minimum address,
++ * alignment and type, try to find an acceptable resource allocation
++ * for a specific device resource.
++ */
++int
++pci_bus_alloc_resource(struct pci_bus *bus, struct resource *res,
++  resource_size_t size, resource_size_t align,
++  resource_size_t min, unsigned int type_mask,
++  resource_size_t (*alignf)(void *,
++       const struct resource *,
++       resource_size_t,
++       resource_size_t),
++  void *alignf_data)
++{
++#ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
++ if (res->flags & IORESOURCE_MEM_64)
++  return pci_bus_alloc_from_region(bus, res, size, align, min,
++       type_mask, alignf, alignf_data,
++       &pci_64_bit);
++#endif
++
++ return pci_bus_alloc_from_region(bus, res, size, align, min,
++      type_mask, alignf, alignf_data,
++      &pci_32_bit);
+ }
+ 
+ void __weak pcibios_resource_survey_bus(struct pci_bus *bus) { }
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 49104ac..0ffa266 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -1542,10 +1542,6 @@ static inline struct pci_dev *pci_dev_get(struct pci_dev *dev)
+ 
+ #include <asm/pci.h>
+ 
+-#ifndef PCIBIOS_MAX_MEM_32
+-#define PCIBIOS_MAX_MEM_32 (-1)
+-#endif
+-
+ /* these helpers provide future and backwards compatibility
+  * for accessing popular PCI BAR info */
+ #define pci_resource_start(dev, bar) ((dev)->resource[(bar)].start)
+-- 
+1.7.1

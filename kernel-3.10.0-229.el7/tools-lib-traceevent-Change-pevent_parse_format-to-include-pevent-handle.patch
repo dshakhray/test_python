@@ -1,0 +1,151 @@
+From 53ea0addc3126973e9fbb166947fef3f2a3d6dbf Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:49:28 -0400
+Subject: [tools] lib/traceevent: Change pevent_parse_format to include pevent handle
+
+Message-id: <1408953210-26343-81-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88816
+O-Subject: [PATCH RHEL7.1 BZ1133083 080/322] tools lib traceevent: Change pevent_parse_format to include pevent handle
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 71ad9583ff15d2e95cb8c67a5c963321d9d1877b
+Author: Jiri Olsa <jolsa@redhat.com>
+Date: Tue Dec 3 14:09:19 2013 +0100
+
+description
+===========
+Changing the pevent_parse_format interface to include the pevent handle.
+
+The goal is to always use pevent object when dealing with traceevent
+library. The reason is that we might need additional processing (like
+plugins), which is not possible otherwise.
+
+Patches follow to make this happen completely.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/lib/traceevent/event-parse.c b/tools/lib/traceevent/event-parse.c
+index 900fca0..9849873 100644
+--- a/tools/lib/traceevent/event-parse.c
++++ b/tools/lib/traceevent/event-parse.c
+@@ -5121,8 +5121,38 @@ enum pevent_errno __pevent_parse_format(struct event_format **eventp,
+  return ret;
+ }
+ 
++static enum pevent_errno
++__pevent_parse_event(struct pevent *pevent,
++       struct event_format **eventp,
++       const char *buf, unsigned long size,
++       const char *sys)
++{
++ int ret = __pevent_parse_format(eventp, pevent, buf, size, sys);
++ struct event_format *event = *eventp;
++
++ if (event == NULL)
++  return ret;
++
++ if (pevent && add_event(pevent, event)) {
++  ret = PEVENT_ERRNO__MEM_ALLOC_FAILED;
++  goto event_add_failed;
++ }
++
++#define PRINT_ARGS 0
++ if (PRINT_ARGS && event->print_fmt.args)
++  print_args(event->print_fmt.args);
++
++ return 0;
++
++event_add_failed:
++ pevent_free_format(event);
++ return ret;
++}
++
+ /**
+  * pevent_parse_format - parse the event format
++ * @pevent: the handle to the pevent
++ * @eventp: returned format
+  * @buf: the buffer storing the event format string
+  * @size: the size of @buf
+  * @sys: the system the event belongs to
+@@ -5134,10 +5164,12 @@ enum pevent_errno __pevent_parse_format(struct event_format **eventp,
+  *
+  * /sys/kernel/debug/tracing/events/.../.../format
+  */
+-enum pevent_errno pevent_parse_format(struct event_format **eventp, const char *buf,
++enum pevent_errno pevent_parse_format(struct pevent *pevent,
++          struct event_format **eventp,
++          const char *buf,
+           unsigned long size, const char *sys)
+ {
+- return __pevent_parse_format(eventp, NULL, buf, size, sys);
++ return __pevent_parse_event(pevent, eventp, buf, size, sys);
+ }
+ 
+ /**
+@@ -5158,25 +5190,7 @@ enum pevent_errno pevent_parse_event(struct pevent *pevent, const char *buf,
+          unsigned long size, const char *sys)
+ {
+  struct event_format *event = NULL;
+- int ret = __pevent_parse_format(&event, pevent, buf, size, sys);
+-
+- if (event == NULL)
+-  return ret;
+-
+- if (add_event(pevent, event)) {
+-  ret = PEVENT_ERRNO__MEM_ALLOC_FAILED;
+-  goto event_add_failed;
+- }
+-
+-#define PRINT_ARGS 0
+- if (PRINT_ARGS && event->print_fmt.args)
+-  print_args(event->print_fmt.args);
+-
+- return 0;
+-
+-event_add_failed:
+- pevent_free_format(event);
+- return ret;
++ return __pevent_parse_event(pevent, &event, buf, size, sys);
+ }
+ 
+ #undef _PE
+diff --git a/tools/lib/traceevent/event-parse.h b/tools/lib/traceevent/event-parse.h
+index 54273c0..620c27a 100644
+--- a/tools/lib/traceevent/event-parse.h
++++ b/tools/lib/traceevent/event-parse.h
+@@ -562,7 +562,9 @@ int pevent_parse_header_page(struct pevent *pevent, char *buf, unsigned long siz
+ 
+ enum pevent_errno pevent_parse_event(struct pevent *pevent, const char *buf,
+          unsigned long size, const char *sys);
+-enum pevent_errno pevent_parse_format(struct event_format **eventp, const char *buf,
++enum pevent_errno pevent_parse_format(struct pevent *pevent,
++          struct event_format **eventp,
++          const char *buf,
+           unsigned long size, const char *sys);
+ void pevent_free_format(struct event_format *event);
+ 
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index b5fe7f9..6a046ed 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -210,7 +210,7 @@ struct event_format *event_format__new(const char *sys, const char *name)
+   size += n;
+  } while (n > 0);
+ 
+- pevent_parse_format(&format, bf, size, sys);
++ pevent_parse_format(NULL, &format, bf, size, sys);
+ 
+ out_free_bf:
+  free(bf);
+-- 
+1.7.1

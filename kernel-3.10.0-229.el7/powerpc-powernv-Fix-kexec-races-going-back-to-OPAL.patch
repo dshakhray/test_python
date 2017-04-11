@@ -1,0 +1,112 @@
+From 56035e9158536ce911f3c28262af757799b42cb9 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:11:22 -0400
+Subject: [powerpc] powernv: Fix kexec races going back to OPAL
+
+Message-id: <1410545655-205645-454-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94506
+O-Subject: [RHEL7 PATCH 453/626] powerpc/powernv: Fix kexec races going back to OPAL
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 298b34d7d578c3b4325248b823f3d83a8ea1541c
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Thu Apr 24 16:14:25 2014 +1000
+
+    powerpc/powernv: Fix kexec races going back to OPAL
+
+    We have a subtle race when sending CPUs back to OPAL on kexec.
+
+    We mark them as "in real mode" right before we send them down. Once
+    we've booted the new kernel, it might try to call opal_reinit_cpus()
+    to change endianness, and that requires all CPUs to be spinning inside
+    OPAL.
+
+    However there is no synchronization here and we've observed cases
+    where the returning CPUs hadn't established their new state inside
+    OPAL before opal_reinit_cpus() is called, causing it to fail.
+
+    The proper fix is to actually wait for them to go down all the way
+    from the kexec'ing kernel.
+
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/platforms/powernv/setup.c b/arch/powerpc/platforms/powernv/setup.c
+index 2d80845..f8c4b03 100644
+--- a/arch/powerpc/platforms/powernv/setup.c
++++ b/arch/powerpc/platforms/powernv/setup.c
+@@ -163,18 +163,62 @@ static void pnv_shutdown(void)
+ }
+ 
+ #ifdef CONFIG_KEXEC
++static void pnv_kexec_wait_secondaries_down(void)
++{
++ int my_cpu, i, notified = -1;
++
++ my_cpu = get_cpu();
++
++ for_each_online_cpu(i) {
++  uint8_t status;
++  int64_t rc;
++
++  if (i == my_cpu)
++   continue;
++
++  for (;;) {
++   rc = opal_query_cpu_status(get_hard_smp_processor_id(i),
++         &status);
++   if (rc != OPAL_SUCCESS || status != OPAL_THREAD_STARTED)
++    break;
++   barrier();
++   if (i != notified) {
++    printk(KERN_INFO "kexec: waiting for cpu %d "
++           "(physical %d) to enter OPAL\n",
++           i, paca[i].hw_cpu_id);
++    notified = i;
++   }
++  }
++ }
++}
++
+ static void pnv_kexec_cpu_down(int crash_shutdown, int secondary)
+ {
+  xics_kexec_teardown_cpu(secondary);
+ 
+- /* Return secondary CPUs to firmware on OPAL v3 */
+- if (firmware_has_feature(FW_FEATURE_OPALv3) && secondary) {
++ /* On OPAL v3, we return all CPUs to firmware */
++
++ if (!firmware_has_feature(FW_FEATURE_OPALv3))
++  return;
++
++ if (secondary) {
++  /* Return secondary CPUs to firmware on OPAL v3 */
+   mb();
+   get_paca()->kexec_state = KEXEC_STATE_REAL_MODE;
+   mb();
+ 
+   /* Return the CPU to OPAL */
+   opal_return_cpu();
++ } else if (crash_shutdown) {
++  /*
++   * On crash, we don't wait for secondaries to go
++   * down as they might be unreachable or hung, so
++   * instead we just wait a bit and move on.
++   */
++  mdelay(1);
++ } else {
++  /* Primary waits for the secondaries to have reached OPAL */
++  pnv_kexec_wait_secondaries_down();
+  }
+ }
+ #endif /* CONFIG_KEXEC */
+-- 
+1.7.1

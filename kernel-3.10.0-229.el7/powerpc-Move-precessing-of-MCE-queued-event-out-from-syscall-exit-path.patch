@@ -1,0 +1,119 @@
+From ed422224a753bb31c9d7ec100b2007ad1824a648 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:14:07 -0400
+Subject: [powerpc] Move precessing of MCE queued event out from syscall exit path
+
+Message-id: <1410545655-205645-619-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94651
+O-Subject: [RHEL7 PATCH 618/626] Move precessing of MCE queued event out from syscall exit path.
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 30c826358d10c1d6f8147de3310b97488daec830
+Author: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+Date:   Tue Jan 14 15:45:09 2014 +0530
+
+    Move precessing of MCE queued event out from syscall exit path.
+
+    Huge Dickins reported an issue that b5ff4211a829
+    "powerpc/book3s: Queue up and process delayed MCE events" breaks the
+    PowerMac G5 boot. This patch fixes it by moving the mce even processing
+    away from syscall exit, which was wrong to do that in first place, and
+    using irq work framework to delay processing of mce event.
+
+    Reported-by: Hugh Dickins <hughd@google.com
+    Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/mce.h b/arch/powerpc/include/asm/mce.h
+index 2257d1e..f97d8cb 100644
+--- a/arch/powerpc/include/asm/mce.h
++++ b/arch/powerpc/include/asm/mce.h
+@@ -192,7 +192,6 @@ extern void save_mce_event(struct pt_regs *regs, long handled,
+ extern int get_mce_event(struct machine_check_event *mce, bool release);
+ extern void release_mce_event(void);
+ extern void machine_check_queue_event(void);
+-extern void machine_check_process_queued_event(void);
+ extern void machine_check_print_event_info(struct machine_check_event *evt);
+ extern uint64_t get_mce_fault_addr(struct machine_check_event *evt);
+ 
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index 5d66bb2..911d453 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -184,11 +184,6 @@ syscall_exit:
+  bl do_show_syscall_exit
+  ld r3,RESULT(r1)
+ #endif
+-#ifdef CONFIG_PPC_BOOK3S_64
+-BEGIN_FTR_SECTION
+- bl .machine_check_process_queued_event
+-END_FTR_SECTION_IFSET(CPU_FTR_HVMODE)
+-#endif
+  CURRENT_THREAD_INFO(r12, r1)
+ 
+  ld r8,_MSR(r1)
+diff --git a/arch/powerpc/kernel/mce.c b/arch/powerpc/kernel/mce.c
+index d6edf2b..a7fd4cb 100644
+--- a/arch/powerpc/kernel/mce.c
++++ b/arch/powerpc/kernel/mce.c
+@@ -26,6 +26,7 @@
+ #include <linux/ptrace.h>
+ #include <linux/percpu.h>
+ #include <linux/export.h>
++#include <linux/irq_work.h>
+ #include <asm/mce.h>
+ 
+ static DEFINE_PER_CPU(int, mce_nest_count);
+@@ -35,6 +36,11 @@ static DEFINE_PER_CPU(struct machine_check_event[MAX_MC_EVT], mce_event);
+ static DEFINE_PER_CPU(int, mce_queue_count);
+ static DEFINE_PER_CPU(struct machine_check_event[MAX_MC_EVT], mce_event_queue);
+ 
++static void machine_check_process_queued_event(struct irq_work *work);
++struct irq_work mce_event_process_work = {
++        .func = machine_check_process_queued_event,
++};
++
+ static void mce_set_error_info(struct machine_check_event *mce,
+           struct mce_error_info *mce_err)
+ {
+@@ -185,17 +191,19 @@ void machine_check_queue_event(void)
+   return;
+  }
+  __get_cpu_var(mce_event_queue[index]) = evt;
++
++ /* Queue irq work to process this event later. */
++ irq_work_queue(&mce_event_process_work);
+ }
+ 
+ /*
+  * process pending MCE event from the mce event queue. This function will be
+  * called during syscall exit.
+  */
+-void machine_check_process_queued_event(void)
++static void machine_check_process_queued_event(struct irq_work *work)
+ {
+  int index;
+ 
+- preempt_disable();
+  /*
+   * For now just print it to console.
+   * TODO: log this error event to FSP or nvram.
+@@ -206,7 +214,6 @@ void machine_check_process_queued_event(void)
+     &__get_cpu_var(mce_event_queue[index]));
+   __get_cpu_var(mce_queue_count)--;
+  }
+- preempt_enable();
+ }
+ 
+ void machine_check_print_event_info(struct machine_check_event *evt)
+-- 
+1.7.1

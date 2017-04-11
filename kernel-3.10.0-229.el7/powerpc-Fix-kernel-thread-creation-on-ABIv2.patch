@@ -1,0 +1,94 @@
+From 74b13065aa984f8fcd40421b77b37f8240fe1b02 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:10:48 -0400
+Subject: [powerpc] Fix kernel thread creation on ABIv2
+
+Message-id: <1410545655-205645-420-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94502
+O-Subject: [RHEL7 PATCH 419/626] powerpc: Fix kernel thread creation on ABIv2
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 7cedd6014bfe353d4b552ed8d54d63f6e06e26ba
+Author: Anton Blanchard <anton@samba.org>
+Date:   Tue Feb 4 16:08:51 2014 +1100
+
+    powerpc: Fix kernel thread creation on ABIv2
+
+    Change how we setup registers for ret_from_kernel_thread. In
+    ABIv1, instead of passing a function descriptor in, dereference
+    it and pass the target in directly.
+
+    Use ppc_global_function_entry to get it right on both ABIv1 and ABIv2.
+
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index cd31cc7..772fdb6 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -383,9 +383,11 @@ _GLOBAL(ret_from_fork)
+ _GLOBAL(ret_from_kernel_thread)
+  bl schedule_tail
+  REST_NVGPRS(r1)
+- ld r14, 0(r14)
+  mtlr r14
+  mr r3,r15
++#if defined(_CALL_ELF) && _CALL_ELF == 2
++ mr r12,r14
++#endif
+  blrl
+  li r3,0
+  b syscall_exit
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index 9d1ecbb..6798dd5 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -54,6 +54,7 @@
+ #ifdef CONFIG_PPC64
+ #include <asm/firmware.h>
+ #endif
++#include <asm/code-patching.h>
+ #include <linux/kprobes.h>
+ #include <linux/kdebug.h>
+ 
+@@ -1108,7 +1109,9 @@ int copy_thread(unsigned long clone_flags, unsigned long usp,
+   struct thread_info *ti = (void *)task_stack_page(p);
+   memset(childregs, 0, sizeof(struct pt_regs));
+   childregs->gpr[1] = sp + sizeof(struct pt_regs);
+-  childregs->gpr[14] = usp; /* function */
++  /* function */
++  if (usp)
++   childregs->gpr[14] = ppc_function_entry((void *)usp);
+ #ifdef CONFIG_PPC64
+   clear_tsk_thread_flag(p, TIF_32BIT);
+   childregs->softe = 1;
+@@ -1187,17 +1190,7 @@ int copy_thread(unsigned long clone_flags, unsigned long usp,
+  if (cpu_has_feature(CPU_FTR_HAS_PPR))
+   p->thread.ppr = INIT_PPR;
+ #endif
+- /*
+-  * The PPC64 ABI makes use of a TOC to contain function 
+-  * pointers.  The function (ret_from_except) is actually a pointer
+-  * to the TOC entry.  The first entry is a pointer to the actual
+-  * function.
+-  */
+-#ifdef CONFIG_PPC64
+- kregs->nip = *((unsigned long *)f);
+-#else
+- kregs->nip = (unsigned long)f;
+-#endif
++ kregs->nip = ppc_function_entry(f);
+  return 0;
+ }
+ 
+-- 
+1.7.1

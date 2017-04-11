@@ -1,0 +1,162 @@
+From e1644575f00cdf4cca71768d2eb4c858f80dec58 Mon Sep 17 00:00:00 2001
+From: Dave Young <dyoung@redhat.com>
+Date: Thu, 22 May 2014 02:43:12 -0400
+Subject: [firmware] efi: Export more EFI table variables to sysfs
+
+Message-id: <1400726607-13717-21-git-send-email-dyoung@redhat.com>
+Patchwork-id: 80121
+O-Subject: [RHEL7.1 PATCH 20/35] efi: Export more EFI table variables to sysfs
+Bugzilla: 1080109
+RH-Acked-by: Chao WANG <chaowang@redhat.com>
+RH-Acked-by: Vivek Goyal <vgoyal@redhat.com>
+
+Resolves: bz1080109
+
+Brew build:
+https://brewweb.devel.redhat.com/taskinfo?taskID=7480539
+
+Test: Tested kexec/kdump on HP workstation and qemu.
+
+Upstream commit:
+commit a0998eb15afeffbf52a2c2829318f67df9ac57b8
+Author: Dave Young <dyoung@redhat.com>
+Date:   Fri Dec 20 18:02:17 2013 +0800
+
+    efi: Export more EFI table variables to sysfs
+
+    Export fw_vendor, runtime and config table physical addresses to
+    /sys/firmware/efi/{fw_vendor,runtime,config_table} because kexec kernels
+    need them.
+
+    From EFI spec these 3 variables will be updated to virtual address after
+    entering virtual mode. But kernel startup code will need the physical
+    address.
+
+    Signed-off-by: Dave Young <dyoung@redhat.com>
+    Tested-by: Toshi Kani <toshi.kani@hp.com>
+    Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/ABI/testing/sysfs-firmware-efi b/Documentation/ABI/testing/sysfs-firmware-efi
+new file mode 100644
+index 0000000..05874da
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-firmware-efi
+@@ -0,0 +1,20 @@
++What:  /sys/firmware/efi/fw_vendor
++Date:  December 2013
++Contact: Dave Young <dyoung@redhat.com>
++Description: It shows the physical address of firmware vendor field in the
++  EFI system table.
++Users:  Kexec
++
++What:  /sys/firmware/efi/runtime
++Date:  December 2013
++Contact: Dave Young <dyoung@redhat.com>
++Description: It shows the physical address of runtime service table entry in
++  the EFI system table.
++Users:  Kexec
++
++What:  /sys/firmware/efi/config_table
++Date:  December 2013
++Contact: Dave Young <dyoung@redhat.com>
++Description: It shows the physical address of config table entry in the EFI
++  system table.
++Users:  Kexec
+diff --git a/arch/x86/platform/efi/efi.c b/arch/x86/platform/efi/efi.c
+index 4694632..2859107 100644
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@ -653,6 +653,10 @@ void __init efi_init(void)
+ 
+  set_bit(EFI_SYSTEM_TABLES, &x86_efi_facility);
+ 
++ efi.config_table = (unsigned long)efi.systab->tables;
++ efi.fw_vendor  = (unsigned long)efi.systab->fw_vendor;
++ efi.runtime  = (unsigned long)efi.systab->runtime;
++
+  /*
+   * Show what we know for posterity
+   */
+diff --git a/drivers/firmware/efi/efi.c b/drivers/firmware/efi/efi.c
+index 2e2fbde..72533af 100644
+--- a/drivers/firmware/efi/efi.c
++++ b/drivers/firmware/efi/efi.c
+@@ -32,6 +32,9 @@ struct efi __read_mostly efi = {
+  .hcdp       = EFI_INVALID_TABLE_ADDR,
+  .uga        = EFI_INVALID_TABLE_ADDR,
+  .uv_systab  = EFI_INVALID_TABLE_ADDR,
++ .fw_vendor  = EFI_INVALID_TABLE_ADDR,
++ .runtime    = EFI_INVALID_TABLE_ADDR,
++ .config_table  = EFI_INVALID_TABLE_ADDR,
+ };
+ EXPORT_SYMBOL(efi);
+ 
+@@ -71,13 +74,49 @@ static ssize_t systab_show(struct kobject *kobj,
+ static struct kobj_attribute efi_attr_systab =
+    __ATTR(systab, 0400, systab_show, NULL);
+ 
++#define EFI_FIELD(var) efi.var
++
++#define EFI_ATTR_SHOW(name) \
++static ssize_t name##_show(struct kobject *kobj, \
++    struct kobj_attribute *attr, char *buf) \
++{ \
++ return sprintf(buf, "0x%lx\n", EFI_FIELD(name)); \
++}
++
++EFI_ATTR_SHOW(fw_vendor);
++EFI_ATTR_SHOW(runtime);
++EFI_ATTR_SHOW(config_table);
++
++static struct kobj_attribute efi_attr_fw_vendor = __ATTR_RO(fw_vendor);
++static struct kobj_attribute efi_attr_runtime = __ATTR_RO(runtime);
++static struct kobj_attribute efi_attr_config_table = __ATTR_RO(config_table);
++
+ static struct attribute *efi_subsys_attrs[] = {
+  &efi_attr_systab.attr,
+- NULL, /* maybe more in the future? */
++ &efi_attr_fw_vendor.attr,
++ &efi_attr_runtime.attr,
++ &efi_attr_config_table.attr,
++ NULL,
+ };
+ 
++static umode_t efi_attr_is_visible(struct kobject *kobj,
++       struct attribute *attr, int n)
++{
++ umode_t mode = attr->mode;
++
++ if (attr == &efi_attr_fw_vendor.attr)
++  return (efi.fw_vendor == EFI_INVALID_TABLE_ADDR) ? 0 : mode;
++ else if (attr == &efi_attr_runtime.attr)
++  return (efi.runtime == EFI_INVALID_TABLE_ADDR) ? 0 : mode;
++ else if (attr == &efi_attr_config_table.attr)
++  return (efi.config_table == EFI_INVALID_TABLE_ADDR) ? 0 : mode;
++
++ return mode;
++}
++
+ static struct attribute_group efi_subsys_attr_group = {
+  .attrs = efi_subsys_attrs,
++ .is_visible = efi_attr_is_visible,
+ };
+ 
+ static struct efivars generic_efivars;
+diff --git a/include/linux/efi.h b/include/linux/efi.h
+index 28ad36b..82476c7 100644
+--- a/include/linux/efi.h
++++ b/include/linux/efi.h
+@@ -582,6 +582,9 @@ extern struct efi {
+  unsigned long hcdp;  /* HCDP table */
+  unsigned long uga;  /* UGA table */
+  unsigned long uv_systab; /* UV system table */
++ unsigned long fw_vendor; /* fw_vendor */
++ unsigned long runtime;  /* runtime table */
++ unsigned long config_table; /* config tables */
+  efi_get_time_t *get_time;
+  efi_set_time_t *set_time;
+  efi_get_wakeup_time_t *get_wakeup_time;
+-- 
+1.7.1

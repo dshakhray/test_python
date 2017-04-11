@@ -1,0 +1,69 @@
+From 146c6459e3cced12fa8d23662e695df4a8bf9cee Mon Sep 17 00:00:00 2001
+From: Mateusz Guzik <mguzik@redhat.com>
+Date: Tue, 27 May 2014 12:51:35 -0400
+Subject: [fs] aio: plug memory disclosure and fix reqs_active accounting
+
+Message-id: <20140527125134.GB10410@mguzik.redhat.com>
+Patchwork-id: 5175
+O-Subject: [kernel team] [RHEL7 PATCH] aio: plug memory disclosure and fix reqs_active accounting
+Bugzilla: 1094605
+CVE: CVE-2014-0206
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+aio: plug memory disclosure and fix reqs_active accounting
+
+Security: CVE-2014-0206
+
+Previously the code failed to validate 'head' parameter (modifable by
+userspace) before use. In effect random memory pages could be disclosed
+to userspace. Fix the problem by making sure 'head' fits the range, like
+previous code did.
+
+Other part of the problem is userspace reading events on its own, which
+results in unreliable reqs_active counter. Fix the problem by
+decrementing the counter up on completion instead of reading.
+
+The problem was introduced with:
+commit a31ad380bed817aa25f8830ad23e1a0480fef797
+Author: Kent Overstreet <koverstreet@google.com>
+Date:   Tue May 7 16:18:45 2013 -0700
+
+    aio: make aio_read_evt() more efficient, convert to hrtimers
+
+Patch below was written by Benjamin LaHaise and backported by me
+(slight changes) to 3.10 kernel.
+
+Signed-off-by: Mateusz Guzik <mguzik@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/aio.c b/fs/aio.c
+index 3c3566a..542a1ef 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -867,6 +867,7 @@ void aio_complete(struct kiocb *iocb, long res, long res2)
+ put_rq:
+  /* everything turned out well, dispose of the aiocb. */
+  aio_put_req(iocb);
++ atomic_dec(&ctx->reqs_active);
+ 
+  /*
+   * We have to order our ring_info tail store above and test
+@@ -907,6 +908,8 @@ static long aio_read_events_ring(struct kioctx *ctx,
+  if (head == ctx->tail)
+   goto out;
+ 
++ head %= ctx->nr_events;
++
+  while (ret < nr) {
+   long avail;
+   struct io_event *ev;
+@@ -956,7 +959,6 @@ static long aio_read_events_ring(struct kioctx *ctx,
+ 
+  pr_debug("%li  h%u t%u\n", ret, head, ctx->tail);
+ 
+- atomic_sub(ret, &ctx->reqs_active);
+ out:
+  mutex_unlock(&ctx->ring_lock);
+ 
+-- 
+1.7.1

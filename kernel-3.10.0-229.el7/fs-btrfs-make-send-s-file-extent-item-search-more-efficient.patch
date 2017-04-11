@@ -1,0 +1,84 @@
+From 52c89695653e457dcaf7ce3c2f9779dfdbbb5ee7 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:00:24 -0400
+Subject: [fs] btrfs: make send's file extent item search more efficient
+
+Message-id: <1407179109-13714-138-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87081
+O-Subject: [RHEL7.1 PATCH 137/422] Btrfs: make send's file extent item search more efficient
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Filipe David Borba Manana <fdmanana@gmail.com>
+
+commit 7fdd29d02e0ab595a857fe9c7b71e752ff665372
+Author: Filipe David Borba Manana <fdmanana@gmail.com>
+Date:   Fri Jan 24 17:42:09 2014 +0000
+
+    Btrfs: make send's file extent item search more efficient
+
+    Instead of looking for a file extent item, process it, release the path
+    and do a btree search for the next file extent item, just process all
+    file extent items in a leaf without intermediate btree searches. This way
+    we save cpu and we're not blocking other tasks or affecting concurrency on
+    the btree, because send's paths use the commit root and skip btree node/leaf
+    locking.
+
+    Signed-off-by: Filipe David Borba Manana <fdmanana@gmail.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index c96e879..4d31f72 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -4573,17 +4573,25 @@ static int process_all_extents(struct send_ctx *sctx)
+  key.objectid = sctx->cmp_key->objectid;
+  key.type = BTRFS_EXTENT_DATA_KEY;
+  key.offset = 0;
+- while (1) {
+-  ret = btrfs_search_slot_for_read(root, &key, path, 1, 0);
+-  if (ret < 0)
+-   goto out;
+-  if (ret) {
+-   ret = 0;
+-   goto out;
+-  }
++ ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
++ if (ret < 0)
++  goto out;
+ 
++ while (1) {
+   eb = path->nodes[0];
+   slot = path->slots[0];
++
++  if (slot >= btrfs_header_nritems(eb)) {
++   ret = btrfs_next_leaf(root, path);
++   if (ret < 0) {
++    goto out;
++   } else if (ret > 0) {
++    ret = 0;
++    break;
++   }
++   continue;
++  }
++
+   btrfs_item_key_to_cpu(eb, &found_key, slot);
+ 
+   if (found_key.objectid != key.objectid ||
+@@ -4596,8 +4604,7 @@ static int process_all_extents(struct send_ctx *sctx)
+   if (ret < 0)
+    goto out;
+ 
+-  btrfs_release_path(path);
+-  key.offset = found_key.offset + 1;
++  path->slots[0]++;
+  }
+ 
+ out:
+-- 
+1.7.1

@@ -1,0 +1,70 @@
+From f5fe77d46379887eb09730a91b646c5897ce1db8 Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:07 -0400
+Subject: [fs] cifs: Fix corrupt SMB2 ioctl requests
+
+Message-id: <1406549822-10376-15-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86729
+O-Subject: [RHEL7.1 PATCH 14/69] [bz1082049]Fix corrupt SMB2 ioctl requests
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Steve French <smfrench@gmail.com>
+
+We were off by one calculating the length of ioctls in some cases
+because the protocol specification for SMB2 ioctl includes a mininum
+one byte payload but not all SMB2 ioctl requests actually have
+a data buffer to send. We were also not zeroing out the
+return buffer (in case of error this is helpful).
+
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 7ff8d45c9dccf0744404d6fe44468ede7c1b9533)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 0012800..e743a5a 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -1137,6 +1137,7 @@ SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
+ 
+  cifs_dbg(FYI, "SMB2 IOCTL\n");
+ 
++ *out_data = NULL;
+  /* zero out returned data len, in case of error */
+  if (plen)
+   *plen = 0;
+@@ -1182,11 +1183,23 @@ SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
+   req->Flags = 0;
+ 
+  iov[0].iov_base = (char *)req;
+- /* 4 for rfc1002 length field */
+- iov[0].iov_len = get_rfc1002_length(req) + 4;
+ 
+- if (indatalen)
+-  inc_rfc1001_len(req, indatalen);
++ /*
++  * If no input data, the size of ioctl struct in
++  * protocol spec still includes a 1 byte data buffer,
++  * but if input data passed to ioctl, we do not
++  * want to double count this, so we do not send
++  * the dummy one byte of data in iovec[0] if sending
++  * input data (in iovec[1]). We also must add 4 bytes
++  * in first iovec to allow for rfc1002 length field.
++  */
++
++ if (indatalen) {
++  iov[0].iov_len = get_rfc1002_length(req) + 4 - 1;
++  inc_rfc1001_len(req, indatalen - 1);
++ } else
++  iov[0].iov_len = get_rfc1002_length(req) + 4;
++
+ 
+  rc = SendReceive2(xid, ses, iov, num_iovecs, &resp_buftype, 0);
+  rsp = (struct smb2_ioctl_rsp *)iov[0].iov_base;
+-- 
+1.7.1

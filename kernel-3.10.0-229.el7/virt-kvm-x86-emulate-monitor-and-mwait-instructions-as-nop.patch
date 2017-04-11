@@ -1,0 +1,141 @@
+From 257c25d41a8e5a429cb1674c6a832d1e2c214269 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:39:55 -0400
+Subject: [virt] kvm/x86: emulate monitor and mwait instructions as nop
+
+Message-id: <1406040016-3289-201-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86279
+O-Subject: [RHEL7 PATCH v2 200/221] kvm: x86: emulate monitor and mwait instructions as nop
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: "Gabriel L. Somlo" <gsomlo@gmail.com>
+
+Treat monitor and mwait instructions as nop, which is architecturally
+correct (but inefficient) behavior. We do this to prevent misbehaving
+guests (e.g. OS X <= 10.7) from crashing after they fail to check for
+monitor/mwait availability via cpuid.
+
+Since mwait-based idle loops relying on these nop-emulated instructions
+would keep the host CPU pegged at 100%, do NOT advertise their presence
+via cpuid, to prevent compliant guests from using them inadvertently.
+
+Signed-off-by: Gabriel L. Somlo <somlo@cmu.edu>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 87c00572ba05aa8c9db118da75c608f47eb10b9e)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index 17b42fa..38a0afe 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -283,6 +283,8 @@ static inline int __do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
+   0 /* Reserved */ | f_lm | F(3DNOWEXT) | F(3DNOW);
+  /* cpuid 1.ecx */
+  const u32 kvm_supported_word4_x86_features =
++  /* NOTE: MONITOR (and MWAIT) are emulated as NOP,
++   * but *not* advertised to guests via CPUID ! */
+   F(XMM3) | F(PCLMULQDQ) | 0 /* DTES64, MONITOR */ |
+   0 /* DS-CPL, VMX, SMX, EST */ |
+   0 /* TM2 */ | F(SSSE3) | 0 /* CNXT-ID */ | 0 /* Reserved */ |
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 86d7015..4aee380 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -2770,12 +2770,6 @@ static int xsetbv_interception(struct vcpu_svm *svm)
+  return 1;
+ }
+ 
+-static int invalid_op_interception(struct vcpu_svm *svm)
+-{
+- kvm_queue_exception(&svm->vcpu, UD_VECTOR);
+- return 1;
+-}
+-
+ static int task_switch_interception(struct vcpu_svm *svm)
+ {
+  u16 tss_selector;
+@@ -3287,6 +3281,24 @@ static int pause_interception(struct vcpu_svm *svm)
+  return 1;
+ }
+ 
++static int nop_interception(struct vcpu_svm *svm)
++{
++ skip_emulated_instruction(&(svm->vcpu));
++ return 1;
++}
++
++static int monitor_interception(struct vcpu_svm *svm)
++{
++ printk_once(KERN_WARNING "kvm: MONITOR instruction emulated as NOP!\n");
++ return nop_interception(svm);
++}
++
++static int mwait_interception(struct vcpu_svm *svm)
++{
++ printk_once(KERN_WARNING "kvm: MWAIT instruction emulated as NOP!\n");
++ return nop_interception(svm);
++}
++
+ static int (*const svm_exit_handlers[])(struct vcpu_svm *svm) = {
+  [SVM_EXIT_READ_CR0]   = cr_interception,
+  [SVM_EXIT_READ_CR3]   = cr_interception,
+@@ -3344,8 +3356,8 @@ static int (*const svm_exit_handlers[])(struct vcpu_svm *svm) = {
+  [SVM_EXIT_CLGI]    = clgi_interception,
+  [SVM_EXIT_SKINIT]   = skinit_interception,
+  [SVM_EXIT_WBINVD]                       = emulate_on_interception,
+- [SVM_EXIT_MONITOR]   = invalid_op_interception,
+- [SVM_EXIT_MWAIT]   = invalid_op_interception,
++ [SVM_EXIT_MONITOR]   = monitor_interception,
++ [SVM_EXIT_MWAIT]   = mwait_interception,
+  [SVM_EXIT_XSETBV]   = xsetbv_interception,
+  [SVM_EXIT_NPF]    = pf_interception,
+ };
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 61e818d..6f7463f 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -5650,12 +5650,24 @@ static int handle_pause(struct kvm_vcpu *vcpu)
+  return 1;
+ }
+ 
+-static int handle_invalid_op(struct kvm_vcpu *vcpu)
++static int handle_nop(struct kvm_vcpu *vcpu)
+ {
+- kvm_queue_exception(vcpu, UD_VECTOR);
++ skip_emulated_instruction(vcpu);
+  return 1;
+ }
+ 
++static int handle_mwait(struct kvm_vcpu *vcpu)
++{
++ printk_once(KERN_WARNING "kvm: MWAIT instruction emulated as NOP!\n");
++ return handle_nop(vcpu);
++}
++
++static int handle_monitor(struct kvm_vcpu *vcpu)
++{
++ printk_once(KERN_WARNING "kvm: MONITOR instruction emulated as NOP!\n");
++ return handle_nop(vcpu);
++}
++
+ /*
+  * To run an L2 guest, we need a vmcs02 based on the L1-specified vmcs12.
+  * We could reuse a single VMCS for all the L2 guests, but we also want the
+@@ -6617,8 +6629,8 @@ static int (*const kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+  [EXIT_REASON_EPT_VIOLATION]       = handle_ept_violation,
+  [EXIT_REASON_EPT_MISCONFIG]           = handle_ept_misconfig,
+  [EXIT_REASON_PAUSE_INSTRUCTION]       = handle_pause,
+- [EXIT_REASON_MWAIT_INSTRUCTION]       = handle_invalid_op,
+- [EXIT_REASON_MONITOR_INSTRUCTION]     = handle_invalid_op,
++ [EXIT_REASON_MWAIT_INSTRUCTION]       = handle_mwait,
++ [EXIT_REASON_MONITOR_INSTRUCTION]     = handle_monitor,
+  [EXIT_REASON_INVEPT]                  = handle_invept,
+ };
+ 
+-- 
+1.7.1

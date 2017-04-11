@@ -1,0 +1,134 @@
+From e125ec56907ea4e9ddd5b9b825c1bc3cd48e0765 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:13:21 -0400
+Subject: [powerpc] powernv: Enable POWER8 doorbell IPIs
+
+Message-id: <1410545655-205645-573-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94575
+O-Subject: [RHEL7 PATCH 572/626] powerpc/powernv: Enable POWER8 doorbell IPIs
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit d4e58e5928f8c6c49228451dd03e0714cbab299a
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Wed Jun 11 15:59:28 2014 +1000
+
+    powerpc/powernv: Enable POWER8 doorbell IPIs
+
+    This patch enables POWER8 doorbell IPIs on powernv.
+
+    Since doorbells can only IPI within a core, we test to see when we can use
+    doorbells and if not we fall back to XICS.  This also enables hypervisor
+    doorbells to wakeup us up from nap/sleep via the LPCR PECEDH bit.
+
+    Based on tests by Anton, the best case IPI latency between two threads dropped
+    from 894ns to 512ns.
+
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/cpu_setup_power.S b/arch/powerpc/kernel/cpu_setup_power.S
+index 1557e7c..4673353 100644
+--- a/arch/powerpc/kernel/cpu_setup_power.S
++++ b/arch/powerpc/kernel/cpu_setup_power.S
+@@ -56,6 +56,7 @@ _GLOBAL(__setup_cpu_power8)
+  li r0,0
+  mtspr SPRN_LPID,r0
+  mfspr r3,SPRN_LPCR
++ ori r3, r3, LPCR_PECEDH
+  bl __init_LPCR
+  bl __init_HFSCR
+  bl __init_tlb_power8
+@@ -74,6 +75,7 @@ _GLOBAL(__restore_cpu_power8)
+  li r0,0
+  mtspr SPRN_LPID,r0
+  mfspr   r3,SPRN_LPCR
++ ori r3, r3, LPCR_PECEDH
+  bl __init_LPCR
+  bl __init_HFSCR
+  bl __init_tlb_power8
+diff --git a/arch/powerpc/platforms/powernv/Kconfig b/arch/powerpc/platforms/powernv/Kconfig
+index 895e8a2..336a9a4 100644
+--- a/arch/powerpc/platforms/powernv/Kconfig
++++ b/arch/powerpc/platforms/powernv/Kconfig
+@@ -11,6 +11,7 @@ config PPC_POWERNV
+  select PPC_UDBG_16550
+  select PPC_SCOM
+  select ARCH_RANDOM
++ select PPC_DOORBELL
+  default y
+ 
+ config PPC_POWERNV_RTAS
+diff --git a/arch/powerpc/platforms/powernv/smp.c b/arch/powerpc/platforms/powernv/smp.c
+index 0062a43..5fcfcf4 100644
+--- a/arch/powerpc/platforms/powernv/smp.c
++++ b/arch/powerpc/platforms/powernv/smp.c
+@@ -32,6 +32,7 @@
+ #include <asm/opal.h>
+ #include <asm/runlatch.h>
+ #include <asm/code-patching.h>
++#include <asm/dbell.h>
+ 
+ #include "powernv.h"
+ 
+@@ -46,6 +47,11 @@ static void pnv_smp_setup_cpu(int cpu)
+ {
+  if (cpu != boot_cpuid)
+   xics_setup_cpu();
++
++#ifdef CONFIG_PPC_DOORBELL
++ if (cpu_has_feature(CPU_FTR_DBELL))
++  doorbell_setup_this_cpu();
++#endif
+ }
+ 
+ int pnv_smp_kick_cpu(int nr)
+diff --git a/arch/powerpc/platforms/pseries/Kconfig b/arch/powerpc/platforms/pseries/Kconfig
+index 2cb8b77..756b482 100644
+--- a/arch/powerpc/platforms/pseries/Kconfig
++++ b/arch/powerpc/platforms/pseries/Kconfig
+@@ -21,6 +21,7 @@ config PPC_PSERIES
+  select HAVE_CONTEXT_TRACKING
+  select HOTPLUG_CPU if SMP
+  select ARCH_RANDOM
++ select PPC_DOORBELL
+  default y
+ 
+ config PPC_SPLPAR
+diff --git a/arch/powerpc/sysdev/xics/icp-native.c b/arch/powerpc/sysdev/xics/icp-native.c
+index 9dee470..de8d948 100644
+--- a/arch/powerpc/sysdev/xics/icp-native.c
++++ b/arch/powerpc/sysdev/xics/icp-native.c
+@@ -26,6 +26,7 @@
+ #include <asm/errno.h>
+ #include <asm/xics.h>
+ #include <asm/kvm_ppc.h>
++#include <asm/dbell.h>
+ 
+ struct icp_ipl {
+  union {
+@@ -145,7 +146,13 @@ static unsigned int icp_native_get_irq(void)
+ static void icp_native_cause_ipi(int cpu, unsigned long data)
+ {
+  kvmppc_set_host_ipi(cpu, 1);
+- icp_native_set_qirr(cpu, IPI_PRIORITY);
++#ifdef CONFIG_PPC_DOORBELL
++ if (cpu_has_feature(CPU_FTR_DBELL) &&
++     (cpumask_test_cpu(cpu, cpu_sibling_mask(smp_processor_id()))))
++  doorbell_cause_ipi(cpu, data);
++ else
++#endif
++  icp_native_set_qirr(cpu, IPI_PRIORITY);
+ }
+ 
+ void xics_wake_cpu(int cpu)
+-- 
+1.7.1

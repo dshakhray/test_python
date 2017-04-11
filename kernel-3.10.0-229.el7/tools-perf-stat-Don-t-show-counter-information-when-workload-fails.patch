@@ -1,0 +1,121 @@
+From 51b88c5020938334183712f8d670ade7a20b01be Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:51:44 -0400
+Subject: [tools] perf/stat: Don't show counter information when workload fails
+
+Message-id: <1408953210-26343-217-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88980
+O-Subject: [PATCH RHEL7.1 BZ1133083 216/322] perf stat: Don't show counter information when workload fails
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 6af206fd911c825b83dd4efb2534a3a34ce77072
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date: Sat Dec 28 15:45:08 2013 -0300
+
+description
+===========
+When starting a workload 'stat' wasn't using prepare_workload evlist
+method's signal based exec() error reporting mechanism.
+
+Use it so that the we don't report 'not counted' counters.
+
+Before:
+
+  [acme@zoo linux]$ perf stat dfadsfa
+  dfadsfa: No such file or directory
+
+   Performance counter stats for 'dfadsfa':
+
+       <not counted>      task-clock
+       <not counted>      context-switches
+       <not counted>      cpu-migrations
+       <not counted>      page-faults
+       <not counted>      cycles
+       <not counted>      stalled-cycles-frontend
+     <not supported>      stalled-cycles-backend
+       <not counted>      instructions
+       <not counted>      branches
+       <not counted>      branch-misses
+
+         0.001831462 seconds time elapsed
+
+  [acme@zoo linux]$
+
+After:
+
+  [acme@zoo linux]$ perf stat dfadsfa
+  dfadsfa: No such file or directory
+  [acme@zoo linux]$
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index 106a5e5..1c76c7a 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -509,6 +509,18 @@ static void handle_initial_delay(void)
+  }
+ }
+ 
++static volatile bool workload_exec_failed;
++
++/*
++ * perf_evlist__prepare_workload will send a SIGUSR1
++ * if the fork fails, since we asked by setting its
++ * want_signal to true.
++ */
++static void workload_exec_failed_signal(int signo __maybe_unused)
++{
++ workload_exec_failed = true;
++}
++
+ static int __run_perf_stat(int argc, const char **argv)
+ {
+  char msg[512];
+@@ -529,7 +541,7 @@ static int __run_perf_stat(int argc, const char **argv)
+ 
+  if (forks) {
+   if (perf_evlist__prepare_workload(evsel_list, &target, argv,
+-        false, false) < 0) {
++        false, true) < 0) {
+    perror("failed to prepare workload");
+    return -1;
+   }
+@@ -584,6 +596,14 @@ static int __run_perf_stat(int argc, const char **argv)
+  clock_gettime(CLOCK_MONOTONIC, &ref_time);
+ 
+  if (forks) {
++  /*
++   * perf_evlist__prepare_workload will, after we call
++   * perf_evlist__start_Workload, send a SIGUSR1 if the exec call
++   * fails, that we will catch in workload_signal to flip
++   * workload_exec_failed.
++    */
++  signal(SIGUSR1, workload_exec_failed_signal);
++
+   perf_evlist__start_workload(evsel_list);
+   handle_initial_delay();
+ 
+@@ -594,6 +614,10 @@ static int __run_perf_stat(int argc, const char **argv)
+    }
+   }
+   wait(&status);
++
++  if (workload_exec_failed)
++   return -1;
++
+   if (WIFSIGNALED(status))
+    psignal(WTERMSIG(status), argv[0]);
+  } else {
+-- 
+1.7.1

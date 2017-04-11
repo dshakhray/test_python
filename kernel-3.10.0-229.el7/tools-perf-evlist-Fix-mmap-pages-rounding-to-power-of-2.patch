@@ -1,0 +1,95 @@
+From ad8947624e6d954ddfc4a3008e71e1e221a75ed3 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:50:00 -0400
+Subject: [tools] perf/evlist: Fix mmap pages rounding to power of 2
+
+Message-id: <1408953210-26343-113-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88832
+O-Subject: [PATCH RHEL7.1 BZ1133083 112/322] perf evlist: Fix mmap pages rounding to power of 2
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 1dbfa9387b397f2c4b8c65411b3e3fdf9284d2b1
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Mon Dec 9 15:18:39 2013 +0200
+
+description
+===========
+'next_pow2()' only works for 'unsigned int' but the argument is
+'unsigned long'.  Checking for values less than (1 << 31) ensures that
+'next_pow2()' is not passed a value out of range but lets anything else
+go through unvalidated.
+
+As a result mmap_pages of zero is used e.g.
+
+  perf record -v -m2147483649 uname
+  mmap size 0B
+  failed to mmap with 22 (Invalid argument)
+
+Fixed:
+
+  perf record -m2147483649 uname
+  rounding mmap pages size to 17592186044416 bytes (4294967296 pages)
+  Invalid argument for --mmap_pages/-m
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index 98ec96b..af25055 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -734,9 +734,11 @@ static long parse_pages_arg(const char *str, unsigned long min,
+ 
+  if (pages == 0 && min == 0) {
+   /* leave number of pages at 0 */
+- } else if (pages < (1UL << 31) && !is_power_of_2(pages)) {
++ } else if (!is_power_of_2(pages)) {
+   /* round pages up to next power of 2 */
+-  pages = next_pow2(pages);
++  pages = next_pow2_l(pages);
++  if (!pages)
++   return -EINVAL;
+   pr_info("rounding mmap pages size to %lu bytes (%lu pages)\n",
+    pages * page_size, pages);
+  }
+diff --git a/tools/perf/util/util.h b/tools/perf/util/util.h
+index adb39f2..659abf3 100644
+--- a/tools/perf/util/util.h
++++ b/tools/perf/util/util.h
+@@ -73,6 +73,7 @@
+ #include <sys/ttydefaults.h>
+ #include <lk/debugfs.h>
+ #include <termios.h>
++#include <linux/bitops.h>
+ 
+ extern const char *graph_line;
+ extern const char *graph_dotted_line;
+@@ -281,6 +282,17 @@ static inline unsigned next_pow2(unsigned x)
+  return 1ULL << (32 - __builtin_clz(x - 1));
+ }
+ 
++static inline unsigned long next_pow2_l(unsigned long x)
++{
++#if BITS_PER_LONG == 64
++ if (x <= (1UL << 31))
++  return next_pow2(x);
++ return (unsigned long)next_pow2(x >> 32) << 32;
++#else
++ return next_pow2(x);
++#endif
++}
++
+ size_t hex_width(u64 v);
+ int hex2u64(const char *ptr, u64 *val);
+ 
+-- 
+1.7.1

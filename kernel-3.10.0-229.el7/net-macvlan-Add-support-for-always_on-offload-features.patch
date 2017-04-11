@@ -1,0 +1,115 @@
+From 4091536b179f57f31f7f918a0cfc95762a9bb0b9 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Fri, 7 Mar 2014 13:10:59 -0500
+Subject: [net] macvlan: Add support for 'always_on' offload features
+
+Message-id: <1394197859-21987-1-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 78006
+O-Subject: [PATCH net RHEL7.x 3/2] fix performance regression due to feat-propagation from lowerdev
+Bugzilla: 928644
+RH-Acked-by: Hannes Frederic Sowa <hannes@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Jiri Benc <jbenc@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+BZ: 928644
+Upstream: 8b4703e9bd1172a5f8244276ebb94302e6153e26 net-next
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7153521
+Tested: ethtool shows sg is on even if turned off on lowerdev
+
+commit 797f87f83b60685ff8a13fa0572d2f10393c50d3
+(macvlan: fix netdev feature propagation from lower device)
+makes macvlan inherit features from the lower device.
+If e.g. scatter-gather is off on lowerdev that causes performance regression
+for macvlan/tap bridge mode (where lower device is not involved at all).
+
+Also tested that ethtool still shows gro off when querying macvlan
+offload settings if gro was disabled on the lower device.
+
+commit 8b4703e9bd1172a5f8244276ebb94302e6153e26
+Author: Vlad Yasevich <vyasevic@redhat.com>
+Date:   Mon Mar 3 15:33:53 2014 -0500
+
+    macvlan: Add support for 'always_on' offload features
+
+    Macvlan currently inherits all of its features from the lower
+    device.  When lower device disables offload support, this causes
+    macvlan to disable offload support as well.  This causes
+    performance regression when using macvlan/macvtap in bridge
+    mode.
+
+    It can be easily demonstrated by creating 2 namespaces using
+    macvlan in bridge mode and running netperf between them:
+
+    MIGRATED TCP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 10.0.0.1 () port 0 AF_INET
+    Recv   Send    Send
+    Socket Socket  Message  Elapsed
+    Size   Size    Size     Time     Throughput
+    bytes  bytes   bytes    secs.    10^6bits/sec
+
+     87380  16384  16384    20.00    1204.61
+
+    To restore the performance, we add software offload features
+    to the list of "always_on" features for macvlan.  This way
+    when a namespace or a guest using macvtap initially sends a
+    packet, this packet will not be segmented at macvlan level.
+    It will only be segmented when macvlan sends the packet
+    to the lower device.
+
+    MIGRATED TCP STREAM TEST from 0.0.0.0 (0.0.0.0) port 0 AF_INET to 10.0.0.1 () port 0 AF_INET
+    Recv   Send    Send
+    Socket Socket  Message  Elapsed
+    Size   Size    Size     Time     Throughput
+    bytes  bytes   bytes    secs.    10^6bits/sec
+
+     87380  16384  16384    20.00    5507.35
+
+    Fixes: 6acf54f1cf0a6747bac9fea26f34cfc5a9029523 (macvtap: Add support of packet capture on macvtap device.)
+    Fixes: 797f87f83b60685ff8a13fa0572d2f10393c50d3 (macvlan: fix netdev feature propagation from lower device)
+    CC: Florian Westphal <fw@strlen.de>
+    CC: Christian Borntraeger <borntraeger@de.ibm.com>
+    CC: Jason Wang <jasowang@redhat.com>
+    CC: Michael S. Tsirkin <mst@redhat.com>
+    Tested-by: Christian Borntraeger <borntraeger@de.ibm.com>
+    Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/macvlan.c b/drivers/net/macvlan.c
+index cd8c567..bc5de79 100644
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@ -468,6 +468,9 @@ static int macvlan_change_mtu(struct net_device *dev, int new_mtu)
+ static struct lock_class_key macvlan_netdev_xmit_lock_key;
+ static struct lock_class_key macvlan_netdev_addr_lock_key;
+ 
++#define ALWAYS_ON_FEATURES \
++ (NETIF_F_SG | NETIF_F_GEN_CSUM | NETIF_F_GSO_SOFTWARE | NETIF_F_LLTX)
++
+ #define MACVLAN_FEATURES \
+  (NETIF_F_SG | NETIF_F_ALL_CSUM | NETIF_F_HIGHDMA | NETIF_F_FRAGLIST | \
+   NETIF_F_GSO | NETIF_F_TSO | NETIF_F_UFO | NETIF_F_GSO_ROBUST | \
+@@ -500,7 +503,7 @@ static int macvlan_init(struct net_device *dev)
+  dev->state  = (dev->state & ~MACVLAN_STATE_MASK) |
+       (lowerdev->state & MACVLAN_STATE_MASK);
+  dev->features   = lowerdev->features & MACVLAN_FEATURES;
+- dev->features  |= NETIF_F_LLTX;
++ dev->features  |= ALWAYS_ON_FEATURES;
+  dev->gso_max_size = lowerdev->gso_max_size;
+  dev->iflink  = lowerdev->ifindex;
+  dev->hard_header_len = lowerdev->hard_header_len;
+@@ -651,7 +654,8 @@ static netdev_features_t macvlan_fix_features(struct net_device *dev,
+  features = netdev_increment_features(vlan->lowerdev->features,
+           features,
+           mask);
+- features |= NETIF_F_LLTX;
++ features |= ALWAYS_ON_FEATURES;
++
+  return features;
+ }
+ 
+-- 
+1.7.1

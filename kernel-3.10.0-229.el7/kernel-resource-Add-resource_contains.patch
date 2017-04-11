@@ -1,0 +1,120 @@
+From 1b60e5e4ea44acd4ee5c6fc76eb45f6da961707d Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Wed, 6 Aug 2014 03:49:33 -0400
+Subject: [kernel] resource: Add resource_contains()
+
+Message-id: <20140806034933.1438.48201.stgit@gir.stowe>
+Patchwork-id: 87460
+O-Subject: [RHEL7.1 PATCH 51/69] resource: Add resource_contains()
+Bugzilla: 1110896
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110896
+Upstream Status: 5edb93b89f6cc3089ee283656555e7a9ad36a8a0
+
+commit 5edb93b89f6cc3089ee283656555e7a9ad36a8a0
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Tue Feb 4 19:32:28 2014 -0800
+
+    resource: Add resource_contains()
+
+    We have two identical copies of resource_contains() already, and more
+    places that could use it.  This moves it to ioport.h where it can be
+    shared.
+
+    resource_contains(struct resource *r1, struct resource *r2) returns true
+    iff r1 and r2 are the same type (most callers already checked this
+    separately) and the r1 address range completely contains r2.
+
+    In addition, the new resource_contains() checks that both r1 and r2 have
+    addresses assigned to them.  If a resource is IORESOURCE_UNSET, it doesn't
+    have a valid address and can't contain or be contained by another resource.
+    Some callers already check this or for res->start.
+
+    No functional change.
+
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/host-bridge.c b/drivers/pci/host-bridge.c
+index 06ace62..47aaf22 100644
+--- a/drivers/pci/host-bridge.c
++++ b/drivers/pci/host-bridge.c
+@@ -32,11 +32,6 @@ void pci_set_host_bridge_release(struct pci_host_bridge *bridge,
+  bridge->release_data = release_data;
+ }
+ 
+-static bool resource_contains(struct resource *res1, struct resource *res2)
+-{
+- return res1->start <= res2->start && res1->end >= res2->end;
+-}
+-
+ void pcibios_resource_to_bus(struct pci_bus *bus, struct pci_bus_region *region,
+         struct resource *res)
+ {
+@@ -45,9 +40,6 @@ void pcibios_resource_to_bus(struct pci_bus *bus, struct pci_bus_region *region,
+  resource_size_t offset = 0;
+ 
+  list_for_each_entry(window, &bridge->windows, list) {
+-  if (resource_type(res) != resource_type(window->res))
+-   continue;
+-
+   if (resource_contains(window->res, res)) {
+    offset = window->offset;
+    break;
+diff --git a/include/linux/ioport.h b/include/linux/ioport.h
+index 89b7c24..9fcaac8 100644
+--- a/include/linux/ioport.h
++++ b/include/linux/ioport.h
+@@ -169,6 +169,16 @@ static inline unsigned long resource_type(const struct resource *res)
+ {
+  return res->flags & IORESOURCE_TYPE_BITS;
+ }
++/* True iff r1 completely contains r2 */
++static inline bool resource_contains(struct resource *r1, struct resource *r2)
++{
++ if (resource_type(r1) != resource_type(r2))
++  return false;
++ if (r1->flags & IORESOURCE_UNSET || r2->flags & IORESOURCE_UNSET)
++  return false;
++ return r1->start <= r2->start && r1->end >= r2->end;
++}
++
+ 
+ /* Convenience shorthand with allocation */
+ #define request_region(start,n,name)  __request_region(&ioport_resource, (start), (n), (name), 0)
+diff --git a/kernel/resource.c b/kernel/resource.c
+index 77bf11a..a79cc6f 100644
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@ -432,11 +432,6 @@ static void resource_clip(struct resource *res, resource_size_t min,
+   res->end = max;
+ }
+ 
+-static bool resource_contains(struct resource *res1, struct resource *res2)
+-{
+- return res1->start <= res2->start && res1->end >= res2->end;
+-}
+-
+ /*
+  * Find empty slot in the resource tree with the given range and
+  * alignment constraints
+@@ -472,10 +467,11 @@ static int __find_resource(struct resource *root, struct resource *old,
+   arch_remove_reservations(&tmp);
+ 
+   /* Check for overflow after ALIGN() */
+-  avail = *new;
+   avail.start = ALIGN(tmp.start, constraint->align);
+   avail.end = tmp.end;
++  avail.flags = new->flags & ~IORESOURCE_UNSET;
+   if (avail.start >= tmp.start) {
++   alloc.flags = avail.flags;
+    alloc.start = constraint->alignf(constraint->alignf_data, &avail,
+      size, constraint->align);
+    alloc.end = alloc.start + size - 1;
+-- 
+1.7.1

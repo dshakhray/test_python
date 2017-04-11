@@ -1,0 +1,117 @@
+From 7e367ec61161ae95f61ce74de1286d7be667e14e Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:13 -0400
+Subject: [fs] cifs: Query device characteristics at mount time from server on SMB2/3 not just on cifs mounts
+
+Message-id: <1406549822-10376-21-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86732
+O-Subject: [RHEL7.1 PATCH 20/69] [bz1082049] Query device characteristics at mount time from server on SMB2/3 not just on cifs mounts
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Steven French <smfrench@gmail.com>
+
+Currently SMB2 and SMB3 mounts do not query the device information at mount time
+from the server as is done for cifs.  These can be useful for debugging.
+This is a minor patch, that extends the previous one (which added ability to
+query file system attributes at mount time - this returns the device
+characteristics - also via in /proc/fs/cifs/DebugData)
+
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 2167114c6ea6e76fd84e368bae5389d37dd156aa)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 1949e23..e37849d 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -229,7 +229,10 @@ smb2_qfs_tcon(const unsigned int xid, struct cifs_tcon *tcon)
+  if (rc)
+   return;
+ 
+- SMB2_QFS_attr(xid, tcon, fid.persistent_fid, fid.volatile_fid);
++ SMB2_QFS_attr(xid, tcon, fid.persistent_fid, fid.volatile_fid,
++   FS_ATTRIBUTE_INFORMATION);
++ SMB2_QFS_attr(xid, tcon, fid.persistent_fid, fid.volatile_fid,
++   FS_DEVICE_INFORMATION);
+  SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
+  return;
+ }
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 3b9bd2a..389c8b9 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -2359,17 +2359,27 @@ qfsinf_exit:
+ 
+ int
+ SMB2_QFS_attr(const unsigned int xid, struct cifs_tcon *tcon,
+-       u64 persistent_fid, u64 volatile_fid)
++       u64 persistent_fid, u64 volatile_fid, int level)
+ {
+  struct smb2_query_info_rsp *rsp = NULL;
+  struct kvec iov;
+  int rc = 0;
+- int resp_buftype;
++ int resp_buftype, max_len, min_len;
+  struct cifs_ses *ses = tcon->ses;
+  unsigned int rsp_len, offset;
+ 
+- rc = build_qfs_info_req(&iov, tcon, SMB_QUERY_FS_ATTRIBUTE_INFO,
+-    sizeof(FILE_SYSTEM_ATTRIBUTE_INFO),
++ if (level == FS_DEVICE_INFORMATION) {
++  max_len = sizeof(FILE_SYSTEM_DEVICE_INFO);
++  min_len = sizeof(FILE_SYSTEM_DEVICE_INFO);
++ } else if (level == FS_ATTRIBUTE_INFORMATION) {
++  max_len = sizeof(FILE_SYSTEM_ATTRIBUTE_INFO);
++  min_len = MIN_FS_ATTR_INFO_SIZE;
++ } else {
++  cifs_dbg(FYI, "Invalid qfsinfo level %d", level);
++  return -EINVAL;
++ }
++
++ rc = build_qfs_info_req(&iov, tcon, level, max_len,
+     persistent_fid, volatile_fid);
+  if (rc)
+   return rc;
+@@ -2383,12 +2393,17 @@ SMB2_QFS_attr(const unsigned int xid, struct cifs_tcon *tcon,
+ 
+  rsp_len = le32_to_cpu(rsp->OutputBufferLength);
+  offset = le16_to_cpu(rsp->OutputBufferOffset);
+- rc = validate_buf(offset, rsp_len, &rsp->hdr, MIN_FS_ATTR_INFO_SIZE);
+- if (!rc) {
++ rc = validate_buf(offset, rsp_len, &rsp->hdr, min_len);
++ if (rc)
++  goto qfsattr_exit;
++
++ if (level == FS_ATTRIBUTE_INFORMATION)
+   memcpy(&tcon->fsAttrInfo, 4 /* RFC1001 len */ + offset
+    + (char *)&rsp->hdr, min_t(unsigned int,
+-   rsp_len, sizeof(FILE_SYSTEM_ATTRIBUTE_INFO)));
+- }
++   rsp_len, max_len));
++ else if (level == FS_DEVICE_INFORMATION)
++  memcpy(&tcon->fsDevInfo, 4 /* RFC1001 len */ + offset
++   + (char *)&rsp->hdr, sizeof(FILE_SYSTEM_DEVICE_INFO));
+ 
+ qfsattr_exit:
+  free_rsp_buf(resp_buftype, iov.iov_base);
+diff --git a/fs/cifs/smb2proto.h b/fs/cifs/smb2proto.h
+index d681ae8..46b6984 100644
+--- a/fs/cifs/smb2proto.h
++++ b/fs/cifs/smb2proto.h
+@@ -152,7 +152,7 @@ extern int SMB2_QFS_info(const unsigned int xid, struct cifs_tcon *tcon,
+     u64 persistent_file_id, u64 volatile_file_id,
+     struct kstatfs *FSData);
+ extern int SMB2_QFS_attr(const unsigned int xid, struct cifs_tcon *tcon,
+-    u64 persistent_file_id, u64 volatile_file_id);
++    u64 persistent_file_id, u64 volatile_file_id, int lvl);
+ extern int SMB2_lock(const unsigned int xid, struct cifs_tcon *tcon,
+        const __u64 persist_fid, const __u64 volatile_fid,
+        const __u32 pid, const __u64 length, const __u64 offset,
+-- 
+1.7.1

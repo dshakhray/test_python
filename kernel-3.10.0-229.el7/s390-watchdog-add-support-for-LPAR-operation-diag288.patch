@@ -1,0 +1,159 @@
+From 51c40031eb8210be664892a4de67b4d745d16189 Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Thu, 10 Jul 2014 09:13:07 -0400
+Subject: [s390] watchdog: add support for LPAR operation (diag288)
+
+Message-id: <1404983588-14286-3-git-send-email-brueckner@redhat.com>
+Patchwork-id: 85650
+O-Subject: [RHEL7.1 PATCH 2/3] [s390] s390/watchdog: add support for LPAR operation (diag288)
+Bugzilla: 1088540
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Description
+-----------
+commit 646f919e93d4371b8654c4ae801aee74a00e4a68
+Author: Philipp Hachtmann <phacht@de.ibm.com>
+Commit: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+    s390/watchdog: add support for LPAR operation (diag288)
+
+    Add the LPAR variant of the diag 288 watchdog to the driver.
+    The only available action on timeout for LPAR is a PSW restart.
+
+    Signed-off-by: Philipp Hachtmann <phacht@de.ibm.com>
+    Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+Bugzilla
+--------
+BZ 1088540
+https://bugzilla.redhat.com/show_bug.cgi?id=1088540
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version v3.16-rc2
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=646f919e93d4371b8654c4ae801aee74a00e4a68
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7683420
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/watchdog/Kconfig b/drivers/watchdog/Kconfig
+index 93119a4..76ce39d 100644
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -1194,6 +1194,8 @@ config DIAG288_WATCHDOG
+    provide a virtual watchdog timer to their guest that cause a
+    user define Control Program command to be executed after a
+    timeout.
++   LPAR provides a very similar interface. This driver handles
++   both.
+ 
+    To compile this driver as a module, choose M here. The module
+    will be called vmwatchdog.
+diff --git a/drivers/watchdog/diag288_wdt.c b/drivers/watchdog/diag288_wdt.c
+index d406711..429494b 100644
+--- a/drivers/watchdog/diag288_wdt.c
++++ b/drivers/watchdog/diag288_wdt.c
+@@ -1,10 +1,15 @@
+ /*
+- * Watchdog driver for z/VM using the diag 288 interface.
++ * Watchdog driver for z/VM and LPAR using the diag 288 interface.
+  *
+  * Under z/VM, expiration of the watchdog will send a "system restart" command
+  * to CP.
+  *
+- * The command can be altered using the module parameter "cmd".
++ * The command can be altered using the module parameter "cmd". This is
++ * not recommended because it's only supported on z/VM but not whith LPAR.
++ *
++ * On LPAR, the watchdog will always trigger a system restart. the module
++ * paramter cmd is meaningless here.
++ *
+  *
+  * Copyright IBM Corp. 2004, 2013
+  * Author(s): Arnd Bergmann (arndb@de.ibm.com)
+@@ -41,6 +46,9 @@
+ #define WDT_FUNC_CANCEL 2
+ #define WDT_FUNC_CONCEAL 0x80000000
+ 
++/* Action codes for LPAR watchdog */
++#define LPARWDT_RESTART 0
++
+ static char wdt_cmd[MAX_CMDLEN] = DEFAULT_CMD;
+ static bool conceal_on;
+ static bool nowayout_info = WATCHDOG_NOWAYOUT;
+@@ -89,6 +97,12 @@ static int __diag288_vm(unsigned int  func, unsigned int timeout,
+  return __diag288(func, timeout, virt_to_phys(cmd), len);
+ }
+ 
++static int __diag288_lpar(unsigned int func, unsigned int timeout,
++     unsigned long action)
++{
++ return __diag288(func, timeout, action, 0);
++}
++
+ static int wdt_start(struct watchdog_device *dev)
+ {
+  char *ebc_cmd;
+@@ -113,6 +127,11 @@ static int wdt_start(struct watchdog_device *dev)
+   kfree(ebc_cmd);
+  }
+ 
++ if (MACHINE_IS_LPAR) {
++  ret = __diag288_lpar(WDT_FUNC_INIT,
++         dev->timeout, LPARWDT_RESTART);
++ }
++
+  if (ret) {
+   pr_err("The watchdog cannot be activated\n");
+   return ret;
+@@ -149,7 +168,8 @@ static int wdt_ping(struct watchdog_device *dev)
+ 
+   /*
+    * It seems to be ok to z/VM to use the init function to
+-   * retrigger the watchdog.
++   * retrigger the watchdog. On LPAR WDT_FUNC_CHANGE must
++   * be used when the watchdog is running.
+    */
+   func = conceal_on ? (WDT_FUNC_INIT | WDT_FUNC_CONCEAL)
+    : WDT_FUNC_INIT;
+@@ -159,6 +179,9 @@ static int wdt_ping(struct watchdog_device *dev)
+   kfree(ebc_cmd);
+  }
+ 
++ if (MACHINE_IS_LPAR)
++  ret = __diag288_lpar(WDT_FUNC_CHANGE, dev->timeout, 0);
++
+  if (ret)
+   pr_err("The watchdog timer cannot be started or reset\n");
+  return ret;
+@@ -256,12 +279,18 @@ static int __init diag288_init(void)
+    pr_err("The watchdog cannot be initialized\n");
+    return -EINVAL;
+   }
++ } else if (MACHINE_IS_LPAR) {
++  pr_info("The watchdog device driver detected an LPAR environment\n");
++  if (__diag288_lpar(WDT_FUNC_INIT, 30, LPARWDT_RESTART)) {
++   pr_err("The watchdog cannot be initialized\n");
++   return -EINVAL;
++  }
+  } else {
+   pr_err("Linux runs in an environment that does not support the diag288 watchdog\n");
+   return -ENODEV;
+  }
+ 
+- if (__diag288_vm(WDT_FUNC_CANCEL, 0, NULL, 0)) {
++ if (__diag288_lpar(WDT_FUNC_CANCEL, 0, 0)) {
+   pr_err("The watchdog cannot be deactivated\n");
+   return -EINVAL;
+  }
+-- 
+1.7.1

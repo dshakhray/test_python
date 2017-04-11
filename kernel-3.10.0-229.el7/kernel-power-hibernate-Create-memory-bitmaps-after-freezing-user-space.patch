@@ -1,0 +1,215 @@
+From a90921661e74d83ecd35753fce74dc63bac96819 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:05:42 -0400
+Subject: [kernel] power/hibernate: Create memory bitmaps after freezing user space
+
+Message-id: <20140710010542.22146.30128.stgit@gir.stowe>
+Patchwork-id: 85611
+O-Subject: [RHEL7.1 PATCH 072/105] PM / hibernate: Create memory bitmaps after freezing user space
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: 8fd37a4c9822d58c93f764864582aa13112b1513
+
+commit 8fd37a4c9822d58c93f764864582aa13112b1513
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Fri Aug 30 14:19:38 2013 +0200
+
+    PM / hibernate: Create memory bitmaps after freezing user space
+
+    The hibernation core uses special memory bitmaps during image
+    creation and restoration and traditionally those bitmaps are
+    allocated before freezing tasks, because in the past GFP_KERNEL
+    allocations might not work after all tasks had been frozen.
+
+    However, this is an anachronism, because hibernation_snapshot()
+    now calls hibernate_preallocate_memory() which allocates memory
+    for the image upfront anyway, so the memory bitmaps may be
+    allocated after freezing user space safely.
+
+    For this reason, move all of the create_basic_memory_bitmaps()
+    calls after freeze_processes() and all of the corresponding
+    free_basic_memory_bitmaps() calls before thaw_processes().
+
+    This will allow us to hold device_hotplug_lock around hibernation
+    without the need to worry about freezing issues with user space
+    processes attempting to acquire it via sysfs attributes after the
+    creation of memory bitmaps and before the freezing of tasks.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Acked-by: Toshi Kani <toshi.kani@hp.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/power/hibernate.c b/kernel/power/hibernate.c
+index b4e75eb..778deac 100644
+--- a/kernel/power/hibernate.c
++++ b/kernel/power/hibernate.c
+@@ -649,22 +649,22 @@ int hibernate(void)
+  if (error)
+   goto Exit;
+ 
+- /* Allocate memory management structures */
+- error = create_basic_memory_bitmaps();
+- if (error)
+-  goto Exit;
+-
+  printk(KERN_INFO "PM: Syncing filesystems ... ");
+  sys_sync();
+  printk("done.\n");
+ 
+  error = freeze_processes();
+  if (error)
+-  goto Free_bitmaps;
++  goto Exit;
++
++ /* Allocate memory management structures */
++ error = create_basic_memory_bitmaps();
++ if (error)
++  goto Thaw;
+ 
+  error = hibernation_snapshot(hibernation_mode == HIBERNATION_PLATFORM);
+  if (error || freezer_test_done)
+-  goto Thaw;
++  goto Free_bitmaps;
+ 
+  if (in_suspend) {
+   unsigned int flags = 0;
+@@ -687,14 +687,13 @@ int hibernate(void)
+   pr_debug("PM: Image restored successfully.\n");
+  }
+ 
++ Free_bitmaps:
++ free_basic_memory_bitmaps();
+  Thaw:
+  thaw_processes();
+ 
+  /* Don't bother checking whether freezer_test_done is true */
+  freezer_test_done = false;
+-
+- Free_bitmaps:
+- free_basic_memory_bitmaps();
+  Exit:
+  pm_notifier_call_chain(PM_POST_HIBERNATION);
+  pm_restore_console();
+@@ -811,21 +810,19 @@ static int software_resume(void)
+  pm_prepare_console();
+  error = pm_notifier_call_chain(PM_RESTORE_PREPARE);
+  if (error)
+-  goto close_finish;
+-
+- error = create_basic_memory_bitmaps();
+- if (error)
+-  goto close_finish;
++  goto Close_Finish;
+ 
+  pr_debug("PM: Preparing processes for restore.\n");
+  error = freeze_processes();
+- if (error) {
+-  swsusp_close(FMODE_READ);
+-  goto Done;
+- }
++ if (error)
++  goto Close_Finish;
+ 
+  pr_debug("PM: Loading hibernation image.\n");
+ 
++ error = create_basic_memory_bitmaps();
++ if (error)
++  goto Thaw;
++
+  error = swsusp_read(&flags);
+  swsusp_close(FMODE_READ);
+  if (!error)
+@@ -833,9 +830,9 @@ static int software_resume(void)
+ 
+  printk(KERN_ERR "PM: Failed to load hibernation image, recovering.\n");
+  swsusp_free();
+- thaw_processes();
+- Done:
+  free_basic_memory_bitmaps();
++ Thaw:
++ thaw_processes();
+  Finish:
+  pm_notifier_call_chain(PM_POST_RESTORE);
+  pm_restore_console();
+@@ -845,7 +842,7 @@ static int software_resume(void)
+  mutex_unlock(&pm_mutex);
+  pr_debug("PM: Hibernation image not present or could not be loaded.\n");
+  return error;
+-close_finish:
++ Close_Finish:
+  swsusp_close(FMODE_READ);
+  goto Finish;
+ }
+diff --git a/kernel/power/user.c b/kernel/power/user.c
+index 520a9c4..2b4391c 100644
+--- a/kernel/power/user.c
++++ b/kernel/power/user.c
+@@ -64,11 +64,6 @@ static int snapshot_open(struct inode *inode, struct file *filp)
+   error = -ENOSYS;
+   goto Unlock;
+  }
+- if(create_basic_memory_bitmaps()) {
+-  atomic_inc(&snapshot_device_available);
+-  error = -ENOMEM;
+-  goto Unlock;
+- }
+  nonseekable_open(inode, filp);
+  data = &snapshot_state;
+  filp->private_data = data;
+@@ -94,10 +89,9 @@ static int snapshot_open(struct inode *inode, struct file *filp)
+   if (error)
+    pm_notifier_call_chain(PM_POST_RESTORE);
+  }
+- if (error) {
+-  free_basic_memory_bitmaps();
++ if (error)
+   atomic_inc(&snapshot_device_available);
+- }
++
+  data->frozen = 0;
+  data->ready = 0;
+  data->platform_support = 0;
+@@ -115,11 +109,11 @@ static int snapshot_release(struct inode *inode, struct file *filp)
+  lock_system_sleep();
+ 
+  swsusp_free();
+- free_basic_memory_bitmaps();
+  data = filp->private_data;
+  free_all_swap_pages(data->swap);
+  if (data->frozen) {
+   pm_restore_gfp_mask();
++  free_basic_memory_bitmaps();
+   thaw_processes();
+  }
+  pm_notifier_call_chain(data->mode == O_RDONLY ?
+@@ -224,14 +218,22 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
+   printk("done.\n");
+ 
+   error = freeze_processes();
+-  if (!error)
++  if (error)
++   break;
++
++  error = create_basic_memory_bitmaps();
++  if (error)
++   thaw_processes();
++  else
+    data->frozen = 1;
++
+   break;
+ 
+  case SNAPSHOT_UNFREEZE:
+   if (!data->frozen || data->ready)
+    break;
+   pm_restore_gfp_mask();
++  free_basic_memory_bitmaps();
+   thaw_processes();
+   data->frozen = 0;
+   break;
+-- 
+1.7.1

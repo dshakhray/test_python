@@ -1,0 +1,133 @@
+From 7a5b851dbdc2cf54fd7e563ed98946176321594e Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:21:41 -0400
+Subject: [cpufreq] Extract the handover of policy cpu to a helper function
+
+Message-id: <1409235879-1283-8-git-send-email-prarit@redhat.com>
+Patchwork-id: 89354
+O-Subject: [RHEL7.1 PATCH BZ 1134639 007/185] cpufreq: Extract the handover of policy cpu to a helper function
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit f9ba680d23ea7e2fc31b4b7106a482d90ec62a24
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Jul 30 04:24:36 2013 +0530
+
+    cpufreq: Extract the handover of policy cpu to a helper function
+
+    During cpu offline, when the policy->cpu is going down, some other CPU
+    present in the policy->cpus mask is nominated as the new policy->cpu.
+    Extract this functionality from __cpufreq_remove_dev() and implement
+    it in a helper function. This helps in upcoming code reorganization.
+
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 5144fb6..2ea0844 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1098,6 +1098,38 @@ static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
+    CPUFREQ_UPDATE_POLICY_CPU, policy);
+ }
+ 
++static int cpufreq_nominate_new_policy_cpu(struct cpufreq_policy *data,
++        unsigned int old_cpu)
++{
++ struct device *cpu_dev;
++ unsigned long flags;
++ int ret;
++
++ /* first sibling now owns the new sysfs dir */
++ cpu_dev = get_cpu_device(cpumask_first(data->cpus));
++ sysfs_remove_link(&cpu_dev->kobj, "cpufreq");
++ ret = kobject_move(&data->kobj, &cpu_dev->kobj);
++ if (ret) {
++  pr_err("%s: Failed to move kobj: %d", __func__, ret);
++
++  WARN_ON(lock_policy_rwsem_write(old_cpu));
++  cpumask_set_cpu(old_cpu, data->cpus);
++
++  write_lock_irqsave(&cpufreq_driver_lock, flags);
++  per_cpu(cpufreq_cpu_data, old_cpu) = data;
++  write_unlock_irqrestore(&cpufreq_driver_lock, flags);
++
++  unlock_policy_rwsem_write(old_cpu);
++
++  ret = sysfs_create_link(&cpu_dev->kobj, &data->kobj,
++     "cpufreq");
++
++  return -EINVAL;
++ }
++
++ return cpu_dev->id;
++}
++
+ /**
+  * __cpufreq_remove_dev - remove a CPU device
+  *
+@@ -1108,12 +1140,12 @@ static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
+ static int __cpufreq_remove_dev(struct device *dev,
+   struct subsys_interface *sif)
+ {
+- unsigned int cpu = dev->id, ret, cpus;
++ unsigned int cpu = dev->id, cpus;
++ int new_cpu;
+  unsigned long flags;
+  struct cpufreq_policy *data;
+  struct kobject *kobj;
+  struct completion *cmp;
+- struct device *cpu_dev;
+ 
+  pr_debug("%s: unregistering CPU %u\n", __func__, cpu);
+ 
+@@ -1148,32 +1180,15 @@ static int __cpufreq_remove_dev(struct device *dev,
+  if (cpu != data->cpu) {
+   sysfs_remove_link(&dev->kobj, "cpufreq");
+  } else if (cpus > 1) {
+-  /* first sibling now owns the new sysfs dir */
+-  cpu_dev = get_cpu_device(cpumask_first(data->cpus));
+-  sysfs_remove_link(&cpu_dev->kobj, "cpufreq");
+-  ret = kobject_move(&data->kobj, &cpu_dev->kobj);
+-  if (ret) {
+-   pr_err("%s: Failed to move kobj: %d", __func__, ret);
+ 
++  new_cpu = cpufreq_nominate_new_policy_cpu(data, cpu);
++  if (new_cpu >= 0) {
+    WARN_ON(lock_policy_rwsem_write(cpu));
+-   cpumask_set_cpu(cpu, data->cpus);
+-
+-   write_lock_irqsave(&cpufreq_driver_lock, flags);
+-   per_cpu(cpufreq_cpu_data, cpu) = data;
+-   write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+-
++   update_policy_cpu(data, new_cpu);
+    unlock_policy_rwsem_write(cpu);
+-
+-   ret = sysfs_create_link(&cpu_dev->kobj, &data->kobj,
+-     "cpufreq");
+-   return -EINVAL;
++   pr_debug("%s: policy Kobject moved to cpu: %d "
++     "from: %d\n",__func__, new_cpu, cpu);
+   }
+-
+-  WARN_ON(lock_policy_rwsem_write(cpu));
+-  update_policy_cpu(data, cpu_dev->id);
+-  unlock_policy_rwsem_write(cpu);
+-  pr_debug("%s: policy Kobject moved to cpu: %d from: %d\n",
+-    __func__, cpu_dev->id, cpu);
+  }
+ 
+  /* If cpu is last user of policy, free policy */
+-- 
+1.7.1

@@ -1,0 +1,94 @@
+From cb7b785f711c16145edccf607b249817b4e0fae9 Mon Sep 17 00:00:00 2001
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Wed, 23 Apr 2014 14:33:48 -0400
+Subject: [ethernet] be2net: Fix invocation of be_close() after be_clear()
+
+Message-id: <1398263628-20048-1-git-send-email-ivecera@redhat.com>
+Patchwork-id: 79005
+O-Subject: [RHEL7.1 PATCH] be2net: Fix invocation of be_close() after be_clear()
+Bugzilla: 1066644
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+
+BZ: #1066644 - RHEL7 - be2net: EEH rebooting system- RHEL7 - be2net: EEH rebooting system
+
+Description:
+During EEH recovery be_close() is called with already destroyed queues and
+this results in a NULL dereference in this function. The patch fixes this.
+
+Test status:
+Tested by IBM
+
+Upstream commit:
+commit e1ad8e33d2e57ca64d9862b63d986fc296a7b876
+Author: Kalesh AP <kalesh.purayil@emulex.com>
+Date:   Mon Apr 14 16:12:41 2014 +0530
+
+    be2net: Fix invocation of be_close() after be_clear()
+
+    In the EEH error recovery path, when a permanent failure occurs,
+    we clean up adapter structure (i.e. destroy queues etc) by calling
+    be_clear() and return PCI_ERS_RESULT_DISCONNECT.
+    After this the stack tries to remove device from bus and calls
+    be_remove() which invokes netdev_unregister()->be_close().
+    be_close() operating on destroyed queues results in a
+    NULL dereference.
+
+    This patch fixes this problem by introducing a flag to keep track
+    of the setup state.
+
+    Signed-off-by: Kalesh AP <kalesh.purayil@emulex.com>
+    Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/emulex/benet/be.h b/drivers/net/ethernet/emulex/benet/be.h
+index eaf292c..c36cd0c 100644
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@ -371,6 +371,7 @@ enum vf_state {
+ #define BE_UC_PMAC_COUNT  30
+ #define BE_VF_UC_PMAC_COUNT  2
+ #define BE_FLAGS_QNQ_ASYNC_EVT_RCVD  (1 << 11)
++#define BE_FLAGS_SETUP_DONE   (1 << 13)
+ 
+ /* Ethtool set_dump flags */
+ #define LANCER_INITIATE_FW_DUMP   0x1
+diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
+index 31ed3a0..154e19e 100644
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -2651,6 +2651,12 @@ static int be_close(struct net_device *netdev)
+  struct be_eq_obj *eqo;
+  int i;
+ 
++ /* This protection is needed as be_close() may be called even when the
++  * adapter is in cleared state (after eeh perm failure)
++  */
++ if (!(adapter->flags & BE_FLAGS_SETUP_DONE))
++  return 0;
++
+  be_roce_dev_close(adapter);
+ 
+  if (adapter->flags & BE_FLAGS_NAPI_ENABLED) {
+@@ -2957,6 +2963,7 @@ static int be_clear(struct be_adapter *adapter)
+  be_clear_queues(adapter);
+ 
+  be_msix_disable(adapter);
++ adapter->flags &= ~BE_FLAGS_SETUP_DONE;
+  return 0;
+ }
+ 
+@@ -3426,6 +3433,7 @@ static int be_setup(struct be_adapter *adapter)
+   adapter->phy.fc_autoneg = 1;
+ 
+  be_schedule_worker(adapter);
++ adapter->flags |= BE_FLAGS_SETUP_DONE;
+  return 0;
+ err:
+  be_clear(adapter);
+-- 
+1.7.1

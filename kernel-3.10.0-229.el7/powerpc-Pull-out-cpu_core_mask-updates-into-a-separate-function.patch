@@ -1,0 +1,126 @@
+From 5da64a4a36e45f7d35b08e6032c27084501473e7 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:04:44 -0400
+Subject: [powerpc] Pull out cpu_core_mask updates into a separate function
+
+Message-id: <1410545655-205645-56-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94108
+O-Subject: [RHEL7 PATCH 055/626] powerpc: Pull out cpu_core_mask updates into a separate function
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit a8a5356cd511db229aeaad636dc0f83d8c4d0a15
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Mon Aug 12 16:28:47 2013 +1000
+
+    powerpc: Pull out cpu_core_mask updates into a separate function
+
+    This factors out the details of updating cpu_core_mask into a separate
+    function, to make it easier to change how the mask is calculated later.
+    This makes no functional change.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/smp.c b/arch/powerpc/kernel/smp.c
+index 91d552b..b312b43 100644
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@ -632,11 +632,36 @@ static struct device_node *cpu_to_l2cache(int cpu)
+  return cache;
+ }
+ 
++static void traverse_core_siblings(int cpu, bool add)
++{
++ struct device_node *l2_cache;
++ const struct cpumask *mask;
++ int i;
++
++ l2_cache = cpu_to_l2cache(cpu);
++ mask = add ? cpu_online_mask : cpu_present_mask;
++ for_each_cpu(i, mask) {
++  struct device_node *np = cpu_to_l2cache(i);
++  if (!np)
++   continue;
++  if (np == l2_cache) {
++   if (add) {
++    cpumask_set_cpu(cpu, cpu_core_mask(i));
++    cpumask_set_cpu(i, cpu_core_mask(cpu));
++   } else {
++    cpumask_clear_cpu(cpu, cpu_core_mask(i));
++    cpumask_clear_cpu(i, cpu_core_mask(cpu));
++   }
++  }
++  of_node_put(np);
++ }
++ of_node_put(l2_cache);
++}
++
+ /* Activate a secondary processor. */
+ void start_secondary(void *unused)
+ {
+  unsigned int cpu = smp_processor_id();
+- struct device_node *l2_cache;
+  int i, base;
+ 
+  atomic_inc(&init_mm.mm_count);
+@@ -675,18 +700,7 @@ void start_secondary(void *unused)
+   cpumask_set_cpu(cpu, cpu_core_mask(base + i));
+   cpumask_set_cpu(base + i, cpu_core_mask(cpu));
+  }
+- l2_cache = cpu_to_l2cache(cpu);
+- for_each_online_cpu(i) {
+-  struct device_node *np = cpu_to_l2cache(i);
+-  if (!np)
+-   continue;
+-  if (np == l2_cache) {
+-   cpumask_set_cpu(cpu, cpu_core_mask(i));
+-   cpumask_set_cpu(i, cpu_core_mask(cpu));
+-  }
+-  of_node_put(np);
+- }
+- of_node_put(l2_cache);
++ traverse_core_siblings(cpu, true);
+ 
+  smp_wmb();
+  notify_cpu_starting(cpu);
+@@ -742,7 +756,6 @@ int arch_sd_sibling_asym_packing(void)
+ #ifdef CONFIG_HOTPLUG_CPU
+ int __cpu_disable(void)
+ {
+- struct device_node *l2_cache;
+  int cpu = smp_processor_id();
+  int base, i;
+  int err;
+@@ -762,20 +775,7 @@ int __cpu_disable(void)
+   cpumask_clear_cpu(cpu, cpu_core_mask(base + i));
+   cpumask_clear_cpu(base + i, cpu_core_mask(cpu));
+  }
+-
+- l2_cache = cpu_to_l2cache(cpu);
+- for_each_present_cpu(i) {
+-  struct device_node *np = cpu_to_l2cache(i);
+-  if (!np)
+-   continue;
+-  if (np == l2_cache) {
+-   cpumask_clear_cpu(cpu, cpu_core_mask(i));
+-   cpumask_clear_cpu(i, cpu_core_mask(cpu));
+-  }
+-  of_node_put(np);
+- }
+- of_node_put(l2_cache);
+-
++ traverse_core_siblings(cpu, false);
+ 
+  return 0;
+ }
+-- 
+1.7.1

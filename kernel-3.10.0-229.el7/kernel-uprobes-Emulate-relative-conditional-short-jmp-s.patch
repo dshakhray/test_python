@@ -1,0 +1,117 @@
+From a5ca41fa1b70ec9a09e857fa391f62f1ce88be8a Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Mon, 16 Jun 2014 16:01:41 -0400
+Subject: [kernel] uprobes: Emulate relative conditional "short" jmp's
+
+Message-id: <20140616160141.GA15446@redhat.com>
+Patchwork-id: 84090
+O-Subject: [PATCH RHEL7 BZ 1073627 14/36] uprobes/x86: Emulate relative conditional "short" jmp's
+Bugzilla: 1073627
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+RHBZ: 1073627
+
+Teach branch_emulate_op() to emulate the conditional "short" jmp's which
+check regs->flags.
+
+Note: this doesn't support jcxz/jcexz, loope/loopz, and loopne/loopnz.
+They all are rel8 and thus they can't trigger the problem, but perhaps
+we will add the support in future just for completeness.
+
+Reported-by: Jonathan Lebon <jlebon@redhat.com>
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+(cherry picked from commit 8f95505bc18a026ef7d3dfdbce4e5b31b3e4fc1b)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index 0914435..0460d04 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -466,9 +466,58 @@ static bool branch_is_call(struct arch_uprobe *auprobe)
+  return auprobe->branch.opc1 == 0xe8;
+ }
+ 
++#define CASE_COND     \
++ COND(70, 71, XF(OF))    \
++ COND(72, 73, XF(CF))    \
++ COND(74, 75, XF(ZF))    \
++ COND(78, 79, XF(SF))    \
++ COND(7a, 7b, XF(PF))    \
++ COND(76, 77, XF(CF) || XF(ZF))   \
++ COND(7c, 7d, XF(SF) != XF(OF))   \
++ COND(7e, 7f, XF(ZF) || XF(SF) != XF(OF))
++
++#define COND(op_y, op_n, expr)    \
++ case 0x ## op_y: DO((expr) != 0)  \
++ case 0x ## op_n: DO((expr) == 0)
++
++#define XF(xf) (!!(flags & X86_EFLAGS_ ## xf))
++
++static bool is_cond_jmp_opcode(u8 opcode)
++{
++ switch (opcode) {
++ #define DO(expr) \
++  return true;
++ CASE_COND
++ #undef DO
++
++ default:
++  return false;
++ }
++}
++
++static bool check_jmp_cond(struct arch_uprobe *auprobe, struct pt_regs *regs)
++{
++ unsigned long flags = regs->flags;
++
++ switch (auprobe->branch.opc1) {
++ #define DO(expr) \
++  return expr;
++ CASE_COND
++ #undef DO
++
++ default: /* not a conditional jmp */
++  return true;
++ }
++}
++
++#undef XF
++#undef COND
++#undef CASE_COND
++
+ static bool branch_emulate_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
+ {
+  unsigned long new_ip = regs->ip += auprobe->branch.ilen;
++ unsigned long offs = (long)auprobe->branch.offs;
+ 
+  if (branch_is_call(auprobe)) {
+   unsigned long new_sp = regs->sp - sizeof_long();
+@@ -484,9 +533,11 @@ static bool branch_emulate_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
+   if (copy_to_user((void __user *)new_sp, &new_ip, sizeof_long()))
+    return false;
+   regs->sp = new_sp;
++ } else if (!check_jmp_cond(auprobe, regs)) {
++  offs = 0;
+  }
+ 
+- regs->ip = new_ip + auprobe->branch.offs;
++ regs->ip = new_ip + offs;
+  return true;
+ }
+ 
+@@ -547,8 +598,10 @@ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
+  case 0xe8: /* call relative */
+   branch_clear_offset(auprobe, insn);
+   break;
++
+  default:
+-  return -ENOSYS;
++  if (!is_cond_jmp_opcode(opc1))
++   return -ENOSYS;
+  }
+ 
+  auprobe->branch.opc1 = opc1;
+-- 
+1.7.1

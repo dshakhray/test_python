@@ -1,0 +1,84 @@
+From f8f05a0a225829c1d3078ee0c7b508fcaa4edcd5 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:23:30 -0400
+Subject: [cpufreq] use cpufreq_cpu_get() to avoid cpufreq_get() race conditions
+
+Message-id: <1409235879-1283-117-git-send-email-prarit@redhat.com>
+Patchwork-id: 89501
+O-Subject: [RHEL7.1 PATCH BZ 1134639 116/185] cpufreq: use cpufreq_cpu_get() to avoid cpufreq_get() race conditions
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit 999976e0f6233322a878b0b7148c810544d6c8a8
+Author: Aaron Plattner <aplattner@nvidia.com>
+Date:   Tue Mar 4 12:42:15 2014 -0800
+
+    cpufreq: use cpufreq_cpu_get() to avoid cpufreq_get() race conditions
+
+    If a module calls cpufreq_get while cpufreq is initializing, it's
+    possible for it to be called after cpufreq_driver is set but before
+    cpufreq_cpu_data is written during subsys_interface_register.  This
+    happens because cpufreq_get doesn't take the cpufreq_driver_lock
+    around its use of cpufreq_cpu_data.
+
+    Fix this by using cpufreq_cpu_get(cpu) to look up the policy rather
+    than reading it out of cpufreq_cpu_data directly.  cpufreq_cpu_get()
+    takes the appropriate locks to prevent this race from happening.
+
+    Since it's possible for policy to be NULL if the caller passes in an
+    invalid CPU number or calls the function before cpufreq is initialized,
+    delete the BUG_ON(!policy) and simply return 0.  Don't try to return
+    -ENOENT because that's negative and the function returns an unsigned
+    integer.
+
+    References: https://bbs.archlinux.org/viewtopic.php?id=177934
+    Signed-off-by: Aaron Plattner <aplattner@nvidia.com>
+    Cc: 3.13+ <stable@vger.kernel.org> # 3.13+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 3b20b79..e535381 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1544,23 +1544,16 @@ static unsigned int __cpufreq_get(unsigned int cpu)
+  */
+ unsigned int cpufreq_get(unsigned int cpu)
+ {
+- struct cpufreq_policy *policy = per_cpu(cpufreq_cpu_data, cpu);
++ struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+  unsigned int ret_freq = 0;
+ 
+- if (cpufreq_disabled() || !cpufreq_driver)
+-  return -ENOENT;
+-
+- BUG_ON(!policy);
+-
+- if (!down_read_trylock(&cpufreq_rwsem))
+-  return 0;
+-
+- down_read(&policy->rwsem);
+-
+- ret_freq = __cpufreq_get(cpu);
++ if (policy) {
++  down_read(&policy->rwsem);
++  ret_freq = __cpufreq_get(cpu);
++  up_read(&policy->rwsem);
+ 
+- up_read(&policy->rwsem);
+- up_read(&cpufreq_rwsem);
++  cpufreq_cpu_put(policy);
++ }
+ 
+  return ret_freq;
+ }
+-- 
+1.7.1

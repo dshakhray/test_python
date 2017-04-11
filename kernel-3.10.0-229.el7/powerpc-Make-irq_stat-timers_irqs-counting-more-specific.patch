@@ -1,0 +1,117 @@
+From 35a45bd26422da1fc8c8462c4bd6c1153dc87855 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:07:13 -0400
+Subject: [powerpc] Make irq_stat.timers_irqs counting more specific
+
+Message-id: <1410545655-205645-205-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94551
+O-Subject: [RHEL7 PATCH 204/626] powerpc: Make irq_stat.timers_irqs counting more specific
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit c041cfa2af1ccb8d0346dc576144a1085e9b4d4b
+Author: fan.du <fan.du@windriver.com>
+Date:   Wed Jan 23 16:06:11 2013 +0800
+
+    powerpc: Make irq_stat.timers_irqs counting more specific
+
+    Current irq_stat.timers_irqs counting doesn't discriminate timer event handler
+    and other timer interrupt(like arch_irq_work_raise). Sometimes we need to know
+    exactly how much interrupts timer event handler fired, so let's be more specific
+    on this.
+
+    Signed-off-by: Fan Du <fan.du@windriver.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+kabi reason:  irq_stat is a per arch per_cpu defined variable.  The kernel allocates
+it and the changes I made retain the original structure.
+
+Because it is defined per_arch, I find it highly odd that any driver would/could
+use this structure.  Reviewing the kabi history of this symbol shows it was blindly
+added in RHEL-5.0 and just blindly copied out from RHEL-6 to RHEL-7.  Therefore I think
+it be fine.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/hardirq.h b/arch/powerpc/include/asm/hardirq.h
+index 3bdcfce..ac491ac 100644
+--- a/arch/powerpc/include/asm/hardirq.h
++++ b/arch/powerpc/include/asm/hardirq.h
+@@ -13,6 +13,10 @@ typedef struct {
+ #ifdef CONFIG_PPC_DOORBELL
+  unsigned int doorbell_irqs;
+ #endif
++#ifndef __GENKSYMS__
++ unsigned int timer_irqs_event;
++ unsigned int timer_irqs_others;
++#endif
+ } ____cacheline_aligned irq_cpustat_t;
+ 
+ DECLARE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
+diff --git a/arch/powerpc/kernel/irq.c b/arch/powerpc/kernel/irq.c
+index c7cb8c2..6296ff5 100644
+--- a/arch/powerpc/kernel/irq.c
++++ b/arch/powerpc/kernel/irq.c
+@@ -354,8 +354,13 @@ int arch_show_interrupts(struct seq_file *p, int prec)
+ 
+  seq_printf(p, "%*s: ", prec, "LOC");
+  for_each_online_cpu(j)
+-  seq_printf(p, "%10u ", per_cpu(irq_stat, j).timer_irqs);
+-        seq_printf(p, "  Local timer interrupts\n");
++  seq_printf(p, "%10u ", per_cpu(irq_stat, j).timer_irqs_event);
++        seq_printf(p, "  Local timer interrupts for timer event device\n");
++
++ seq_printf(p, "%*s: ", prec, "LOC");
++ for_each_online_cpu(j)
++  seq_printf(p, "%10u ", per_cpu(irq_stat, j).timer_irqs_others);
++        seq_printf(p, "  Local timer interrupts for others\n");
+ 
+  seq_printf(p, "%*s: ", prec, "SPU");
+  for_each_online_cpu(j)
+@@ -389,11 +394,12 @@ int arch_show_interrupts(struct seq_file *p, int prec)
+  */
+ u64 arch_irq_stat_cpu(unsigned int cpu)
+ {
+- u64 sum = per_cpu(irq_stat, cpu).timer_irqs;
++ u64 sum = per_cpu(irq_stat, cpu).timer_irqs_event;
+ 
+  sum += per_cpu(irq_stat, cpu).pmu_irqs;
+  sum += per_cpu(irq_stat, cpu).mce_exceptions;
+  sum += per_cpu(irq_stat, cpu).spurious_irqs;
++ sum += per_cpu(irq_stat, cpu).timer_irqs_others;
+ #ifdef CONFIG_PPC_DOORBELL
+  sum += per_cpu(irq_stat, cpu).doorbell_irqs;
+ #endif
+diff --git a/arch/powerpc/kernel/time.c b/arch/powerpc/kernel/time.c
+index dee20bd..a59860b 100644
+--- a/arch/powerpc/kernel/time.c
++++ b/arch/powerpc/kernel/time.c
+@@ -510,7 +510,6 @@ void timer_interrupt(struct pt_regs * regs)
+   */
+  may_hard_irq_enable();
+ 
+- __get_cpu_var(irq_stat).timer_irqs++;
+ 
+ #if defined(CONFIG_PPC32) && defined(CONFIG_PMAC)
+  if (atomic_read(&ppc_n_lost_interrupts) != 0)
+@@ -532,10 +531,12 @@ void timer_interrupt(struct pt_regs * regs)
+   *next_tb = ~(u64)0;
+   if (evt->event_handler)
+    evt->event_handler(evt);
++  __get_cpu_var(irq_stat).timer_irqs_event++;
+  } else {
+   now = *next_tb - now;
+   if (now <= DECREMENTER_MAX)
+    set_dec((int)now);
++  __get_cpu_var(irq_stat).timer_irqs_others++;
+  }
+ 
+ #ifdef CONFIG_PPC64
+-- 
+1.7.1

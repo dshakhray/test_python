@@ -1,0 +1,112 @@
+From e9bbde196b3aca45830a7188afe8141f7ddd9b61 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:13:26 -0400
+Subject: [powerpc] book3s: Fix guest MC delivery mechanism to avoid soft lockups in guest
+
+Message-id: <1410545655-205645-578-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94520
+O-Subject: [RHEL7 PATCH 577/626] powerpc/book3s: Fix guest MC delivery mechanism to avoid soft lockups in guest.
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 74845bc2fa9c0e6b218821cd4e1eb7a552d3e503
+Author: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+Date:   Wed Jun 11 14:18:21 2014 +0530
+
+    powerpc/book3s: Fix guest MC delivery mechanism to avoid soft lockups in guest.
+
+    Currently we forward MCEs to guest which have been recovered by guest.
+    And for unhandled errors we do not deliver the MCE to guest. It looks like
+    with no support of FWNMI in qemu, guest just panics whenever we deliver the
+    recovered MCEs to guest. Also, the existig code used to return to host for
+    unhandled errors which was casuing guest to hang with soft lockups inside
+    guest and makes it difficult to recover guest instance.
+
+    This patch now forwards all fatal MCEs to guest causing guest to crash/panic.
+    And, for recovered errors we just go back to normal functioning of guest
+    instead of returning to host. This fixes soft lockup issues in guest.
+    This patch also fixes an issue where guest MCE events were not logged to
+    host console.
+
+    Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_hv_ras.c b/arch/powerpc/kvm/book3s_hv_ras.c
+index 768a9f9..3a5c568 100644
+--- a/arch/powerpc/kvm/book3s_hv_ras.c
++++ b/arch/powerpc/kvm/book3s_hv_ras.c
+@@ -113,10 +113,8 @@ static long kvmppc_realmode_mc_power7(struct kvm_vcpu *vcpu)
+   * We assume that if the condition is recovered then linux host
+   * will have generated an error log event that we will pick
+   * up and log later.
+-  * Don't release mce event now. In case if condition is not
+-  * recovered we do guest exit and go back to linux host machine
+-  * check handler. Hence we need make sure that current mce event
+-  * is available for linux host to consume.
++  * Don't release mce event now. We will queue up the event so that
++  * we can log the MCE event info on host console.
+   */
+  if (!get_mce_event(&mce_evt, MCE_EVENT_DONTRELEASE))
+   goto out;
+@@ -128,11 +126,12 @@ static long kvmppc_realmode_mc_power7(struct kvm_vcpu *vcpu)
+ 
+ out:
+  /*
+-  * If we have handled the error, then release the mce event because
+-  * we will be delivering machine check to guest.
++  * We are now going enter guest either through machine check
++  * interrupt (for unhandled errors) or will continue from
++  * current HSRR0 (for handled errors) in guest. Hence
++  * queue up the event so that we can log it from host console later.
+   */
+- if (handled)
+-  release_mce_event();
++ machine_check_queue_event();
+ 
+  return handled;
+ }
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 982991e..18ea7be 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -2221,14 +2221,27 @@ machine_check_realmode:
+  mr r3, r9  /* get vcpu pointer */
+  bl kvmppc_realmode_machine_check
+  nop
+- cmpdi r3, 0  /* continue exiting from guest? */
++ cmpdi r3, 0  /* Did we handle MCE ? */
+  ld r9, HSTATE_KVM_VCPU(r13)
+  li r12, BOOK3S_INTERRUPT_MACHINE_CHECK
+- beq mc_cont
++ /*
++  * Deliver unhandled/fatal (e.g. UE) MCE errors to guest through
++  * machine check interrupt (set HSRR0 to 0x200). And for handled
++  * errors (no-fatal), just go back to guest execution with current
++  * HSRR0 instead of exiting guest. This new approach will inject
++  * machine check to guest for fatal error causing guest to crash.
++  *
++  * The old code used to return to host for unhandled errors which
++  * was causing guest to hang with soft lockups inside guest and
++  * makes it difficult to recover guest instance.
++  */
++ ld r10, VCPU_PC(r9)
++ ld r11, VCPU_MSR(r9)
++ bne 2f /* Continue guest execution. */
+  /* If not, deliver a machine check.  SRR0/1 are already set */
+  li r10, BOOK3S_INTERRUPT_MACHINE_CHECK
+  bl kvmppc_msr_interrupt
+- b fast_interrupt_c_return
++2: b fast_interrupt_c_return
+ 
+ /*
+  * Check the reason we woke from nap, and take appropriate action.
+-- 
+1.7.1

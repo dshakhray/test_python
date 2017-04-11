@@ -1,0 +1,112 @@
+From 816a48a2403225d2f10e31bdf58d96d311026f12 Mon Sep 17 00:00:00 2001
+From: Baoquan He <bhe@redhat.com>
+Date: Fri, 15 Aug 2014 07:27:23 -0400
+Subject: [kernel] kexec: export free_huge_page to VMCOREINFO
+
+Message-id: <1408087644-31621-3-git-send-email-bhe@redhat.com>
+Patchwork-id: 87783
+O-Subject: [PATCH 2/3] kexec: export free_huge_page to VMCOREINFO
+Bugzilla: 1115240
+RH-Acked-by: Vivek Goyal <vgoyal@redhat.com>
+RH-Acked-by: Chao WANG <chaowang@redhat.com>
+
+Resolves: bz1115240
+https://bugzilla.redhat.com/show_bug.cgi?id=1115240
+
+This is back ported from upstream. There are 2 small conflicts in this patch.
+First is the declaration of free_huge_page in hugetlb.h since several
+unrelated commits are not in rhel7. The second is the inclusion of
+"linux/hugetlb.h" which conflict with inclusion of "linux/security.h".
+Inclusion of "linux/security.h" is from a post to upstream but not accepted
+into Linus's tree.
+
+commit 8f1d26d0e59b9676587c54578f976709b625d6e9
+Author: Atsushi Kumagai <kumagai-atsushi@mxc.nes.nec.co.jp>
+Date:   Wed Jul 30 16:08:39 2014 -0700
+
+    kexec: export free_huge_page to VMCOREINFO
+
+    PG_head_mask was added into VMCOREINFO to filter huge pages in b3acc56bfe1
+    ("kexec: save PG_head_mask in VMCOREINFO"), but makedumpfile still need
+    another symbol to filter *hugetlbfs* pages.
+
+    If a user hope to filter user pages, makedumpfile tries to exclude them by
+    checking the condition whether the page is anonymous, but hugetlbfs pages
+    aren't anonymous while they also be user pages.
+
+    We know it's possible to detect them in the same way as PageHuge(),
+    so we need the start address of free_huge_page():
+
+        int PageHuge(struct page *page)
+        {
+                if (!PageCompound(page))
+                        return 0;
+
+                page = compound_head(page);
+                return get_compound_page_dtor(page) == free_huge_page;
+        }
+
+    For that reason, this patch changes free_huge_page() into public
+    to export it to VMCOREINFO.
+
+    Signed-off-by: Atsushi Kumagai <kumagai-atsushi@mxc.nes.nec.co.jp>
+    Acked-by: Baoquan He <bhe@redhat.com>
+    Cc: Vivek Goyal <vgoyal@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Brew build:
+https://brewweb.devel.redhat.com/taskinfo?taskID=7844251
+
+Test: Passed on kvm guest.
+
+Signed-off-by: Baoquan He <bhe@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 499a690..5fb0244 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -67,6 +67,7 @@ int hugetlb_reserve_pages(struct inode *inode, long from, long to,
+       vm_flags_t vm_flags);
+ void hugetlb_unreserve_pages(struct inode *inode, long offset, long freed);
+ int dequeue_hwpoisoned_huge_page(struct page *page);
++void free_huge_page(struct page *page);
+ 
+ extern unsigned long hugepages_treat_as_movable;
+ extern const unsigned long hugetlb_zero, hugetlb_infinity;
+diff --git a/kernel/kexec.c b/kernel/kexec.c
+index 650eef6..28b158e 100644
+--- a/kernel/kexec.c
++++ b/kernel/kexec.c
+@@ -33,6 +33,7 @@
+ #include <linux/swap.h>
+ #include <linux/syscore_ops.h>
+ #include <linux/security.h>
++#include <linux/hugetlb.h>
+ 
+ #include <asm/page.h>
+ #include <asm/uaccess.h>
+@@ -1682,6 +1683,7 @@ static int __init crash_save_vmcoreinfo_init(void)
+ #endif
+  VMCOREINFO_NUMBER(PG_head_mask);
+  VMCOREINFO_NUMBER(PAGE_BUDDY_MAPCOUNT_VALUE);
++ VMCOREINFO_SYMBOL(free_huge_page);
+ 
+  arch_crash_save_vmcoreinfo();
+  update_vmcoreinfo_note();
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 749eeb7..5207b1b 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -803,7 +803,7 @@ struct hstate *size_to_hstate(unsigned long size)
+  return NULL;
+ }
+ 
+-static void free_huge_page(struct page *page)
++void free_huge_page(struct page *page)
+ {
+  /*
+   * Can't pass hstate in here because it is called from the
+-- 
+1.7.1

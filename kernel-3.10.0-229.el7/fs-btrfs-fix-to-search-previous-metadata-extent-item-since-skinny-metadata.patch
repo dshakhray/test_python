@@ -1,0 +1,115 @@
+From dcc73d84c62d7dae8d306fa5b91d14fbd5efc86a Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:00:01 -0400
+Subject: [fs] btrfs: fix to search previous metadata extent item since skinny metadata
+
+Message-id: <1407179109-13714-115-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87063
+O-Subject: [RHEL7.1 PATCH 114/422] Btrfs: fix to search previous metadata extent item since skinny metadata
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+
+commit ade2e0b3eeca941a5cd486bac21599ff87f288c8
+Author: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+Date:   Sun Jan 12 21:38:33 2014 +0800
+
+    Btrfs: fix to search previous metadata extent item since skinny metadata
+
+    There is a bug that using btrfs_previous_item() to search metadata extent item.
+    This is because in btrfs_previous_item(), we need type match, however, since
+    skinny metada was introduced by josef, we may mix this two types. So just
+    use btrfs_previous_item() is not working right.
+
+    To keep btrfs_previous_item() like normal tree search, i introduce another
+    function btrfs_previous_extent_item().
+
+    Signed-off-by: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/ctree.c b/fs/btrfs/ctree.c
+index 9e9de68..30f5b11 100644
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -5955,3 +5955,46 @@ int btrfs_previous_item(struct btrfs_root *root,
+  }
+  return 1;
+ }
++
++/*
++ * search in extent tree to find a previous Metadata/Data extent item with
++ * min objecitd.
++ *
++ * returns 0 if something is found, 1 if nothing was found and < 0 on error
++ */
++int btrfs_previous_extent_item(struct btrfs_root *root,
++   struct btrfs_path *path, u64 min_objectid)
++{
++ struct btrfs_key found_key;
++ struct extent_buffer *leaf;
++ u32 nritems;
++ int ret;
++
++ while (1) {
++  if (path->slots[0] == 0) {
++   btrfs_set_path_blocking(path);
++   ret = btrfs_prev_leaf(root, path);
++   if (ret != 0)
++    return ret;
++  } else {
++   path->slots[0]--;
++  }
++  leaf = path->nodes[0];
++  nritems = btrfs_header_nritems(leaf);
++  if (nritems == 0)
++   return 1;
++  if (path->slots[0] == nritems)
++   path->slots[0]--;
++
++  btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
++  if (found_key.objectid < min_objectid)
++   break;
++  if (found_key.type == BTRFS_EXTENT_ITEM_KEY ||
++      found_key.type == BTRFS_METADATA_ITEM_KEY)
++   return 0;
++  if (found_key.objectid == min_objectid &&
++      found_key.type < BTRFS_EXTENT_ITEM_KEY)
++   break;
++ }
++ return 1;
++}
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index ca6bcc3..3708fd7 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -3334,6 +3334,8 @@ int btrfs_comp_cpu_keys(struct btrfs_key *k1, struct btrfs_key *k2);
+ int btrfs_previous_item(struct btrfs_root *root,
+    struct btrfs_path *path, u64 min_objectid,
+    int type);
++int btrfs_previous_extent_item(struct btrfs_root *root,
++   struct btrfs_path *path, u64 min_objectid);
+ void btrfs_set_item_key_safe(struct btrfs_root *root, struct btrfs_path *path,
+         struct btrfs_key *new_key);
+ struct extent_buffer *btrfs_root_node(struct btrfs_root *root);
+diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+index e0677e4..51c342b 100644
+--- a/fs/btrfs/scrub.c
++++ b/fs/btrfs/scrub.c
+@@ -2385,8 +2385,7 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,
+    goto out;
+ 
+   if (ret > 0) {
+-   ret = btrfs_previous_item(root, path, 0,
+-        BTRFS_EXTENT_ITEM_KEY);
++   ret = btrfs_previous_extent_item(root, path, 0);
+    if (ret < 0)
+     goto out;
+    if (ret > 0) {
+-- 
+1.7.1

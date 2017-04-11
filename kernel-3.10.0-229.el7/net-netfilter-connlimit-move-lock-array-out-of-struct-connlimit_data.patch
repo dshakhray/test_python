@@ -1,0 +1,113 @@
+From e15119bebcc811438c075b73359df129ee11ecd0 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Thu, 24 Jul 2014 12:29:09 -0400
+Subject: [net] netfilter: connlimit: move lock array out of struct connlimit_data
+
+Message-id: <1406204949-17382-9-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 86627
+O-Subject: [PATCH 8/8] [RHEL7.1 net] netfilter: connlimit: move lock array out of struct connlimit_data
+Bugzilla: 1052282
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+BZ: 1052282
+
+commit e00b437b3d6d4d26ecd95108b575ee1bcfcb478f
+Author: Florian Westphal <fw@strlen.de>
+Date:   Thu Mar 20 11:53:39 2014 +0100
+
+    netfilter: connlimit: move lock array out of struct connlimit_data
+
+    Eric points out that the locks can be global.
+    Moreover, both Jesper and Eric note that using only 32 locks increases
+    false sharing as only two cache lines are used.
+
+    This increases locks to 256 (16 cache lines assuming 64byte cacheline and
+    4 bytes per spinlock).
+
+    Suggested-by: Jesper Dangaard Brouer <brouer@redhat.com>
+    Suggested-by: Eric Dumazet <eric.dumazet@gmail.com>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/netfilter/xt_connlimit.c b/net/netfilter/xt_connlimit.c
+index a6e129e..fbc66bb 100644
+--- a/net/netfilter/xt_connlimit.c
++++ b/net/netfilter/xt_connlimit.c
+@@ -32,8 +32,14 @@
+ #include <net/netfilter/nf_conntrack_tuple.h>
+ #include <net/netfilter/nf_conntrack_zones.h>
+ 
+-#define CONNLIMIT_SLOTS  32
+-#define CONNLIMIT_LOCK_SLOTS 32
++#define CONNLIMIT_SLOTS  256U
++
++#ifdef CONFIG_LOCKDEP
++#define CONNLIMIT_LOCK_SLOTS 8U
++#else
++#define CONNLIMIT_LOCK_SLOTS 256U
++#endif
++
+ #define CONNLIMIT_GC_MAX_NODES 8
+ 
+ /* we will save the tuples of all connections we care about */
+@@ -49,10 +55,11 @@ struct xt_connlimit_rb {
+  union nf_inet_addr addr; /* search key */
+ };
+ 
++static spinlock_t xt_connlimit_locks[CONNLIMIT_LOCK_SLOTS] __cacheline_aligned_in_smp;
++
+ struct xt_connlimit_data {
+  struct rb_root climit_root4[CONNLIMIT_SLOTS];
+  struct rb_root climit_root6[CONNLIMIT_SLOTS];
+- spinlock_t  locks[CONNLIMIT_LOCK_SLOTS];
+ };
+ 
+ static u_int32_t connlimit_rnd __read_mostly;
+@@ -297,11 +304,11 @@ static int count_them(struct net *net,
+   root = &data->climit_root4[hash];
+  }
+ 
+- spin_lock_bh(&data->locks[hash % CONNLIMIT_LOCK_SLOTS]);
++ spin_lock_bh(&xt_connlimit_locks[hash % CONNLIMIT_LOCK_SLOTS]);
+ 
+  count = count_tree(net, root, tuple, addr, mask, family);
+ 
+- spin_unlock_bh(&data->locks[hash % CONNLIMIT_LOCK_SLOTS]);
++ spin_unlock_bh(&xt_connlimit_locks[hash % CONNLIMIT_LOCK_SLOTS]);
+ 
+  return count;
+ }
+@@ -377,9 +384,6 @@ static int connlimit_mt_check(const struct xt_mtchk_param *par)
+   return -ENOMEM;
+  }
+ 
+- for (i = 0; i < CONNLIMIT_LOCK_SLOTS; ++i)
+-  spin_lock_init(&info->data->locks[i]);
+-
+  for (i = 0; i < ARRAY_SIZE(info->data->climit_root4); ++i)
+   info->data->climit_root4[i] = RB_ROOT;
+  for (i = 0; i < ARRAY_SIZE(info->data->climit_root6); ++i)
+@@ -435,11 +439,14 @@ static struct xt_match connlimit_mt_reg __read_mostly = {
+ 
+ static int __init connlimit_mt_init(void)
+ {
+- int ret;
++ int ret, i;
+ 
+  BUILD_BUG_ON(CONNLIMIT_LOCK_SLOTS > CONNLIMIT_SLOTS);
+  BUILD_BUG_ON((CONNLIMIT_SLOTS % CONNLIMIT_LOCK_SLOTS) != 0);
+ 
++ for (i = 0; i < CONNLIMIT_LOCK_SLOTS; ++i)
++  spin_lock_init(&xt_connlimit_locks[i]);
++
+  connlimit_conn_cachep = kmem_cache_create("xt_connlimit_conn",
+         sizeof(struct xt_connlimit_conn),
+         0, 0, NULL);
+-- 
+1.7.1

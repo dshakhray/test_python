@@ -1,0 +1,109 @@
+From 268863f79e858d845482aa0a5a2964e538f6e68c Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Sat, 19 Jul 2014 04:31:13 -0400
+Subject: [x86] Revert: Insert GART region into resource map
+
+Message-id: <20140719043113.19438.99450.stgit@gir.stowe>
+Patchwork-id: 86043
+O-Subject: [RHEL7.1 PATCH 81/81] Revert "[PATCH] Insert GART region into resource map"
+Bugzilla: 1110895
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110895
+Upstream Status: 707d4eefbdb31f8e588277157056b0ce637d6c68
+
+commit 707d4eefbdb31f8e588277157056b0ce637d6c68
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Tue Mar 18 14:26:12 2014 -0600
+
+    Revert "[PATCH] Insert GART region into resource map"
+
+    This reverts commit 56dd669a138c, which makes the GART visible in
+    /proc/iomem.  This fixes a regression: e501b3d87f00 ("agp: Support 64-bit
+    APBASE") exposed an existing problem with a conflict between the GART
+    region and a PCI BAR region.
+
+    The GART addresses are bus addresses, not CPU addresses, and therefore
+    should not be inserted in iomem_resource.
+
+    On many machines, the GART region is addressable by the CPU as well as by
+    an AGP master, but CPU addressability is not required by the spec.  On some
+    of these machines, the GART is mapped by a PCI BAR, and in that case, the
+    PCI core automatically inserts it into iomem_resource, just as it does for
+    all BARs.
+
+    Inserting it here means we'll have a conflict if the PCI core later tries
+    to claim the GART region, so let's drop the insertion here.
+
+    The conflict indirectly causes X failures, as reported by Jouni in the
+    bugzilla below.  We detected the conflict even before e501b3d87f00, but
+    after it the AGP code (fix_northbridge()) uses the PCI resource (which is
+    zeroed because of the conflict) instead of reading the BAR again.
+
+    Conflicts:
+        arch/x86_64/kernel/aperture.c
+
+    Fixes: e501b3d87f00 agp: Support 64-bit APBASE
+    Link: https://bugzilla.kernel.org/show_bug.cgi?id=72201
+    Reported-and-tested-by: Jouni Mettala <jtmettala@gmail.com>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/aperture_64.c b/arch/x86/kernel/aperture_64.c
+index fd972a3..9fa8aa0 100644
+--- a/arch/x86/kernel/aperture_64.c
++++ b/arch/x86/kernel/aperture_64.c
+@@ -18,7 +18,6 @@
+ #include <linux/pci_ids.h>
+ #include <linux/pci.h>
+ #include <linux/bitops.h>
+-#include <linux/ioport.h>
+ #include <linux/suspend.h>
+ #include <asm/e820.h>
+ #include <asm/io.h>
+@@ -54,18 +53,6 @@ int fallback_aper_force __initdata;
+ 
+ int fix_aperture __initdata = 1;
+ 
+-static struct resource gart_resource = {
+- .name = "GART",
+- .flags = IORESOURCE_MEM,
+-};
+-
+-static void __init insert_aperture_resource(u32 aper_base, u32 aper_size)
+-{
+- gart_resource.start = aper_base;
+- gart_resource.end = aper_base + aper_size - 1;
+- insert_resource(&iomem_resource, &gart_resource);
+-}
+-
+ /* This code runs before the PCI subsystem is initialized, so just
+    access the northbridge directly. */
+ 
+@@ -96,7 +83,6 @@ static u32 __init allocate_aperture(void)
+  memblock_reserve(addr, aper_size);
+  printk(KERN_INFO "Mapping aperture over %d KB of RAM @ %lx\n",
+    aper_size >> 10, addr);
+- insert_aperture_resource((u32)addr, aper_size);
+  register_nosave_region(addr >> PAGE_SHIFT,
+           (addr+aper_size) >> PAGE_SHIFT);
+ 
+@@ -444,12 +430,8 @@ int __init gart_iommu_hole_init(void)
+ 
+ out:
+  if (!fix && !fallback_aper_force) {
+-  if (last_aper_base) {
+-   unsigned long n = (32 * 1024 * 1024) << last_aper_order;
+-
+-   insert_aperture_resource((u32)last_aper_base, n);
++  if (last_aper_base)
+    return 1;
+-  }
+   return 0;
+  }
+ 
+-- 
+1.7.1

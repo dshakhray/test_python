@@ -1,0 +1,122 @@
+From f01ee8453eaa248ee40d37572c67054a64786113 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:06:13 -0400
+Subject: [acpi] hotplug/pci: Avoid parent bus rescans on spurious device checks
+
+Message-id: <20140710010613.22146.24817.stgit@gir.stowe>
+Patchwork-id: 85615
+O-Subject: [RHEL7.1 PATCH 077/105] ACPI / hotplug / PCI: Avoid parent bus rescans on spurious device checks
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: a47d8c8e72a5fa2e69117674c4b0b6cc79c5bc53
+
+commit a47d8c8e72a5fa2e69117674c4b0b6cc79c5bc53
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Sun Sep 8 00:07:28 2013 +0200
+
+    ACPI / hotplug / PCI: Avoid parent bus rescans on spurious device checks
+
+    In the current ACPIPHP notify handler we always go directly for a
+    rescan of the parent bus if we get a device check notification for
+    a device that is not a bridge.  However, this obviously is
+    overzealous if nothing really changes, because this way we may rescan
+    the whole PCI hierarchy pretty much in vain.
+
+    That happens on Alex Williamson's machine whose ACPI tables contain
+    device objects that are supposed to coresspond to PCIe root ports,
+    but those ports aren't physically present (or at least they aren't
+    visible in the PCI config space to us).  The BIOS generates multiple
+    device check notifies for those objects during boot and for each of
+    them we go straight for the parent bus rescan, but the parent bus is
+    the root bus in this particular case.  In consequence, we rescan the
+    whole PCI bus from the top several times in a row, which is
+    completely unnecessary, increases boot time by 50% (after previous
+    fixes) and generates excess dmesg output from the PCI subsystem.
+
+    Fix the problem by checking if we can find anything new in the
+    slot corresponding to the device we've got a device check notify
+    for and doing nothig if that's not the case.
+
+    The spec (ACPI 5.0, Section 5.6.6) appears to mandate this behavior,
+    as it says:
+
+      Device Check. Used to notify OSPM that the device either appeared
+      or disappeared. If the device has appeared, OSPM will re-enumerate
+      from the parent. If the device has disappeared, OSPM will
+      invalidate the state of the device. OSPM may optimize out
+      re-enumeration.
+
+    Therefore, according to the spec, we are free to do nothing if
+    nothing changes.
+
+    References: https://bugzilla.kernel.org/show_bug.cgi?id=60865
+    Reported-and-tested-by: Alex Williamson <alex.williamson@redhat.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index 47f78d1..6557702 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -528,6 +528,16 @@ static void check_hotplug_bridge(struct acpiphp_slot *slot, struct pci_dev *dev)
+  }
+ }
+ 
++static int acpiphp_rescan_slot(struct acpiphp_slot *slot)
++{
++ struct acpiphp_func *func;
++
++ list_for_each_entry(func, &slot->funcs, sibling)
++  acpiphp_bus_add(func_to_handle(func));
++
++ return pci_scan_slot(slot->bus, PCI_DEVFN(slot->device, 0));
++}
++
+ /**
+  * enable_slot - enable, configure a slot
+  * @slot: slot to be enabled
+@@ -544,10 +554,7 @@ static void __ref enable_slot(struct acpiphp_slot *slot)
+  LIST_HEAD(add_list);
+  int nr_found;
+ 
+- list_for_each_entry(func, &slot->funcs, sibling)
+-  acpiphp_bus_add(func_to_handle(func));
+-
+- nr_found = pci_scan_slot(bus, PCI_DEVFN(slot->device, 0));
++ nr_found = acpiphp_rescan_slot(slot);
+  max = acpiphp_max_busnr(bus);
+  for (pass = 0; pass < 2; pass++) {
+   list_for_each_entry(dev, &bus->devices, bus_list) {
+@@ -840,11 +847,22 @@ static void hotplug_event(acpi_handle handle, u32 type, void *data)
+  case ACPI_NOTIFY_DEVICE_CHECK:
+   /* device check */
+   pr_debug("%s: Device check notify on %s\n", __func__, objname);
+-  if (bridge)
++  if (bridge) {
+    acpiphp_check_bridge(bridge);
+-  else
+-   acpiphp_check_bridge(func->parent);
++  } else {
++   struct acpiphp_slot *slot = func->slot;
++   int ret;
+ 
++   /*
++    * Check if anything has changed in the slot and rescan
++    * from the parent if that's the case.
++    */
++   mutex_lock(&slot->crit_sect);
++   ret = acpiphp_rescan_slot(slot);
++   mutex_unlock(&slot->crit_sect);
++   if (ret)
++    acpiphp_check_bridge(func->parent);
++  }
+   break;
+ 
+  case ACPI_NOTIFY_EJECT_REQUEST:
+-- 
+1.7.1

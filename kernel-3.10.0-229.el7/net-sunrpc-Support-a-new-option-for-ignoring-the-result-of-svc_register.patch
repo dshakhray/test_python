@@ -1,0 +1,132 @@
+From 5948844cca0d5c605dfde81cf745acd4f656d765 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Mon, 23 Jun 2014 21:49:32 -0400
+Subject: [net] sunrpc: Support a new option for ignoring the result of svc_register
+
+Message-id: <1403560314-32525-31-git-send-email-bfields@redhat.com>
+Patchwork-id: 84527
+O-Subject: [Patch RHEL7 030/172] SUNRPC/NFSD: Support a new option for ignoring the result of svc_register
+Bugzilla: 1103348 1111719
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Kinglong Mee <kinglongmee@gmail.com>
+
+NFSv4 clients can contact port 2049 directly instead of needing the
+portmapper.
+
+Therefore a failure to register to the portmapper when starting an
+NFSv4-only server isn't really a problem.
+
+But Gareth Williams reports that an attempt to start an NFSv4-only
+server without starting portmap fails:
+
+  #rpc.nfsd -N 2 -N 3
+  rpc.nfsd: writing fd to kernel failed: errno 111 (Connection refused)
+  rpc.nfsd: unable to set any sockets for nfsd
+
+Add a flag to svc_version to tell the rpc layer it can safely ignore an
+rpcbind failure in the NFSv4-only case.
+
+Reported-by: Gareth Williams <gareth@garethwilliams.me.uk>
+Reviewed-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Kinglong Mee <kinglongmee@gmail.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 7e55b59b2f32afc83452ae250dfd6173c9a7b515
+Bugzilla: 1111719, 1103348
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c
+index 99e7ac5..416ead8 100644
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@ -1889,6 +1889,7 @@ struct svc_version nfsd_version4 = {
+   .vs_proc = nfsd_procedures4,
+   .vs_dispatch = nfsd_dispatch,
+   .vs_xdrsize = NFS4_SVC_XDRSIZE,
++  .vs_rpcb_optnl = 1,
+ };
+ 
+ /*
+diff --git a/include/linux/sunrpc/svc.h b/include/linux/sunrpc/svc.h
+index b631642..04e7632 100644
+--- a/include/linux/sunrpc/svc.h
++++ b/include/linux/sunrpc/svc.h
+@@ -386,8 +386,10 @@ struct svc_version {
+  struct svc_procedure * vs_proc; /* per-procedure info */
+  u32   vs_xdrsize; /* xdrsize needed for this version */
+ 
+- unsigned int  vs_hidden : 1; /* Don't register with portmapper.
++ unsigned int  vs_hidden : 1, /* Don't register with portmapper.
+        * Only used for nfsacl so far. */
++    vs_rpcb_optnl:1;/* Don't care the result of register.
++       * Only used for nfsv4. */
+ 
+  /* Override dispatch function (e.g. when caching replies).
+   * A return value of 0 means drop the request. 
+diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
+index e009aab..11c1597 100644
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@ -916,9 +916,6 @@ static int __svc_register(struct net *net, const char *progname,
+ #endif
+  }
+ 
+- if (error < 0)
+-  printk(KERN_WARNING "svc: failed to register %sv%u RPC "
+-   "service (errno %d).\n", progname, version, -error);
+  return error;
+ }
+ 
+@@ -937,6 +934,7 @@ int svc_register(const struct svc_serv *serv, struct net *net,
+    const unsigned short port)
+ {
+  struct svc_program *progp;
++ struct svc_version *vers;
+  unsigned int  i;
+  int   error = 0;
+ 
+@@ -946,7 +944,8 @@ int svc_register(const struct svc_serv *serv, struct net *net,
+ 
+  for (progp = serv->sv_program; progp; progp = progp->pg_next) {
+   for (i = 0; i < progp->pg_nvers; i++) {
+-   if (progp->pg_vers[i] == NULL)
++   vers = progp->pg_vers[i];
++   if (vers == NULL)
+     continue;
+ 
+    dprintk("svc: svc_register(%sv%d, %s, %u, %u)%s\n",
+@@ -955,16 +954,26 @@ int svc_register(const struct svc_serv *serv, struct net *net,
+      proto == IPPROTO_UDP?  "udp" : "tcp",
+      port,
+      family,
+-     progp->pg_vers[i]->vs_hidden?
+-      " (but not telling portmap)" : "");
++     vers->vs_hidden ?
++     " (but not telling portmap)" : "");
+ 
+-   if (progp->pg_vers[i]->vs_hidden)
++   if (vers->vs_hidden)
+     continue;
+ 
+    error = __svc_register(net, progp->pg_name, progp->pg_prog,
+       i, family, proto, port);
+-   if (error < 0)
++
++   if (vers->vs_rpcb_optnl) {
++    error = 0;
++    continue;
++   }
++
++   if (error < 0) {
++    printk(KERN_WARNING "svc: failed to register "
++     "%sv%u RPC service (errno %d).\n",
++     progp->pg_name, i, -error);
+     break;
++   }
+   }
+  }
+ 
+-- 
+1.7.1

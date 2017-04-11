@@ -1,0 +1,171 @@
+From 85287691940d9c275729443c880ff3635d0af37d Mon Sep 17 00:00:00 2001
+From: Steve Best <sbest@redhat.com>
+Date: Fri, 29 Aug 2014 18:14:30 -0400
+Subject: [char] hwrng: Add a driver for the hwrng found in power7+ systems
+
+Message-id: <20140829181430.27191.24505.sendpatchset@ibm-p7r2-01.lab.bos.redhat.com>
+Patchwork-id: 89894
+O-Subject: [PATCH RHEL7.1 BZ1123116 1/2] hwrng: Add a driver for the hwrng found in power7+ systems
+Bugzilla: 1123116
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+RHBZ#:
+------
+https://bugzilla.redhat.com/show_bug.cgi?id=1123116
+
+Description:
+------------
+Add a driver for the hwrng found in power7+ systems, based on the
+existing code for the arch_get_random_long() hook.
+
+We only register a single instance of the driver, not one per device,
+because we use the existing per_cpu array of devices in the arch code.
+This means we always read from the "closest" device, avoiding inter-chip
+memory traffic.
+
+Signed-off-by: Guo Chao <yan@linux.vnet.ibm.com>
+Signed-off-by: Michael Ellerman <michael@ellerman.id.au>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+RHEL Version Found:
+-------------------
+7.0
+
+Upstream Status:
+----------------
+http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=66548e40583b1470300341c6784fdc5176f7609f
+
+----------------
+Steve Best
+
+Proposed Patch:
+---------------
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/char/hw_random/Kconfig b/drivers/char/hw_random/Kconfig
+index 2f9dbf7..34f8b0c 100644
+--- a/drivers/char/hw_random/Kconfig
++++ b/drivers/char/hw_random/Kconfig
+@@ -290,6 +290,19 @@ config HW_RANDOM_PSERIES
+ 
+    If unsure, say Y.
+ 
++config HW_RANDOM_POWERNV
++ tristate "PowerNV Random Number Generator support"
++ depends on HW_RANDOM && PPC_POWERNV
++ default HW_RANDOM
++ ---help---
++   This is the driver for Random Number Generator hardware found
++   in POWER7+ and above machines for PowerNV platform.
++
++   To compile this driver as a module, choose M here: the
++   module will be called powernv-rng.
++
++   If unsure, say Y.
++
+ config HW_RANDOM_EXYNOS
+  tristate "EXYNOS HW random number generator support"
+  depends on HW_RANDOM && HAS_IOMEM && HAVE_CLK
+diff --git a/drivers/char/hw_random/Makefile b/drivers/char/hw_random/Makefile
+index bed467c..d7d2435 100644
+--- a/drivers/char/hw_random/Makefile
++++ b/drivers/char/hw_random/Makefile
+@@ -24,6 +24,7 @@ obj-$(CONFIG_HW_RANDOM_NOMADIK) += nomadik-rng.o
+ obj-$(CONFIG_HW_RANDOM_PICOXCELL) += picoxcell-rng.o
+ obj-$(CONFIG_HW_RANDOM_PPC4XX) += ppc4xx-rng.o
+ obj-$(CONFIG_HW_RANDOM_PSERIES) += pseries-rng.o
++obj-$(CONFIG_HW_RANDOM_POWERNV) += powernv-rng.o
+ obj-$(CONFIG_HW_RANDOM_EXYNOS) += exynos-rng.o
+ obj-$(CONFIG_HW_RANDOM_TPM) += tpm-rng.o
+ obj-$(CONFIG_HW_RANDOM_BCM2835) += bcm2835-rng.o
+diff --git a/drivers/char/hw_random/powernv-rng.c b/drivers/char/hw_random/powernv-rng.c
+new file mode 100644
+index 0000000..3f4f632
+--- /dev/null
++++ b/drivers/char/hw_random/powernv-rng.c
+@@ -0,0 +1,81 @@
++/*
++ * Copyright 2013 Michael Ellerman, Guo Chao, IBM Corp.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/platform_device.h>
++#include <linux/random.h>
++#include <linux/hw_random.h>
++
++static int powernv_rng_read(struct hwrng *rng, void *data, size_t max, bool wait)
++{
++ unsigned long *buf;
++ int i, len;
++
++ /* We rely on rng_buffer_size() being >= sizeof(unsigned long) */
++ len = max / sizeof(unsigned long);
++
++ buf = (unsigned long *)data;
++
++ for (i = 0; i < len; i++)
++  powernv_get_random_long(buf++);
++
++ return len * sizeof(unsigned long);
++}
++
++static struct hwrng powernv_hwrng = {
++ .name = "powernv-rng",
++ .read = powernv_rng_read,
++};
++
++static int powernv_rng_remove(struct platform_device *pdev)
++{
++ hwrng_unregister(&powernv_hwrng);
++
++ return 0;
++}
++
++static int powernv_rng_probe(struct platform_device *pdev)
++{
++ int rc;
++
++ rc = hwrng_register(&powernv_hwrng);
++ if (rc) {
++  /* We only register one device, ignore any others */
++  if (rc == -EEXIST)
++   rc = -ENODEV;
++
++  return rc;
++ }
++
++ pr_info("Registered powernv hwrng.\n");
++
++ return 0;
++}
++
++static struct of_device_id powernv_rng_match[] = {
++ { .compatible = "ibm,power-rng",},
++ {},
++};
++MODULE_DEVICE_TABLE(of, powernv_rng_match);
++
++static struct platform_driver powernv_rng_driver = {
++ .driver = {
++  .name = "powernv_rng",
++  .of_match_table = powernv_rng_match,
++ },
++ .probe = powernv_rng_probe,
++ .remove = powernv_rng_remove,
++};
++module_platform_driver(powernv_rng_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Bare metal HWRNG driver for POWER7+ and above");
+-- 
+1.7.1

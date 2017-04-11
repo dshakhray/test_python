@@ -1,0 +1,95 @@
+From 390f263417b504d3c87bf79967dce59c1e7e356a Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:53:15 -0400
+Subject: [tools] perf/buildid-cache: Check relocation when checking for existing kcore
+
+Message-id: <1408953210-26343-308-git-send-email-jolsa@redhat.com>
+Patchwork-id: 89018
+O-Subject: [PATCH RHEL7.1 BZ1133083 307/322] perf buildid-cache: Check relocation when checking for existing kcore
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit d3b70220292c40d3b499797fd2f33f608fc35edb
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Wed Jan 29 16:14:44 2014 +0200
+
+description
+===========
+perf buildid-cache does not make another copy of kcore if the buildid
+and modules match an existing copy.
+
+That does not take into account the possibility that the kernel has been
+relocated.
+
+Extend the check to check if the reference relocation symbol matches
+too, otherwise do make a copy.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-buildid-cache.c b/tools/perf/builtin-buildid-cache.c
+index cfede86..b22dbb1 100644
+--- a/tools/perf/builtin-buildid-cache.c
++++ b/tools/perf/builtin-buildid-cache.c
+@@ -63,11 +63,35 @@ static int build_id_cache__kcore_dir(char *dir, size_t sz)
+  return 0;
+ }
+ 
++static bool same_kallsyms_reloc(const char *from_dir, char *to_dir)
++{
++ char from[PATH_MAX];
++ char to[PATH_MAX];
++ const char *name;
++ u64 addr1 = 0, addr2 = 0;
++ int i;
++
++ scnprintf(from, sizeof(from), "%s/kallsyms", from_dir);
++ scnprintf(to, sizeof(to), "%s/kallsyms", to_dir);
++
++ for (i = 0; (name = ref_reloc_sym_names[i]) != NULL; i++) {
++  addr1 = kallsyms__get_function_start(from, name);
++  if (addr1)
++   break;
++ }
++
++ if (name)
++  addr2 = kallsyms__get_function_start(to, name);
++
++ return addr1 == addr2;
++}
++
+ static int build_id_cache__kcore_existing(const char *from_dir, char *to_dir,
+        size_t to_dir_sz)
+ {
+  char from[PATH_MAX];
+  char to[PATH_MAX];
++ char to_subdir[PATH_MAX];
+  struct dirent *dent;
+  int ret = -1;
+  DIR *d;
+@@ -86,10 +110,11 @@ static int build_id_cache__kcore_existing(const char *from_dir, char *to_dir,
+    continue;
+   scnprintf(to, sizeof(to), "%s/%s/modules", to_dir,
+      dent->d_name);
+-  if (!compare_proc_modules(from, to)) {
+-   scnprintf(to, sizeof(to), "%s/%s", to_dir,
+-      dent->d_name);
+-   strlcpy(to_dir, to, to_dir_sz);
++  scnprintf(to_subdir, sizeof(to_subdir), "%s/%s",
++     to_dir, dent->d_name);
++  if (!compare_proc_modules(from, to) &&
++      same_kallsyms_reloc(from_dir, to_subdir)) {
++   strlcpy(to_dir, to_subdir, to_dir_sz);
+    ret = 0;
+    break;
+   }
+-- 
+1.7.1

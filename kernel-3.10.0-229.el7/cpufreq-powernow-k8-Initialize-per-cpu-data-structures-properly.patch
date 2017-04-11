@@ -1,0 +1,95 @@
+From 558ba78cb6268c23d18f2e7f04926131b83d94dd Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:23:17 -0400
+Subject: [cpufreq] powernow-k8: Initialize per-cpu data-structures properly
+
+Message-id: <1409235879-1283-104-git-send-email-prarit@redhat.com>
+Patchwork-id: 89426
+O-Subject: [RHEL7.1 PATCH BZ 1134639 103/185] cpufreq: powernow-k8: Initialize per-cpu data-structures properly
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit c3274763bfc3bf1ececa269ed6e6c4d7ec1c3e5e
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Mon Feb 17 16:18:21 2014 +0530
+
+    cpufreq: powernow-k8: Initialize per-cpu data-structures properly
+
+    The powernow-k8 driver maintains a per-cpu data-structure called
+    powernow_data that is used to perform the frequency transitions.
+    It initializes this data structure only for the policy->cpu. So,
+    accesses to this data structure by other CPUs results in various
+    problems because they would have been uninitialized.
+
+    Specifically, if a cpu (!= policy->cpu) invokes the drivers' ->get()
+    function, it returns 0 as the KHz value, since its per-cpu memory
+    doesn't point to anything valid. This causes problems during
+    suspend/resume since cpufreq_update_policy() tries to enforce this
+    (0 KHz) as the current frequency of the CPU, and this madness gets
+    propagated to adjust_jiffies() as well. Eventually, lots of things
+    start breaking down, including the r8169 ethernet card, in one
+    particularly interesting case reported by Pierre Ossman.
+
+    Fix this by initializing the per-cpu data-structures of all the CPUs
+    in the policy appropriately.
+
+    References: https://bugzilla.kernel.org/show_bug.cgi?id=70311
+    Reported-by: Pierre Ossman <pierre@ossman.eu>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Cc: All applicable <stable@vger.kernel.org>
+    Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/powernow-k8.c b/drivers/cpufreq/powernow-k8.c
+index 0c85050..fa4dca1 100644
+--- a/drivers/cpufreq/powernow-k8.c
++++ b/drivers/cpufreq/powernow-k8.c
+@@ -1076,7 +1076,7 @@ static int powernowk8_cpu_init(struct cpufreq_policy *pol)
+ {
+  struct powernow_k8_data *data;
+  struct init_on_cpu init_on_cpu;
+- int rc;
++ int rc, cpu;
+ 
+  smp_call_function_single(pol->cpu, check_supported_cpu, &rc, 1);
+  if (rc)
+@@ -1140,7 +1140,9 @@ static int powernowk8_cpu_init(struct cpufreq_policy *pol)
+  pr_debug("cpu_init done, current fid 0x%x, vid 0x%x\n",
+    data->currfid, data->currvid);
+ 
+- per_cpu(powernow_data, pol->cpu) = data;
++ /* Point all the CPUs in this policy to the same data */
++ for_each_cpu(cpu, pol->cpus)
++  per_cpu(powernow_data, cpu) = data;
+ 
+  return 0;
+ 
+@@ -1155,6 +1157,7 @@ err_out:
+ static int powernowk8_cpu_exit(struct cpufreq_policy *pol)
+ {
+  struct powernow_k8_data *data = per_cpu(powernow_data, pol->cpu);
++ int cpu;
+ 
+  if (!data)
+   return -EINVAL;
+@@ -1165,7 +1168,8 @@ static int powernowk8_cpu_exit(struct cpufreq_policy *pol)
+ 
+  kfree(data->powernow_table);
+  kfree(data);
+- per_cpu(powernow_data, pol->cpu) = NULL;
++ for_each_cpu(cpu, pol->cpus)
++  per_cpu(powernow_data, cpu) = NULL;
+ 
+  return 0;
+ }
+-- 
+1.7.1

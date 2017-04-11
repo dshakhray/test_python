@@ -1,0 +1,103 @@
+From 99c5e5e9cf4a7ac463572147cc119130f85d9ced Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:49:16 -0400
+Subject: [tools] perf: Do not disable source line lookup just because of 1 failure
+
+Message-id: <1408953210-26343-69-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88833
+O-Subject: [PATCH RHEL7.1 BZ1133083 068/322] perf tools: Do not disable source line lookup just because of 1 failure
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 906049c8276eb99af997f73d602649a98e360035
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Tue Dec 3 09:23:10 2013 +0200
+
+description
+===========
+Looking up an ip's source file name and line number does not succeed
+always.  Current logic disables the lookup for a dso entirely on any
+failure.  Change it so that disabling never happens if there has ever
+been a successful lookup for that dso but disable if the first 123
+lookups fail.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index 49da968..a0c7c59 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -451,6 +451,7 @@ struct dso *dso__new(const char *name)
+   dso->sorted_by_name = 0;
+   dso->has_build_id = 0;
+   dso->has_srcline = 1;
++  dso->a2l_fails = 1;
+   dso->kernel = DSO_TYPE_USER;
+   dso->needs_swap = DSO_SWAP__UNSET;
+   INIT_LIST_HEAD(&dso->node);
+diff --git a/tools/perf/util/dso.h b/tools/perf/util/dso.h
+index 7142e52..384f2d9 100644
+--- a/tools/perf/util/dso.h
++++ b/tools/perf/util/dso.h
+@@ -79,6 +79,7 @@ struct dso {
+  struct rb_root  cache;
+  void   *a2l;
+  char   *symsrc_filename;
++ unsigned int  a2l_fails;
+  enum dso_kernel_type kernel;
+  enum dso_swap_type needs_swap;
+  enum dso_binary_type symtab_type;
+diff --git a/tools/perf/util/srcline.c b/tools/perf/util/srcline.c
+index 93795f9..0c07556 100644
+--- a/tools/perf/util/srcline.c
++++ b/tools/perf/util/srcline.c
+@@ -244,6 +244,12 @@ void dso__free_a2l(struct dso *dso __maybe_unused)
+ 
+ #endif /* HAVE_LIBBFD_SUPPORT */
+ 
++/*
++ * Number of addr2line failures (without success) before disabling it for that
++ * dso.
++ */
++#define A2L_FAIL_LIMIT 123
++
+ char *get_srcline(struct dso *dso, unsigned long addr)
+ {
+  char *file = NULL;
+@@ -268,15 +274,21 @@ char *get_srcline(struct dso *dso, unsigned long addr)
+  if (!addr2line(dso_name, addr, &file, &line, dso))
+   goto out;
+ 
+- if (asprintf(&srcline, "%s:%u", file, line) < 0)
+-  srcline = SRCLINE_UNKNOWN;
++ if (asprintf(&srcline, "%s:%u", file, line) < 0) {
++  free(file);
++  goto out;
++ }
++
++ dso->a2l_fails = 0;
+ 
+  free(file);
+  return srcline;
+ 
+ out:
+- dso->has_srcline = 0;
+- dso__free_a2l(dso);
++ if (dso->a2l_fails && ++dso->a2l_fails > A2L_FAIL_LIMIT) {
++  dso->has_srcline = 0;
++  dso__free_a2l(dso);
++ }
+  return SRCLINE_UNKNOWN;
+ }
+ 
+-- 
+1.7.1

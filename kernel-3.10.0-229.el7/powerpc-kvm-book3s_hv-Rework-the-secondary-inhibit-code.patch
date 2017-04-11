@@ -1,0 +1,213 @@
+From c926e0989b64022a1bdcb572e0f4cd02c7ddd344 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:12:42 -0400
+Subject: [powerpc] kvm/book3s_hv: Rework the secondary inhibit code
+
+Message-id: <1410545655-205645-534-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94555
+O-Subject: [RHEL7 PATCH 533/626] powerpc/kvm/book3s_hv: Rework the secondary inhibit code
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 441c19c8a290f5f1e1b263691641124c84232b6e
+Author: Michael Ellerman <mpe@ellerman.id.au>
+Date:   Fri May 23 18:15:25 2014 +1000
+
+    powerpc/kvm/book3s_hv: Rework the secondary inhibit code
+
+    As part of the support for split core on POWER8, we want to be able to
+    block splitting of the core while KVM VMs are active.
+
+    The logic to do that would be exactly the same as the code we currently
+    have for inhibiting onlining of secondaries.
+
+    Instead of adding an identical mechanism to block split core, rework the
+    secondary inhibit code to be a "HV KVM is active" check. We can then use
+    that in both the cpu hotplug code and the upcoming split core code.
+
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Acked-by: Alexander Graf <agraf@suse.de>
+    Acked-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index 0d01d9b..22222a4 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -337,6 +337,10 @@ static inline void kvmppc_fast_vcpu_kick(struct kvm_vcpu *vcpu)
+  vcpu->kvm->arch.kvm_ops->fast_vcpu_kick(vcpu);
+ }
+ 
++extern void kvm_hv_vm_activated(void);
++extern void kvm_hv_vm_deactivated(void);
++extern bool kvm_hv_mode_active(void);
++
+ #else
+ static inline void __init kvm_cma_reserve(void)
+ {}
+@@ -356,6 +360,9 @@ static inline void kvmppc_fast_vcpu_kick(struct kvm_vcpu *vcpu)
+ {
+  kvm_vcpu_kick(vcpu);
+ }
++
++static inline bool kvm_hv_mode_active(void)  { return false; }
++
+ #endif
+ 
+ #ifdef CONFIG_KVM_XICS
+diff --git a/arch/powerpc/include/asm/smp.h b/arch/powerpc/include/asm/smp.h
+index ff51046..5a6614a 100644
+--- a/arch/powerpc/include/asm/smp.h
++++ b/arch/powerpc/include/asm/smp.h
+@@ -68,14 +68,6 @@ void generic_mach_cpu_die(void);
+ void generic_set_cpu_dead(unsigned int cpu);
+ void generic_set_cpu_up(unsigned int cpu);
+ int generic_check_cpu_restart(unsigned int cpu);
+-
+-extern void inhibit_secondary_onlining(void);
+-extern void uninhibit_secondary_onlining(void);
+-
+-#else /* HOTPLUG_CPU */
+-static inline void inhibit_secondary_onlining(void) {}
+-static inline void uninhibit_secondary_onlining(void) {}
+-
+ #endif
+ 
+ #ifdef CONFIG_PPC64
+diff --git a/arch/powerpc/kernel/smp.c b/arch/powerpc/kernel/smp.c
+index 4863ea1..5cdd9eb 100644
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@ -36,6 +36,7 @@
+ #include <linux/atomic.h>
+ #include <asm/irq.h>
+ #include <asm/hw_irq.h>
++#include <asm/kvm_ppc.h>
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
+ #include <asm/prom.h>
+@@ -458,38 +459,9 @@ int generic_check_cpu_restart(unsigned int cpu)
+  return per_cpu(cpu_state, cpu) == CPU_UP_PREPARE;
+ }
+ 
+-static atomic_t secondary_inhibit_count;
+-
+-/*
+- * Don't allow secondary CPU threads to come online
+- */
+-void inhibit_secondary_onlining(void)
+-{
+- /*
+-  * This makes secondary_inhibit_count stable during cpu
+-  * online/offline operations.
+-  */
+- get_online_cpus();
+-
+- atomic_inc(&secondary_inhibit_count);
+- put_online_cpus();
+-}
+-EXPORT_SYMBOL_GPL(inhibit_secondary_onlining);
+-
+-/*
+- * Allow secondary CPU threads to come online again
+- */
+-void uninhibit_secondary_onlining(void)
+-{
+- get_online_cpus();
+- atomic_dec(&secondary_inhibit_count);
+- put_online_cpus();
+-}
+-EXPORT_SYMBOL_GPL(uninhibit_secondary_onlining);
+-
+-static int secondaries_inhibited(void)
++static bool secondaries_inhibited(void)
+ {
+- return atomic_read(&secondary_inhibit_count);
++ return kvm_hv_mode_active();
+ }
+ 
+ #else /* HOTPLUG_CPU */
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index fe83764..5c09f30 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -2315,10 +2315,10 @@ static int kvmppc_core_init_vm_hv(struct kvm *kvm)
+  spin_lock_init(&kvm->arch.slot_phys_lock);
+ 
+  /*
+-  * Don't allow secondary CPU threads to come online
+-  * while any KVM VMs exist.
++  * Track that we now have a HV mode VM active. This blocks secondary
++  * CPU threads from coming online.
+   */
+- inhibit_secondary_onlining();
++ kvm_hv_vm_activated();
+ 
+  return 0;
+ }
+@@ -2334,7 +2334,7 @@ static void kvmppc_free_vcores(struct kvm *kvm)
+ 
+ static void kvmppc_core_destroy_vm_hv(struct kvm *kvm)
+ {
+- uninhibit_secondary_onlining();
++ kvm_hv_vm_deactivated();
+ 
+  kvmppc_free_vcores(kvm);
+  if (kvm->arch.rma) {
+diff --git a/arch/powerpc/kvm/book3s_hv_builtin.c b/arch/powerpc/kvm/book3s_hv_builtin.c
+index 8cd0dae..7cde8a6 100644
+--- a/arch/powerpc/kvm/book3s_hv_builtin.c
++++ b/arch/powerpc/kvm/book3s_hv_builtin.c
+@@ -6,6 +6,7 @@
+  * published by the Free Software Foundation.
+  */
+ 
++#include <linux/cpu.h>
+ #include <linux/kvm_host.h>
+ #include <linux/preempt.h>
+ #include <linux/export.h>
+@@ -181,3 +182,33 @@ void __init kvm_cma_reserve(void)
+   kvm_cma_declare_contiguous(selected_size, align_size);
+  }
+ }
++
++/*
++ * When running HV mode KVM we need to block certain operations while KVM VMs
++ * exist in the system. We use a counter of VMs to track this.
++ *
++ * One of the operations we need to block is onlining of secondaries, so we
++ * protect hv_vm_count with get/put_online_cpus().
++ */
++static atomic_t hv_vm_count;
++
++void kvm_hv_vm_activated(void)
++{
++ get_online_cpus();
++ atomic_inc(&hv_vm_count);
++ put_online_cpus();
++}
++EXPORT_SYMBOL_GPL(kvm_hv_vm_activated);
++
++void kvm_hv_vm_deactivated(void)
++{
++ get_online_cpus();
++ atomic_dec(&hv_vm_count);
++ put_online_cpus();
++}
++EXPORT_SYMBOL_GPL(kvm_hv_vm_deactivated);
++
++bool kvm_hv_mode_active(void)
++{
++ return atomic_read(&hv_vm_count) != 0;
++}
+-- 
+1.7.1

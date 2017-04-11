@@ -1,0 +1,167 @@
+From 0c80c2ef90be3b298a01dfc154fbe08410b2892a Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Fri, 5 Sep 2014 13:36:34 -0400
+Subject: [net] netns: Delay default_device_exit_batch until no devices are unregistering
+
+Message-id: <1409924195-15933-2-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 91449
+O-Subject: [PATCH 1/2] [RHEL7.1 net] net: Delay default_device_exit_batch until no devices are unregistering v2
+Bugzilla: 1133741
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+BZ: 1133741
+
+KABI: add new struct netns member at the end to not alter offsets
+of existing members.
+
+commit 50624c934db18ab90aaea4908f60dd39aab4e6e5
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Mon Sep 23 21:19:49 2013 -0700
+
+    net: Delay default_device_exit_batch until no devices are unregistering v2
+
+    There is currently serialization network namespaces exiting and
+    network devices exiting as the final part of netdev_run_todo does not
+    happen under the rtnl_lock.  This is compounded by the fact that the
+    only list of devices unregistering in netdev_run_todo is local to the
+    netdev_run_todo.
+
+    This lack of serialization in extreme cases results in network devices
+    unregistering in netdev_run_todo after the loopback device of their
+    network namespace has been freed (making dst_ifdown unsafe), and after
+    the their network namespace has exited (making the NETDEV_UNREGISTER,
+    and NETDEV_UNREGISTER_FINAL callbacks unsafe).
+
+    Add the missing serialization by a per network namespace count of how
+    many network devices are unregistering and having a wait queue that is
+    woken up whenever the count is decreased.  The count and wait queue
+    allow default_device_exit_batch to wait until all of the unregistration
+    activity for a network namespace has finished before proceeding to
+    unregister the loopback device and then allowing the network namespace
+    to exit.
+
+    Only a single global wait queue is used because there is a single global
+    lock, and there is a single waiter, per network namespace wait queues
+    would be a waste of resources.
+
+    The per network namespace count of unregistering devices gives a
+    progress guarantee because the number of network devices unregistering
+    in an exiting network namespace must ultimately drop to zero (assuming
+    network device unregistration completes).
+
+    The basic logic remains the same as in v1.  This patch is now half
+    comment and half rtnl_lock_unregistering an expanded version of
+    wait_event performs no extra work in the common case where no network
+    devices are unregistering when we get to default_device_exit_batch.
+
+    Reported-by: Francesco Ruggeri <fruggeri@aristanetworks.com>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+index 3ee206f..a5f0725 100644
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -122,6 +122,10 @@ struct net {
+  struct netns_ipvs *ipvs;
+  struct sock  *diag_nlsk;
+  atomic_t  rt_genid;
++
++#ifndef __GENKSYMS__
++ unsigned int  dev_unreg_count;
++#endif
+ };
+ 
+ /*
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 4bc0aaa..cf723ff 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -5001,10 +5001,12 @@ static int dev_new_index(struct net *net)
+ 
+ /* Delayed registration/unregisteration */
+ static LIST_HEAD(net_todo_list);
++static DECLARE_WAIT_QUEUE_HEAD(netdev_unregistering_wq);
+ 
+ static void net_set_todo(struct net_device *dev)
+ {
+  list_add_tail(&dev->todo_list, &net_todo_list);
++ dev_net(dev)->dev_unreg_count++;
+ }
+ 
+ static void rollback_registered_many(struct list_head *head)
+@@ -5668,6 +5670,12 @@ void netdev_run_todo(void)
+   if (dev->destructor)
+    dev->destructor(dev);
+ 
++  /* Report a network device has been unregistered */
++  rtnl_lock();
++  dev_net(dev)->dev_unreg_count--;
++  __rtnl_unlock();
++  wake_up(&netdev_unregistering_wq);
++
+   /* Free network device */
+   kobject_put(&dev->dev.kobj);
+  }
+@@ -6352,6 +6360,34 @@ static void __net_exit default_device_exit(struct net *net)
+  rtnl_unlock();
+ }
+ 
++static void __net_exit rtnl_lock_unregistering(struct list_head *net_list)
++{
++ /* Return with the rtnl_lock held when there are no network
++  * devices unregistering in any network namespace in net_list.
++  */
++ struct net *net;
++ bool unregistering;
++ DEFINE_WAIT(wait);
++
++ for (;;) {
++  prepare_to_wait(&netdev_unregistering_wq, &wait,
++    TASK_UNINTERRUPTIBLE);
++  unregistering = false;
++  rtnl_lock();
++  list_for_each_entry(net, net_list, exit_list) {
++   if (net->dev_unreg_count > 0) {
++    unregistering = true;
++    break;
++   }
++  }
++  if (!unregistering)
++   break;
++  __rtnl_unlock();
++  schedule();
++ }
++ finish_wait(&netdev_unregistering_wq, &wait);
++}
++
+ static void __net_exit default_device_exit_batch(struct list_head *net_list)
+ {
+  /* At exit all network devices most be removed from a network
+@@ -6363,7 +6399,18 @@ static void __net_exit default_device_exit_batch(struct list_head *net_list)
+  struct net *net;
+  LIST_HEAD(dev_kill_list);
+ 
+- rtnl_lock();
++ /* To prevent network device cleanup code from dereferencing
++  * loopback devices or network devices that have been freed
++  * wait here for all pending unregistrations to complete,
++  * before unregistring the loopback device and allowing the
++  * network namespace be freed.
++  *
++  * The netdev todo list containing all network devices
++  * unregistrations that happen in default_device_exit_batch
++  * will run in the rtnl_unlock() at the end of
++  * default_device_exit_batch.
++  */
++ rtnl_lock_unregistering(net_list);
+  list_for_each_entry(net, net_list, exit_list) {
+   for_each_netdev_reverse(net, dev) {
+    if (dev->rtnl_link_ops)
+-- 
+1.7.1

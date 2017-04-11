@@ -1,0 +1,102 @@
+From 0d4c0455ec0ebd8321c59e48486bb25d6eff745a Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Mon, 23 Jun 2014 21:51:14 -0400
+Subject: [fs] nfsd: don't treat readlink like a zero-copy operation
+
+Message-id: <1403560314-32525-133-git-send-email-bfields@redhat.com>
+Patchwork-id: 84551
+O-Subject: [Patch RHEL7 132/172] nfsd4: don't treat readlink like a zero-copy operation
+Bugzilla: 1111719
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+There's no advantage to this zero-copy-style readlink encoding, and it
+unnecessarily limits the kinds of compounds we can handle.  (In practice
+I can't see why a client would want e.g. multiple readlink calls in a
+comound, but it's probably a spec violation for us not to handle it.)
+
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 476a7b1f4b2c9c38255653fa55157565be8b14be
+Bugzilla: 1111719
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c
+index 3f2a52c..cda6226 100644
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@ -3160,8 +3160,9 @@ static __be32
+ nfsd4_encode_readlink(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_readlink *readlink)
+ {
+  int maxcount;
++ __be32 wire_count;
++ int zero = 0;
+  struct xdr_stream *xdr = &resp->xdr;
+- char *page;
+  int length_offset = xdr->buf->len;
+  __be32 *p;
+ 
+@@ -3171,26 +3172,19 @@ nfsd4_encode_readlink(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd
+  p = xdr_reserve_space(xdr, 4);
+  if (!p)
+   return nfserr_resource;
+-
+- if (resp->xdr.buf->page_len)
+-  return nfserr_resource;
+- if (!*resp->rqstp->rq_next_page)
+-  return nfserr_resource;
+-
+- page = page_address(*(resp->rqstp->rq_next_page++));
+-
+  maxcount = PAGE_SIZE;
+ 
+- if (xdr->end - xdr->p < 1)
++ p = xdr_reserve_space(xdr, maxcount);
++ if (!p)
+   return nfserr_resource;
+-
+  /*
+   * XXX: By default, the ->readlink() VFS op will truncate symlinks
+   * if they would overflow the buffer.  Is this kosher in NFSv4?  If
+   * not, one easy fix is: if ->readlink() precisely fills the buffer,
+   * assume that truncation occurred, and return NFS4ERR_RESOURCE.
+   */
+- nfserr = nfsd_readlink(readlink->rl_rqstp, readlink->rl_fhp, page, &maxcount);
++ nfserr = nfsd_readlink(readlink->rl_rqstp, readlink->rl_fhp,
++      (char *)p, &maxcount);
+  if (nfserr == nfserr_isdir)
+   nfserr = nfserr_inval;
+  if (nfserr) {
+@@ -3198,24 +3192,12 @@ nfsd4_encode_readlink(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd
+   return nfserr;
+  }
+ 
+- WRITE32(maxcount);
+- resp->xdr.buf->head[0].iov_len = (char *)p
+-    - (char *)resp->xdr.buf->head[0].iov_base;
+- resp->xdr.buf->page_len = maxcount;
+- xdr->buf->len += maxcount;
+- xdr->page_ptr += 1;
+- xdr->buf->buflen -= PAGE_SIZE;
+- xdr->iov = xdr->buf->tail;
+-
+- /* Use rest of head for padding and remaining ops: */
+- resp->xdr.buf->tail[0].iov_base = p;
+- resp->xdr.buf->tail[0].iov_len = 0;
+- if (maxcount&3) {
+-  p = xdr_reserve_space(xdr, 4);
+-  WRITE32(0);
+-  resp->xdr.buf->tail[0].iov_base += maxcount&3;
+-  resp->xdr.buf->tail[0].iov_len = 4 - (maxcount&3);
+- }
++ wire_count = htonl(maxcount);
++ write_bytes_to_xdr_buf(xdr->buf, length_offset, &wire_count, 4);
++ xdr_truncate_encode(xdr, length_offset + 4 + maxcount);
++ if (maxcount & 3)
++  write_bytes_to_xdr_buf(xdr->buf, length_offset + 4 + maxcount,
++      &zero, 4 - (maxcount&3));
+  return 0;
+ }
+ 
+-- 
+1.7.1

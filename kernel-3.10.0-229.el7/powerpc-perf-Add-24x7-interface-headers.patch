@@ -1,0 +1,198 @@
+From 4b7d4759f12bf6a7dc068c7bffb4ad6eed6948a7 Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Mon, 1 Sep 2014 20:15:22 -0400
+Subject: [powerpc] perf: Add 24x7 interface headers
+
+Message-id: <1409602534-23951-4-git-send-email-gduarte@redhat.com>
+Patchwork-id: 90122
+O-Subject: [RHEL7.1 PATCH BZ 947159 03/15] powerpc/perf: Add 24x7 interface headers
+Bugzilla: 947159
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=947159
+Upstream Status: a8b2c4367179e65c2ac945a284ab5d77be161bdf
+
+commit a8b2c4367179e65c2ac945a284ab5d77be161bdf
+Author: Cody P Schafer <cody@linux.vnet.ibm.com>
+Date:   Fri Mar 14 16:00:38 2014 +1100
+
+    powerpc/perf: Add 24x7 interface headers
+
+    24x7 (also called hv_24x7 or H_24X7) is an interface to obtain
+    performance counters from the hypervisor. These counters do not have a
+    fixed format/possition and are instead documented in a "24x7 Catalog",
+    which is provided by the hypervisor (that interface is also documented
+    paritialy in the included hv-24x7-catalog.h and fully in at
+    https://raw.githubusercontent.com/jmesmon/catalog-24x7/master/hv-24x7-catalog.h ).
+
+    The 24x7 data access is simply a copy operation into a 4 dimentional
+    array of 64bit counters (from hypervisor to kernel memory). There is no
+    interupt triggered on overflow, these are completely disjoint from the
+    typical power pmu.
+
+    This method of obtaining performance counters from the hypervisor is
+    intended to paritialy replace the gpci interface.
+
+    Signed-off-by: Cody P Schafer <cody@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/perf/hv-24x7-catalog.h b/arch/powerpc/perf/hv-24x7-catalog.h
+new file mode 100644
+index 0000000..21b19dd
+--- /dev/null
++++ b/arch/powerpc/perf/hv-24x7-catalog.h
+@@ -0,0 +1,33 @@
++#ifndef LINUX_POWERPC_PERF_HV_24X7_CATALOG_H_
++#define LINUX_POWERPC_PERF_HV_24X7_CATALOG_H_
++
++#include <linux/types.h>
++
++/* From document "24x7 Event and Group Catalog Formats Proposal" v0.15 */
++
++struct hv_24x7_catalog_page_0 {
++#define HV_24X7_CATALOG_MAGIC 0x32347837 /* "24x7" in ASCII */
++ __be32 magic;
++ __be32 length; /* In 4096 byte pages */
++ __be64 version; /* XXX: arbitrary? what's the meaning/useage/purpose? */
++ __u8 build_time_stamp[16]; /* "YYYYMMDDHHMMSS\0\0" */
++ __u8 reserved2[32];
++ __be16 schema_data_offs; /* in 4096 byte pages */
++ __be16 schema_data_len;  /* in 4096 byte pages */
++ __be16 schema_entry_count;
++ __u8 reserved3[2];
++ __be16 event_data_offs;
++ __be16 event_data_len;
++ __be16 event_entry_count;
++ __u8 reserved4[2];
++ __be16 group_data_offs; /* in 4096 byte pages */
++ __be16 group_data_len;  /* in 4096 byte pages */
++ __be16 group_entry_count;
++ __u8 reserved5[2];
++ __be16 formula_data_offs; /* in 4096 byte pages */
++ __be16 formula_data_len;  /* in 4096 byte pages */
++ __be16 formula_entry_count;
++ __u8 reserved6[2];
++} __packed;
++
++#endif
+diff --git a/arch/powerpc/perf/hv-24x7.h b/arch/powerpc/perf/hv-24x7.h
+new file mode 100644
+index 0000000..720ebce
+--- /dev/null
++++ b/arch/powerpc/perf/hv-24x7.h
+@@ -0,0 +1,109 @@
++#ifndef LINUX_POWERPC_PERF_HV_24X7_H_
++#define LINUX_POWERPC_PERF_HV_24X7_H_
++
++#include <linux/types.h>
++
++struct hv_24x7_request {
++ /* PHYSICAL domains require enabling via phyp/hmc. */
++#define HV_24X7_PERF_DOMAIN_PHYSICAL_CHIP 0x01
++#define HV_24X7_PERF_DOMAIN_PHYSICAL_CORE 0x02
++#define HV_24X7_PERF_DOMAIN_VIRTUAL_PROCESSOR_HOME_CORE   0x03
++#define HV_24X7_PERF_DOMAIN_VIRTUAL_PROCESSOR_HOME_CHIP   0x04
++#define HV_24X7_PERF_DOMAIN_VIRTUAL_PROCESSOR_HOME_NODE   0x05
++#define HV_24X7_PERF_DOMAIN_VIRTUAL_PROCESSOR_REMOTE_NODE 0x06
++ __u8 performance_domain;
++ __u8 reserved[0x1];
++
++ /* bytes to read starting at @data_offset. must be a multiple of 8 */
++ __be16 data_size;
++
++ /*
++  * byte offset within the perf domain to read from. must be 8 byte
++  * aligned
++  */
++ __be32 data_offset;
++
++ /*
++  * only valid for VIRTUAL_PROCESSOR domains, ignored for others.
++  * -1 means "current partition only"
++  *  Enabling via phyp/hmc required for non-"-1" values. 0 forbidden
++  *  unless requestor is 0.
++  */
++ __be16 starting_lpar_ix;
++
++ /*
++  * Ignored when @starting_lpar_ix == -1
++  * Ignored when @performance_domain is not VIRTUAL_PROCESSOR_*
++  * -1 means "infinite" or all
++  */
++ __be16 max_num_lpars;
++
++ /* chip, core, or virtual processor based on @performance_domain */
++ __be16 starting_ix;
++ __be16 max_ix;
++} __packed;
++
++struct hv_24x7_request_buffer {
++ /* 0 - ? */
++ /* 1 - ? */
++#define HV_24X7_IF_VERSION_CURRENT 0x01
++ __u8 interface_version;
++ __u8 num_requests;
++ __u8 reserved[0xE];
++ struct hv_24x7_request requests[];
++} __packed;
++
++struct hv_24x7_result_element {
++ __be16 lpar_ix;
++
++ /*
++  * represents the core, chip, or virtual processor based on the
++  * request's @performance_domain
++  */
++ __be16 domain_ix;
++
++ /* -1 if @performance_domain does not refer to a virtual processor */
++ __be32 lpar_cfg_instance_id;
++
++ /* size = @result_element_data_size of cointaining result. */
++ __u8 element_data[];
++} __packed;
++
++struct hv_24x7_result {
++ __u8 result_ix;
++
++ /*
++  * 0 = not all result elements fit into the buffer, additional requests
++  *     required
++  * 1 = all result elements were returned
++  */
++ __u8 results_complete;
++ __be16 num_elements_returned;
++
++ /* This is a copy of @data_size from the coresponding hv_24x7_request */
++ __be16 result_element_data_size;
++ __u8 reserved[0x2];
++
++ /* WARNING: only valid for first result element due to variable sizes
++  *          of result elements */
++ /* struct hv_24x7_result_element[@num_elements_returned] */
++ struct hv_24x7_result_element elements[];
++} __packed;
++
++struct hv_24x7_data_result_buffer {
++ /* See versioning for request buffer */
++ __u8 interface_version;
++
++ __u8 num_results;
++ __u8 reserved[0x1];
++ __u8 failing_request_ix;
++ __be32 detailed_rc;
++ __be64 cec_cfg_instance_id;
++ __be64 catalog_version_num;
++ __u8 reserved2[0x8];
++ /* WARNING: only valid for the first result due to variable sizes of
++  *     results */
++ struct hv_24x7_result results[]; /* [@num_results] */
++} __packed;
++
++#endif
+-- 
+1.7.1

@@ -1,0 +1,85 @@
+From a7922ebc0182cf022f78ce43e30696c152356fcc Mon Sep 17 00:00:00 2001
+From: John Greene <jogreene@redhat.com>
+Date: Mon, 8 Sep 2014 15:07:58 -0400
+Subject: [ethernet] ixgbevf: Add bit to mark work queue initialization
+
+Message-id: <1410188883-6595-44-git-send-email-jogreene@redhat.com>
+Patchwork-id: 92372
+O-Subject: [RHEL7.1 PATCH 43/48] ixgbevf: Add bit to mark work queue initialization
+Bugzilla: 1091124
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+
+BZ: 1091124
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7919168
+Tested: In beaker. See BZ for details
+
+An indication of work queue initialization is needed. This is
+because register accesses prior to that time can detect a removal
+and attempt to schedule the watchdog task. Adding the
+__IXGBEVF_WORK_INIT bit allows this to be checked and if not
+set prevent the watchdog task scheduling. By checking for a
+removal right after initialization, the probe can be failed
+at that point without getting the watchdog task involved.
+
+Signed-off-by: Mark Rustad <mark.d.rustad@intel.com>
+Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit ea699569b150daa5d5f6c23040da997b83e4cfa3)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ixgbevf.h b/drivers/net/ethernet/intel/ixgbevf/ixgbevf.h
+index e586d30..2bbc97f 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf.h
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf.h
+@@ -421,6 +421,7 @@ enum ixbgevf_state_t {
+  __IXGBEVF_DOWN,
+  __IXGBEVF_DISABLED,
+  __IXGBEVF_REMOVING,
++ __IXGBEVF_WORK_INIT,
+ };
+ 
+ struct ixgbevf_cb {
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+index 4456689..96dcb6d 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+@@ -107,7 +107,8 @@ static void ixgbevf_remove_adapter(struct ixgbe_hw *hw)
+   return;
+  hw->hw_addr = NULL;
+  dev_err(&adapter->pdev->dev, "Adapter removed\n");
+- schedule_work(&adapter->watchdog_task);
++ if (test_bit(__IXGBEVF_WORK_INIT, &adapter->state))
++  schedule_work(&adapter->watchdog_task);
+ }
+ 
+ static void ixgbevf_check_remove(struct ixgbe_hw *hw, u32 reg)
+@@ -3573,8 +3574,13 @@ static int ixgbevf_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+  adapter->watchdog_timer.function = ixgbevf_watchdog;
+  adapter->watchdog_timer.data = (unsigned long)adapter;
+ 
++ if (IXGBE_REMOVED(hw->hw_addr)) {
++  err = -EIO;
++  goto err_sw_init;
++ }
+  INIT_WORK(&adapter->reset_task, ixgbevf_reset_task);
+  INIT_WORK(&adapter->watchdog_task, ixgbevf_watchdog_task);
++ set_bit(__IXGBEVF_WORK_INIT, &adapter->state);
+ 
+  err = ixgbevf_init_interrupt_scheme(adapter);
+  if (err)
+@@ -3667,6 +3673,9 @@ static pci_ers_result_t ixgbevf_io_error_detected(struct pci_dev *pdev,
+  struct net_device *netdev = pci_get_drvdata(pdev);
+  struct ixgbevf_adapter *adapter = netdev_priv(netdev);
+ 
++ if (!test_bit(__IXGBEVF_WORK_INIT, &adapter->state))
++  return PCI_ERS_RESULT_DISCONNECT;
++
+  rtnl_lock();
+  netif_device_detach(netdev);
+ 
+-- 
+1.7.1

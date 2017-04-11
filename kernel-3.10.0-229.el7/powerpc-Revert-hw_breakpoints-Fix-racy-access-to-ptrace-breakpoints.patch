@@ -1,0 +1,156 @@
+From 697794bd68ba686a42f6c83ff67ced96e6a9e0d6 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:04:11 -0400
+Subject: [powerpc] Revert: hw_breakpoints: Fix racy access to ptrace breakpoints
+
+Message-id: <1410545655-205645-23-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94103
+O-Subject: [RHEL7 PATCH 022/626] ptrace/powerpc: revert "hw_breakpoints: Fix racy access to ptrace breakpoints"
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 6961ed96f14463d7c6e38d8c2093f5d53bd70574
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Mon Jul 8 16:00:49 2013 -0700
+
+    ptrace/powerpc: revert "hw_breakpoints: Fix racy access to ptrace breakpoints"
+
+    This reverts commit 07fa7a0a8a58 ("hw_breakpoints: Fix racy access to
+    ptrace breakpoints") and removes ptrace_get/put_breakpoints() added by
+    other commits.
+
+    The patch was fine but we can no longer race with SIGKILL after commit
+    9899d11f6544 ("ptrace: ensure arch_ptrace/ptrace_request can never race
+    with SIGKILL"), the __TASK_TRACED tracee can't be woken up and
+    ->ptrace_bps[] can't go away.
+
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Acked-by: Michael Neuling <mikey@neuling.org>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Frederic Weisbecker <fweisbec@gmail.com>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Cc: Jan Kratochvil <jan.kratochvil@redhat.com>
+    Cc: Paul Mundt <lethal@linux-sh.org>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Prasad <prasad@linux.vnet.ibm.com>
+    Cc: Russell King <linux@arm.linux.org.uk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/ptrace.c b/arch/powerpc/kernel/ptrace.c
+index 3b9776b..a451284 100644
+--- a/arch/powerpc/kernel/ptrace.c
++++ b/arch/powerpc/kernel/ptrace.c
+@@ -976,16 +976,12 @@ int ptrace_set_debugreg(struct task_struct *task, unsigned long addr,
+  hw_brk.type = (data & HW_BRK_TYPE_DABR) | HW_BRK_TYPE_PRIV_ALL;
+  hw_brk.len = 8;
+ #ifdef CONFIG_HAVE_HW_BREAKPOINT
+- if (ptrace_get_breakpoints(task) < 0)
+-  return -ESRCH;
+-
+  bp = thread->ptrace_bps[0];
+  if ((!data) || !(hw_brk.type & HW_BRK_TYPE_RDWR)) {
+   if (bp) {
+    unregister_hw_breakpoint(bp);
+    thread->ptrace_bps[0] = NULL;
+   }
+-  ptrace_put_breakpoints(task);
+   return 0;
+  }
+  if (bp) {
+@@ -998,11 +994,9 @@ int ptrace_set_debugreg(struct task_struct *task, unsigned long addr,
+ 
+   ret =  modify_user_hw_breakpoint(bp, &attr);
+   if (ret) {
+-   ptrace_put_breakpoints(task);
+    return ret;
+   }
+   thread->ptrace_bps[0] = bp;
+-  ptrace_put_breakpoints(task);
+   thread->hw_brk = hw_brk;
+   return 0;
+  }
+@@ -1017,12 +1011,9 @@ int ptrace_set_debugreg(struct task_struct *task, unsigned long addr,
+             ptrace_triggered, NULL, task);
+  if (IS_ERR(bp)) {
+   thread->ptrace_bps[0] = NULL;
+-  ptrace_put_breakpoints(task);
+   return PTR_ERR(bp);
+  }
+ 
+- ptrace_put_breakpoints(task);
+-
+ #endif /* CONFIG_HAVE_HW_BREAKPOINT */
+  task->thread.hw_brk = hw_brk;
+ #else /* CONFIG_PPC_ADV_DEBUG_REGS */
+@@ -1441,26 +1432,19 @@ static long ppc_set_hwdebug(struct task_struct *child,
+  if (bp_info->trigger_type & PPC_BREAKPOINT_TRIGGER_WRITE)
+   brk.type |= HW_BRK_TYPE_WRITE;
+ #ifdef CONFIG_HAVE_HW_BREAKPOINT
+- if (ptrace_get_breakpoints(child) < 0)
+-  return -ESRCH;
+-
+  /*
+   * Check if the request is for 'range' breakpoints. We can
+   * support it if range < 8 bytes.
+   */
+- if (bp_info->addr_mode == PPC_BREAKPOINT_MODE_RANGE_INCLUSIVE) {
++ if (bp_info->addr_mode == PPC_BREAKPOINT_MODE_RANGE_INCLUSIVE)
+   len = bp_info->addr2 - bp_info->addr;
+- } else if (bp_info->addr_mode == PPC_BREAKPOINT_MODE_EXACT)
++ else if (bp_info->addr_mode == PPC_BREAKPOINT_MODE_EXACT)
+   len = 1;
+- else {
+-  ptrace_put_breakpoints(child);
++ else
+   return -EINVAL;
+- }
+  bp = thread->ptrace_bps[0];
+- if (bp) {
+-  ptrace_put_breakpoints(child);
++ if (bp)
+   return -ENOSPC;
+- }
+ 
+  /* Create a new breakpoint request if one doesn't exist already */
+  hw_breakpoint_init(&attr);
+@@ -1472,11 +1456,9 @@ static long ppc_set_hwdebug(struct task_struct *child,
+             ptrace_triggered, NULL, child);
+  if (IS_ERR(bp)) {
+   thread->ptrace_bps[0] = NULL;
+-  ptrace_put_breakpoints(child);
+   return PTR_ERR(bp);
+  }
+ 
+- ptrace_put_breakpoints(child);
+  return 1;
+ #endif /* CONFIG_HAVE_HW_BREAKPOINT */
+ 
+@@ -1520,16 +1502,12 @@ static long ppc_del_hwdebug(struct task_struct *child, long data)
+   return -EINVAL;
+ 
+ #ifdef CONFIG_HAVE_HW_BREAKPOINT
+- if (ptrace_get_breakpoints(child) < 0)
+-  return -ESRCH;
+-
+  bp = thread->ptrace_bps[0];
+  if (bp) {
+   unregister_hw_breakpoint(bp);
+   thread->ptrace_bps[0] = NULL;
+  } else
+   ret = -ENOENT;
+- ptrace_put_breakpoints(child);
+  return ret;
+ #else /* CONFIG_HAVE_HW_BREAKPOINT */
+  if (child->thread.hw_brk.address == 0)
+-- 
+1.7.1

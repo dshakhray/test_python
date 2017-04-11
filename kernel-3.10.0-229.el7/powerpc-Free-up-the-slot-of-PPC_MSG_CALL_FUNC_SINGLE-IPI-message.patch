@@ -1,0 +1,131 @@
+From d4ec33e7be422ad3a795368168af008aaac0755e Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:08:55 -0400
+Subject: [powerpc] Free up the slot of PPC_MSG_CALL_FUNC_SINGLE IPI message
+
+Message-id: <1410545655-205645-307-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94529
+O-Subject: [RHEL7 PATCH 306/626] powerpc: Free up the slot of PPC_MSG_CALL_FUNC_SINGLE IPI message
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 402d9a1e02f7215628f13b7c80ff3e98c3a0cadc
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Wed Feb 26 05:37:29 2014 +0530
+
+    powerpc: Free up the slot of PPC_MSG_CALL_FUNC_SINGLE IPI message
+
+    The IPI handlers for both PPC_MSG_CALL_FUNC and PPC_MSG_CALL_FUNC_SINGLE map
+    to a common implementation - generic_smp_call_function_single_interrupt(). So,
+    we can consolidate them and save one of the IPI message slots, (which are
+    precious on powerpc, since only 4 of those slots are available).
+
+    So, implement the functionality of PPC_MSG_CALL_FUNC_SINGLE using
+    PPC_MSG_CALL_FUNC itself and release its IPI message slot, so that it can be
+    used for something else in the future, if desired.
+
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Preeti U. Murthy <preeti@linux.vnet.ibm.com>
+    Acked-by: Geoff Levand <geoff@infradead.org> [For the PS3 part]
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/smp.h b/arch/powerpc/include/asm/smp.h
+index 084e080..9f7356b 100644
+--- a/arch/powerpc/include/asm/smp.h
++++ b/arch/powerpc/include/asm/smp.h
+@@ -120,7 +120,7 @@ extern int cpu_to_core_id(int cpu);
+  * in /proc/interrupts will be wrong!!! --Troy */
+ #define PPC_MSG_CALL_FUNCTION   0
+ #define PPC_MSG_RESCHEDULE      1
+-#define PPC_MSG_CALL_FUNC_SINGLE 2
++#define PPC_MSG_UNUSED  2
+ #define PPC_MSG_DEBUGGER_BREAK  3
+ 
+ /* for irq controllers that have dedicated ipis per message (4) */
+diff --git a/arch/powerpc/kernel/smp.c b/arch/powerpc/kernel/smp.c
+index ac2621a..ee7d76b 100644
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@ -145,9 +145,9 @@ static irqreturn_t reschedule_action(int irq, void *data)
+  return IRQ_HANDLED;
+ }
+ 
+-static irqreturn_t call_function_single_action(int irq, void *data)
++static irqreturn_t unused_action(int irq, void *data)
+ {
+- generic_smp_call_function_single_interrupt();
++ /* This slot is unused and hence available for use, if needed */
+  return IRQ_HANDLED;
+ }
+ 
+@@ -168,14 +168,14 @@ static irqreturn_t debug_ipi_action(int irq, void *data)
+ static irq_handler_t smp_ipi_action[] = {
+  [PPC_MSG_CALL_FUNCTION] =  call_function_action,
+  [PPC_MSG_RESCHEDULE] = reschedule_action,
+- [PPC_MSG_CALL_FUNC_SINGLE] = call_function_single_action,
++ [PPC_MSG_UNUSED] = unused_action,
+  [PPC_MSG_DEBUGGER_BREAK] = debug_ipi_action,
+ };
+ 
+ const char *smp_ipi_name[] = {
+  [PPC_MSG_CALL_FUNCTION] =  "ipi call function",
+  [PPC_MSG_RESCHEDULE] = "ipi reschedule",
+- [PPC_MSG_CALL_FUNC_SINGLE] = "ipi call function single",
++ [PPC_MSG_UNUSED] = "ipi unused",
+  [PPC_MSG_DEBUGGER_BREAK] = "ipi debugger",
+ };
+ 
+@@ -251,8 +251,6 @@ irqreturn_t smp_ipi_demux(void)
+    generic_smp_call_function_interrupt();
+   if (all & IPI_MESSAGE(PPC_MSG_RESCHEDULE))
+    scheduler_ipi();
+-  if (all & IPI_MESSAGE(PPC_MSG_CALL_FUNC_SINGLE))
+-   generic_smp_call_function_single_interrupt();
+   if (all & IPI_MESSAGE(PPC_MSG_DEBUGGER_BREAK))
+    debug_ipi_action(0, NULL);
+  } while (info->messages);
+@@ -280,7 +278,7 @@ EXPORT_SYMBOL_GPL(smp_send_reschedule);
+ 
+ void arch_send_call_function_single_ipi(int cpu)
+ {
+- do_message_pass(cpu, PPC_MSG_CALL_FUNC_SINGLE);
++ do_message_pass(cpu, PPC_MSG_CALL_FUNCTION);
+ }
+ 
+ void arch_send_call_function_ipi_mask(const struct cpumask *mask)
+diff --git a/arch/powerpc/platforms/cell/interrupt.c b/arch/powerpc/platforms/cell/interrupt.c
+index 2d42f3b..adf3726 100644
+--- a/arch/powerpc/platforms/cell/interrupt.c
++++ b/arch/powerpc/platforms/cell/interrupt.c
+@@ -215,7 +215,7 @@ void iic_request_IPIs(void)
+ {
+  iic_request_ipi(PPC_MSG_CALL_FUNCTION);
+  iic_request_ipi(PPC_MSG_RESCHEDULE);
+- iic_request_ipi(PPC_MSG_CALL_FUNC_SINGLE);
++ iic_request_ipi(PPC_MSG_UNUSED);
+  iic_request_ipi(PPC_MSG_DEBUGGER_BREAK);
+ }
+ 
+diff --git a/arch/powerpc/platforms/ps3/smp.c b/arch/powerpc/platforms/ps3/smp.c
+index 4b35166..00d1a7c 100644
+--- a/arch/powerpc/platforms/ps3/smp.c
++++ b/arch/powerpc/platforms/ps3/smp.c
+@@ -76,7 +76,7 @@ static int __init ps3_smp_probe(void)
+ 
+   BUILD_BUG_ON(PPC_MSG_CALL_FUNCTION    != 0);
+   BUILD_BUG_ON(PPC_MSG_RESCHEDULE       != 1);
+-  BUILD_BUG_ON(PPC_MSG_CALL_FUNC_SINGLE != 2);
++  BUILD_BUG_ON(PPC_MSG_UNUSED       != 2);
+   BUILD_BUG_ON(PPC_MSG_DEBUGGER_BREAK   != 3);
+ 
+   for (i = 0; i < MSG_COUNT; i++) {
+-- 
+1.7.1

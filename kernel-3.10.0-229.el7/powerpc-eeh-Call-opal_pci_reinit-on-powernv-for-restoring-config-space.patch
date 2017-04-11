@@ -1,0 +1,107 @@
+From e945232d559f4f547b8399c0c73791e1486291c3 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:08:10 -0400
+Subject: [powerpc] eeh: Call opal_pci_reinit() on powernv for restoring config space
+
+Message-id: <1410545655-205645-262-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94325
+O-Subject: [RHEL7 PATCH 261/626] powerpc/eeh: Call opal_pci_reinit() on powernv for restoring config space
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 9be3becc2f99f4f2b1b697a616b1aa9e7889d68f
+Author: Gavin Shan <shangw@linux.vnet.ibm.com>
+Date:   Fri Jan 3 17:47:13 2014 +0800
+
+    powerpc/eeh: Call opal_pci_reinit() on powernv for restoring config space
+
+    The patch implements the EEH operation backend restore_config()
+    for PowerNV platform. That relies on OPAL API opal_pci_reinit()
+    where we reinitialize the error reporting properly after PE or
+    PHB reset.
+
+    Signed-off-by: Gavin Shan <shangw@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index a4041e9..9a87b44 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -344,12 +344,16 @@ enum OpalMveEnableAction {
+  OPAL_ENABLE_MVE = 1
+ };
+ 
+-enum OpalPciResetAndReinitScope {
++enum OpalPciResetScope {
+  OPAL_PHB_COMPLETE = 1, OPAL_PCI_LINK = 2, OPAL_PHB_ERROR = 3,
+  OPAL_PCI_HOT_RESET = 4, OPAL_PCI_FUNDAMENTAL_RESET = 5,
+  OPAL_PCI_IODA_TABLE_RESET = 6,
+ };
+ 
++enum OpalPciReinitScope {
++ OPAL_REINIT_PCI_DEV = 1000
++};
++
+ enum OpalPciResetState {
+  OPAL_DEASSERT_RESET = 0,
+  OPAL_ASSERT_RESET = 1
+@@ -801,7 +805,7 @@ int64_t opal_pci_get_phb_diag_data(uint64_t phb_id, void *diag_buffer,
+ int64_t opal_pci_get_phb_diag_data2(uint64_t phb_id, void *diag_buffer,
+         uint64_t diag_buffer_len);
+ int64_t opal_pci_fence_phb(uint64_t phb_id);
+-int64_t opal_pci_reinit(uint64_t phb_id, uint8_t reinit_scope);
++int64_t opal_pci_reinit(uint64_t phb_id, uint64_t reinit_scope, uint64_t data);
+ int64_t opal_pci_mask_pe_error(uint64_t phb_id, uint16_t pe_number, uint8_t error_type, uint8_t mask_action);
+ int64_t opal_set_slot_led_status(uint64_t phb_id, uint64_t slot_id, uint8_t led_type, uint8_t led_action);
+ int64_t opal_get_epow_status(__be64 *status);
+diff --git a/arch/powerpc/platforms/powernv/eeh-powernv.c b/arch/powerpc/platforms/powernv/eeh-powernv.c
+index ab91e6a..a79fddc 100644
+--- a/arch/powerpc/platforms/powernv/eeh-powernv.c
++++ b/arch/powerpc/platforms/powernv/eeh-powernv.c
+@@ -344,6 +344,27 @@ static int powernv_eeh_next_error(struct eeh_pe **pe)
+  return -EEXIST;
+ }
+ 
++static int powernv_eeh_restore_config(struct device_node *dn)
++{
++ struct eeh_dev *edev = of_node_to_eeh_dev(dn);
++ struct pnv_phb *phb;
++ s64 ret;
++
++ if (!edev)
++  return -EEXIST;
++
++ phb = edev->phb->private_data;
++ ret = opal_pci_reinit(phb->opal_id,
++         OPAL_REINIT_PCI_DEV, edev->config_addr);
++ if (ret) {
++  pr_warn("%s: Can't reinit PCI dev 0x%x (%lld)\n",
++   __func__, edev->config_addr, ret);
++  return -EIO;
++ }
++
++ return 0;
++}
++
+ static struct eeh_ops powernv_eeh_ops = {
+  .name                   = "powernv",
+  .init                   = powernv_eeh_init,
+@@ -360,7 +381,7 @@ static struct eeh_ops powernv_eeh_ops = {
+  .read_config            = pnv_pci_cfg_read,
+  .write_config           = pnv_pci_cfg_write,
+  .next_error  = powernv_eeh_next_error,
+- .restore_config  = NULL
++ .restore_config  = powernv_eeh_restore_config
+ };
+ 
+ /**
+-- 
+1.7.1

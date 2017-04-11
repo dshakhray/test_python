@@ -1,0 +1,65 @@
+From 183981091abd6cad3dad3f7bbd7ae30f1ac11617 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:35:06 -0400
+Subject: [block] relax when to modify the timeout timer
+
+Message-id: <1402670238-13916-19-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83782
+O-Subject: [RHEL7.1 PATCH 018/150] block: relax when to modify the timeout timer
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit f793aa53786668c9e0db5900f70f560e99d62fa0
+Author: Jens Axboe <axboe@fb.com>
+Date:   Wed Apr 16 11:36:54 2014 -0600
+
+    block: relax when to modify the timeout timer
+
+    Since we are now, by default, applying timer slack to expiry times,
+    the logic for when to modify a timer in the block code is suboptimal.
+    The block layer keeps a forward rolling timer per queue for all
+    requests, and modifies this timer if a request has a shorter timeout
+    than what the current expiry time is. However, this breaks down
+    when our rounded timer values get applied slack. Then each new
+    request ends up modifying the timer, since we're still a little
+    in front of the timer + slack.
+
+    Fix this by allowing a tolerance of HZ / 2, the timeout handling
+    doesn't need to be very precise. This drastically cuts down
+    the number of timer modifications we have to make.
+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-timeout.c b/block/blk-timeout.c
+index 7a882f7..2d8c29f 100644
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@ -198,8 +198,19 @@ void __blk_add_timer(struct request *req, struct list_head *timeout_list)
+  expiry = round_jiffies_up(req->deadline);
+ 
+  if (!timer_pending(&q->timeout) ||
+-     time_before(expiry, q->timeout.expires))
+-  mod_timer(&q->timeout, expiry);
++     time_before(expiry, q->timeout.expires)) {
++  unsigned long diff = q->timeout.expires - expiry;
++
++  /*
++   * Due to added timer slack to group timers, the timer
++   * will often be a little in front of what we asked for.
++   * So apply some tolerance here too, otherwise we keep
++   * modifying the timer because expires for value X
++   * will be X + something.
++   */
++  if (diff >= HZ / 2)
++   mod_timer(&q->timeout, expiry);
++ }
+ 
+ }
+ 
+-- 
+1.7.1

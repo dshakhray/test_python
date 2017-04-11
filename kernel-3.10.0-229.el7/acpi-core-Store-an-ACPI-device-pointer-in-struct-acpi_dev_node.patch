@@ -1,0 +1,560 @@
+From 5e4bfe0a822167bd9a7f62ed8026ced9b8afadc3 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 28 Aug 2014 03:05:00 -0400
+Subject: [acpi] core: Store an ACPI device pointer in struct acpi_dev_node
+
+Message-id: <20140828030500.2117.22685.stgit@gir.stowe>
+Patchwork-id: 89302
+O-Subject: [RHEL7.1 PATCH 14/30] ACPI / driver core: Store an ACPI device pointer in struct acpi_dev_node
+Bugzilla: 1128632
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1128632
+Upstream Status: 7b1998116bbb2f3e5dd6cb9a8ee6db479b0b50a9
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+  All hunks related to file of unsupported architectures were skipped:
+    arch/ia64/hp/common/sba_iommu.c
+    arch/ia64/include/asm/pci.h
+    arch/ia64/pci/pci.c
+    arch/ia64/sn/kernel/io_acpi_init.c
+
+  ./arch/x86/pci/acpi.c
+    Hunk #1 suffix context is due to upstream commits 7b19981 (this patch)
+    and affbda8 being taken into RHEL7 out-of-order.
+
+  ./drivers/ata/libata-acpi.c
+    Hunks #1 and #2 is not applicable to RHEL7 due to upstream commit
+    f1bc1e4 - ata: acpi: rework the ata acpi bind support - not having
+    been brought into RHEL7.
+
+  ./drivers/i2c/i2c-core.c
+    Hunk #2: File is ./drivers/acpi/acpi-i2c.c due to upstream commit
+    55e71ed - i2c: move ACPI helpers into the core - not having been
+    brought into RHEL7.
+
+  ./include/linux/device.h
+    Hunk #1 had to be adjusted for KABI.  The change to 'struct
+    acpi_dev_node' triggers the KABI checker.  It's actually the indirect
+    change to 'struct device' which triggers as 'struct device' contains a
+    'struct acpi_dev_node' (see: ./include/linux/device.h).
+
+    We discussed this extensively in our group and believe that this is
+    a false trigger:
+      o The change is still a pointer so allocation is fine,
+      o the offset is fine (doesn't change),
+      o so the issue becomes ACPI_HANDLE related; ACPI_HANDLE needs
+ acpi_get_child to feed it, acpi_get_child is an inline around
+ acpi_find_child, and acpi_find_child is NOT on the whitelist,
+ therefore partners should not be affected and the patch is fine.
+
+commit 7b1998116bbb2f3e5dd6cb9a8ee6db479b0b50a9
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Mon Nov 11 22:41:56 2013 +0100
+
+    ACPI / driver core: Store an ACPI device pointer in struct acpi_dev_node
+
+    Modify struct acpi_dev_node to contain a pointer to struct acpi_device
+    associated with the given device object (that is, its ACPI companion
+    device) instead of an ACPI handle corresponding to it.  Introduce two
+    new macros for manipulating that pointer in a CONFIG_ACPI-safe way,
+    ACPI_COMPANION() and ACPI_COMPANION_SET(), and rework the
+    ACPI_HANDLE() macro to take the above changes into account.
+    Drop the ACPI_HANDLE_SET() macro entirely and rework its users to
+    use ACPI_COMPANION_SET() instead.  For some of them who used to
+    pass the result of acpi_get_child() directly to ACPI_HANDLE_SET()
+    introduce a helper routine acpi_preset_companion() doing an
+    equivalent thing.
+
+    The main motivation for doing this is that there are things
+    represented by struct acpi_device objects that don't have valid
+    ACPI handles (so called fixed ACPI hardware features, such as
+    power and sleep buttons) and we would like to create platform
+    device objects for them and "glue" them to their ACPI companions
+    in the usual way (which currently is impossible due to the
+    lack of valid ACPI handles).  However, there are more reasons
+    why it may be useful.
+
+    First, struct acpi_device pointers allow of much better type checking
+    than void pointers which are ACPI handles, so it should be more
+    difficult to write buggy code using modified struct acpi_dev_node
+    and the new macros.  Second, the change should help to reduce (over
+    time) the number of places in which the result of ACPI_HANDLE() is
+    passed to acpi_bus_get_device() in order to obtain a pointer to the
+    struct acpi_device associated with the given "physical" device,
+    because now that pointer is returned by ACPI_COMPANION() directly.
+    Finally, the change should make it easier to write generic code that
+    will build both for CONFIG_ACPI set and unset without adding explicit
+    compiler directives to it.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com> # on Haswell
+    Reviewed-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+    Reviewed-by: Aaron Lu <aaron.lu@intel.com> # for ATA and SDIO part
+
+diff --git a/arch/x86/include/asm/pci.h b/arch/x86/include/asm/pci.h
+index 887e0af..96ae4f4 100644
+--- a/arch/x86/include/asm/pci.h
++++ b/arch/x86/include/asm/pci.h
+@@ -15,7 +15,7 @@ struct pci_sysdata {
+  int  domain;  /* PCI domain */
+  int  node;  /* NUMA node */
+ #ifdef CONFIG_ACPI
+- void  *acpi;  /* ACPI-specific data */
++ struct acpi_device *companion; /* ACPI companion device */
+ #endif
+ #ifdef CONFIG_X86_64
+  void  *iommu;  /* IOMMU private data */
+diff --git a/arch/x86/pci/acpi.c b/arch/x86/pci/acpi.c
+index 03bbb77..01edac6 100644
+--- a/arch/x86/pci/acpi.c
++++ b/arch/x86/pci/acpi.c
+@@ -505,7 +505,7 @@ struct pci_bus *pci_acpi_scan_root(struct acpi_pci_root *root)
+  sd = &info->sd;
+  sd->domain = domain;
+  sd->node = node;
+- sd->acpi = device->handle;
++ sd->companion = device;
+ 
+  bus = pci_find_bus(domain, busnum);
+  if (bus) {
+@@ -566,7 +566,7 @@ int pcibios_root_bridge_prepare(struct pci_host_bridge *bridge)
+ {
+  struct pci_sysdata *sd = bridge->bus->sysdata;
+ 
+- ACPI_HANDLE_SET(&bridge->dev, sd->acpi);
++ ACPI_COMPANION_SET(&bridge->dev, sd->companion);
+  return 0;
+ }
+ 
+diff --git a/drivers/acpi/acpi_i2c.c b/drivers/acpi/acpi_i2c.c
+index a82c762..7282ef0 100644
+--- a/drivers/acpi/acpi_i2c.c
++++ b/drivers/acpi/acpi_i2c.c
+@@ -56,7 +56,7 @@ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
+   return AE_OK;
+ 
+  memset(&info, 0, sizeof(info));
+- info.acpi_node.handle = handle;
++ info.acpi_node.companion = adev;
+  info.irq = -1;
+ 
+  INIT_LIST_HEAD(&resource_list);
+diff --git a/drivers/acpi/acpi_platform.c b/drivers/acpi/acpi_platform.c
+index fafec5d..fcb0021 100644
+--- a/drivers/acpi/acpi_platform.c
++++ b/drivers/acpi/acpi_platform.c
+@@ -102,7 +102,7 @@ int acpi_create_platform_device(struct acpi_device *adev,
+  pdevinfo.id = -1;
+  pdevinfo.res = resources;
+  pdevinfo.num_res = count;
+- pdevinfo.acpi_node.handle = adev->handle;
++ pdevinfo.acpi_node.companion = adev;
+  pdev = platform_device_register_full(&pdevinfo);
+  if (IS_ERR(pdev)) {
+   dev_err(&adev->dev, "platform device creation failed: %ld\n",
+diff --git a/drivers/acpi/device_pm.c b/drivers/acpi/device_pm.c
+index 2efd5a5..b666de7 100644
+--- a/drivers/acpi/device_pm.c
++++ b/drivers/acpi/device_pm.c
+@@ -22,16 +22,12 @@
+  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  */
+ 
+-#include <linux/device.h>
++#include <linux/acpi.h>
+ #include <linux/export.h>
+ #include <linux/mutex.h>
+ #include <linux/pm_qos.h>
+ #include <linux/pm_runtime.h>
+ 
+-#include <acpi/acpi.h>
+-#include <acpi/acpi_bus.h>
+-#include <acpi/acpi_drivers.h>
+-
+ #include "internal.h"
+ 
+ #define _COMPONENT ACPI_POWER_COMPONENT
+diff --git a/drivers/acpi/glue.c b/drivers/acpi/glue.c
+index 9467229..6b7f59b 100644
+--- a/drivers/acpi/glue.c
++++ b/drivers/acpi/glue.c
+@@ -184,30 +184,27 @@ static void acpi_physnode_link_name(char *buf, unsigned int node_id)
+ 
+ int acpi_bind_one(struct device *dev, acpi_handle handle)
+ {
+- struct acpi_device *acpi_dev;
+- acpi_status status;
++ struct acpi_device *acpi_dev = NULL;
+  struct acpi_device_physical_node *physical_node, *pn;
+  char physical_node_name[PHYSICAL_NODE_NAME_SIZE];
+  struct list_head *physnode_list;
+  unsigned int node_id;
+  int retval = -EINVAL;
+ 
+- if (ACPI_HANDLE(dev)) {
++ if (ACPI_COMPANION(dev)) {
+   if (handle) {
+-   dev_warn(dev, "ACPI handle is already set\n");
++   dev_warn(dev, "ACPI companion already set\n");
+    return -EINVAL;
+   } else {
+-   handle = ACPI_HANDLE(dev);
++   acpi_dev = ACPI_COMPANION(dev);
+   }
++ } else {
++  acpi_bus_get_device(handle, &acpi_dev);
+  }
+- if (!handle)
++ if (!acpi_dev)
+   return -EINVAL;
+ 
+  get_device(dev);
+- status = acpi_bus_get_device(handle, &acpi_dev);
+- if (ACPI_FAILURE(status))
+-  goto err;
+-
+  physical_node = kzalloc(sizeof(*physical_node), GFP_KERNEL);
+  if (!physical_node) {
+   retval = -ENOMEM;
+@@ -229,7 +226,7 @@ int acpi_bind_one(struct device *dev, acpi_handle handle)
+ 
+    dev_warn(dev, "Already associated with ACPI node\n");
+    kfree(physical_node);
+-   if (ACPI_HANDLE(dev) != handle)
++   if (ACPI_COMPANION(dev) != acpi_dev)
+     goto err;
+ 
+    put_device(dev);
+@@ -246,8 +243,8 @@ int acpi_bind_one(struct device *dev, acpi_handle handle)
+  list_add(&physical_node->node, physnode_list);
+  acpi_dev->physical_node_count++;
+ 
+- if (!ACPI_HANDLE(dev))
+-  ACPI_HANDLE_SET(dev, acpi_dev->handle);
++ if (!ACPI_COMPANION(dev))
++  ACPI_COMPANION_SET(dev, acpi_dev);
+ 
+  acpi_physnode_link_name(physical_node_name, node_id);
+  retval = sysfs_create_link(&acpi_dev->dev.kobj, &dev->kobj,
+@@ -270,7 +267,7 @@ int acpi_bind_one(struct device *dev, acpi_handle handle)
+  return 0;
+ 
+  err:
+- ACPI_HANDLE_SET(dev, NULL);
++ ACPI_COMPANION_SET(dev, NULL);
+  put_device(dev);
+  return retval;
+ }
+@@ -278,19 +275,12 @@ EXPORT_SYMBOL_GPL(acpi_bind_one);
+ 
+ int acpi_unbind_one(struct device *dev)
+ {
++ struct acpi_device *acpi_dev = ACPI_COMPANION(dev);
+  struct acpi_device_physical_node *entry;
+- struct acpi_device *acpi_dev;
+- acpi_status status;
+ 
+- if (!ACPI_HANDLE(dev))
++ if (!acpi_dev)
+   return 0;
+ 
+- status = acpi_bus_get_device(ACPI_HANDLE(dev), &acpi_dev);
+- if (ACPI_FAILURE(status)) {
+-  dev_err(dev, "Oops, ACPI handle corrupt in %s()\n", __func__);
+-  return -EINVAL;
+- }
+-
+  mutex_lock(&acpi_dev->physical_node_lock);
+ 
+  list_for_each_entry(entry, &acpi_dev->physical_node_list, node)
+@@ -303,7 +293,7 @@ int acpi_unbind_one(struct device *dev)
+    acpi_physnode_link_name(physnode_name, entry->node_id);
+    sysfs_remove_link(&acpi_dev->dev.kobj, physnode_name);
+    sysfs_remove_link(&dev->kobj, "firmware_node");
+-   ACPI_HANDLE_SET(dev, NULL);
++   ACPI_COMPANION_SET(dev, NULL);
+    /* acpi_bind_one() increase refcnt by one. */
+    put_device(dev);
+    kfree(entry);
+@@ -315,6 +305,15 @@ int acpi_unbind_one(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(acpi_unbind_one);
+ 
++void acpi_preset_companion(struct device *dev, acpi_handle parent, u64 addr)
++{
++ struct acpi_device *adev;
++
++ if (!acpi_bus_get_device(acpi_get_child(parent, addr), &adev))
++  ACPI_COMPANION_SET(dev, adev);
++}
++EXPORT_SYMBOL_GPL(acpi_preset_companion);
++
+ static int acpi_platform_notify(struct device *dev)
+ {
+  struct acpi_bus_type *type = acpi_get_bus_type(dev);
+diff --git a/drivers/base/platform.c b/drivers/base/platform.c
+index 96a9303..55684f0 100644
+--- a/drivers/base/platform.c
++++ b/drivers/base/platform.c
+@@ -435,7 +435,7 @@ struct platform_device *platform_device_register_full(
+   goto err_alloc;
+ 
+  pdev->dev.parent = pdevinfo->parent;
+- ACPI_HANDLE_SET(&pdev->dev, pdevinfo->acpi_node.handle);
++ ACPI_COMPANION_SET(&pdev->dev, pdevinfo->acpi_node.companion);
+ 
+  if (pdevinfo->dma_mask) {
+   /*
+@@ -466,7 +466,7 @@ struct platform_device *platform_device_register_full(
+  ret = platform_device_add(pdev);
+  if (ret) {
+ err:
+-  ACPI_HANDLE_SET(&pdev->dev, NULL);
++  ACPI_COMPANION_SET(&pdev->dev, NULL);
+   kfree(pdev->dev.dma_mask);
+ 
+ err_alloc:
+diff --git a/drivers/gpio/gpiolib.c b/drivers/gpio/gpiolib.c
+index c2534d6..81790dd 100644
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@ -12,6 +12,7 @@
+ #include <linux/of_gpio.h>
+ #include <linux/idr.h>
+ #include <linux/slab.h>
++#include <linux/acpi.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/gpio.h>
+diff --git a/drivers/gpu/drm/radeon/radeon_atpx_handler.c b/drivers/gpu/drm/radeon/radeon_atpx_handler.c
+index d96070b..27a6e9d 100644
+--- a/drivers/gpu/drm/radeon/radeon_atpx_handler.c
++++ b/drivers/gpu/drm/radeon/radeon_atpx_handler.c
+@@ -8,8 +8,7 @@
+  */
+ #include <linux/vga_switcheroo.h>
+ #include <linux/slab.h>
+-#include <acpi/acpi.h>
+-#include <acpi/acpi_bus.h>
++#include <linux/acpi.h>
+ #include <linux/pci.h>
+ 
+ #include "radeon_acpi.h"
+diff --git a/drivers/hid/i2c-hid/i2c-hid.c b/drivers/hid/i2c-hid/i2c-hid.c
+index 2b1799a..8870e3e 100644
+--- a/drivers/hid/i2c-hid/i2c-hid.c
++++ b/drivers/hid/i2c-hid/i2c-hid.c
+@@ -988,7 +988,7 @@ static int i2c_hid_probe(struct i2c_client *client,
+  hid->hid_get_raw_report = i2c_hid_get_raw_report;
+  hid->hid_output_raw_report = i2c_hid_output_raw_report;
+  hid->dev.parent = &client->dev;
+- ACPI_HANDLE_SET(&hid->dev, ACPI_HANDLE(&client->dev));
++ ACPI_COMPANION_SET(&hid->dev, ACPI_COMPANION(&client->dev));
+  hid->bus = BUS_I2C;
+  hid->version = le16_to_cpu(ihid->hdesc.bcdVersion);
+  hid->vendor = le16_to_cpu(ihid->hdesc.wVendorID);
+diff --git a/drivers/i2c/i2c-core.c b/drivers/i2c/i2c-core.c
+index f32ca29..d6835cd 100644
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@ -665,7 +665,7 @@ i2c_new_device(struct i2c_adapter *adap, struct i2c_board_info const *info)
+  client->dev.bus = &i2c_bus_type;
+  client->dev.type = &i2c_client_type;
+  client->dev.of_node = info->of_node;
+- ACPI_HANDLE_SET(&client->dev, info->acpi_node.handle);
++ ACPI_COMPANION_SET(&client->dev, info->acpi_node.companion);
+ 
+  /* For 10-bit clients, add an arbitrary offset to avoid collisions */
+  dev_set_name(&client->dev, "%d-%04x", i2c_adapter_id(adap),
+diff --git a/drivers/ide/ide-acpi.c b/drivers/ide/ide-acpi.c
+index 140c8ef..3662c4c 100644
+--- a/drivers/ide/ide-acpi.c
++++ b/drivers/ide/ide-acpi.c
+@@ -7,6 +7,7 @@
+  * Copyright (C) 2006 Hannes Reinecke
+  */
+ 
++#include <linux/acpi.h>
+ #include <linux/ata.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+@@ -19,8 +20,6 @@
+ #include <linux/dmi.h>
+ #include <linux/module.h>
+ 
+-#include <acpi/acpi_bus.h>
+-
+ #define REGS_PER_GTF  7
+ 
+ struct GTM_buffer {
+diff --git a/drivers/mmc/core/sdio_bus.c b/drivers/mmc/core/sdio_bus.c
+index 6d67492..66d914a 100644
+--- a/drivers/mmc/core/sdio_bus.c
++++ b/drivers/mmc/core/sdio_bus.c
+@@ -305,8 +305,7 @@ static void sdio_acpi_set_handle(struct sdio_func *func)
+  struct mmc_host *host = func->card->host;
+  u64 addr = (host->slotno << 16) | func->num;
+ 
+- ACPI_HANDLE_SET(&func->dev,
+-   acpi_get_child(ACPI_HANDLE(host->parent), addr));
++ acpi_preset_companion(&func->dev, ACPI_HANDLE(host->parent), addr);
+ }
+ #else
+ static inline void sdio_acpi_set_handle(struct sdio_func *func) {}
+diff --git a/drivers/pci/hotplug/sgi_hotplug.c b/drivers/pci/hotplug/sgi_hotplug.c
+index 57935f1..613043f 100644
+--- a/drivers/pci/hotplug/sgi_hotplug.c
++++ b/drivers/pci/hotplug/sgi_hotplug.c
+@@ -9,6 +9,7 @@
+  * Work to add BIOS PROM support was completed by Mike Habeck.
+  */
+ 
++#include <linux/acpi.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+@@ -29,7 +30,6 @@
+ #include <asm/sn/sn_feature_sets.h>
+ #include <asm/sn/sn_sal.h>
+ #include <asm/sn/types.h>
+-#include <linux/acpi.h>
+ #include <asm/sn/acpi.h>
+ 
+ #include "../pci.h"
+@@ -414,7 +414,7 @@ static int enable_slot(struct hotplug_slot *bss_hotplug_slot)
+   acpi_handle rethandle;
+   acpi_status ret;
+ 
+-  phandle = PCI_CONTROLLER(slot->pci_bus)->acpi_handle;
++  phandle = acpi_device_handle(PCI_CONTROLLER(slot->pci_bus)->companion);
+ 
+   if (acpi_bus_get_device(phandle, &pdevice)) {
+    dev_dbg(&slot->pci_bus->self->dev,
+@@ -498,7 +498,7 @@ static int disable_slot(struct hotplug_slot *bss_hotplug_slot)
+ 
+  /* free the ACPI resources for the slot */
+  if (SN_ACPI_BASE_SUPPORT() &&
+-            PCI_CONTROLLER(slot->pci_bus)->acpi_handle) {
++            PCI_CONTROLLER(slot->pci_bus)->companion) {
+   unsigned long long adr;
+   struct acpi_device *device;
+   acpi_handle phandle;
+@@ -507,7 +507,7 @@ static int disable_slot(struct hotplug_slot *bss_hotplug_slot)
+   acpi_status ret;
+ 
+   /* Get the rootbus node pointer */
+-  phandle = PCI_CONTROLLER(slot->pci_bus)->acpi_handle;
++  phandle = acpi_device_handle(PCI_CONTROLLER(slot->pci_bus)->companion);
+ 
+   acpi_scan_lock_acquire();
+   /*
+diff --git a/drivers/spi/spi.c b/drivers/spi/spi.c
+index 095cfad..bff6fcc 100644
+--- a/drivers/spi/spi.c
++++ b/drivers/spi/spi.c
+@@ -955,7 +955,7 @@ static acpi_status acpi_spi_add_device(acpi_handle handle, u32 level,
+   return AE_NO_MEMORY;
+  }
+ 
+- ACPI_HANDLE_SET(&spi->dev, handle);
++ ACPI_COMPANION_SET(&spi->dev, adev);
+  spi->irq = -1;
+ 
+  INIT_LIST_HEAD(&resource_list);
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index f40e6d7..0c39077 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -440,9 +440,9 @@ static inline acpi_handle acpi_get_child(acpi_handle handle, u64 addr)
+ {
+  return acpi_find_child(handle, addr, false);
+ }
++void acpi_preset_companion(struct device *dev, acpi_handle parent, u64 addr);
+ int acpi_is_root_bridge(acpi_handle);
+ struct acpi_pci_root *acpi_pci_find_root(acpi_handle handle);
+-#define DEVICE_ACPI_HANDLE(dev) ((acpi_handle)ACPI_HANDLE(dev))
+ 
+ int acpi_enable_wakeup_device_power(struct acpi_device *dev, int state);
+ int acpi_disable_wakeup_device_power(struct acpi_device *dev);
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+index 73fb559..9f86bab 100644
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -44,6 +44,15 @@
+ #include <acpi/acpi_numa.h>
+ #include <asm/acpi.h>
+ 
++static inline acpi_handle acpi_device_handle(struct acpi_device *adev)
++{
++ return adev ? adev->handle : NULL;
++}
++
++#define ACPI_COMPANION(dev)  ((dev)->acpi_node.companion)
++#define ACPI_COMPANION_SET(dev, adev) ACPI_COMPANION(dev) = (adev)
++#define ACPI_HANDLE(dev)  acpi_device_handle(ACPI_COMPANION(dev))
++
+ enum acpi_irq_model_id {
+  ACPI_IRQ_MODEL_PIC = 0,
+  ACPI_IRQ_MODEL_IOAPIC,
+@@ -395,6 +404,10 @@ static inline bool acpi_driver_match_device(struct device *dev,
+ 
+ #define acpi_disabled 1
+ 
++#define ACPI_COMPANION(dev)  (NULL)
++#define ACPI_COMPANION_SET(dev, adev) do { } while (0)
++#define ACPI_HANDLE(dev)  (NULL)
++
+ static inline void acpi_early_init(void) { }
+ 
+ static inline int early_acpi_boot_init(void)
+@@ -463,6 +476,8 @@ static inline bool acpi_driver_match_device(struct device *dev,
+ 
+ #endif /* !CONFIG_ACPI */
+ 
++#define DEVICE_ACPI_HANDLE(dev) ACPI_HANDLE(dev)
++
+ #ifdef CONFIG_ACPI
+ void acpi_os_set_prepare_sleep(int (*func)(u8 sleep_state,
+           u32 pm1a_ctrl,  u32 pm1b_ctrl));
+diff --git a/include/linux/device.h b/include/linux/device.h
+index df81021..9efbedb 100644
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -630,9 +630,15 @@ struct device_dma_parameters {
+  unsigned long segment_boundary_mask;
+ };
+ 
++struct acpi_device;
++
+ struct acpi_dev_node {
+ #ifdef CONFIG_ACPI
++ #ifndef __GENKSYMS__
++ struct acpi_device *companion;
++ #else
+  void *handle;
++ #endif
+ #endif
+ };
+ 
+@@ -786,14 +792,6 @@ static inline struct device *kobj_to_dev(struct kobject *kobj)
+  return container_of(kobj, struct device, kobj);
+ }
+ 
+-#ifdef CONFIG_ACPI
+-#define ACPI_HANDLE(dev) ((dev)->acpi_node.handle)
+-#define ACPI_HANDLE_SET(dev, _handle_) (dev)->acpi_node.handle = (_handle_)
+-#else
+-#define ACPI_HANDLE(dev) (NULL)
+-#define ACPI_HANDLE_SET(dev, _handle_) do { } while (0)
+-#endif
+-
+ /* Get the wakeup routines, which depend on struct device */
+ #include <linux/pm_wakeup.h>
+ 
+-- 
+1.7.1

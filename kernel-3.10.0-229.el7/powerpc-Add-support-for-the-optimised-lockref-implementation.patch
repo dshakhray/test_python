@@ -1,0 +1,113 @@
+From aa53774766bb0308a469cba45710d144cf98dd0d Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:08:21 -0400
+Subject: [powerpc] Add support for the optimised lockref implementation
+
+Message-id: <1410545655-205645-273-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94320
+O-Subject: [RHEL7 PATCH 272/626] powerpc: Add support for the optimised lockref implementation
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 3405d230b374b6923878b21b8d708d7db1f734ef
+Author: Michael Ellerman <mpe@ellerman.id.au>
+Date:   Wed Jan 15 18:14:28 2014 +1100
+
+    powerpc: Add support for the optimised lockref implementation
+
+    This commit adds the architecture support required to enable the
+    optimised implementation of lockrefs.
+
+    That's as simple as defining arch_spin_value_unlocked() and selecting
+    the Kconfig option.
+
+    We also define cmpxchg64_relaxed(), because the lockref code does not
+    need the cmpxchg to have barrier semantics.
+
+    Using Linus' test case[1] on one system I see a 4x improvement for the
+    basic enablement, and a further 1.3x for cmpxchg64_relaxed(), for a
+    total of 5.3x vs the baseline.
+
+    On another system I see more like 2x improvement.
+
+    [1]: http://marc.info/?l=linux-fsdevel&m=137782380714721&w=4
+
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+kabi reason: The struct is a union so the size and offset don't matter as
+the lock_count size is smaller than the lock.  Had to jump through hoops to
+establish the exception case for ppc64. :-/
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/Kconfig b/arch/powerpc/Kconfig
+index a446336..ab693ec 100644
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -140,6 +140,7 @@ config PPC
+  select OLD_SIGSUSPEND
+  select OLD_SIGACTION if PPC32
+  select HAVE_IRQ_EXIT_ON_IRQ_STACK
++ select ARCH_USE_CMPXCHG_LOCKREF if PPC64
+ 
+ config GENERIC_CSUM
+  def_bool CPU_LITTLE_ENDIAN
+diff --git a/arch/powerpc/include/asm/cmpxchg.h b/arch/powerpc/include/asm/cmpxchg.h
+index e245aab..d463c68 100644
+--- a/arch/powerpc/include/asm/cmpxchg.h
++++ b/arch/powerpc/include/asm/cmpxchg.h
+@@ -300,6 +300,7 @@ __cmpxchg_local(volatile void *ptr, unsigned long old, unsigned long new,
+  BUILD_BUG_ON(sizeof(*(ptr)) != 8);    \
+  cmpxchg_local((ptr), (o), (n));     \
+   })
++#define cmpxchg64_relaxed cmpxchg64_local
+ #else
+ #include <asm-generic/cmpxchg-local.h>
+ #define cmpxchg64_local(ptr, o, n) __cmpxchg64_local_generic((ptr), (o), (n))
+diff --git a/arch/powerpc/include/asm/spinlock.h b/arch/powerpc/include/asm/spinlock.h
+index f6e78d6..2ef3cc8 100644
+--- a/arch/powerpc/include/asm/spinlock.h
++++ b/arch/powerpc/include/asm/spinlock.h
+@@ -56,6 +56,11 @@
+ #define SYNC_IO
+ #endif
+ 
++static __always_inline int arch_spin_value_unlocked(arch_spinlock_t lock)
++{
++ return lock.slock == 0;
++}
++
+ /*
+  * This returns the old value in the lock, so we succeeded
+  * in getting the lock if the return value is 0.
+diff --git a/include/linux/lockref.h b/include/linux/lockref.h
+index 13dfd36..7a904f8 100644
+--- a/include/linux/lockref.h
++++ b/include/linux/lockref.h
+@@ -18,9 +18,17 @@
+ 
+ struct lockref {
+  union {
++#ifdef CONFIG_PPC64
++#ifndef __GENKSYMS__
+ #ifdef CONFIG_CMPXCHG_LOCKREF
+   aligned_u64 lock_count;
+ #endif
++#endif /* __GENKSYMS__ */
++#else /* CONFIG_PPC64 */
++#ifdef CONFIG_CMPXCHG_LOCKREF
++  aligned_u64 lock_count;
++#endif
++#endif /* CONFIG_PPC64 */
+   struct {
+    spinlock_t lock;
+    unsigned int count;
+-- 
+1.7.1

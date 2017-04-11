@@ -1,0 +1,189 @@
+From 323fed8c57ebb5685a0e5ee9251a236ba678094c Mon Sep 17 00:00:00 2001
+From: Stefan Assmann <sassmann@redhat.com>
+Date: Tue, 26 Aug 2014 14:11:33 -0400
+Subject: [ethernet] igb: Add media switching feature for i354 PHY's
+
+Message-id: <1409062359-13063-16-git-send-email-sassmann@redhat.com>
+Patchwork-id: 89135
+O-Subject: [RHEL7.1 PATCH 15/81] igb: Add media switching feature for i354 PHY's
+Bugzilla: 1091121
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Carolyn Wyborny <carolyn.wyborny@intel.com>
+
+This patch adds a new feature which is supported in some PHY's on some i354
+devices.  This feature is Auto Media Detect and allows which ever media is
+detected first by the PHY to be the media used and configured by the
+device.  This is a media swapping feature that is wholly contained in the
+Marvell PHY.
+
+Signed-off-by: Carolyn Wyborny <carolyn.wyborny@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Stefan Assmann <sassmann@redhat.com>
+(cherry picked from commit 2bdfc4e271c290be448ae5df580be1163b998508)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/igb/e1000_82575.c b/drivers/net/ethernet/intel/igb/e1000_82575.c
+index 47c2d10..fe9db48 100644
+--- a/drivers/net/ethernet/intel/igb/e1000_82575.c
++++ b/drivers/net/ethernet/intel/igb/e1000_82575.c
+@@ -113,6 +113,59 @@ static bool igb_sgmii_uses_mdio_82575(struct e1000_hw *hw)
+ }
+ 
+ /**
++ *  igb_check_for_link_media_swap - Check which M88E1112 interface linked
++ *  @hw: pointer to the HW structure
++ *
++ *  Poll the M88E1112 interfaces to see which interface achieved link.
++ */
++static s32 igb_check_for_link_media_swap(struct e1000_hw *hw)
++{
++ struct e1000_phy_info *phy = &hw->phy;
++ s32 ret_val;
++ u16 data;
++ u8 port = 0;
++
++ /* Check the copper medium. */
++ ret_val = phy->ops.write_reg(hw, E1000_M88E1112_PAGE_ADDR, 0);
++ if (ret_val)
++  return ret_val;
++
++ ret_val = phy->ops.read_reg(hw, E1000_M88E1112_STATUS, &data);
++ if (ret_val)
++  return ret_val;
++
++ if (data & E1000_M88E1112_STATUS_LINK)
++  port = E1000_MEDIA_PORT_COPPER;
++
++ /* Check the other medium. */
++ ret_val = phy->ops.write_reg(hw, E1000_M88E1112_PAGE_ADDR, 1);
++ if (ret_val)
++  return ret_val;
++
++ ret_val = phy->ops.read_reg(hw, E1000_M88E1112_STATUS, &data);
++ if (ret_val)
++  return ret_val;
++
++ /* reset page to 0 */
++ ret_val = phy->ops.write_reg(hw, E1000_M88E1112_PAGE_ADDR, 0);
++ if (ret_val)
++  return ret_val;
++
++ if (data & E1000_M88E1112_STATUS_LINK)
++  port = E1000_MEDIA_PORT_OTHER;
++
++ /* Determine if a swap needs to happen. */
++ if (port && (hw->dev_spec._82575.media_port != port)) {
++  hw->dev_spec._82575.media_port = port;
++  hw->dev_spec._82575.media_changed = true;
++ } else {
++  ret_val = igb_check_for_link_82575(hw);
++ }
++
++ return E1000_SUCCESS;
++}
++
++/**
+  *  igb_init_phy_params_82575 - Init PHY func ptrs.
+  *  @hw: pointer to the HW structure
+  **/
+@@ -189,6 +242,29 @@ static s32 igb_init_phy_params_82575(struct e1000_hw *hw)
+   else
+    phy->ops.get_cable_length = igb_get_cable_length_m88;
+   phy->ops.force_speed_duplex = igb_phy_force_speed_duplex_m88;
++  /* Check if this PHY is confgured for media swap. */
++  if (phy->id == M88E1112_E_PHY_ID) {
++   u16 data;
++
++   ret_val = phy->ops.write_reg(hw,
++           E1000_M88E1112_PAGE_ADDR,
++           2);
++   if (ret_val)
++    goto out;
++
++   ret_val = phy->ops.read_reg(hw,
++          E1000_M88E1112_MAC_CTRL_1,
++          &data);
++   if (ret_val)
++    goto out;
++
++   data = (data & E1000_M88E1112_MAC_CTRL_1_MODE_MASK) >>
++          E1000_M88E1112_MAC_CTRL_1_MODE_SHIFT;
++   if (data == E1000_M88E1112_AUTO_COPPER_SGMII ||
++       data == E1000_M88E1112_AUTO_COPPER_BASEX)
++    hw->mac.ops.check_for_link =
++      igb_check_for_link_media_swap;
++  }
+   break;
+  case IGP03E1000_E_PHY_ID:
+   phy->type = e1000_phy_igp_3;
+diff --git a/drivers/net/ethernet/intel/igb/e1000_defines.h b/drivers/net/ethernet/intel/igb/e1000_defines.h
+index 978eca3..378ca21 100644
+--- a/drivers/net/ethernet/intel/igb/e1000_defines.h
++++ b/drivers/net/ethernet/intel/igb/e1000_defines.h
+@@ -532,6 +532,17 @@
+ #define E1000_MDICNFG_PHY_MASK    0x03E00000
+ #define E1000_MDICNFG_PHY_SHIFT   21
+ 
++#define E1000_MEDIA_PORT_COPPER   1
++#define E1000_MEDIA_PORT_OTHER   2
++#define E1000_M88E1112_AUTO_COPPER_SGMII 0x2
++#define E1000_M88E1112_AUTO_COPPER_BASEX 0x3
++#define E1000_M88E1112_STATUS_LINK  0x0004 /* Interface Link Bit */
++#define E1000_M88E1112_MAC_CTRL_1  0x10
++#define E1000_M88E1112_MAC_CTRL_1_MODE_MASK 0x0380 /* Mode Select */
++#define E1000_M88E1112_MAC_CTRL_1_MODE_SHIFT 7
++#define E1000_M88E1112_PAGE_ADDR  0x16
++#define E1000_M88E1112_STATUS   0x01
++
+ /* PCI Express Control */
+ #define E1000_GCR_CMPL_TMOUT_MASK       0x0000F000
+ #define E1000_GCR_CMPL_TMOUT_10ms       0x00001000
+diff --git a/drivers/net/ethernet/intel/igb/e1000_hw.h b/drivers/net/ethernet/intel/igb/e1000_hw.h
+index 2e166b2..5f9758f 100644
+--- a/drivers/net/ethernet/intel/igb/e1000_hw.h
++++ b/drivers/net/ethernet/intel/igb/e1000_hw.h
+@@ -533,6 +533,8 @@ struct e1000_dev_spec_82575 {
+  bool clear_semaphore_once;
+  struct e1000_sfp_flags eth_flags;
+  bool module_plugged;
++ u8 media_port;
++ bool media_changed;
+ };
+ 
+ struct e1000_hw {
+diff --git a/drivers/net/ethernet/intel/igb/igb.h b/drivers/net/ethernet/intel/igb/igb.h
+index 5e9ed89..6c80792 100644
+--- a/drivers/net/ethernet/intel/igb/igb.h
++++ b/drivers/net/ethernet/intel/igb/igb.h
+@@ -462,6 +462,7 @@ struct igb_adapter {
+ #define IGB_FLAG_RSS_FIELD_IPV6_UDP (1 << 7)
+ #define IGB_FLAG_WOL_SUPPORTED  (1 << 8)
+ #define IGB_FLAG_NEED_LINK_UPDATE (1 << 9)
++#define IGB_FLAG_MEDIA_RESET  (1 << 10)
+ 
+ /* DMA Coalescing defines */
+ #define IGB_MIN_TXPBSIZE 20408
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index 025e5f4..6da479b 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -3946,6 +3946,12 @@ static void igb_watchdog_task(struct work_struct *work)
+  }
+ 
+  if (link) {
++  /* Perform a reset if the media type changed. */
++  if (hw->dev_spec._82575.media_changed) {
++   hw->dev_spec._82575.media_changed = false;
++   adapter->flags |= IGB_FLAG_MEDIA_RESET;
++   igb_reset(adapter);
++  }
+   /* Cancel scheduled suspend requests. */
+   pm_runtime_resume(netdev->dev.parent);
+ 
+-- 
+1.7.1

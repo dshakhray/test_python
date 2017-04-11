@@ -1,0 +1,150 @@
+From 5ce3b0f78ccea6a6077872c6b9f5cfaaa8d90643 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:12:59 -0400
+Subject: [powerpc] Allow ppc_md platform hook to override memory_block_size_bytes
+
+Message-id: <1410545655-205645-551-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94414
+O-Subject: [RHEL7 PATCH 550/626] powerpc: Allow ppc_md platform hook to override memory_block_size_bytes
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit a5d862576a64cb3e0c22dc9cc2170e4d750714f9
+Author: Anton Blanchard <anton@au1.ibm.com>
+Date:   Wed Jun 4 17:50:47 2014 +1000
+
+    powerpc: Allow ppc_md platform hook to override memory_block_size_bytes
+
+    The pseries platform code unconditionally overrides
+    memory_block_size_bytes regardless of the running platform.
+
+    Create a ppc_md hook that so each platform can choose to
+    do what it wants.
+
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/machdep.h b/arch/powerpc/include/asm/machdep.h
+index d76cb68..bb44313 100644
+--- a/arch/powerpc/include/asm/machdep.h
++++ b/arch/powerpc/include/asm/machdep.h
+@@ -86,6 +86,9 @@ struct machdep_calls {
+  void  (*iommu_save)(void);
+  void  (*iommu_restore)(void);
+ #endif
++#ifdef CONFIG_MEMORY_HOTPLUG_SPARSE
++ unsigned long (*memory_block_size)(void);
++#endif
+ #endif /* CONFIG_PPC64 */
+ 
+  void  (*pci_dma_dev_setup)(struct pci_dev *dev);
+diff --git a/arch/powerpc/kernel/setup_64.c b/arch/powerpc/kernel/setup_64.c
+index 1e03245..0a46a65 100644
+--- a/arch/powerpc/kernel/setup_64.c
++++ b/arch/powerpc/kernel/setup_64.c
+@@ -36,6 +36,7 @@
+ #include <linux/lockdep.h>
+ #include <linux/memblock.h>
+ #include <linux/hugetlb.h>
++#include <linux/memory.h>
+ 
+ #include <asm/io.h>
+ #include <asm/kdump.h>
+@@ -730,6 +731,15 @@ void __init setup_per_cpu_areas(void)
+ }
+ #endif
+ 
++#ifdef CONFIG_MEMORY_HOTPLUG_SPARSE
++unsigned long memory_block_size_bytes(void)
++{
++ if (ppc_md.memory_block_size)
++  return ppc_md.memory_block_size();
++
++ return MIN_MEMORY_BLOCK_SIZE;
++}
++#endif
+ 
+ #if defined(CONFIG_PPC_INDIRECT_PIO) || defined(CONFIG_PPC_INDIRECT_MMIO)
+ struct ppc_pci_io ppc_pci_io;
+diff --git a/arch/powerpc/platforms/pseries/hotplug-memory.c b/arch/powerpc/platforms/pseries/hotplug-memory.c
+index 7f75c94..7995135 100644
+--- a/arch/powerpc/platforms/pseries/hotplug-memory.c
++++ b/arch/powerpc/platforms/pseries/hotplug-memory.c
+@@ -21,7 +21,7 @@
+ #include <asm/prom.h>
+ #include <asm/sparsemem.h>
+ 
+-static unsigned long get_memblock_size(void)
++unsigned long pseries_memory_block_size(void)
+ {
+  struct device_node *np;
+  unsigned int memblock_size = MIN_MEMORY_BLOCK_SIZE;
+@@ -64,17 +64,6 @@ static unsigned long get_memblock_size(void)
+  return memblock_size;
+ }
+ 
+-/* WARNING: This is going to override the generic definition whenever
+- * pseries is built-in regardless of what platform is active at boot
+- * time. This is fine for now as this is the only "option" and it
+- * should work everywhere. If not, we'll have to turn this into a
+- * ppc_md. callback
+- */
+-unsigned long memory_block_size_bytes(void)
+-{
+- return get_memblock_size();
+-}
+-
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+ static int pseries_remove_memory(u64 start, u64 size)
+ {
+@@ -105,7 +94,7 @@ static int pseries_remove_memblock(unsigned long base, unsigned int memblock_siz
+  if (!pfn_valid(start_pfn))
+   goto out;
+ 
+- block_sz = memory_block_size_bytes();
++ block_sz = pseries_memory_block_size();
+  sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
+  nid = memory_add_physaddr_to_nid(base);
+ 
+@@ -201,7 +190,7 @@ static int pseries_update_drconf_memory(struct of_prop_reconfig *pr)
+  u32 *p;
+  int i, rc = -EINVAL;
+ 
+- memblock_size = get_memblock_size();
++ memblock_size = pseries_memory_block_size();
+  if (!memblock_size)
+   return -EINVAL;
+ 
+diff --git a/arch/powerpc/platforms/pseries/pseries.h b/arch/powerpc/platforms/pseries/pseries.h
+index 9921953..361add6 100644
+--- a/arch/powerpc/platforms/pseries/pseries.h
++++ b/arch/powerpc/platforms/pseries/pseries.h
+@@ -64,4 +64,6 @@ extern int dlpar_detach_node(struct device_node *);
+ struct pci_host_bridge;
+ int pseries_root_bridge_prepare(struct pci_host_bridge *bridge);
+ 
++unsigned long pseries_memory_block_size(void);
++
+ #endif /* _PSERIES_PSERIES_H */
+diff --git a/arch/powerpc/platforms/pseries/setup.c b/arch/powerpc/platforms/pseries/setup.c
+index dbf0c7c..6f65dbd 100644
+--- a/arch/powerpc/platforms/pseries/setup.c
++++ b/arch/powerpc/platforms/pseries/setup.c
+@@ -781,4 +781,7 @@ define_machine(pseries) {
+ #ifdef CONFIG_KEXEC
+  .machine_kexec          = pSeries_machine_kexec,
+ #endif
++#ifdef CONFIG_MEMORY_HOTPLUG_SPARSE
++ .memory_block_size = pseries_memory_block_size,
++#endif
+ };
+-- 
+1.7.1

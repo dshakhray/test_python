@@ -1,0 +1,177 @@
+From 30a18b5074efdd5699b58784cdb98dccd89dad15 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:47 -0400
+Subject: [virt] kvm/ppc: book3s hv - Reserve POWER8 space in get/set_one_reg
+
+Message-id: <1410545655-205645-119-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94162
+O-Subject: [RHEL7 PATCH 118/626] KVM: PPC: Book3S HV: Reserve POWER8 space in get/set_one_reg
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 3b7834743f9492e3509930feb4ca47135905e640
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Tue Sep 3 11:13:12 2013 +1000
+
+    KVM: PPC: Book3S HV: Reserve POWER8 space in get/set_one_reg
+
+    This reserves space in get/set_one_reg ioctl for the extra guest state
+    needed for POWER8.  It doesn't implement these at all, it just reserves
+    them so that the ABI is defined now.
+
+    A few things to note here:
+
+    - This add *a lot* state for transactional memory.  TM suspend mode,
+      this is unavoidable, you can't simply roll back all transactions and
+      store only the checkpointed state.  I've added this all to
+      get/set_one_reg (including GPRs) rather than creating a new ioctl
+      which returns a struct kvm_regs like KVM_GET_REGS does.  This means we
+      if we need to extract the TM state, we are going to need a bucket load
+      of IOCTLs.  Hopefully most of the time this will not be needed as we
+      can look at the MSR to see if TM is active and only grab them when
+      needed.  If this becomes a bottle neck in future we can add another
+      ioctl to grab all this state in one go.
+
+    - The TM state is offset by 0x80000000.
+
+    - For TM, I've done away with VMX and FP and created a single 64x128 bit
+      VSX register space.
+
+    - I've left a space of 1 (at 0x9c) since Paulus needs to add a value
+      which applies to POWER7 as well.
+
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index 2f18824..e49a81c 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -1823,6 +1823,45 @@ registers, find a list below:
+   PPC   | KVM_REG_PPC_TLB3PS | 32
+   PPC   | KVM_REG_PPC_EPTCFG | 32
+   PPC   | KVM_REG_PPC_ICP_STATE | 64
++  PPC   | KVM_REG_PPC_SPMC1 | 32
++  PPC   | KVM_REG_PPC_SPMC2 | 32
++  PPC   | KVM_REG_PPC_IAMR | 64
++  PPC   | KVM_REG_PPC_TFHAR | 64
++  PPC   | KVM_REG_PPC_TFIAR | 64
++  PPC   | KVM_REG_PPC_TEXASR | 64
++  PPC   | KVM_REG_PPC_FSCR | 64
++  PPC   | KVM_REG_PPC_PSPB | 32
++  PPC   | KVM_REG_PPC_EBBHR | 64
++  PPC   | KVM_REG_PPC_EBBRR | 64
++  PPC   | KVM_REG_PPC_BESCR | 64
++  PPC   | KVM_REG_PPC_TAR | 64
++  PPC   | KVM_REG_PPC_DPDES | 64
++  PPC   | KVM_REG_PPC_DAWR | 64
++  PPC   | KVM_REG_PPC_DAWRX | 64
++  PPC   | KVM_REG_PPC_CIABR | 64
++  PPC   | KVM_REG_PPC_IC | 64
++  PPC   | KVM_REG_PPC_VTB | 64
++  PPC   | KVM_REG_PPC_CSIGR | 64
++  PPC   | KVM_REG_PPC_TACR | 64
++  PPC   | KVM_REG_PPC_TCSCR | 64
++  PPC   | KVM_REG_PPC_PID | 64
++  PPC   | KVM_REG_PPC_ACOP | 64
++  PPC   | KVM_REG_PPC_TM_GPR0 | 64
++          ...
++  PPC   | KVM_REG_PPC_TM_GPR31 | 64
++  PPC   | KVM_REG_PPC_TM_VSR0 | 128
++          ...
++  PPC   | KVM_REG_PPC_TM_VSR63 | 128
++  PPC   | KVM_REG_PPC_TM_CR | 64
++  PPC   | KVM_REG_PPC_TM_LR | 64
++  PPC   | KVM_REG_PPC_TM_CTR | 64
++  PPC   | KVM_REG_PPC_TM_FPSCR | 64
++  PPC   | KVM_REG_PPC_TM_AMR | 64
++  PPC   | KVM_REG_PPC_TM_PPR | 64
++  PPC   | KVM_REG_PPC_TM_VRSAVE | 64
++  PPC   | KVM_REG_PPC_TM_VSCR | 32
++  PPC   | KVM_REG_PPC_TM_DSCR | 64
++  PPC   | KVM_REG_PPC_TM_TAR | 64
+ 
+ ARM registers are mapped using the lower 32 bits.  The upper 16 of that
+ is the register group type, or coprocessor number:
+diff --git a/arch/powerpc/include/uapi/asm/kvm.h b/arch/powerpc/include/uapi/asm/kvm.h
+index 0fb1a6e..7ed41c0 100644
+--- a/arch/powerpc/include/uapi/asm/kvm.h
++++ b/arch/powerpc/include/uapi/asm/kvm.h
+@@ -429,6 +429,11 @@ struct kvm_get_htab_header {
+ #define KVM_REG_PPC_MMCR0 (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x10)
+ #define KVM_REG_PPC_MMCR1 (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x11)
+ #define KVM_REG_PPC_MMCRA (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x12)
++#define KVM_REG_PPC_MMCR2 (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x13)
++#define KVM_REG_PPC_MMCRS (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x14)
++#define KVM_REG_PPC_SIAR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x15)
++#define KVM_REG_PPC_SDAR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x16)
++#define KVM_REG_PPC_SIER (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x17)
+ 
+ #define KVM_REG_PPC_PMC1 (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x18)
+ #define KVM_REG_PPC_PMC2 (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x19)
+@@ -499,6 +504,55 @@ struct kvm_get_htab_header {
+ #define KVM_REG_PPC_TLB3PS (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x9a)
+ #define KVM_REG_PPC_EPTCFG (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x9b)
+ 
++/* POWER8 registers */
++#define KVM_REG_PPC_SPMC1 (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x9d)
++#define KVM_REG_PPC_SPMC2 (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x9e)
++#define KVM_REG_PPC_IAMR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x9f)
++#define KVM_REG_PPC_TFHAR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xa0)
++#define KVM_REG_PPC_TFIAR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xa1)
++#define KVM_REG_PPC_TEXASR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xa2)
++#define KVM_REG_PPC_FSCR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xa3)
++#define KVM_REG_PPC_PSPB (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0xa4)
++#define KVM_REG_PPC_EBBHR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xa5)
++#define KVM_REG_PPC_EBBRR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xa6)
++#define KVM_REG_PPC_BESCR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xa7)
++#define KVM_REG_PPC_TAR  (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xa8)
++#define KVM_REG_PPC_DPDES (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xa9)
++#define KVM_REG_PPC_DAWR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xaa)
++#define KVM_REG_PPC_DAWRX (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xab)
++#define KVM_REG_PPC_CIABR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xac)
++#define KVM_REG_PPC_IC  (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xad)
++#define KVM_REG_PPC_VTB  (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xae)
++#define KVM_REG_PPC_CSIGR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xaf)
++#define KVM_REG_PPC_TACR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb0)
++#define KVM_REG_PPC_TCSCR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb1)
++#define KVM_REG_PPC_PID  (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb2)
++#define KVM_REG_PPC_ACOP (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb3)
++
++/* Transactional Memory checkpointed state:
++ * This is all GPRs, all VSX regs and a subset of SPRs
++ */
++#define KVM_REG_PPC_TM  (KVM_REG_PPC | 0x80000000)
++/* TM GPRs */
++#define KVM_REG_PPC_TM_GPR0 (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0)
++#define KVM_REG_PPC_TM_GPR(n) (KVM_REG_PPC_TM_GPR0 + (n))
++#define KVM_REG_PPC_TM_GPR31 (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x1f)
++/* TM VSX */
++#define KVM_REG_PPC_TM_VSR0 (KVM_REG_PPC_TM | KVM_REG_SIZE_U128 | 0x20)
++#define KVM_REG_PPC_TM_VSR(n) (KVM_REG_PPC_TM_VSR0 + (n))
++#define KVM_REG_PPC_TM_VSR63 (KVM_REG_PPC_TM | KVM_REG_SIZE_U128 | 0x5f)
++/* TM SPRS */
++#define KVM_REG_PPC_TM_CR (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x60)
++#define KVM_REG_PPC_TM_LR (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x61)
++#define KVM_REG_PPC_TM_CTR (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x62)
++#define KVM_REG_PPC_TM_FPSCR (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x63)
++#define KVM_REG_PPC_TM_AMR (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x64)
++#define KVM_REG_PPC_TM_PPR (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x65)
++#define KVM_REG_PPC_TM_VRSAVE (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x66)
++#define KVM_REG_PPC_TM_VSCR (KVM_REG_PPC_TM | KVM_REG_SIZE_U32 | 0x67)
++#define KVM_REG_PPC_TM_DSCR (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x68)
++#define KVM_REG_PPC_TM_TAR (KVM_REG_PPC_TM | KVM_REG_SIZE_U64 | 0x69)
++
+ /* PPC64 eXternal Interrupt Controller Specification */
+ #define KVM_DEV_XICS_GRP_SOURCES 1 /* 64-bit source attributes */
+ 
+-- 
+1.7.1

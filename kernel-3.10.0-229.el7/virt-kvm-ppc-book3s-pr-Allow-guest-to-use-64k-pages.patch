@@ -1,0 +1,486 @@
+From d7003b650c6c8a1994b3790553efb905b42b9461 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:06:00 -0400
+Subject: [virt] kvm/ppc: book3s pr - Allow guest to use 64k pages
+
+Message-id: <1410545655-205645-132-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94133
+O-Subject: [RHEL7 PATCH 131/626] KVM: PPC: Book3S PR: Allow guest to use 64k pages
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit a4a0f2524acc2c602cadd8e743be19d86f3a746b
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:44 2013 +1000
+
+    KVM: PPC: Book3S PR: Allow guest to use 64k pages
+
+    This adds the code to interpret 64k HPTEs in the guest hashed page
+    table (HPT), 64k SLB entries, and to tell the guest about 64k pages
+    in kvm_vm_ioctl_get_smmu_info().  Guest 64k pages are still shadowed
+    by 4k pages.
+
+    This also adds another hash table to the four we have already in
+    book3s_mmu_hpte.c to allow us to find all the PTEs that we have
+    instantiated that match a given 64k guest page.
+
+    The tlbie instruction changed starting with POWER6 to use a bit in
+    the RB operand to indicate large page invalidations, and to use other
+    RB bits to indicate the base and actual page sizes and the segment
+    size.  64k pages came in slightly earlier, with POWER5++.
+    We use one bit in vcpu->arch.hflags to indicate that the emulated
+    cpu supports 64k pages, and another to indicate that it has the new
+    tlbie definition.
+
+    The KVM_PPC_GET_SMMU_INFO ioctl presents a bit of a problem, because
+    the MMU capabilities depend on which CPU model we're emulating, but it
+    is a VM ioctl not a VCPU ioctl and therefore doesn't get passed a VCPU
+    fd.  In addition, commonly-used userspace (QEMU) calls it before
+    setting the PVR for any VCPU.  Therefore, as a best effort we look at
+    the first vcpu in the VM and return 64k pages or not depending on its
+    capabilities.  We also make the PVR default to the host PVR on recent
+    CPUs that support 1TB segments (and therefore multiple page sizes as
+    well) so that KVM_PPC_GET_SMMU_INFO will include 64k page and 1TB
+    segment support on those CPUs.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_asm.h b/arch/powerpc/include/asm/kvm_asm.h
+index 851bac7..e2d4d46 100644
+--- a/arch/powerpc/include/asm/kvm_asm.h
++++ b/arch/powerpc/include/asm/kvm_asm.h
+@@ -123,6 +123,8 @@
+ #define BOOK3S_HFLAG_SLB   0x2
+ #define BOOK3S_HFLAG_PAIRED_SINGLE  0x4
+ #define BOOK3S_HFLAG_NATIVE_PS   0x8
++#define BOOK3S_HFLAG_MULTI_PGSIZE  0x10
++#define BOOK3S_HFLAG_NEW_TLBIE   0x20
+ 
+ #define RESUME_FLAG_NV          (1<<0)  /* Reload guest nonvolatile state? */
+ #define RESUME_FLAG_HOST        (1<<1)  /* Resume host? */
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 40f22d9..1d4a120 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -58,6 +58,9 @@ struct hpte_cache {
+  struct hlist_node list_pte_long;
+  struct hlist_node list_vpte;
+  struct hlist_node list_vpte_long;
++#ifdef CONFIG_PPC_BOOK3S_64
++ struct hlist_node list_vpte_64k;
++#endif
+  struct rcu_head rcu_head;
+  u64 host_vpn;
+  u64 pfn;
+@@ -99,6 +102,9 @@ struct kvmppc_vcpu_book3s {
+  struct hlist_head hpte_hash_pte_long[HPTEG_HASH_NUM_PTE_LONG];
+  struct hlist_head hpte_hash_vpte[HPTEG_HASH_NUM_VPTE];
+  struct hlist_head hpte_hash_vpte_long[HPTEG_HASH_NUM_VPTE_LONG];
++#ifdef CONFIG_PPC_BOOK3S_64
++ struct hlist_head hpte_hash_vpte_64k[HPTEG_HASH_NUM_VPTE_64K];
++#endif
+  int hpte_cache_count;
+  spinlock_t mmu_lock;
+ };
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 933ae29..2c7963b 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -73,10 +73,12 @@ extern void kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte);
+ #define HPTEG_HASH_BITS_PTE_LONG 12
+ #define HPTEG_HASH_BITS_VPTE  13
+ #define HPTEG_HASH_BITS_VPTE_LONG 5
++#define HPTEG_HASH_BITS_VPTE_64K 11
+ #define HPTEG_HASH_NUM_PTE  (1 << HPTEG_HASH_BITS_PTE)
+ #define HPTEG_HASH_NUM_PTE_LONG  (1 << HPTEG_HASH_BITS_PTE_LONG)
+ #define HPTEG_HASH_NUM_VPTE  (1 << HPTEG_HASH_BITS_VPTE)
+ #define HPTEG_HASH_NUM_VPTE_LONG (1 << HPTEG_HASH_BITS_VPTE_LONG)
++#define HPTEG_HASH_NUM_VPTE_64K  (1 << HPTEG_HASH_BITS_VPTE_64K)
+ 
+ /* Physical Address Mask - allowed range of real mode RAM access */
+ #define KVM_PAM   0x0fffffffffffffffULL
+@@ -332,6 +334,7 @@ struct kvmppc_pte {
+  bool may_read  : 1;
+  bool may_write  : 1;
+  bool may_execute : 1;
++ u8 page_size;  /* MMU_PAGE_xxx */
+ };
+ 
+ struct kvmppc_mmu {
+@@ -364,6 +367,7 @@ struct kvmppc_slb {
+  bool large : 1; /* PTEs are 16MB */
+  bool tb  : 1; /* 1TB segment */
+  bool class : 1;
++ u8 base_page_size; /* MMU_PAGE_xxx */
+ };
+ 
+ # ifdef CONFIG_PPC_FSL_BOOK3E
+diff --git a/arch/powerpc/kvm/book3s_64_mmu.c b/arch/powerpc/kvm/book3s_64_mmu.c
+index 7e345e0..8277264 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu.c
++++ b/arch/powerpc/kvm/book3s_64_mmu.c
+@@ -107,9 +107,20 @@ static u64 kvmppc_mmu_book3s_64_ea_to_vp(struct kvm_vcpu *vcpu, gva_t eaddr,
+  return kvmppc_slb_calc_vpn(slb, eaddr);
+ }
+ 
++static int mmu_pagesize(int mmu_pg)
++{
++ switch (mmu_pg) {
++ case MMU_PAGE_64K:
++  return 16;
++ case MMU_PAGE_16M:
++  return 24;
++ }
++ return 12;
++}
++
+ static int kvmppc_mmu_book3s_64_get_pagesize(struct kvmppc_slb *slbe)
+ {
+- return slbe->large ? 24 : 12;
++ return mmu_pagesize(slbe->base_page_size);
+ }
+ 
+ static u32 kvmppc_mmu_book3s_64_get_page(struct kvmppc_slb *slbe, gva_t eaddr)
+@@ -166,14 +177,34 @@ static u64 kvmppc_mmu_book3s_64_get_avpn(struct kvmppc_slb *slbe, gva_t eaddr)
+  avpn = kvmppc_mmu_book3s_64_get_page(slbe, eaddr);
+  avpn |= slbe->vsid << (kvmppc_slb_sid_shift(slbe) - p);
+ 
+- if (p < 24)
+-  avpn >>= ((80 - p) - 56) - 8;
++ if (p < 16)
++  avpn >>= ((80 - p) - 56) - 8; /* 16 - p */
+  else
+-  avpn <<= 8;
++  avpn <<= p - 16;
+ 
+  return avpn;
+ }
+ 
++/*
++ * Return page size encoded in the second word of a HPTE, or
++ * -1 for an invalid encoding for the base page size indicated by
++ * the SLB entry.  This doesn't handle mixed pagesize segments yet.
++ */
++static int decode_pagesize(struct kvmppc_slb *slbe, u64 r)
++{
++ switch (slbe->base_page_size) {
++ case MMU_PAGE_64K:
++  if ((r & 0xf000) == 0x1000)
++   return MMU_PAGE_64K;
++  break;
++ case MMU_PAGE_16M:
++  if ((r & 0xff000) == 0)
++   return MMU_PAGE_16M;
++  break;
++ }
++ return -1;
++}
++
+ static int kvmppc_mmu_book3s_64_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+     struct kvmppc_pte *gpte, bool data)
+ {
+@@ -189,6 +220,7 @@ static int kvmppc_mmu_book3s_64_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+  u8 pp, key = 0;
+  bool found = false;
+  bool second = false;
++ int pgsize;
+  ulong mp_ea = vcpu->arch.magic_page_ea;
+ 
+  /* Magic page override */
+@@ -202,6 +234,7 @@ static int kvmppc_mmu_book3s_64_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+   gpte->may_execute = true;
+   gpte->may_read = true;
+   gpte->may_write = true;
++  gpte->page_size = MMU_PAGE_4K;
+ 
+   return 0;
+  }
+@@ -222,6 +255,8 @@ static int kvmppc_mmu_book3s_64_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+  v_mask = SLB_VSID_B | HPTE_V_AVPN | HPTE_V_LARGE | HPTE_V_VALID |
+   HPTE_V_SECONDARY;
+ 
++ pgsize = slbe->large ? MMU_PAGE_16M : MMU_PAGE_4K;
++
+ do_second:
+  ptegp = kvmppc_mmu_book3s_64_get_pteg(vcpu_book3s, slbe, eaddr, second);
+  if (kvm_is_error_hva(ptegp))
+@@ -240,6 +275,13 @@ do_second:
+  for (i=0; i<16; i+=2) {
+   /* Check all relevant fields of 1st dword */
+   if ((pteg[i] & v_mask) == v_val) {
++   /* If large page bit is set, check pgsize encoding */
++   if (slbe->large &&
++       (vcpu->arch.hflags & BOOK3S_HFLAG_MULTI_PGSIZE)) {
++    pgsize = decode_pagesize(slbe, pteg[i+1]);
++    if (pgsize < 0)
++     continue;
++   }
+    found = true;
+    break;
+   }
+@@ -256,13 +298,13 @@ do_second:
+  v = pteg[i];
+  r = pteg[i+1];
+  pp = (r & HPTE_R_PP) | key;
+- eaddr_mask = 0xFFF;
+ 
+  gpte->eaddr = eaddr;
+  gpte->vpage = kvmppc_mmu_book3s_64_ea_to_vp(vcpu, eaddr, data);
+- if (slbe->large)
+-  eaddr_mask = 0xFFFFFF;
++
++ eaddr_mask = (1ull << mmu_pagesize(pgsize)) - 1;
+  gpte->raddr = (r & HPTE_R_RPN & ~eaddr_mask) | (eaddr & eaddr_mask);
++ gpte->page_size = pgsize;
+  gpte->may_execute = ((r & HPTE_R_N) ? false : true);
+  gpte->may_read = false;
+  gpte->may_write = false;
+@@ -345,6 +387,21 @@ static void kvmppc_mmu_book3s_64_slbmte(struct kvm_vcpu *vcpu, u64 rs, u64 rb)
+  slbe->nx    = (rs & SLB_VSID_N) ? 1 : 0;
+  slbe->class = (rs & SLB_VSID_C) ? 1 : 0;
+ 
++ slbe->base_page_size = MMU_PAGE_4K;
++ if (slbe->large) {
++  if (vcpu->arch.hflags & BOOK3S_HFLAG_MULTI_PGSIZE) {
++   switch (rs & SLB_VSID_LP) {
++   case SLB_VSID_LP_00:
++    slbe->base_page_size = MMU_PAGE_16M;
++    break;
++   case SLB_VSID_LP_01:
++    slbe->base_page_size = MMU_PAGE_64K;
++    break;
++   }
++  } else
++   slbe->base_page_size = MMU_PAGE_16M;
++ }
++
+  slbe->orige = rb & (ESID_MASK | SLB_ESID_V);
+  slbe->origv = rs;
+ 
+@@ -463,8 +520,25 @@ static void kvmppc_mmu_book3s_64_tlbie(struct kvm_vcpu *vcpu, ulong va,
+ 
+  dprintk("KVM MMU: tlbie(0x%lx)\n", va);
+ 
+- if (large)
+-  mask = 0xFFFFFF000ULL;
++ /*
++  * The tlbie instruction changed behaviour starting with
++  * POWER6.  POWER6 and later don't have the large page flag
++  * in the instruction but in the RB value, along with bits
++  * indicating page and segment sizes.
++  */
++ if (vcpu->arch.hflags & BOOK3S_HFLAG_NEW_TLBIE) {
++  /* POWER6 or later */
++  if (va & 1) {  /* L bit */
++   if ((va & 0xf000) == 0x1000)
++    mask = 0xFFFFFFFF0ULL; /* 64k page */
++   else
++    mask = 0xFFFFFF000ULL; /* 16M page */
++  }
++ } else {
++  /* older processors, e.g. PPC970 */
++  if (large)
++   mask = 0xFFFFFF000ULL;
++ }
+  kvmppc_mmu_pte_vflush(vcpu, va >> 12, mask);
+ }
+ 
+diff --git a/arch/powerpc/kvm/book3s_mmu_hpte.c b/arch/powerpc/kvm/book3s_mmu_hpte.c
+index da8b13c..d2d280b 100644
+--- a/arch/powerpc/kvm/book3s_mmu_hpte.c
++++ b/arch/powerpc/kvm/book3s_mmu_hpte.c
+@@ -56,6 +56,14 @@ static inline u64 kvmppc_mmu_hash_vpte_long(u64 vpage)
+          HPTEG_HASH_BITS_VPTE_LONG);
+ }
+ 
++#ifdef CONFIG_PPC_BOOK3S_64
++static inline u64 kvmppc_mmu_hash_vpte_64k(u64 vpage)
++{
++ return hash_64((vpage & 0xffffffff0ULL) >> 4,
++         HPTEG_HASH_BITS_VPTE_64K);
++}
++#endif
++
+ void kvmppc_mmu_hpte_cache_map(struct kvm_vcpu *vcpu, struct hpte_cache *pte)
+ {
+  u64 index;
+@@ -83,6 +91,13 @@ void kvmppc_mmu_hpte_cache_map(struct kvm_vcpu *vcpu, struct hpte_cache *pte)
+  hlist_add_head_rcu(&pte->list_vpte_long,
+       &vcpu3s->hpte_hash_vpte_long[index]);
+ 
++#ifdef CONFIG_PPC_BOOK3S_64
++ /* Add to vPTE_64k list */
++ index = kvmppc_mmu_hash_vpte_64k(pte->pte.vpage);
++ hlist_add_head_rcu(&pte->list_vpte_64k,
++      &vcpu3s->hpte_hash_vpte_64k[index]);
++#endif
++
+  spin_unlock(&vcpu3s->mmu_lock);
+ }
+ 
+@@ -113,6 +128,9 @@ static void invalidate_pte(struct kvm_vcpu *vcpu, struct hpte_cache *pte)
+  hlist_del_init_rcu(&pte->list_pte_long);
+  hlist_del_init_rcu(&pte->list_vpte);
+  hlist_del_init_rcu(&pte->list_vpte_long);
++#ifdef CONFIG_PPC_BOOK3S_64
++ hlist_del_init_rcu(&pte->list_vpte_64k);
++#endif
+ 
+  spin_unlock(&vcpu3s->mmu_lock);
+ 
+@@ -219,6 +237,29 @@ static void kvmppc_mmu_pte_vflush_short(struct kvm_vcpu *vcpu, u64 guest_vp)
+  rcu_read_unlock();
+ }
+ 
++#ifdef CONFIG_PPC_BOOK3S_64
++/* Flush with mask 0xffffffff0 */
++static void kvmppc_mmu_pte_vflush_64k(struct kvm_vcpu *vcpu, u64 guest_vp)
++{
++ struct kvmppc_vcpu_book3s *vcpu3s = to_book3s(vcpu);
++ struct hlist_head *list;
++ struct hpte_cache *pte;
++ u64 vp_mask = 0xffffffff0ULL;
++
++ list = &vcpu3s->hpte_hash_vpte_64k[
++  kvmppc_mmu_hash_vpte_64k(guest_vp)];
++
++ rcu_read_lock();
++
++ /* Check the list for matching entries and invalidate */
++ hlist_for_each_entry_rcu(pte, list, list_vpte_64k)
++  if ((pte->pte.vpage & vp_mask) == guest_vp)
++   invalidate_pte(vcpu, pte);
++
++ rcu_read_unlock();
++}
++#endif
++
+ /* Flush with mask 0xffffff000 */
+ static void kvmppc_mmu_pte_vflush_long(struct kvm_vcpu *vcpu, u64 guest_vp)
+ {
+@@ -249,6 +290,11 @@ void kvmppc_mmu_pte_vflush(struct kvm_vcpu *vcpu, u64 guest_vp, u64 vp_mask)
+  case 0xfffffffffULL:
+   kvmppc_mmu_pte_vflush_short(vcpu, guest_vp);
+   break;
++#ifdef CONFIG_PPC_BOOK3S_64
++ case 0xffffffff0ULL:
++  kvmppc_mmu_pte_vflush_64k(vcpu, guest_vp);
++  break;
++#endif
+  case 0xffffff000ULL:
+   kvmppc_mmu_pte_vflush_long(vcpu, guest_vp);
+   break;
+@@ -320,6 +366,10 @@ int kvmppc_mmu_hpte_init(struct kvm_vcpu *vcpu)
+       ARRAY_SIZE(vcpu3s->hpte_hash_vpte));
+  kvmppc_mmu_hpte_init_hash(vcpu3s->hpte_hash_vpte_long,
+       ARRAY_SIZE(vcpu3s->hpte_hash_vpte_long));
++#ifdef CONFIG_PPC_BOOK3S_64
++ kvmppc_mmu_hpte_init_hash(vcpu3s->hpte_hash_vpte_64k,
++      ARRAY_SIZE(vcpu3s->hpte_hash_vpte_64k));
++#endif
+ 
+  spin_lock_init(&vcpu3s->mmu_lock);
+ 
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 487148e..8edd7bc 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -306,6 +306,23 @@ void kvmppc_set_pvr(struct kvm_vcpu *vcpu, u32 pvr)
+  if (!strcmp(cur_cpu_spec->platform, "ppc-cell-be"))
+   to_book3s(vcpu)->msr_mask &= ~(MSR_FE0 | MSR_FE1);
+ 
++ /*
++  * If they're asking for POWER6 or later, set the flag
++  * indicating that we can do multiple large page sizes
++  * and 1TB segments.
++  * Also set the flag that indicates that tlbie has the large
++  * page bit in the RB operand instead of the instruction.
++  */
++ switch (PVR_VER(pvr)) {
++ case PVR_POWER6:
++ case PVR_POWER7:
++ case PVR_POWER7p:
++ case PVR_POWER8:
++  vcpu->arch.hflags |= BOOK3S_HFLAG_MULTI_PGSIZE |
++   BOOK3S_HFLAG_NEW_TLBIE;
++  break;
++ }
++
+ #ifdef CONFIG_PPC_BOOK3S_32
+  /* 32 bit Book3S always has 32 byte dcbz */
+  vcpu->arch.hflags |= BOOK3S_HFLAG_DCBZ32;
+@@ -1128,8 +1145,14 @@ struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
+  vcpu->arch.shared = (void *)(p + PAGE_SIZE - 4096);
+ 
+ #ifdef CONFIG_PPC_BOOK3S_64
+- /* default to book3s_64 (970fx) */
++ /*
++  * Default to the same as the host if we're on sufficiently
++  * recent machine that we have 1TB segments;
++  * otherwise default to PPC970FX.
++  */
+  vcpu->arch.pvr = 0x3C0301;
++ if (mmu_has_feature(MMU_FTR_1T_SEGMENT))
++  vcpu->arch.pvr = mfspr(SPRN_PVR);
+ #else
+  /* default to book3s_32 (750) */
+  vcpu->arch.pvr = 0x84202;
+@@ -1309,7 +1332,10 @@ out:
+ #ifdef CONFIG_PPC64
+ int kvm_vm_ioctl_get_smmu_info(struct kvm *kvm, struct kvm_ppc_smmu_info *info)
+ {
+- info->flags = KVM_PPC_1T_SEGMENTS;
++ long int i;
++ struct kvm_vcpu *vcpu;
++
++ info->flags = 0;
+ 
+  /* SLB is always 64 entries */
+  info->slb_size = 64;
+@@ -1320,11 +1346,31 @@ int kvm_vm_ioctl_get_smmu_info(struct kvm *kvm, struct kvm_ppc_smmu_info *info)
+  info->sps[0].enc[0].page_shift = 12;
+  info->sps[0].enc[0].pte_enc = 0;
+ 
++ /*
++  * 64k large page size.
++  * We only want to put this in if the CPUs we're emulating
++  * support it, but unfortunately we don't have a vcpu easily
++  * to hand here to test.  Just pick the first vcpu, and if
++  * that doesn't exist yet, report the minimum capability,
++  * i.e., no 64k pages.
++  * 1T segment support goes along with 64k pages.
++  */
++ i = 1;
++ vcpu = kvm_get_vcpu(kvm, 0);
++ if (vcpu && (vcpu->arch.hflags & BOOK3S_HFLAG_MULTI_PGSIZE)) {
++  info->flags = KVM_PPC_1T_SEGMENTS;
++  info->sps[i].page_shift = 16;
++  info->sps[i].slb_enc = SLB_VSID_L | SLB_VSID_LP_01;
++  info->sps[i].enc[0].page_shift = 16;
++  info->sps[i].enc[0].pte_enc = 1;
++  ++i;
++ }
++
+  /* Standard 16M large page size segment */
+- info->sps[1].page_shift = 24;
+- info->sps[1].slb_enc = SLB_VSID_L;
+- info->sps[1].enc[0].page_shift = 24;
+- info->sps[1].enc[0].pte_enc = 0;
++ info->sps[i].page_shift = 24;
++ info->sps[i].slb_enc = SLB_VSID_L;
++ info->sps[i].enc[0].page_shift = 24;
++ info->sps[i].enc[0].pte_enc = 0;
+ 
+  return 0;
+ }
+-- 
+1.7.1

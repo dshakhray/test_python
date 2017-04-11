@@ -1,0 +1,220 @@
+From cd036b12efdf7d41b577301581dca77d15a73804 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:37:06 -0400
+Subject: [scsi] do not manipulate device reference counts in scsi_get_put_command
+
+Message-id: <1402670238-13916-139-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83843
+O-Subject: [RHEL7.1 PATCH 138/150] scsi: do not manipulate device reference counts in scsi_get_put_command
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+
+BZ: 1105204
+
+Upstream commit 0479633686d370303e3430256ace4bd5f7f138dc
+Author: Christoph Hellwig <hch@infradead.org>
+Date:   Thu Feb 20 14:20:55 2014 -0800
+
+    [SCSI] do not manipulate device reference counts in scsi_get/put_command
+
+    Many callers won't need this and we can optimize them away.  In addition
+    the handling in the __-prefixed variants was inconsistant to start with.
+
+    Based on an earlier patch from Bart Van Assche.
+
+    [jejb: fix kerneldoc probelm picked up by Fengguang Wu]
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Hannes Reinecke <hare@suse.de>
+    Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
+index fb86479..2b12983 100644
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@ -284,27 +284,19 @@ EXPORT_SYMBOL_GPL(__scsi_get_command);
+  */
+ struct scsi_cmnd *scsi_get_command(struct scsi_device *dev, gfp_t gfp_mask)
+ {
+- struct scsi_cmnd *cmd;
++ struct scsi_cmnd *cmd = __scsi_get_command(dev->host, gfp_mask);
++ unsigned long flags;
+ 
+- /* Bail if we can't get a reference to the device */
+- if (!get_device(&dev->sdev_gendev))
++ if (unlikely(cmd == NULL))
+   return NULL;
+ 
+- cmd = __scsi_get_command(dev->host, gfp_mask);
+-
+- if (likely(cmd != NULL)) {
+-  unsigned long flags;
+-
+-  cmd->device = dev;
+-  INIT_LIST_HEAD(&cmd->list);
+-  INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
+-  spin_lock_irqsave(&dev->list_lock, flags);
+-  list_add_tail(&cmd->list, &dev->cmd_list);
+-  spin_unlock_irqrestore(&dev->list_lock, flags);
+-  cmd->jiffies_at_alloc = jiffies;
+- } else
+-  put_device(&dev->sdev_gendev);
+-
++ cmd->device = dev;
++ INIT_LIST_HEAD(&cmd->list);
++ INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
++ spin_lock_irqsave(&dev->list_lock, flags);
++ list_add_tail(&cmd->list, &dev->cmd_list);
++ spin_unlock_irqrestore(&dev->list_lock, flags);
++ cmd->jiffies_at_alloc = jiffies;
+  return cmd;
+ }
+ EXPORT_SYMBOL(scsi_get_command);
+@@ -313,10 +305,8 @@ EXPORT_SYMBOL(scsi_get_command);
+  * __scsi_put_command - Free a struct scsi_cmnd
+  * @shost: dev->host
+  * @cmd: Command to free
+- * @dev: parent scsi device
+  */
+-void __scsi_put_command(struct Scsi_Host *shost, struct scsi_cmnd *cmd,
+-   struct device *dev)
++void __scsi_put_command(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
+ {
+  unsigned long flags;
+ 
+@@ -331,8 +321,6 @@ void __scsi_put_command(struct Scsi_Host *shost, struct scsi_cmnd *cmd,
+ 
+  if (likely(cmd != NULL))
+   scsi_pool_free_command(shost->cmd_pool, cmd);
+-
+- put_device(dev);
+ }
+ EXPORT_SYMBOL(__scsi_put_command);
+ 
+@@ -346,7 +334,6 @@ EXPORT_SYMBOL(__scsi_put_command);
+  */
+ void scsi_put_command(struct scsi_cmnd *cmd)
+ {
+- struct scsi_device *sdev = cmd->device;
+  unsigned long flags;
+ 
+  /* serious error if the command hasn't come from a device list */
+@@ -357,7 +344,7 @@ void scsi_put_command(struct scsi_cmnd *cmd)
+ 
+  cancel_delayed_work(&cmd->abort_work);
+ 
+- __scsi_put_command(cmd->device->host, cmd, &sdev->sdev_gendev);
++ __scsi_put_command(cmd->device->host, cmd);
+ }
+ EXPORT_SYMBOL(scsi_put_command);
+ 
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index 799cfe5..907bd22 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -2301,6 +2301,11 @@ scsi_reset_provider(struct scsi_device *dev, int flag)
+  if (scsi_autopm_get_host(shost) < 0)
+   return FAILED;
+ 
++ if (!get_device(&dev->sdev_gendev)) {
++  rtn = FAILED;
++  goto out_put_autopm_host;
++ }
++
+  scmd = scsi_get_command(dev, GFP_KERNEL);
+  if (!scmd) {
+   rtn = FAILED;
+@@ -2364,6 +2369,7 @@ scsi_reset_provider(struct scsi_device *dev, int flag)
+  scsi_run_host_queues(shost);
+ 
+  scsi_next_command(scmd);
++out_put_autopm_host:
+  scsi_autopm_put_host(shost);
+  return rtn;
+ }
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index e208721..92b5d8d 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -117,6 +117,7 @@ static void scsi_unprep_request(struct request *req)
+  req->special = NULL;
+ 
+  scsi_put_command(cmd);
++ put_device(&cmd->device->sdev_gendev);
+ }
+ 
+ /**
+@@ -552,6 +553,7 @@ void scsi_next_command(struct scsi_cmnd *cmd)
+  get_device(&sdev->sdev_gendev);
+ 
+  scsi_put_command(cmd);
++ put_device(&sdev->sdev_gendev);
+  scsi_run_queue(q);
+ 
+  /* ok to remove device now */
+@@ -1146,6 +1148,7 @@ err_exit:
+  scsi_release_buffers(cmd);
+  cmd->request->special = NULL;
+  scsi_put_command(cmd);
++ put_device(&cmd->device->sdev_gendev);
+  return error;
+ }
+ EXPORT_SYMBOL(scsi_init_io);
+@@ -1156,9 +1159,15 @@ static struct scsi_cmnd *scsi_get_cmd_from_req(struct scsi_device *sdev,
+  struct scsi_cmnd *cmd;
+ 
+  if (!req->special) {
++  /* Bail if we can't get a reference to the device */
++  if (!get_device(&sdev->sdev_gendev))
++   return NULL;
++
+   cmd = scsi_get_command(sdev, GFP_ATOMIC);
+-  if (unlikely(!cmd))
++  if (unlikely(!cmd)) {
++   put_device(&sdev->sdev_gendev);
+    return NULL;
++  }
+   req->special = cmd;
+  } else {
+   cmd = req->special;
+@@ -1321,6 +1330,7 @@ int scsi_prep_return(struct request_queue *q, struct request *req, int ret)
+    struct scsi_cmnd *cmd = req->special;
+    scsi_release_buffers(cmd);
+    scsi_put_command(cmd);
++   put_device(&cmd->device->sdev_gendev);
+    req->special = NULL;
+   }
+   break;
+diff --git a/drivers/scsi/scsi_tgt_lib.c b/drivers/scsi/scsi_tgt_lib.c
+index 84a1fdf..e51add0 100644
+--- a/drivers/scsi/scsi_tgt_lib.c
++++ b/drivers/scsi/scsi_tgt_lib.c
+@@ -155,7 +155,8 @@ void scsi_host_put_command(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
+  __blk_put_request(q, rq);
+  spin_unlock_irqrestore(q->queue_lock, flags);
+ 
+- __scsi_put_command(shost, cmd, &shost->shost_gendev);
++ __scsi_put_command(shost, cmd);
++ put_device(&shost->shost_gendev);
+ }
+ EXPORT_SYMBOL_GPL(scsi_host_put_command);
+ 
+diff --git a/include/scsi/scsi_cmnd.h b/include/scsi/scsi_cmnd.h
+index 82cc531..ef144a5 100644
+--- a/include/scsi/scsi_cmnd.h
++++ b/include/scsi/scsi_cmnd.h
+@@ -153,8 +153,7 @@ static inline struct scsi_driver *scsi_cmd_to_driver(struct scsi_cmnd *cmd)
+ extern struct scsi_cmnd *scsi_get_command(struct scsi_device *, gfp_t);
+ extern struct scsi_cmnd *__scsi_get_command(struct Scsi_Host *, gfp_t);
+ extern void scsi_put_command(struct scsi_cmnd *);
+-extern void __scsi_put_command(struct Scsi_Host *, struct scsi_cmnd *,
+-          struct device *);
++extern void __scsi_put_command(struct Scsi_Host *, struct scsi_cmnd *);
+ extern void scsi_finish_command(struct scsi_cmnd *cmd);
+ 
+ extern void *scsi_kmap_atomic_sg(struct scatterlist *sg, int sg_count,
+-- 
+1.7.1

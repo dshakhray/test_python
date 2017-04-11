@@ -1,0 +1,140 @@
+From 3ceffe82b6266bb9a3836b213a5538a3c54c94b0 Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Wed, 23 Jul 2014 10:50:00 -0400
+Subject: [virt] virtio_ccw: fix vcdev pointer handling issues
+
+Message-id: <1406112611-9862-13-git-send-email-brueckner@redhat.com>
+Patchwork-id: 86322
+O-Subject: [RHEL7.1 PATCH 12/23] [s390] virtio_ccw: fix vcdev pointer handling issues
+Bugzilla: 1088554
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Description
+-----------
+commit 2e0210432d34bc7f01644905c2bb2d5d9be5b6ac
+Author: Heinz Graalfs <graalfs@linux.vnet.ibm.com>
+Commit: Christian Borntraeger <borntraeger@de.ibm.com>
+
+    virtio_ccw: fix vcdev pointer handling issues
+
+    The interrupt handler virtio_ccw_int_handler() using the vcdev pointer
+    is protected by the ccw_device lock. Resetting the pointer within the
+    ccw_device structure should be done when holding this lock.
+
+    Also resetting the vcdev pointer (under the ccw_device lock) prior to
+    freeing the vcdev pointer memory removes a critical path.
+
+    Signed-off-by: Heinz Graalfs <graalfs@linux.vnet.ibm.com>
+    Acked-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+    Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+
+Bugzilla
+--------
+BZ 1088554
+https://bugzilla.redhat.com/show_bug.cgi?id=1088554
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version v3.15-rc1
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=2e0210432d34bc7f01644905c2bb2d5d9be5b6ac
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7725759
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/s390/kvm/virtio_ccw.c b/drivers/s390/kvm/virtio_ccw.c
+index 0fc5848..413c630 100644
+--- a/drivers/s390/kvm/virtio_ccw.c
++++ b/drivers/s390/kvm/virtio_ccw.c
+@@ -636,6 +636,8 @@ static void virtio_ccw_int_handler(struct ccw_device *cdev,
+  struct virtqueue *vq;
+  struct virtio_driver *drv;
+ 
++ if (!vcdev)
++  return;
+  /* Check if it's a notification from the host. */
+  if ((intparm == 0) &&
+      (scsw_stctl(&irb->scsw) ==
+@@ -734,23 +736,37 @@ static int virtio_ccw_probe(struct ccw_device *cdev)
+  return 0;
+ }
+ 
++static struct virtio_ccw_device *virtio_grab_drvdata(struct ccw_device *cdev)
++{
++ unsigned long flags;
++ struct virtio_ccw_device *vcdev;
++
++ spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
++ vcdev = dev_get_drvdata(&cdev->dev);
++ if (!vcdev) {
++  spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
++  return NULL;
++ }
++ dev_set_drvdata(&cdev->dev, NULL);
++ spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
++ return vcdev;
++}
++
+ static void virtio_ccw_remove(struct ccw_device *cdev)
+ {
+- struct virtio_ccw_device *vcdev = dev_get_drvdata(&cdev->dev);
++ struct virtio_ccw_device *vcdev = virtio_grab_drvdata(cdev);
+ 
+- if (cdev->online) {
++ if (vcdev && cdev->online)
+   unregister_virtio_device(&vcdev->vdev);
+-  dev_set_drvdata(&cdev->dev, NULL);
+- }
+  cdev->handler = NULL;
+ }
+ 
+ static int virtio_ccw_offline(struct ccw_device *cdev)
+ {
+- struct virtio_ccw_device *vcdev = dev_get_drvdata(&cdev->dev);
++ struct virtio_ccw_device *vcdev = virtio_grab_drvdata(cdev);
+ 
+- unregister_virtio_device(&vcdev->vdev);
+- dev_set_drvdata(&cdev->dev, NULL);
++ if (vcdev)
++  unregister_virtio_device(&vcdev->vdev);
+  return 0;
+ }
+ 
+@@ -759,6 +775,7 @@ static int virtio_ccw_online(struct ccw_device *cdev)
+ {
+  int ret;
+  struct virtio_ccw_device *vcdev;
++ unsigned long flags;
+ 
+  vcdev = kzalloc(sizeof(*vcdev), GFP_KERNEL);
+  if (!vcdev) {
+@@ -786,7 +803,9 @@ static int virtio_ccw_online(struct ccw_device *cdev)
+  INIT_LIST_HEAD(&vcdev->virtqueues);
+  spin_lock_init(&vcdev->lock);
+ 
++ spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
+  dev_set_drvdata(&cdev->dev, vcdev);
++ spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
+  vcdev->vdev.id.vendor = cdev->id.cu_type;
+  vcdev->vdev.id.device = cdev->id.cu_model;
+  ret = register_virtio_device(&vcdev->vdev);
+@@ -797,7 +816,9 @@ static int virtio_ccw_online(struct ccw_device *cdev)
+  }
+  return 0;
+ out_put:
++ spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
+  dev_set_drvdata(&cdev->dev, NULL);
++ spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
+  put_device(&vcdev->vdev.dev);
+  return ret;
+ out_free:
+-- 
+1.7.1

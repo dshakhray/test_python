@@ -1,0 +1,354 @@
+From 50bd91c4aa102cdbe2e6304c97ab41ef539e38ad Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Mon, 18 Aug 2014 19:56:28 -0400
+Subject: [scsi] qla2xxx: Add IOCB Abort command asynchronous handling
+
+Message-id: <1408391817-6389-41-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 87936
+O-Subject: [PATCH RHEL 7.1 e-stor 40/69] qla2xxx: Add IOCB Abort command asynchronous handling.
+Bugzilla: 1089346
+RH-Acked-by: Rob Evers <revers@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Armen Baloyan <armen.baloyan@qlogic.com>
+
+scsi commit id 4440e46d5db7b445a961a84444849b2a31fa7fd1
+
+Send aborts to the firmware via the request/response queue mechanism.
+
+Signed-off-by: Armen Baloyan <armen.baloyan@qlogic.com>
+Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index 2a16009..34782f9 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -327,6 +327,7 @@ qla24xx_get_isp_stats(scsi_qla_host_t *, struct link_statistics *,
+     dma_addr_t);
+ 
+ extern int qla24xx_abort_command(srb_t *);
++extern int qla24xx_async_abort_command(srb_t *);
+ extern int
+ qla24xx_abort_target(struct fc_port *, unsigned int, int);
+ extern int
+@@ -594,7 +595,6 @@ extern char *qlafx00_fw_version_str(struct scsi_qla_host *, char *);
+ extern irqreturn_t qlafx00_intr_handler(int, void *);
+ extern void qlafx00_enable_intrs(struct qla_hw_data *);
+ extern void qlafx00_disable_intrs(struct qla_hw_data *);
+-extern int qlafx00_abort_command(srb_t *);
+ extern int qlafx00_abort_target(fc_port_t *, unsigned int, int);
+ extern int qlafx00_lun_reset(fc_port_t *, unsigned int, int);
+ extern int qlafx00_start_scsi(srb_t *);
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index d29b122..3090bdd 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -347,6 +347,94 @@ done:
+  return rval;
+ }
+ 
++static void
++qla24xx_abort_iocb_timeout(void *data)
++{
++ srb_t *sp = (srb_t *)data;
++ struct srb_iocb *abt = &sp->u.iocb_cmd;
++
++ abt->u.abt.comp_status = CS_TIMEOUT;
++ complete(&abt->u.abt.comp);
++}
++
++static void
++qla24xx_abort_sp_done(void *data, void *ptr, int res)
++{
++ srb_t *sp = (srb_t *)ptr;
++ struct srb_iocb *abt = &sp->u.iocb_cmd;
++
++ complete(&abt->u.abt.comp);
++}
++
++static int
++qla24xx_async_abort_cmd(srb_t *cmd_sp)
++{
++ scsi_qla_host_t *vha = cmd_sp->fcport->vha;
++ fc_port_t *fcport = cmd_sp->fcport;
++ struct srb_iocb *abt_iocb;
++ srb_t *sp;
++ int rval = QLA_FUNCTION_FAILED;
++
++ sp = qla2x00_get_sp(vha, fcport, GFP_KERNEL);
++ if (!sp)
++  goto done;
++
++ abt_iocb = &sp->u.iocb_cmd;
++ sp->type = SRB_ABT_CMD;
++ sp->name = "abort";
++ qla2x00_init_timer(sp, qla2x00_get_async_timeout(vha));
++ abt_iocb->u.abt.cmd_hndl = cmd_sp->handle;
++ sp->done = qla24xx_abort_sp_done;
++ abt_iocb->timeout = qla24xx_abort_iocb_timeout;
++ init_completion(&abt_iocb->u.abt.comp);
++
++ rval = qla2x00_start_sp(sp);
++ if (rval != QLA_SUCCESS)
++  goto done_free_sp;
++
++ ql_dbg(ql_dbg_async, vha, 0x507c,
++     "Abort command issued - hdl=%x, target_id=%x\n",
++     cmd_sp->handle, fcport->tgt_id);
++
++ wait_for_completion(&abt_iocb->u.abt.comp);
++
++ rval = abt_iocb->u.abt.comp_status == CS_COMPLETE ?
++     QLA_SUCCESS : QLA_FUNCTION_FAILED;
++
++done_free_sp:
++ sp->free(vha, sp);
++done:
++ return rval;
++}
++
++int
++qla24xx_async_abort_command(srb_t *sp)
++{
++ unsigned long   flags = 0;
++
++ uint32_t handle;
++ fc_port_t *fcport = sp->fcport;
++ struct scsi_qla_host *vha = fcport->vha;
++ struct qla_hw_data *ha = vha->hw;
++ struct req_que *req = vha->req;
++
++ spin_lock_irqsave(&ha->hardware_lock, flags);
++ for (handle = 1; handle < req->num_outstanding_cmds; handle++) {
++  if (req->outstanding_cmds[handle] == sp)
++   break;
++ }
++ spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ if (handle == req->num_outstanding_cmds) {
++  /* Command not found. */
++  return QLA_FUNCTION_FAILED;
++ }
++ if (sp->type == SRB_FXIOCB_DCMD)
++  return qlafx00_fx_disc(vha, &vha->hw->mr.fcport,
++      FXDISC_ABORT_IOCTL);
++
++ return qla24xx_async_abort_cmd(sp);
++}
++
+ void
+ qla2x00_async_login_done(struct scsi_qla_host *vha, fc_port_t *fcport,
+     uint16_t *data)
+diff --git a/drivers/scsi/qla2xxx/qla_iocb.c b/drivers/scsi/qla2xxx/qla_iocb.c
+index 7c75766..102d7ba 100644
+--- a/drivers/scsi/qla2xxx/qla_iocb.c
++++ b/drivers/scsi/qla2xxx/qla_iocb.c
+@@ -2585,6 +2585,29 @@ queuing_error:
+  return QLA_FUNCTION_FAILED;
+ }
+ 
++void
++qla24xx_abort_iocb(srb_t *sp, struct abort_entry_24xx *abt_iocb)
++{
++ struct srb_iocb *aio = &sp->u.iocb_cmd;
++ scsi_qla_host_t *vha = sp->fcport->vha;
++ struct req_que *req = vha->req;
++
++ memset(abt_iocb, 0, sizeof(struct abort_entry_24xx));
++ abt_iocb->entry_type = ABORT_IOCB_TYPE;
++ abt_iocb->entry_count = 1;
++ abt_iocb->handle = cpu_to_le32(MAKE_HANDLE(req->id, sp->handle));
++ abt_iocb->nport_handle = cpu_to_le16(sp->fcport->loop_id);
++ abt_iocb->handle_to_abort =
++     cpu_to_le32(MAKE_HANDLE(req->id, aio->u.abt.cmd_hndl));
++ abt_iocb->port_id[0] = sp->fcport->d_id.b.al_pa;
++ abt_iocb->port_id[1] = sp->fcport->d_id.b.area;
++ abt_iocb->port_id[2] = sp->fcport->d_id.b.domain;
++ abt_iocb->vp_index = vha->vp_idx;
++ abt_iocb->req_que_no = cpu_to_le16(req->id);
++ /* Send the command to the firmware */
++ wmb();
++}
++
+ int
+ qla2x00_start_sp(srb_t *sp)
+ {
+@@ -2638,7 +2661,9 @@ qla2x00_start_sp(srb_t *sp)
+   qlafx00_fxdisc_iocb(sp, pkt);
+   break;
+  case SRB_ABT_CMD:
+-  qlafx00_abort_iocb(sp, pkt);
++  IS_QLAFX00(ha) ?
++   qlafx00_abort_iocb(sp, pkt) :
++   qla24xx_abort_iocb(sp, pkt);
+   break;
+  default:
+   break;
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index 72819c6..d49fff7 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -2398,6 +2398,23 @@ qla24xx_mbx_completion(scsi_qla_host_t *vha, uint16_t mb0)
+  }
+ }
+ 
++static void
++qla24xx_abort_iocb_entry(scsi_qla_host_t *vha, struct req_que *req,
++ struct abort_entry_24xx *pkt)
++{
++ const char func[] = "ABT_IOCB";
++ srb_t *sp;
++ struct srb_iocb *abt;
++
++ sp = qla2x00_get_sp_from_handle(vha, func, req, pkt);
++ if (!sp)
++  return;
++
++ abt = &sp->u.iocb_cmd;
++ abt->u.abt.comp_status = le32_to_cpu(pkt->nport_handle);
++ sp->done(vha, sp, 0);
++}
++
+ /**
+  * qla24xx_process_response_queue() - Process response queue entries.
+  * @ha: SCSI driver HA context
+@@ -2466,6 +2483,10 @@ void qla24xx_process_response_queue(struct scsi_qla_host *vha,
+     * from falling into default case
+     */
+    break;
++  case ABORT_IOCB_TYPE:
++   qla24xx_abort_iocb_entry(vha, rsp->req,
++       (struct abort_entry_24xx *)pkt);
++   break;
+   default:
+    /* Type Not Supported. */
+    ql_dbg(ql_dbg_async, vha, 0x5042,
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index 8cc2f1e..05ddd66 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -2590,6 +2590,9 @@ qla24xx_abort_command(srb_t *sp)
+  ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x108c,
+      "Entered %s.\n", __func__);
+ 
++ if (ql2xasynctmfenable)
++  return qla24xx_async_abort_command(sp);
++
+  spin_lock_irqsave(&ha->hardware_lock, flags);
+  for (handle = 1; handle < req->num_outstanding_cmds; handle++) {
+   if (req->outstanding_cmds[handle] == sp)
+diff --git a/drivers/scsi/qla2xxx/qla_mr.c b/drivers/scsi/qla2xxx/qla_mr.c
+index 5504bed..84c038e 100644
+--- a/drivers/scsi/qla2xxx/qla_mr.c
++++ b/drivers/scsi/qla2xxx/qla_mr.c
+@@ -1962,94 +1962,6 @@ done:
+  return rval;
+ }
+ 
+-static void
+-qlafx00_abort_iocb_timeout(void *data)
+-{
+- srb_t *sp = (srb_t *)data;
+- struct srb_iocb *abt = &sp->u.iocb_cmd;
+-
+- abt->u.abt.comp_status = cpu_to_le16((uint16_t)CS_TIMEOUT);
+- complete(&abt->u.abt.comp);
+-}
+-
+-static void
+-qlafx00_abort_sp_done(void *data, void *ptr, int res)
+-{
+- srb_t *sp = (srb_t *)ptr;
+- struct srb_iocb *abt = &sp->u.iocb_cmd;
+-
+- complete(&abt->u.abt.comp);
+-}
+-
+-static int
+-qlafx00_async_abt_cmd(srb_t *cmd_sp)
+-{
+- scsi_qla_host_t *vha = cmd_sp->fcport->vha;
+- fc_port_t *fcport = cmd_sp->fcport;
+- struct srb_iocb *abt_iocb;
+- srb_t *sp;
+- int rval = QLA_FUNCTION_FAILED;
+-
+- sp = qla2x00_get_sp(vha, fcport, GFP_KERNEL);
+- if (!sp)
+-  goto done;
+-
+- abt_iocb = &sp->u.iocb_cmd;
+- sp->type = SRB_ABT_CMD;
+- sp->name = "abort";
+- qla2x00_init_timer(sp, FXDISC_TIMEOUT);
+- abt_iocb->u.abt.cmd_hndl = cmd_sp->handle;
+- sp->done = qlafx00_abort_sp_done;
+- abt_iocb->timeout = qlafx00_abort_iocb_timeout;
+- init_completion(&abt_iocb->u.abt.comp);
+-
+- rval = qla2x00_start_sp(sp);
+- if (rval != QLA_SUCCESS)
+-  goto done_free_sp;
+-
+- ql_dbg(ql_dbg_async, vha, 0x507c,
+-     "Abort command issued - hdl=%x, target_id=%x\n",
+-     cmd_sp->handle, fcport->tgt_id);
+-
+- wait_for_completion(&abt_iocb->u.abt.comp);
+-
+- rval = abt_iocb->u.abt.comp_status == CS_COMPLETE ?
+-     QLA_SUCCESS : QLA_FUNCTION_FAILED;
+-
+-done_free_sp:
+- sp->free(vha, sp);
+-done:
+- return rval;
+-}
+-
+-int
+-qlafx00_abort_command(srb_t *sp)
+-{
+- unsigned long   flags = 0;
+-
+- uint32_t handle;
+- fc_port_t *fcport = sp->fcport;
+- struct scsi_qla_host *vha = fcport->vha;
+- struct qla_hw_data *ha = vha->hw;
+- struct req_que *req = vha->req;
+-
+- spin_lock_irqsave(&ha->hardware_lock, flags);
+- for (handle = 1; handle < DEFAULT_OUTSTANDING_COMMANDS; handle++) {
+-  if (req->outstanding_cmds[handle] == sp)
+-   break;
+- }
+- spin_unlock_irqrestore(&ha->hardware_lock, flags);
+- if (handle == DEFAULT_OUTSTANDING_COMMANDS) {
+-  /* Command not found. */
+-  return QLA_FUNCTION_FAILED;
+- }
+- if (sp->type == SRB_FXIOCB_DCMD)
+-  return qlafx00_fx_disc(vha, &vha->hw->mr.fcport,
+-      FXDISC_ABORT_IOCTL);
+-
+- return qlafx00_async_abt_cmd(sp);
+-}
+-
+ /*
+  * qlafx00_initialize_adapter
+  *      Initialize board.
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 6892af1..243bb96 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -2094,7 +2094,7 @@ static struct isp_operations qlafx00_isp_ops = {
+  .intr_handler  = qlafx00_intr_handler,
+  .enable_intrs  = qlafx00_enable_intrs,
+  .disable_intrs  = qlafx00_disable_intrs,
+- .abort_command  = qlafx00_abort_command,
++ .abort_command  = qla24xx_async_abort_command,
+  .target_reset  = qlafx00_abort_target,
+  .lun_reset  = qlafx00_lun_reset,
+  .fabric_login  = NULL,
+-- 
+1.7.1

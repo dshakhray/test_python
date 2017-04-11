@@ -1,0 +1,132 @@
+From 8ae69cb1e8237646b86d058175ab26eb2ae6508b Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:36:02 -0400
+Subject: [block] blk-mq: allow the hctx cpu hotplug notifier to return errors
+
+Message-id: <1402670238-13916-75-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83818
+O-Subject: [RHEL7.1 PATCH 074/150] blk-mq: allow the hctx cpu hotplug notifier to return errors
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit e814e71ba4a6e1d7509b0f4b1928365ea650cace
+Author: Jens Axboe <axboe@fb.com>
+Date:   Wed May 21 13:59:08 2014 -0600
+
+    blk-mq: allow the hctx cpu hotplug notifier to return errors
+
+    Prepare this for the next patch which adds more smarts in the
+    plugging logic, so that we can save some memory.
+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq-cpu.c b/block/blk-mq-cpu.c
+index 136ef86..d2c253f 100644
+--- a/block/blk-mq-cpu.c
++++ b/block/blk-mq-cpu.c
+@@ -18,14 +18,18 @@ static int blk_mq_main_cpu_notify(struct notifier_block *self,
+ {
+  unsigned int cpu = (unsigned long) hcpu;
+  struct blk_mq_cpu_notifier *notify;
++ int ret = NOTIFY_OK;
+ 
+  raw_spin_lock(&blk_mq_cpu_notify_lock);
+ 
+- list_for_each_entry(notify, &blk_mq_cpu_notify_list, list)
+-  notify->notify(notify->data, action, cpu);
++ list_for_each_entry(notify, &blk_mq_cpu_notify_list, list) {
++  ret = notify->notify(notify->data, action, cpu);
++  if (ret != NOTIFY_OK)
++   break;
++ }
+ 
+  raw_spin_unlock(&blk_mq_cpu_notify_lock);
+- return NOTIFY_OK;
++ return ret;
+ }
+ 
+ void blk_mq_register_cpu_notifier(struct blk_mq_cpu_notifier *notifier)
+@@ -45,7 +49,7 @@ void blk_mq_unregister_cpu_notifier(struct blk_mq_cpu_notifier *notifier)
+ }
+ 
+ void blk_mq_init_cpu_notifier(struct blk_mq_cpu_notifier *notifier,
+-         void (*fn)(void *, unsigned long, unsigned int),
++         int (*fn)(void *, unsigned long, unsigned int),
+          void *data)
+ {
+  notifier->notify = fn;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index ef7ed5e..5a3683f 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1196,8 +1196,8 @@ void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *hctx,
+ }
+ EXPORT_SYMBOL(blk_mq_free_single_hw_queue);
+ 
+-static void blk_mq_hctx_notify(void *data, unsigned long action,
+-          unsigned int cpu)
++static int blk_mq_hctx_notify(void *data, unsigned long action,
++         unsigned int cpu)
+ {
+  struct blk_mq_hw_ctx *hctx = data;
+  struct request_queue *q = hctx->queue;
+@@ -1205,7 +1205,7 @@ static void blk_mq_hctx_notify(void *data, unsigned long action,
+  LIST_HEAD(tmp);
+ 
+  if (action != CPU_DEAD && action != CPU_DEAD_FROZEN)
+-  return;
++  return NOTIFY_OK;
+ 
+  /*
+   * Move ctx entries to new CPU, if this one is going away.
+@@ -1220,7 +1220,7 @@ static void blk_mq_hctx_notify(void *data, unsigned long action,
+  spin_unlock(&ctx->lock);
+ 
+  if (list_empty(&tmp))
+-  return;
++  return NOTIFY_OK;
+ 
+  ctx = blk_mq_get_ctx(q);
+  spin_lock(&ctx->lock);
+@@ -1240,6 +1240,7 @@ static void blk_mq_hctx_notify(void *data, unsigned long action,
+ 
+  blk_mq_run_hw_queue(hctx, true);
+  blk_mq_put_ctx(ctx);
++ return NOTIFY_OK;
+ }
+ 
+ static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 7db4fe4..491dbd4 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -39,7 +39,7 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+  */
+ struct blk_mq_cpu_notifier;
+ void blk_mq_init_cpu_notifier(struct blk_mq_cpu_notifier *notifier,
+-         void (*fn)(void *, unsigned long, unsigned int),
++         int (*fn)(void *, unsigned long, unsigned int),
+          void *data);
+ void blk_mq_register_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ void blk_mq_unregister_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index dff8efc..27ad889 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -8,7 +8,7 @@ struct blk_mq_tags;
+ struct blk_mq_cpu_notifier {
+  struct list_head list;
+  void *data;
+- void (*notify)(void *data, unsigned long action, unsigned int cpu);
++ int (*notify)(void *data, unsigned long action, unsigned int cpu);
+ };
+ 
+ struct blk_mq_ctxmap {
+-- 
+1.7.1

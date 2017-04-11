@@ -1,0 +1,218 @@
+From 551c7b3678e71d9e3fe8574fc54fc0c7c0d0e30b Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:24:47 -0400
+Subject: [tools] perf: Add possibility to specify mmap size
+
+Message-id: <1408462094-14194-119-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88142
+O-Subject: [PATCH RHEL7.1 BZ1131394 118/325] perf tools: Add possibility to specify mmap size
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 27050f530dc4fd88dc93d85c177e000efe970d12
+Author: Jiri Olsa <jolsa@redhat.com>
+Date: Sun Sep 1 12:36:13 2013 +0200
+
+description
+===========
+Adding possibility to specify mmap size via -m/--mmap-pages
+by appending unit size character (B/K/M/G) to the
+number, like:
+  $ perf record -m 8K ls
+  $ perf record -m 2M ls
+
+The size is rounded up appropriately to follow perf
+mmap restrictions.
+
+If no unit is specified the number provides pages as
+of now, like:
+  $ perf record -m 8 ls
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/Documentation/perf-kvm.txt b/tools/perf/Documentation/perf-kvm.txt
+index ac84db2..6a06cef 100644
+--- a/tools/perf/Documentation/perf-kvm.txt
++++ b/tools/perf/Documentation/perf-kvm.txt
+@@ -109,7 +109,9 @@ STAT LIVE OPTIONS
+ 
+ -m::
+ --mmap-pages=::
+-    Number of mmap data pages. Must be a power of two.
++    Number of mmap data pages (must be a power of two) or size
++    specification with appended unit character - B/K/M/G. The
++    size is rounded up to have nearest pages power of two value.
+ 
+ -a::
+ --all-cpus::
+diff --git a/tools/perf/Documentation/perf-record.txt b/tools/perf/Documentation/perf-record.txt
+index c096eaf..052f7c4 100644
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@ -87,7 +87,9 @@ OPTIONS
+ 
+ -m::
+ --mmap-pages=::
+- Number of mmap data pages. Must be a power of two.
++ Number of mmap data pages (must be a power of two) or size
++ specification with appended unit character - B/K/M/G. The
++ size is rounded up to have nearest pages power of two value.
+ 
+ -g::
+  Enables call-graph (stack chain/backtrace) recording.
+diff --git a/tools/perf/Documentation/perf-top.txt b/tools/perf/Documentation/perf-top.txt
+index d159740..92e152d 100644
+--- a/tools/perf/Documentation/perf-top.txt
++++ b/tools/perf/Documentation/perf-top.txt
+@@ -68,7 +68,9 @@ Default is to monitor all CPUS.
+ 
+ -m <pages>::
+ --mmap-pages=<pages>::
+- Number of mmapped data pages.
++ Number of mmap data pages (must be a power of two) or size
++ specification with appended unit character - B/K/M/G. The
++ size is rounded up to have nearest pages power of two value.
+ 
+ -p <pid>::
+ --pid=<pid>::
+diff --git a/tools/perf/Documentation/perf-trace.txt b/tools/perf/Documentation/perf-trace.txt
+index 3777385..7f70d36 100644
+--- a/tools/perf/Documentation/perf-trace.txt
++++ b/tools/perf/Documentation/perf-trace.txt
+@@ -59,7 +59,9 @@ OPTIONS
+ 
+ -m::
+ --mmap-pages=::
+- Number of mmap data pages. Must be a power of two.
++ Number of mmap data pages (must be a power of two) or size
++ specification with appended unit character - B/K/M/G. The
++ size is rounded up to have nearest pages power of two value.
+ 
+ -C::
+ --cpu::
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index 97b151f..a7952af 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -694,14 +694,33 @@ static size_t perf_evlist__mmap_size(unsigned long pages)
+ int perf_evlist__parse_mmap_pages(const struct option *opt, const char *str,
+       int unset __maybe_unused)
+ {
+- unsigned int pages, *mmap_pages = opt->value;
++ unsigned int pages, val, *mmap_pages = opt->value;
+  size_t size;
+- char *eptr;
++ static struct parse_tag tags[] = {
++  { .tag  = 'B', .mult = 1       },
++  { .tag  = 'K', .mult = 1 << 10 },
++  { .tag  = 'M', .mult = 1 << 20 },
++  { .tag  = 'G', .mult = 1 << 30 },
++  { .tag  = 0 },
++ };
+ 
+- pages = strtoul(str, &eptr, 10);
+- if (*eptr != '\0') {
+-  pr_err("failed to parse --mmap_pages/-m value\n");
+-  return -1;
++ val = parse_tag_value(str, tags);
++ if (val != (unsigned int) -1) {
++  /* we got file size value */
++  pages = PERF_ALIGN(val, page_size) / page_size;
++  if (!is_power_of_2(pages)) {
++   pages = next_pow2(pages);
++   pr_info("rounding mmap pages size to %u (%u pages)\n",
++    pages * page_size, pages);
++  }
++ } else {
++  /* we got pages count value */
++  char *eptr;
++  pages = strtoul(str, &eptr, 10);
++  if (*eptr != '\0') {
++   pr_err("failed to parse --mmap_pages/-m value\n");
++   return -1;
++  }
+  }
+ 
+  size = perf_evlist__mmap_size(pages);
+@@ -745,6 +764,7 @@ int perf_evlist__mmap(struct perf_evlist *evlist, unsigned int pages,
+ 
+  evlist->overwrite = overwrite;
+  evlist->mmap_len = perf_evlist__mmap_size(pages);
++ pr_debug("mmap size %luB\n", evlist->mmap_len);
+  mask = evlist->mmap_len - page_size - 1;
+ 
+  list_for_each_entry(evsel, &evlist->entries, node) {
+diff --git a/tools/perf/util/util.c b/tools/perf/util/util.c
+index ccfdeb6..ab71d62 100644
+--- a/tools/perf/util/util.c
++++ b/tools/perf/util/util.c
+@@ -361,3 +361,28 @@ int parse_nsec_time(const char *str, u64 *ptime)
+  *ptime = time_sec * NSEC_PER_SEC + time_nsec;
+  return 0;
+ }
++
++unsigned long parse_tag_value(const char *str, struct parse_tag *tags)
++{
++ struct parse_tag *i = tags;
++
++ while (i->tag) {
++  char *s;
++
++  s = strchr(str, i->tag);
++  if (s) {
++   unsigned long int value;
++   char *endptr;
++
++   value = strtoul(str, &endptr, 10);
++   if (s != endptr)
++    break;
++
++   value *= i->mult;
++   return value;
++  }
++  i++;
++ }
++
++ return (unsigned long) -1;
++}
+diff --git a/tools/perf/util/util.h b/tools/perf/util/util.h
+index a535359..c29ecaa 100644
+--- a/tools/perf/util/util.h
++++ b/tools/perf/util/util.h
+@@ -270,6 +270,13 @@ bool is_power_of_2(unsigned long n)
+  return (n != 0 && ((n & (n - 1)) == 0));
+ }
+ 
++static inline unsigned next_pow2(unsigned x)
++{
++ if (!x)
++  return 1;
++ return 1ULL << (32 - __builtin_clz(x - 1));
++}
++
+ size_t hex_width(u64 v);
+ int hex2u64(const char *ptr, u64 *val);
+ 
+@@ -281,4 +288,11 @@ void dump_stack(void);
+ extern unsigned int page_size;
+ 
+ void get_term_dimensions(struct winsize *ws);
++
++struct parse_tag {
++ char tag;
++ int mult;
++};
++
++unsigned long parse_tag_value(const char *str, struct parse_tag *tags);
+ #endif /* GIT_COMPAT_UTIL_H */
+-- 
+1.7.1

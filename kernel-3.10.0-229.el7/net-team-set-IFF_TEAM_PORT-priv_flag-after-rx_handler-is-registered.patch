@@ -1,0 +1,148 @@
+From e62f947a6b946f62de55bfd3ea727f63f1fc93db Mon Sep 17 00:00:00 2001
+From: Jiri Pirko <jpirko@redhat.com>
+Date: Tue, 26 Aug 2014 11:31:35 -0400
+Subject: [net] team: set IFF_TEAM_PORT priv_flag after rx_handler is registered
+
+Message-id: <1409052695-4919-1-git-send-email-jpirko@redhat.com>
+Patchwork-id: 89075
+O-Subject: [patch rhel7 net] team: set IFF_TEAM_PORT priv_flag after rx_handler is registered
+Bugzilla: 1132943
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+
+BZ1132943
+https://brewweb.devel.redhat.com/taskinfo?taskID=7879326
+tested on my testing kvm guest
+
+upstream commit d7d3c05135f37d8fdf73f9966d27155cada36e56
+Author: Jiri Pirko <jiri@resnulli.us>
+Date:   Mon Aug 25 21:38:27 2014 +0200
+
+    team: set IFF_TEAM_PORT priv_flag after rx_handler is registered
+
+    When one tries to add eth as a port into team and that eth is already in
+    use by other rx_handler device (macvlan, bond, bridge, ...) a bug in
+    team_port_add() causes that IFF_TEAM_PORT flag is set before rx_handler
+    is registered. In between, netdev nofifier is called and
+    team_device_event() sees IFF_TEAM_PORT and thinks that rx_handler_data
+    pointer is set to team_port. But it isn't.
+
+    Fix this by reordering rx_handler register and IFF_TEAM_PORT priv flag
+    set so it is very similar to how bonding does this.
+
+Signed-off-by: Jiri Pirko <jpirko@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index dbdae73..b69a91a 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -1003,7 +1003,6 @@ static int team_port_enter(struct team *team, struct team_port *port)
+  int err = 0;
+ 
+  dev_hold(team->dev);
+- port->dev->priv_flags |= IFF_TEAM_PORT;
+  if (team->ops.port_enter) {
+   err = team->ops.port_enter(team, port);
+   if (err) {
+@@ -1016,7 +1015,6 @@ static int team_port_enter(struct team *team, struct team_port *port)
+  return 0;
+ 
+ err_port_enter:
+- port->dev->priv_flags &= ~IFF_TEAM_PORT;
+  dev_put(team->dev);
+ 
+  return err;
+@@ -1026,7 +1024,6 @@ static void team_port_leave(struct team *team, struct team_port *port)
+ {
+  if (team->ops.port_leave)
+   team->ops.port_leave(team, port);
+- port->dev->priv_flags &= ~IFF_TEAM_PORT;
+  dev_put(team->dev);
+ }
+ 
+@@ -1084,6 +1081,25 @@ static struct netpoll_info *team_netpoll_info(struct team *team)
+ }
+ #endif
+ 
++static int team_upper_dev_link(struct net_device *dev,
++          struct net_device *port_dev)
++{
++ int err;
++
++ err = netdev_master_upper_dev_link(port_dev, dev);
++ if (err)
++  return err;
++ port_dev->priv_flags |= IFF_TEAM_PORT;
++ return 0;
++}
++
++static void team_upper_dev_unlink(struct net_device *dev,
++      struct net_device *port_dev)
++{
++ netdev_upper_dev_unlink(port_dev, dev);
++ port_dev->priv_flags &= ~IFF_TEAM_PORT;
++}
++
+ static void __team_port_change_port_added(struct team_port *port, bool linkup);
+ static int team_dev_type_check_change(struct net_device *dev,
+           struct net_device *port_dev);
+@@ -1172,13 +1188,6 @@ static int team_port_add(struct team *team, struct net_device *port_dev)
+   }
+  }
+ 
+- err = netdev_master_upper_dev_link(port_dev, dev);
+- if (err) {
+-  netdev_err(dev, "Device %s failed to set upper link\n",
+-      portname);
+-  goto err_set_upper_link;
+- }
+-
+  err = netdev_rx_handler_register(port_dev, team_handle_frame,
+       port);
+  if (err) {
+@@ -1187,6 +1196,13 @@ static int team_port_add(struct team *team, struct net_device *port_dev)
+   goto err_handler_register;
+  }
+ 
++ err = team_upper_dev_link(dev, port_dev);
++ if (err) {
++  netdev_err(dev, "Device %s failed to set upper link\n",
++      portname);
++  goto err_set_upper_link;
++ }
++
+  err = __team_option_inst_add_port(team, port);
+  if (err) {
+   netdev_err(dev, "Device %s failed to add per-port options\n",
+@@ -1206,12 +1222,12 @@ static int team_port_add(struct team *team, struct net_device *port_dev)
+  return 0;
+ 
+ err_option_port_add:
++ team_upper_dev_unlink(dev, port_dev);
++
++err_set_upper_link:
+  netdev_rx_handler_unregister(port_dev);
+ 
+ err_handler_register:
+- netdev_upper_dev_unlink(port_dev, dev);
+-
+-err_set_upper_link:
+  team_port_disable_netpoll(port);
+ 
+ err_enable_netpoll:
+@@ -1250,8 +1266,8 @@ static int team_port_del(struct team *team, struct net_device *port_dev)
+ 
+  team_port_disable(team, port);
+  list_del_rcu(&port->list);
++ team_upper_dev_unlink(dev, port_dev);
+  netdev_rx_handler_unregister(port_dev);
+- netdev_upper_dev_unlink(port_dev, dev);
+  team_port_disable_netpoll(port);
+  vlan_vids_del_by_dev(port_dev, dev);
+  dev_uc_unsync(port_dev, dev);
+-- 
+1.7.1

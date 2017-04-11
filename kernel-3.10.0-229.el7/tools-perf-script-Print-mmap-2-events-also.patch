@@ -1,0 +1,155 @@
+From f4fde6444853de1833fdb942ea89cb9bcb4ff688 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:48:55 -0400
+Subject: [tools] perf/script: Print mmap[2] events also
+
+Message-id: <1408953210-26343-48-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88757
+O-Subject: [PATCH RHEL7.1 BZ1133083 047/322] perf script: Print mmap[2] events also
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit ba1ddf42f3c3af111d3adee277534f73c1ef6a9b
+Author: Namhyung Kim <namhyung@kernel.org>
+Date: Tue Nov 26 17:54:26 2013 +0900
+
+description
+===========
+If --show-mmap-events option is given, also print internal MMAP and
+MMAP2 events.  It would be helpful for debugging.
+
+  $ perf script --show-mmap-events
+  ...
+           sleep  9486 [009] 3350640.335531: PERF_RECORD_MMAP 9486/9486: [0x400000(0x6000) @ 0]: x /usr/bin/sleep
+           sleep  9486 [009] 3350640.335542: PERF_RECORD_MMAP 9486/9486: [0x3153a00000(0x223000) @ 0]: x /usr/lib64/ld-2.17.so
+           sleep  9486 [009] 3350640.335553: PERF_RECORD_MMAP 9486/9486: [0x7fff8b5fe000(0x2000) @ 0x7fff8b5fe000]: x [vdso]
+           sleep  9486 [009] 3350640.335643: PERF_RECORD_MMAP 9486/9486: [0x3153e00000(0x3c0000) @ 0]: x /usr/lib64/libc-2.17.so
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/Documentation/perf-script.txt b/tools/perf/Documentation/perf-script.txt
+index 67af9b7..cfdbb1e 100644
+--- a/tools/perf/Documentation/perf-script.txt
++++ b/tools/perf/Documentation/perf-script.txt
+@@ -206,6 +206,9 @@ OPTIONS
+ --show-task-events
+  Display task related events (e.g. FORK, COMM, EXIT).
+ 
++--show-mmap-events
++ Display mmap related events (e.g. MMAP, MMAP2).
++
+ SEE ALSO
+ --------
+ linkperf:perf-record[1], linkperf:perf-script-perl[1],
+diff --git a/tools/perf/builtin-script.c b/tools/perf/builtin-script.c
+index e2b9aff..952dce9 100644
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@ -573,6 +573,7 @@ struct perf_script {
+  struct perf_tool tool;
+  struct perf_session *session;
+  bool   show_task_events;
++ bool   show_mmap_events;
+ };
+ 
+ static int process_attr(struct perf_tool *tool, union perf_event *event,
+@@ -698,6 +699,68 @@ static int process_exit_event(struct perf_tool *tool,
+  return 0;
+ }
+ 
++static int process_mmap_event(struct perf_tool *tool,
++         union perf_event *event,
++         struct perf_sample *sample,
++         struct machine *machine)
++{
++ struct thread *thread;
++ struct perf_script *script = container_of(tool, struct perf_script, tool);
++ struct perf_session *session = script->session;
++ struct perf_evsel *evsel = perf_evlist__first(session->evlist);
++
++ if (perf_event__process_mmap(tool, event, sample, machine) < 0)
++  return -1;
++
++ thread = machine__findnew_thread(machine, event->mmap.pid, event->mmap.tid);
++ if (thread == NULL) {
++  pr_debug("problem processing MMAP event, skipping it.\n");
++  return -1;
++ }
++
++ if (!evsel->attr.sample_id_all) {
++  sample->cpu = 0;
++  sample->time = 0;
++  sample->tid = event->mmap.tid;
++  sample->pid = event->mmap.pid;
++ }
++ print_sample_start(sample, thread, evsel);
++ perf_event__fprintf(event, stdout);
++
++ return 0;
++}
++
++static int process_mmap2_event(struct perf_tool *tool,
++         union perf_event *event,
++         struct perf_sample *sample,
++         struct machine *machine)
++{
++ struct thread *thread;
++ struct perf_script *script = container_of(tool, struct perf_script, tool);
++ struct perf_session *session = script->session;
++ struct perf_evsel *evsel = perf_evlist__first(session->evlist);
++
++ if (perf_event__process_mmap2(tool, event, sample, machine) < 0)
++  return -1;
++
++ thread = machine__findnew_thread(machine, event->mmap2.pid, event->mmap2.tid);
++ if (thread == NULL) {
++  pr_debug("problem processing MMAP2 event, skipping it.\n");
++  return -1;
++ }
++
++ if (!evsel->attr.sample_id_all) {
++  sample->cpu = 0;
++  sample->time = 0;
++  sample->tid = event->mmap2.tid;
++  sample->pid = event->mmap2.pid;
++ }
++ print_sample_start(sample, thread, evsel);
++ perf_event__fprintf(event, stdout);
++
++ return 0;
++}
++
+ static void sig_handler(int sig __maybe_unused)
+ {
+  session_done = 1;
+@@ -715,6 +778,10 @@ static int __cmd_script(struct perf_script *script)
+   script->tool.fork = process_fork_event;
+   script->tool.exit = process_exit_event;
+  }
++ if (script->show_mmap_events) {
++  script->tool.mmap = process_mmap_event;
++  script->tool.mmap2 = process_mmap2_event;
++ }
+ 
+  ret = perf_session__process_events(script->session, &script->tool);
+ 
+@@ -1480,6 +1547,8 @@ int cmd_script(int argc, const char **argv, const char *prefix __maybe_unused)
+       "Show the path of [kernel.kallsyms]"),
+  OPT_BOOLEAN('\0', "show-task-events", &script.show_task_events,
+       "Show the fork/comm/exit events"),
++ OPT_BOOLEAN('\0', "show-mmap-events", &script.show_mmap_events,
++      "Show the mmap events"),
+  OPT_END()
+  };
+  const char * const script_usage[] = {
+-- 
+1.7.1

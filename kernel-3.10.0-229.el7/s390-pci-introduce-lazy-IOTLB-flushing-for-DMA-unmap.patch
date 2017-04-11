@@ -1,0 +1,170 @@
+From 910ee6d66f437d9d58e2eb157b47d68f7b523a8e Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Thu, 21 Aug 2014 14:48:54 -0400
+Subject: [s390] pci: introduce lazy IOTLB flushing for DMA unmap
+
+Message-id: <1408632535-642-6-git-send-email-brueckner@redhat.com>
+Patchwork-id: 88683
+O-Subject: [RHEL7.1 PATCH] [s390] s390/pci: introduce lazy IOTLB flushing for DMA unmap
+Bugzilla: 1132382
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Description
+-----------
+commit c60d1ae4efcb5790f7d085369baf66c167a6484f
+Author: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+Date:   Fri Jul 18 17:37:08 2014 +0200
+
+    s390/pci: introduce lazy IOTLB flushing for DMA unmap
+
+    This changes the default IOTLB flushing method to lazy flushing, which
+    means that there will be no direct flush after each DMA unmap operation.
+    Instead, the iommu bitmap pointer will be adjusted after unmap, so that
+    no DMA address will be re-used until after an iommu bitmap wrap-around.
+    The only IOTLB flush will then happen after each wrap-around.
+
+    A new kernel parameter "s390_iommu=" is also introduced, to allow changing
+    the flushing behaviour to the old strict method.
+
+    Reviewed-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+    Signed-off-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+    Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+Bugzilla
+--------
+BZ 1132382
+https://bugzilla.redhat.com/show_bug.cgi?id=1132382
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=c60d1ae4efcb5790f7d085369baf66c167a6484f
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7869031
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index 245bda4..a058403 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -2800,6 +2800,13 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 
+  S  [KNL] Run init in single mode
+ 
++ s390_iommu= [HW,S390]
++   Set s390 IOTLB flushing mode
++  strict
++   With strict flushing every unmap operation will result in
++   an IOTLB flush. Default is lazy flushing before reuse,
++   which is faster.
++
+  sa1100ir [NET]
+    See drivers/net/irda/sa1100_ir.c.
+ 
+diff --git a/arch/s390/pci/pci_dma.c b/arch/s390/pci/pci_dma.c
+index f91c031..4cbb29a 100644
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@ -16,6 +16,13 @@
+ 
+ static struct kmem_cache *dma_region_table_cache;
+ static struct kmem_cache *dma_page_table_cache;
++static int s390_iommu_strict;
++
++static int zpci_refresh_global(struct zpci_dev *zdev)
++{
++ return zpci_refresh_trans((u64) zdev->fh << 32, zdev->start_dma,
++      zdev->iommu_pages * PAGE_SIZE);
++}
+ 
+ static unsigned long *dma_alloc_cpu_table(void)
+ {
+@@ -155,18 +162,15 @@ static int dma_update_trans(struct zpci_dev *zdev, unsigned long pa,
+  }
+ 
+  /*
+-  * rpcit is not required to establish new translations when previously
+-  * invalid translation-table entries are validated, however it is
+-  * required when altering previously valid entries.
++  * With zdev->tlb_refresh == 0, rpcit is not required to establish new
++  * translations when previously invalid translation-table entries are
++  * validated. With lazy unmap, it also is skipped for previously valid
++  * entries, but a global rpcit is then required before any address can
++  * be re-used, i.e. after each iommu bitmap wrap-around.
+   */
+  if (!zdev->tlb_refresh &&
+-     ((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID))
+-  /*
+-   * TODO: also need to check that the old entry is indeed INVALID
+-   * and not only for one page but for the whole range...
+-   * -> now we WARN_ON in that case but with lazy unmap that
+-   * needs to be redone!
+-   */
++   (!s390_iommu_strict ||
++   ((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID)))
+   goto no_refresh;
+ 
+  rc = zpci_refresh_trans((u64) zdev->fh << 32, start_dma_addr,
+@@ -220,16 +224,21 @@ static unsigned long __dma_alloc_iommu(struct zpci_dev *zdev,
+ static unsigned long dma_alloc_iommu(struct zpci_dev *zdev, int size)
+ {
+  unsigned long offset, flags;
++ int wrap = 0;
+ 
+  spin_lock_irqsave(&zdev->iommu_bitmap_lock, flags);
+  offset = __dma_alloc_iommu(zdev, zdev->next_bit, size);
+- if (offset == -1)
++ if (offset == -1) {
++  /* wrap-around */
+   offset = __dma_alloc_iommu(zdev, 0, size);
++  wrap = 1;
++ }
+ 
+  if (offset != -1) {
+   zdev->next_bit = offset + size;
+-  if (zdev->next_bit >= zdev->iommu_pages)
+-   zdev->next_bit = 0;
++  if (!zdev->tlb_refresh && !s390_iommu_strict && wrap)
++   /* global flush after wrap-around with lazy unmap */
++   zpci_refresh_global(zdev);
+  }
+  spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, flags);
+  return offset;
+@@ -243,7 +252,11 @@ static void dma_free_iommu(struct zpci_dev *zdev, unsigned long offset, int size
+  if (!zdev->iommu_bitmap)
+   goto out;
+  bitmap_clear(zdev->iommu_bitmap, offset, size);
+- if (offset >= zdev->next_bit)
++ /*
++  * Lazy flush for unmap: need to move next_bit to avoid address re-use
++  * until wrap-around.
++  */
++ if (!s390_iommu_strict && offset >= zdev->next_bit)
+   zdev->next_bit = offset + size;
+ out:
+  spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, flags);
+@@ -504,3 +517,12 @@ struct dma_map_ops s390_dma_ops = {
+  /* dma_supported is unconditionally true without a callback */
+ };
+ EXPORT_SYMBOL_GPL(s390_dma_ops);
++
++static int __init s390_iommu_setup(char *str)
++{
++ if (!strncmp(str, "strict", 6))
++  s390_iommu_strict = 1;
++ return 0;
++}
++
++__setup("s390_iommu=", s390_iommu_setup);
+-- 
+1.7.1

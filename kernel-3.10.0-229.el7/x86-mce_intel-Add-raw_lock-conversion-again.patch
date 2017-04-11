@@ -1,0 +1,141 @@
+From 18cdd5a507fc713de521542dd8a567db5a8b7276 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Wed, 6 Aug 2014 13:39:42 -0400
+Subject: [x86] mce_intel: Add raw_lock conversion again
+
+Message-id: <1407332382-18719-1-git-send-email-prarit@redhat.com>
+Patchwork-id: 87504
+O-Subject: [RHEL7.1 PATCH BZ 1127257] x86: MCE: Add raw_lock conversion again
+Bugzilla: 1127257
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1127257
+
+Date: Wed Aug  6 09:36:01 EDT 2014
+Build OS: Red Hat Enterprise Linux Server release 7.0 (Maipo)
+System name: intel-canoepass-05.lab.bos.redhat.com with -j24
+Built on: kernel-3.10.0-142.el7
+Arch built: ppc64 s390x x86_64
+
+Clark pointed this out to me yesterday and the patch went in very quickly.
+Without this patch, hotplug on RT kernels is broken.  This needs to be
+fixed ASAP.
+
+commit ed5c41d30ef2ce578fd6b6e2f7ec23f2a58b1eba
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue Aug 5 22:57:19 2014 +0200
+
+    x86: MCE: Add raw_lock conversion again
+
+    Commit ea431643d6c3 ("x86/mce: Fix CMCI preemption bugs") breaks RT by
+    the completely unrelated conversion of the cmci_discover_lock to a
+    regular (non raw) spinlock.  This lock was annotated in commit
+    59d958d2c7de ("locking, x86: mce: Annotate cmci_discover_lock as raw")
+    with a proper explanation why.
+
+    The argument for converting the lock back to a regular spinlock was:
+
+     - it does percpu ops without disabling preemption. Preemption is not
+       disabled due to the mistaken use of a raw spinlock.
+
+    Which is complete nonsense.  The raw_spinlock is disabling preemption in
+    the same way as a regular spinlock.  In mainline spinlock maps to
+    raw_spinlock, in RT spinlock becomes a "sleeping" lock.
+
+    raw_spinlock has on RT exactly the same semantics as in mainline.  And
+    because this lock is taken in non preemptible context it must be raw on
+    RT.
+
+    Undo the locking brainfart.
+
+    Reported-by: Clark Williams <williams@redhat.com>
+    Reported-by: Steven Rostedt <rostedt@goodmis.org>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+I have not done any hotplug on RT, but I did do some MCE logging and verified
+that nothing was broken.
+
+Cc: Dean Nelson <dnelson@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Cc: Clark Williams <williams@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/cpu/mcheck/mce_intel.c b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+index 9a316b2..3bdb95a 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce_intel.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+@@ -42,7 +42,7 @@ static DEFINE_PER_CPU(mce_banks_t, mce_banks_owned);
+  * cmci_discover_lock protects against parallel discovery attempts
+  * which could race against each other.
+  */
+-static DEFINE_SPINLOCK(cmci_discover_lock);
++static DEFINE_RAW_SPINLOCK(cmci_discover_lock);
+ 
+ #define CMCI_THRESHOLD  1
+ #define CMCI_POLL_INTERVAL (30 * HZ)
+@@ -144,14 +144,14 @@ static void cmci_storm_disable_banks(void)
+  int bank;
+  u64 val;
+ 
+- spin_lock_irqsave(&cmci_discover_lock, flags);
++ raw_spin_lock_irqsave(&cmci_discover_lock, flags);
+  owned = __get_cpu_var(mce_banks_owned);
+  for_each_set_bit(bank, owned, MAX_NR_BANKS) {
+   rdmsrl(MSR_IA32_MCx_CTL2(bank), val);
+   val &= ~MCI_CTL2_CMCI_EN;
+   wrmsrl(MSR_IA32_MCx_CTL2(bank), val);
+  }
+- spin_unlock_irqrestore(&cmci_discover_lock, flags);
++ raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
+ }
+ 
+ static bool cmci_storm_detect(void)
+@@ -211,7 +211,7 @@ static void cmci_discover(int banks)
+  int i;
+  int bios_wrong_thresh = 0;
+ 
+- spin_lock_irqsave(&cmci_discover_lock, flags);
++ raw_spin_lock_irqsave(&cmci_discover_lock, flags);
+  for (i = 0; i < banks; i++) {
+   u64 val;
+   int bios_zero_thresh = 0;
+@@ -266,7 +266,7 @@ static void cmci_discover(int banks)
+    WARN_ON(!test_bit(i, __get_cpu_var(mce_poll_banks)));
+   }
+  }
+- spin_unlock_irqrestore(&cmci_discover_lock, flags);
++ raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
+  if (mca_cfg.bios_cmci_threshold && bios_wrong_thresh) {
+   pr_info_once(
+    "bios_cmci_threshold: Some banks do not have valid thresholds set\n");
+@@ -316,10 +316,10 @@ void cmci_clear(void)
+ 
+  if (!cmci_supported(&banks))
+   return;
+- spin_lock_irqsave(&cmci_discover_lock, flags);
++ raw_spin_lock_irqsave(&cmci_discover_lock, flags);
+  for (i = 0; i < banks; i++)
+   __cmci_disable_bank(i);
+- spin_unlock_irqrestore(&cmci_discover_lock, flags);
++ raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
+ }
+ 
+ static void cmci_rediscover_work_func(void *arg)
+@@ -360,9 +360,9 @@ void cmci_disable_bank(int bank)
+  if (!cmci_supported(&banks))
+   return;
+ 
+- spin_lock_irqsave(&cmci_discover_lock, flags);
++ raw_spin_lock_irqsave(&cmci_discover_lock, flags);
+  __cmci_disable_bank(bank);
+- spin_unlock_irqrestore(&cmci_discover_lock, flags);
++ raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
+ }
+ 
+ static void intel_init_cmci(void)
+-- 
+1.7.1

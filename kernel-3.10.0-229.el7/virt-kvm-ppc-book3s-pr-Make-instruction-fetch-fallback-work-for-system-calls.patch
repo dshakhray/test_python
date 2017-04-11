@@ -1,0 +1,113 @@
+From ddc407d738bbfb61a22e7318078aa89b27b2effe Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:45 -0400
+Subject: [virt] kvm/ppc: book3s pr - Make instruction fetch fallback work for system calls
+
+Message-id: <1410545655-205645-117-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94305
+O-Subject: [RHEL7 PATCH 116/626] KVM: PPC: Book3S PR: Make instruction fetch fallback work for system calls
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 8b23de29489fd63fce753db9d53055e4bbf8f616
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Tue Aug 6 14:15:19 2013 +1000
+
+    KVM: PPC: Book3S PR: Make instruction fetch fallback work for system calls
+
+    It turns out that if we exit the guest due to a hcall instruction (sc 1),
+    and the loading of the instruction in the guest exit path fails for any
+    reason, the call to kvmppc_ld() in kvmppc_get_last_inst() fetches the
+    instruction after the hcall instruction rather than the hcall itself.
+    This in turn means that the instruction doesn't get recognized as an
+    hcall in kvmppc_handle_exit_pr() but gets passed to the guest kernel
+    as a sc instruction.  That usually results in the guest kernel getting
+    a return code of 38 (ENOSYS) from an hcall, which often triggers a
+    BUG_ON() or other failure.
+
+    This fixes the problem by adding a new variant of kvmppc_get_last_inst()
+    called kvmppc_get_last_sc(), which fetches the instruction if necessary
+    from pc - 4 rather than pc.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 08891d0..fa19e2f 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -334,6 +334,27 @@ static inline u32 kvmppc_get_last_inst(struct kvm_vcpu *vcpu)
+  return r;
+ }
+ 
++/*
++ * Like kvmppc_get_last_inst(), but for fetching a sc instruction.
++ * Because the sc instruction sets SRR0 to point to the following
++ * instruction, we have to fetch from pc - 4.
++ */
++static inline u32 kvmppc_get_last_sc(struct kvm_vcpu *vcpu)
++{
++ ulong pc = kvmppc_get_pc(vcpu) - 4;
++ struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
++ u32 r;
++
++ /* Load the instruction manually if it failed to do so in the
++  * exit path */
++ if (svcpu->last_inst == KVM_INST_FETCH_FAILED)
++  kvmppc_ld(vcpu, &pc, sizeof(u32), &svcpu->last_inst, false);
++
++ r = svcpu->last_inst;
++ svcpu_put(svcpu);
++ return r;
++}
++
+ static inline ulong kvmppc_get_fault_dar(struct kvm_vcpu *vcpu)
+ {
+  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+@@ -446,6 +467,23 @@ static inline u32 kvmppc_get_last_inst(struct kvm_vcpu *vcpu)
+  return vcpu->arch.last_inst;
+ }
+ 
++/*
++ * Like kvmppc_get_last_inst(), but for fetching a sc instruction.
++ * Because the sc instruction sets SRR0 to point to the following
++ * instruction, we have to fetch from pc - 4.
++ */
++static inline u32 kvmppc_get_last_sc(struct kvm_vcpu *vcpu)
++{
++ ulong pc = kvmppc_get_pc(vcpu) - 4;
++
++ /* Load the instruction manually if it failed to do so in the
++  * exit path */
++ if (vcpu->arch.last_inst == KVM_INST_FETCH_FAILED)
++  kvmppc_ld(vcpu, &pc, sizeof(u32), &vcpu->arch.last_inst, false);
++
++ return vcpu->arch.last_inst;
++}
++
+ static inline ulong kvmppc_get_fault_dar(struct kvm_vcpu *vcpu)
+ {
+  return vcpu->arch.fault_dar;
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 0dd6aa7..c0b48f9 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -792,7 +792,7 @@ program_interrupt:
+  }
+  case BOOK3S_INTERRUPT_SYSCALL:
+   if (vcpu->arch.papr_enabled &&
+-      (kvmppc_get_last_inst(vcpu) == 0x44000022) &&
++      (kvmppc_get_last_sc(vcpu) == 0x44000022) &&
+       !(vcpu->arch.shared->msr & MSR_PR)) {
+    /* SC 1 papr hypercalls */
+    ulong cmd = kvmppc_get_gpr(vcpu, 3);
+-- 
+1.7.1

@@ -1,0 +1,127 @@
+From ec652e54195ad39bbab764e07f4ec7caa37f653c Mon Sep 17 00:00:00 2001
+From: Rob Evers <revers@redhat.com>
+Date: Mon, 23 Jun 2014 21:41:49 -0400
+Subject: [scsi] lpfc 8.3.45: Fixed crash during driver unload
+
+Message-id: <1403559726-20488-8-git-send-email-revers@redhat.com>
+Patchwork-id: 84418
+O-Subject: [RHEL7.1 e-stor PATCH 07/24] scsi: lpfc 8.3.45: Fixed crash during driver unload.
+Bugzilla: 1088574
+RH-Acked-by: Ewan Milne <emilne@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: James Smart <james.smart@emulex.com>
+
+Signed-off-by: James Smart <james.smart@emulex.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit 06918ac56682bea444981c46297147bd5acd02c2)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/lpfc/lpfc_els.c b/drivers/scsi/lpfc/lpfc_els.c
+index a6198e9..624fe0b 100644
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -6223,11 +6223,11 @@ lpfc_els_timeout(unsigned long ptr)
+ 
+  spin_lock_irqsave(&vport->work_port_lock, iflag);
+  tmo_posted = vport->work_port_events & WORKER_ELS_TMO;
+- if (!tmo_posted)
++ if ((!tmo_posted) && (!(vport->load_flag & FC_UNLOADING)))
+   vport->work_port_events |= WORKER_ELS_TMO;
+  spin_unlock_irqrestore(&vport->work_port_lock, iflag);
+ 
+- if (!tmo_posted)
++ if ((!tmo_posted) && (!(vport->load_flag & FC_UNLOADING)))
+   lpfc_worker_wake_up(phba);
+  return;
+ }
+@@ -6259,10 +6259,19 @@ lpfc_els_timeout_handler(struct lpfc_vport *vport)
+  timeout = (uint32_t)(phba->fc_ratov << 1);
+ 
+  pring = &phba->sli.ring[LPFC_ELS_RING];
++ if ((phba->pport->load_flag & FC_UNLOADING))
++  return;
+  spin_lock_irq(&phba->hbalock);
+  if (phba->sli_rev == LPFC_SLI_REV4)
+   spin_lock(&pring->ring_lock);
+ 
++ if ((phba->pport->load_flag & FC_UNLOADING)) {
++  if (phba->sli_rev == LPFC_SLI_REV4)
++   spin_unlock(&pring->ring_lock);
++  spin_unlock_irq(&phba->hbalock);
++  return;
++ }
++
+  list_for_each_entry_safe(piocb, tmp_iocb, &pring->txcmplq, list) {
+   cmd = &piocb->iocb;
+ 
+@@ -6319,8 +6328,9 @@ lpfc_els_timeout_handler(struct lpfc_vport *vport)
+  }
+ 
+  if (!list_empty(&phba->sli.ring[LPFC_ELS_RING].txcmplq))
+-  mod_timer(&vport->els_tmofunc,
+-     jiffies + msecs_to_jiffies(1000 * timeout));
++  if (!(phba->pport->load_flag & FC_UNLOADING))
++   mod_timer(&vport->els_tmofunc,
++      jiffies + msecs_to_jiffies(1000 * timeout));
+ }
+ 
+ /**
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index 20390b1..48a96e7 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -1006,9 +1006,14 @@ lpfc_rrq_timeout(unsigned long ptr)
+ 
+  phba = (struct lpfc_hba *)ptr;
+  spin_lock_irqsave(&phba->pport->work_port_lock, iflag);
+- phba->hba_flag |= HBA_RRQ_ACTIVE;
++ if (!(phba->pport->load_flag & FC_UNLOADING))
++  phba->hba_flag |= HBA_RRQ_ACTIVE;
++ else
++  phba->hba_flag &= ~HBA_RRQ_ACTIVE;
+  spin_unlock_irqrestore(&phba->pport->work_port_lock, iflag);
+- lpfc_worker_wake_up(phba);
++
++ if (!(phba->pport->load_flag & FC_UNLOADING))
++  lpfc_worker_wake_up(phba);
+ }
+ 
+ /**
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index 38e56d9..db2100d 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -678,7 +678,8 @@ lpfc_handle_rrq_active(struct lpfc_hba *phba)
+    next_time = rrq->rrq_stop_time;
+  }
+  spin_unlock_irqrestore(&phba->hbalock, iflags);
+- if (!list_empty(&phba->active_rrq_list))
++ if ((!list_empty(&phba->active_rrq_list)) &&
++     (!(phba->pport->load_flag & FC_UNLOADING)))
+   mod_timer(&phba->rrq_tmr, next_time);
+  list_for_each_entry_safe(rrq, nextrrq, &send_rrq, list) {
+   list_del(&rrq->list);
+@@ -792,7 +793,9 @@ lpfc_cleanup_wt_rrqs(struct lpfc_hba *phba)
+   list_del(&rrq->list);
+   lpfc_clr_rrq_active(phba, rrq->xritag, rrq);
+  }
+- if (!list_empty(&phba->active_rrq_list))
++ if ((!list_empty(&phba->active_rrq_list)) &&
++     (!(phba->pport->load_flag & FC_UNLOADING)))
++
+   mod_timer(&phba->rrq_tmr, next_time);
+ }
+ 
+@@ -1323,7 +1326,8 @@ lpfc_sli_ringtxcmpl_put(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+ 
+  if ((unlikely(pring->ringno == LPFC_ELS_RING)) &&
+     (piocb->iocb.ulpCommand != CMD_ABORT_XRI_CN) &&
+-    (piocb->iocb.ulpCommand != CMD_CLOSE_XRI_CN)) {
++    (piocb->iocb.ulpCommand != CMD_CLOSE_XRI_CN) &&
++  (!(piocb->vport->load_flag & FC_UNLOADING))) {
+   if (!piocb->vport)
+    BUG();
+   else
+-- 
+1.7.1

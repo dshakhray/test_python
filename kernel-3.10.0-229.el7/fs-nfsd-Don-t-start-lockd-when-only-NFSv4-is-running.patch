@@ -1,0 +1,99 @@
+From 9ffcb86b8d3cde1ce5790312a01d6bfeb106aa41 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Mon, 23 Jun 2014 21:49:33 -0400
+Subject: [fs] nfsd: Don't start lockd when only NFSv4 is running
+
+Message-id: <1403560314-32525-32-git-send-email-bfields@redhat.com>
+Patchwork-id: 84468
+O-Subject: [Patch RHEL7 031/172] NFSD: Don't start lockd when only NFSv4 is running
+Bugzilla: 1111719
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Kinglong Mee <kinglongmee@gmail.com>
+
+When starting without nfsv2 and nfsv3, nfsd does not need to start
+lockd (and certainly doesn't need to fail because lockd failed to
+register with the portmapper).
+
+Reported-by: Gareth Williams <gareth@garethwilliams.me.uk>
+Reviewed-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Kinglong Mee <kinglongmee@gmail.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 8ef667140c52e9b88934664954217f28559c75d6
+Bugzilla: 1111719
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/netns.h b/fs/nfsd/netns.h
+index 849a7c3..d32b3aa 100644
+--- a/fs/nfsd/netns.h
++++ b/fs/nfsd/netns.h
+@@ -95,6 +95,7 @@ struct nfsd_net {
+  time_t nfsd4_grace;
+ 
+  bool nfsd_net_up;
++ bool lockd_up;
+ 
+  /*
+   * Time of server startup
+diff --git a/fs/nfsd/nfssvc.c b/fs/nfsd/nfssvc.c
+index 760c85a..55b5b57 100644
+--- a/fs/nfsd/nfssvc.c
++++ b/fs/nfsd/nfssvc.c
+@@ -241,6 +241,11 @@ static void nfsd_shutdown_generic(void)
+  nfsd_racache_shutdown();
+ }
+ 
++static bool nfsd_needs_lockd(void)
++{
++ return (nfsd_versions[2] != NULL) || (nfsd_versions[3] != NULL);
++}
++
+ static int nfsd_startup_net(int nrservs, struct net *net)
+ {
+  struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+@@ -255,9 +260,14 @@ static int nfsd_startup_net(int nrservs, struct net *net)
+  ret = nfsd_init_socks(net);
+  if (ret)
+   goto out_socks;
+- ret = lockd_up(net);
+- if (ret)
+-  goto out_socks;
++
++ if (nfsd_needs_lockd() && !nn->lockd_up) {
++  ret = lockd_up(net);
++  if (ret)
++   goto out_socks;
++  nn->lockd_up = 1;
++ }
++
+  ret = nfs4_state_start_net(net);
+  if (ret)
+   goto out_lockd;
+@@ -266,7 +276,10 @@ static int nfsd_startup_net(int nrservs, struct net *net)
+  return 0;
+ 
+ out_lockd:
+- lockd_down(net);
++ if (nn->lockd_up) {
++  lockd_down(net);
++  nn->lockd_up = 0;
++ }
+ out_socks:
+  nfsd_shutdown_generic();
+  return ret;
+@@ -277,7 +290,10 @@ static void nfsd_shutdown_net(struct net *net)
+  struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+ 
+  nfs4_state_shutdown_net(net);
+- lockd_down(net);
++ if (nn->lockd_up) {
++  lockd_down(net);
++  nn->lockd_up = 0;
++ }
+  nn->nfsd_net_up = false;
+  nfsd_shutdown_generic();
+ }
+-- 
+1.7.1

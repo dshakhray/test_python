@@ -1,0 +1,90 @@
+From b199ba0b2f742edae5d41a20a223b83e86b1257f Mon Sep 17 00:00:00 2001
+From: Andy Grover <agrover@redhat.com>
+Date: Fri, 5 Sep 2014 16:36:01 -0400
+Subject: [target] iscsi, iser: Avoid accepting transport connections during stop stage
+
+Message-id: <1409934989-29941-4-git-send-email-agrover@redhat.com>
+Patchwork-id: 91468
+O-Subject: [RHEL7.1 PATCH e-stor 03/31] Target/iscsi, iser: Avoid accepting transport connections during stop stage
+Bugzilla: 1129387
+RH-Acked-by: Chris Leech <cleech@redhat.com>
+RH-Acked-by: Rob Evers <revers@redhat.com>
+
+From: Sagi Grimberg <sagig@mellanox.com>
+
+commit 14f4b54fe38f3a8f8392a50b951c8aa43b63687a upstream.
+
+When the target is in stop stage, iSER transport initiates RDMA disconnects.
+The iSER initiator may wish to establish a new connection over the
+still existing network portal. In this case iSER transport should not
+accept and resume new RDMA connections. In order to learn that, iscsi_np
+is added with enabled flag so the iSER transport can check when deciding
+weather to accept and resume a new connection request.
+
+The iscsi_np is enabled after successful transport setup, and disabled
+before iscsi_np login threads are cleaned up.
+
+(Fix up context changes for v3.10.y - nab)
+
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.c b/drivers/infiniband/ulp/isert/ib_isert.c
+index 3d8fe41..6ed2011 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -386,6 +386,14 @@ isert_connect_request(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+  struct ib_device *ib_dev = cma_id->device;
+  int ret = 0;
+ 
++ spin_lock_bh(&np->np_thread_lock);
++ if (!np->enabled) {
++  spin_unlock_bh(&np->np_thread_lock);
++  pr_debug("iscsi_np is not enabled, reject connect request\n");
++  return rdma_reject(cma_id, NULL, 0);
++ }
++ spin_unlock_bh(&np->np_thread_lock);
++
+  pr_debug("Entering isert_connect_request cma_id: %p, context: %p\n",
+    cma_id, cma_id->context);
+ 
+diff --git a/drivers/target/iscsi/iscsi_target_core.h b/drivers/target/iscsi/iscsi_target_core.h
+index 9ea9e79..4245a37 100644
+--- a/drivers/target/iscsi/iscsi_target_core.h
++++ b/drivers/target/iscsi/iscsi_target_core.h
+@@ -760,6 +760,7 @@ struct iscsi_np {
+  int   np_ip_proto;
+  int   np_sock_type;
+  enum np_thread_state_table np_thread_state;
++ bool                    enabled;
+  enum iscsi_timer_flags_table np_login_timer_flags;
+  u32   np_exports;
+  enum np_flags_table np_flags;
+diff --git a/drivers/target/iscsi/iscsi_target_login.c b/drivers/target/iscsi/iscsi_target_login.c
+index 75c2707..d806607 100644
+--- a/drivers/target/iscsi/iscsi_target_login.c
++++ b/drivers/target/iscsi/iscsi_target_login.c
+@@ -984,6 +984,7 @@ int iscsi_target_setup_login_socket(
+  }
+ 
+  np->np_transport = t;
++ np->enabled = true;
+  return 0;
+ }
+ 
+diff --git a/drivers/target/iscsi/iscsi_target_tpg.c b/drivers/target/iscsi/iscsi_target_tpg.c
+index 439260b..f08ef99 100644
+--- a/drivers/target/iscsi/iscsi_target_tpg.c
++++ b/drivers/target/iscsi/iscsi_target_tpg.c
+@@ -182,6 +182,7 @@ static void iscsit_clear_tpg_np_login_thread(
+   return;
+  }
+ 
++ tpg_np->tpg_np->enabled = false;
+  iscsit_reset_np_thread(tpg_np->tpg_np, tpg_np, tpg);
+ }
+ 
+-- 
+1.7.1

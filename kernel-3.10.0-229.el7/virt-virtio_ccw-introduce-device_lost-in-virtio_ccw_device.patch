@@ -1,0 +1,144 @@
+From 7470020c8eface2e04f0aa3364ee346b8bf82568 Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Wed, 23 Jul 2014 10:50:09 -0400
+Subject: [virt] virtio_ccw: introduce device_lost in virtio_ccw_device
+
+Message-id: <1406112611-9862-22-git-send-email-brueckner@redhat.com>
+Patchwork-id: 86330
+O-Subject: [RHEL7.1 PATCH 21/23] [s390] virtio_ccw: introduce device_lost in virtio_ccw_device
+Bugzilla: 1088554
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Description
+-----------
+commit e75279c4fb853f42004cbabb6dbf6b23188dc163
+Author: Heinz Graalfs <graalfs@linux.vnet.ibm.com>
+Commit: Rusty Russell <rusty@rustcorp.com.au>
+
+    virtio_ccw: introduce device_lost in virtio_ccw_device
+
+    When a device is lost, the common I/O layer calls the notification
+    handler with CIO_GONE: In that event, flag device_lost as true.
+
+    In case the device had been flagged as lost when the remove/offline callbacks
+    are called, call the new virtio_break_device() function prior to invoking
+    device_unregister(). This avoids hangs of I/O triggered via the device
+    unregistration callbacks.
+
+    Signed-off-by: Heinz Graalfs <graalfs@linux.vnet.ibm.com>
+    Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+Bugzilla
+--------
+BZ 1088554
+https://bugzilla.redhat.com/show_bug.cgi?id=1088554
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version v3.16-rc1
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=e75279c4fb853f42004cbabb6dbf6b23188dc163
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7725759
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/s390/kvm/virtio_ccw.c b/drivers/s390/kvm/virtio_ccw.c
+index 1e1fc67..d2c0b44 100644
+--- a/drivers/s390/kvm/virtio_ccw.c
++++ b/drivers/s390/kvm/virtio_ccw.c
+@@ -27,6 +27,7 @@
+ #include <linux/module.h>
+ #include <linux/io.h>
+ #include <linux/kvm_para.h>
++#include <linux/notifier.h>
+ #include <asm/setup.h>
+ #include <asm/irq.h>
+ #include <asm/cio.h>
+@@ -62,6 +63,7 @@ struct virtio_ccw_device {
+  struct vq_config_block *config_block;
+  bool is_thinint;
+  bool going_away;
++ bool device_lost;
+  void *airq_info;
+ };
+ 
+@@ -1010,11 +1012,14 @@ static void virtio_ccw_remove(struct ccw_device *cdev)
+  unsigned long flags;
+  struct virtio_ccw_device *vcdev = virtio_grab_drvdata(cdev);
+ 
+- if (vcdev && cdev->online)
++ if (vcdev && cdev->online) {
++  if (vcdev->device_lost)
++   virtio_break_device(&vcdev->vdev);
+   unregister_virtio_device(&vcdev->vdev);
+- spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
+- dev_set_drvdata(&cdev->dev, NULL);
+- spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
++  spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
++  dev_set_drvdata(&cdev->dev, NULL);
++  spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
++ }
+  cdev->handler = NULL;
+ }
+ 
+@@ -1023,12 +1028,14 @@ static int virtio_ccw_offline(struct ccw_device *cdev)
+  unsigned long flags;
+  struct virtio_ccw_device *vcdev = virtio_grab_drvdata(cdev);
+ 
+- if (vcdev) {
+-  unregister_virtio_device(&vcdev->vdev);
+-  spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
+-  dev_set_drvdata(&cdev->dev, NULL);
+-  spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
+- }
++ if (!vcdev)
++  return 0;
++ if (vcdev->device_lost)
++  virtio_break_device(&vcdev->vdev);
++ unregister_virtio_device(&vcdev->vdev);
++ spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
++ dev_set_drvdata(&cdev->dev, NULL);
++ spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
+  return 0;
+ }
+ 
+@@ -1096,8 +1103,26 @@ out_free:
+ 
+ static int virtio_ccw_cio_notify(struct ccw_device *cdev, int event)
+ {
+- /* TODO: Check whether we need special handling here. */
+- return 0;
++ int rc;
++ struct virtio_ccw_device *vcdev = dev_get_drvdata(&cdev->dev);
++
++ /*
++  * Make sure vcdev is set
++  * i.e. set_offline/remove callback not already running
++  */
++ if (!vcdev)
++  return NOTIFY_DONE;
++
++ switch (event) {
++ case CIO_GONE:
++  vcdev->device_lost = true;
++  rc = NOTIFY_DONE;
++  break;
++ default:
++  rc = NOTIFY_DONE;
++  break;
++ }
++ return rc;
+ }
+ 
+ static struct ccw_device_id virtio_ids[] = {
+-- 
+1.7.1

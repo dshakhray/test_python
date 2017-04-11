@@ -1,0 +1,84 @@
+From 7d504ff9677c144d74bdc775ab94af7f8f8ed018 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Mon, 23 Jun 2014 21:50:37 -0400
+Subject: [fs] nfsd: Only set PF_LESS_THROTTLE when really needed
+
+Message-id: <1403560314-32525-96-git-send-email-bfields@redhat.com>
+Patchwork-id: 84611
+O-Subject: [Patch RHEL7 095/172] nfsd: Only set PF_LESS_THROTTLE when really needed.
+Bugzilla: 1111719
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: NeilBrown <neilb@suse.de>
+
+PF_LESS_THROTTLE has a very specific use case: to avoid deadlocks
+and live-locks while writing to the page cache in a loop-back
+NFS mount situation.
+
+It therefore makes sense to *only* set PF_LESS_THROTTLE in this
+situation.
+We now know when a request came from the local-host so it could be a
+loop-back mount.  We already know when we are handling write requests,
+and when we are doing anything else.
+
+So combine those two to allow nfsd to still be throttled (like any
+other process) in every situation except when it is known to be
+problematic.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 8658452e4a588da603f6cb5ee2615deafcd82b71
+Bugzilla: 1111719
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfssvc.c b/fs/nfsd/nfssvc.c
+index 9a4a5f9..1879e43 100644
+--- a/fs/nfsd/nfssvc.c
++++ b/fs/nfsd/nfssvc.c
+@@ -591,12 +591,6 @@ nfsd(void *vrqstp)
+  nfsdstats.th_cnt++;
+  mutex_unlock(&nfsd_mutex);
+ 
+- /*
+-  * We want less throttling in balance_dirty_pages() so that nfs to
+-  * localhost doesn't cause nfsd to lock up due to all the client's
+-  * dirty pages.
+-  */
+- current->flags |= PF_LESS_THROTTLE;
+  set_freezable();
+ 
+  /*
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index 546a14b..57205f9 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -1059,6 +1059,16 @@ nfsd_vfs_write(struct svc_rqst *rqstp, struct svc_fh *fhp, struct file *file,
+  int   stable = *stablep;
+  int   use_wgather;
+  loff_t   pos = offset;
++ unsigned int  pflags = current->flags;
++
++ if (rqstp->rq_local)
++  /*
++   * We want less throttling in balance_dirty_pages()
++   * and shrink_inactive_list() so that nfs to
++   * localhost doesn't cause nfsd to lock up due to all
++   * the client's dirty pages or its congested queue.
++   */
++  current->flags |= PF_LESS_THROTTLE;
+ 
+  dentry = file->f_path.dentry;
+  inode = dentry->d_inode;
+@@ -1092,6 +1102,8 @@ out_nfserr:
+   err = 0;
+  else
+   err = nfserrno(host_err);
++ if (rqstp->rq_local)
++  tsk_restore_flags(current, pflags, PF_LESS_THROTTLE);
+  return err;
+ }
+ 
+-- 
+1.7.1

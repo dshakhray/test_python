@@ -1,0 +1,79 @@
+From 823ee2789362c52f14882e22c814eae1c7dc5a33 Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:01 -0400
+Subject: [fs] cifs: Avoid umount hangs with smb2 when server is unresponsive
+
+Message-id: <1406549822-10376-9-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86728
+O-Subject: [RHEL7.1 PATCH 08/69] [bz1082049]cifs: Avoid umount hangs with smb2 when server is unresponsive
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Shirish Pargaonkar <shirishpargaonkar@gmail.com>
+
+Do not send SMB2 Logoff command when reconnecting, the way smb1
+code base works.
+
+Also, no need to wait for a credit for an echo command when one is already
+in flight.
+
+Without these changes, umount command hangs if the server is unresponsive
+e.g. hibernating.
+
+Signed-off-by: Shirish Pargaonkar <shirishpargaonkar@gmail.com>
+Acked-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Steve French <smfrench@us.ibm.com>
+(cherry picked from commit eb4c7df6c20b407ecbf1a985edc33d967371c2e8)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 880ce08..0012800 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -687,6 +687,10 @@ SMB2_logoff(const unsigned int xid, struct cifs_ses *ses)
+  else
+   return -EIO;
+ 
++ /* no need to send SMB logoff if uid already closed due to reconnect */
++ if (ses->need_reconnect)
++  goto smb2_session_already_dead;
++
+  rc = small_smb2_init(SMB2_LOGOFF, NULL, (void **) &req);
+  if (rc)
+   return rc;
+@@ -701,6 +705,8 @@ SMB2_logoff(const unsigned int xid, struct cifs_ses *ses)
+   * No tcon so can't do
+   * cifs_stats_inc(&tcon->stats.smb2_stats.smb2_com_fail[SMB2...]);
+   */
++
++smb2_session_already_dead:
+  return rc;
+ }
+ 
+diff --git a/fs/cifs/transport.c b/fs/cifs/transport.c
+index 9108798..fdc5a58 100644
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@ -439,8 +439,13 @@ static int
+ wait_for_free_request(struct TCP_Server_Info *server, const int timeout,
+         const int optype)
+ {
+- return wait_for_free_credits(server, timeout,
+-    server->ops->get_credits_field(server, optype));
++ int *val;
++
++ val = server->ops->get_credits_field(server, optype);
++ /* Since an echo is already inflight, no need to wait to send another */
++ if (*val <= 0 && optype == CIFS_ECHO_OP)
++  return -EAGAIN;
++ return wait_for_free_credits(server, timeout, val);
+ }
+ 
+ static int allocate_mid(struct cifs_ses *ses, struct smb_hdr *in_buf,
+-- 
+1.7.1

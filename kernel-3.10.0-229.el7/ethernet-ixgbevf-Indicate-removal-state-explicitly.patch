@@ -1,0 +1,151 @@
+From 32d34b0c0873261c3a1a244894becdb7ae13a127 Mon Sep 17 00:00:00 2001
+From: John Greene <jogreene@redhat.com>
+Date: Mon, 8 Sep 2014 15:07:48 -0400
+Subject: [ethernet] ixgbevf: Indicate removal state explicitly
+
+Message-id: <1410188883-6595-34-git-send-email-jogreene@redhat.com>
+Patchwork-id: 92380
+O-Subject: [RHEL7.1 PATCH 33/48] ixgbevf: Indicate removal state explicitly
+Bugzilla: 1091124
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+
+BZ: 1091124
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7919168
+Tested: In beaker. See BZ for details
+
+[backport note: not sure why element of ixgbevf_msix_other were still
+in that function.  But now aligned with upstream
+
+Add a bit, __IXGBEVF_REMOVING, to indicate that the module is being
+removed. The __IXGBEVF_DOWN bit had been overloaded for this purpose,
+but that leads to trouble. A few places now check both __IXGBEVF_DOWN
+and __IXGBEVF_REMOVING.
+
+Signed-off-by: Mark Rustad <mark.d.rustad@intel.com>
+Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 2e7cfbdde8412a95ea4b003a68c2737434f543bb)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+---
+
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ixgbevf.h b/drivers/net/ethernet/intel/ixgbevf/ixgbevf.h
+index b07eb72..07f9a69 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf.h
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf.h
+@@ -1,7 +1,7 @@
+ /*******************************************************************************
+ 
+   Intel 82599 Virtual Function driver
+-  Copyright(c) 1999 - 2012 Intel Corporation.
++  Copyright(c) 1999 - 2014 Intel Corporation.
+ 
+   This program is free software; you can redistribute it and/or modify it
+   under the terms and conditions of the GNU General Public License,
+@@ -412,7 +412,8 @@ struct ixgbevf_adapter {
+ enum ixbgevf_state_t {
+  __IXGBEVF_TESTING,
+  __IXGBEVF_RESETTING,
+- __IXGBEVF_DOWN
++ __IXGBEVF_DOWN,
++ __IXGBEVF_REMOVING,
+ };
+ 
+ struct ixgbevf_cb {
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+index 3ee8148..b02534b 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+@@ -1,7 +1,7 @@
+ /*******************************************************************************
+ 
+   Intel 82599 Virtual Function driver
+-  Copyright(c) 1999 - 2012 Intel Corporation.
++  Copyright(c) 1999 - 2014 Intel Corporation.
+ 
+   This program is free software; you can redistribute it and/or modify it
+   under the terms and conditions of the GNU General Public License,
+@@ -608,7 +608,8 @@ static int ixgbevf_poll(struct napi_struct *napi, int budget)
+  napi_complete(napi);
+  if (adapter->rx_itr_setting & 1)
+   ixgbevf_set_itr(q_vector);
+- if (!test_bit(__IXGBEVF_DOWN, &adapter->state))
++ if (!test_bit(__IXGBEVF_DOWN, &adapter->state) &&
++     !test_bit(__IXGBEVF_REMOVING, &adapter->state))
+   ixgbevf_irq_enable_queues(adapter,
+        1 << q_vector->v_idx);
+ 
+@@ -829,37 +830,13 @@ static void ixgbevf_set_itr(struct ixgbevf_q_vector *q_vector)
+ static irqreturn_t ixgbevf_msix_other(int irq, void *data)
+ {
+  struct ixgbevf_adapter *adapter = data;
+- struct pci_dev *pdev = adapter->pdev;
+  struct ixgbe_hw *hw = &adapter->hw;
+- u32 msg;
+- bool got_ack = false;
+ 
+  hw->mac.get_link_status = 1;
+- if (!hw->mbx.ops.check_for_ack(hw))
+-  got_ack = true;
+-
+- if (!hw->mbx.ops.check_for_msg(hw)) {
+-  hw->mbx.ops.read(hw, &msg, 1);
+ 
+-  if ((msg & IXGBE_MBVFICR_VFREQ_MASK) == IXGBE_PF_CONTROL_MSG) {
+-   mod_timer(&adapter->watchdog_timer,
+-      round_jiffies(jiffies + 1));
+-   adapter->link_up = false;
+-  }
+-
+-  if (msg & IXGBE_VT_MSGTYPE_NACK)
+-   dev_info(&pdev->dev,
+-     "Last Request of type %2.2x to PF Nacked\n",
+-     msg & 0xFF);
+-  hw->mbx.v2p_mailbox |= IXGBE_VFMAILBOX_PFSTS;
+- }
+-
+- /* checking for the ack clears the PFACK bit.  Place
+-  * it back in the v2p_mailbox cache so that anyone
+-  * polling for an ack will not miss it
+-  */
+- if (got_ack)
+-  hw->mbx.v2p_mailbox |= IXGBE_VFMAILBOX_PFACK;
++ if (!test_bit(__IXGBEVF_DOWN, &adapter->state) &&
++     !test_bit(__IXGBEVF_REMOVING, &adapter->state))
++  mod_timer(&adapter->watchdog_timer, jiffies);
+ 
+  IXGBE_WRITE_REG(hw, IXGBE_VTEIMS, adapter->eims_other);
+ 
+@@ -2354,6 +2331,7 @@ static void ixgbevf_reset_task(struct work_struct *work)
+ 
+  /* If we're already down or resetting, just bail */
+  if (test_bit(__IXGBEVF_DOWN, &adapter->state) ||
++     test_bit(__IXGBEVF_REMOVING, &adapter->state) ||
+      test_bit(__IXGBEVF_RESETTING, &adapter->state))
+   return;
+ 
+@@ -2438,7 +2416,8 @@ static void ixgbevf_watchdog_task(struct work_struct *work)
+ 
+ pf_has_reset:
+  /* Reset the timer */
+- if (!test_bit(__IXGBEVF_DOWN, &adapter->state))
++ if (!test_bit(__IXGBEVF_DOWN, &adapter->state) &&
++     !test_bit(__IXGBEVF_REMOVING, &adapter->state))
+   mod_timer(&adapter->watchdog_timer,
+      round_jiffies(jiffies + (2 * HZ)));
+ 
+@@ -3588,7 +3567,7 @@ static void ixgbevf_remove(struct pci_dev *pdev)
+  struct net_device *netdev = pci_get_drvdata(pdev);
+  struct ixgbevf_adapter *adapter = netdev_priv(netdev);
+ 
+- set_bit(__IXGBEVF_DOWN, &adapter->state);
++ set_bit(__IXGBEVF_REMOVING, &adapter->state);
+ 
+  del_timer_sync(&adapter->watchdog_timer);
+ 
+-- 
+1.7.1

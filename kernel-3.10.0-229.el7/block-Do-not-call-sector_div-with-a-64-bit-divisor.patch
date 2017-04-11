@@ -1,0 +1,75 @@
+From 6d40c7bb96bd17bb9b6c8f51280d1562b87d0287 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:34:50 -0400
+Subject: [block] Do not call sector_div() with a 64-bit divisor
+
+Message-id: <1402670238-13916-3-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83762
+O-Subject: [RHEL7.1 PATCH 002/150] block: Do not call sector_div() with a 64-bit divisor
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit 97597dc08f58e25bc74154b7d1c387a4c0432950
+Author: Geert Uytterhoeven <geert@linux-m68k.org>
+Date:   Mon Nov 4 14:00:06 2013 +0100
+
+    block: Do not call sector_div() with a 64-bit divisor
+
+    do_div() (called by sector_div() if CONFIG_LBDAF=y) is meant for divisions
+    of 64-bit number by 32-bit numbers.  Passing 64-bit divisor types caused
+    issues in the past on 32-bit platforms, cfr. commit
+    ea077b1b96e073eac5c3c5590529e964767fc5f7 ("m68k: Truncate base in
+    do_div()").
+
+    As queue_limits.max_discard_sectors and .discard_granularity are unsigned
+    int, max_discard_sectors and granularity should be unsigned int.
+    As bdev_discard_alignment() returns int, alignment should be int.
+    Now 2 calls to sector_div() can be replaced by 32-bit arithmetic:
+      - The 64-bit modulo operation can become a 32-bit modulo operation,
+      - The 64-bit division and multiplication can be replaced by a 32-bit
+        modulo operation and a subtraction.
+
+    Signed-off-by: Geert Uytterhoeven <geert@linux-m68k.org>
+    Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-lib.c b/block/blk-lib.c
+index 9a32f58..4cb9ee8 100644
+--- a/block/blk-lib.c
++++ b/block/blk-lib.c
+@@ -43,8 +43,8 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
+  DECLARE_COMPLETION_ONSTACK(wait);
+  struct request_queue *q = bdev_get_queue(bdev);
+  int type = REQ_WRITE | REQ_DISCARD;
+- sector_t max_discard_sectors;
+- sector_t granularity, alignment;
++ unsigned int max_discard_sectors, granularity;
++ int alignment;
+  struct bio_batch bb;
+  struct bio *bio;
+  int ret = 0;
+@@ -58,16 +58,14 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
+ 
+  /* Zero-sector (unknown) and one-sector granularities are the same.  */
+  granularity = max(q->limits.discard_granularity >> 9, 1U);
+- alignment = bdev_discard_alignment(bdev) >> 9;
+- alignment = sector_div(alignment, granularity);
++ alignment = (bdev_discard_alignment(bdev) >> 9) % granularity;
+ 
+  /*
+   * Ensure that max_discard_sectors is of the proper
+   * granularity, so that requests stay aligned after a split.
+   */
+  max_discard_sectors = min(q->limits.max_discard_sectors, UINT_MAX >> 9);
+- sector_div(max_discard_sectors, granularity);
+- max_discard_sectors *= granularity;
++ max_discard_sectors -= max_discard_sectors % granularity;
+  if (unlikely(!max_discard_sectors)) {
+   /* Avoid infinite loop below. Being cautious never hurts. */
+   return -EOPNOTSUPP;
+-- 
+1.7.1

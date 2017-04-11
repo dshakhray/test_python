@@ -1,0 +1,396 @@
+From 95adfa7d5725d6e0646873f81a4d9b8ce995aac8 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:11:30 -0400
+Subject: [powerpc] powernv: Create OPAL sglist helper functions and fix endian issues
+
+Message-id: <1410545655-205645-462-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94343
+O-Subject: [RHEL7 PATCH 461/626] powerpc/powernv: Create OPAL sglist helper functions and fix endian issues
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 3441f04b4b62758a798f9fbbf2047dfedf0329a5
+Author: Anton Blanchard <anton@samba.org>
+Date:   Tue Apr 22 15:01:26 2014 +1000
+
+    powerpc/powernv: Create OPAL sglist helper functions and fix endian issues
+
+    We have two copies of code that creates an OPAL sg list. Consolidate
+    these into a common set of helpers and fix the endian issues.
+
+    The flash interface embedded a version number in the num_entries
+    field, whereas the dump interface did did not. Since versioning
+    wasn't added to the flash interface and it is impossible to add
+    this in a backwards compatible way, just remove it.
+
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 1a752ac..afb0fed 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -41,14 +41,14 @@ struct opal_takeover_args {
+  * size except the last one in the list to be as well.
+  */
+ struct opal_sg_entry {
+- void    *data;
+- long    length;
++ __be64 data;
++ __be64 length;
+ };
+ 
+-/* sg list */
++/* SG list */
+ struct opal_sg_list {
+- unsigned long num_entries;
+- struct opal_sg_list *next;
++ __be64 length;
++ __be64 next;
+  struct opal_sg_entry entry[];
+ };
+ 
+@@ -929,6 +929,10 @@ extern int opal_resync_timebase(void);
+ 
+ extern void opal_lpc_init(void);
+ 
++struct opal_sg_list *opal_vmalloc_to_sg_list(void *vmalloc_addr,
++          unsigned long vmalloc_size);
++void opal_free_sg_list(struct opal_sg_list *sg);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* __OPAL_H */
+diff --git a/arch/powerpc/platforms/powernv/opal-dump.c b/arch/powerpc/platforms/powernv/opal-dump.c
+index 0c767c5..423f0f1 100644
+--- a/arch/powerpc/platforms/powernv/opal-dump.c
++++ b/arch/powerpc/platforms/powernv/opal-dump.c
+@@ -214,80 +214,6 @@ static struct kobj_type dump_ktype = {
+  .default_attrs = dump_default_attrs,
+ };
+ 
+-static void free_dump_sg_list(struct opal_sg_list *list)
+-{
+- struct opal_sg_list *sg1;
+- while (list) {
+-  sg1 = list->next;
+-  kfree(list);
+-  list = sg1;
+- }
+- list = NULL;
+-}
+-
+-static struct opal_sg_list *dump_data_to_sglist(struct dump_obj *dump)
+-{
+- struct opal_sg_list *sg1, *list = NULL;
+- void *addr;
+- int64_t size;
+-
+- addr = dump->buffer;
+- size = dump->size;
+-
+- sg1 = kzalloc(PAGE_SIZE, GFP_KERNEL);
+- if (!sg1)
+-  goto nomem;
+-
+- list = sg1;
+- sg1->num_entries = 0;
+- while (size > 0) {
+-  /* Translate virtual address to physical address */
+-  sg1->entry[sg1->num_entries].data =
+-   (void *)(vmalloc_to_pfn(addr) << PAGE_SHIFT);
+-
+-  if (size > PAGE_SIZE)
+-   sg1->entry[sg1->num_entries].length = PAGE_SIZE;
+-  else
+-   sg1->entry[sg1->num_entries].length = size;
+-
+-  sg1->num_entries++;
+-  if (sg1->num_entries >= SG_ENTRIES_PER_NODE) {
+-   sg1->next = kzalloc(PAGE_SIZE, GFP_KERNEL);
+-   if (!sg1->next)
+-    goto nomem;
+-
+-   sg1 = sg1->next;
+-   sg1->num_entries = 0;
+-  }
+-  addr += PAGE_SIZE;
+-  size -= PAGE_SIZE;
+- }
+- return list;
+-
+-nomem:
+- pr_err("%s : Failed to allocate memory\n", __func__);
+- free_dump_sg_list(list);
+- return NULL;
+-}
+-
+-static void sglist_to_phy_addr(struct opal_sg_list *list)
+-{
+- struct opal_sg_list *sg, *next;
+-
+- for (sg = list; sg; sg = next) {
+-  next = sg->next;
+-  /* Don't translate NULL pointer for last entry */
+-  if (sg->next)
+-   sg->next = (struct opal_sg_list *)__pa(sg->next);
+-  else
+-   sg->next = NULL;
+-
+-  /* Convert num_entries to length */
+-  sg->num_entries =
+-   sg->num_entries * sizeof(struct opal_sg_entry) + 16;
+- }
+-}
+-
+ static int64_t dump_read_info(uint32_t *id, uint32_t *size, uint32_t *type)
+ {
+  int rc;
+@@ -319,15 +245,12 @@ static int64_t dump_read_data(struct dump_obj *dump)
+  }
+ 
+  /* Generate SG list */
+- list = dump_data_to_sglist(dump);
++ list = opal_vmalloc_to_sg_list(dump->buffer, dump->size);
+  if (!list) {
+   rc = -ENOMEM;
+   goto out;
+  }
+ 
+- /* Translate sg list addr to real address */
+- sglist_to_phy_addr(list);
+-
+  /* First entry address */
+  addr = __pa(list);
+ 
+@@ -346,7 +269,7 @@ static int64_t dump_read_data(struct dump_obj *dump)
+    __func__, dump->id);
+ 
+  /* Free SG list */
+- free_dump_sg_list(list);
++ opal_free_sg_list(list);
+ 
+ out:
+  return rc;
+diff --git a/arch/powerpc/platforms/powernv/opal-flash.c b/arch/powerpc/platforms/powernv/opal-flash.c
+index daa0bcb..75b2264 100644
+--- a/arch/powerpc/platforms/powernv/opal-flash.c
++++ b/arch/powerpc/platforms/powernv/opal-flash.c
+@@ -79,9 +79,6 @@
+ /* XXX: Assume candidate image size is <= 1GB */
+ #define MAX_IMAGE_SIZE 0x40000000
+ 
+-/* Flash sg list version */
+-#define SG_LIST_VERSION (1UL)
+-
+ /* Image status */
+ enum {
+  IMAGE_INVALID,
+@@ -272,93 +269,11 @@ static ssize_t manage_store(struct kobject *kobj,
+ }
+ 
+ /*
+- * Free sg list
+- */
+-static void free_sg_list(struct opal_sg_list *list)
+-{
+- struct opal_sg_list *sg1;
+- while (list) {
+-  sg1 = list->next;
+-  kfree(list);
+-  list = sg1;
+- }
+- list = NULL;
+-}
+-
+-/*
+- * Build candidate image scatter gather list
+- *
+- * list format:
+- *   -----------------------------------
+- *  |  VER (8) | Entry length in bytes  |
+- *   -----------------------------------
+- *  |  Pointer to next entry            |
+- *   -----------------------------------
+- *  |  Address of memory area 1         |
+- *   -----------------------------------
+- *  |  Length of memory area 1          |
+- *   -----------------------------------
+- *  |   .........                       |
+- *   -----------------------------------
+- *  |   .........                       |
+- *   -----------------------------------
+- *  |  Address of memory area N         |
+- *   -----------------------------------
+- *  |  Length of memory area N          |
+- *   -----------------------------------
+- */
+-static struct opal_sg_list *image_data_to_sglist(void)
+-{
+- struct opal_sg_list *sg1, *list = NULL;
+- void *addr;
+- int size;
+-
+- addr = image_data.data;
+- size = image_data.size;
+-
+- sg1 = kzalloc(PAGE_SIZE, GFP_KERNEL);
+- if (!sg1)
+-  return NULL;
+-
+- list = sg1;
+- sg1->num_entries = 0;
+- while (size > 0) {
+-  /* Translate virtual address to physical address */
+-  sg1->entry[sg1->num_entries].data =
+-   (void *)(vmalloc_to_pfn(addr) << PAGE_SHIFT);
+-
+-  if (size > PAGE_SIZE)
+-   sg1->entry[sg1->num_entries].length = PAGE_SIZE;
+-  else
+-   sg1->entry[sg1->num_entries].length = size;
+-
+-  sg1->num_entries++;
+-  if (sg1->num_entries >= SG_ENTRIES_PER_NODE) {
+-   sg1->next = kzalloc(PAGE_SIZE, GFP_KERNEL);
+-   if (!sg1->next) {
+-    pr_err("%s : Failed to allocate memory\n",
+-           __func__);
+-    goto nomem;
+-   }
+-
+-   sg1 = sg1->next;
+-   sg1->num_entries = 0;
+-  }
+-  addr += PAGE_SIZE;
+-  size -= PAGE_SIZE;
+- }
+- return list;
+-nomem:
+- free_sg_list(list);
+- return NULL;
+-}
+-
+-/*
+  * OPAL update flash
+  */
+ static int opal_flash_update(int op)
+ {
+- struct opal_sg_list *sg, *list, *next;
++ struct opal_sg_list *list;
+  unsigned long addr;
+  int64_t rc = OPAL_PARAMETER;
+ 
+@@ -368,30 +283,13 @@ static int opal_flash_update(int op)
+   goto flash;
+  }
+ 
+- list = image_data_to_sglist();
++ list = opal_vmalloc_to_sg_list(image_data.data, image_data.size);
+  if (!list)
+   goto invalid_img;
+ 
+  /* First entry address */
+  addr = __pa(list);
+ 
+- /* Translate sg list address to absolute */
+- for (sg = list; sg; sg = next) {
+-  next = sg->next;
+-  /* Don't translate NULL pointer for last entry */
+-  if (sg->next)
+-   sg->next = (struct opal_sg_list *)__pa(sg->next);
+-  else
+-   sg->next = NULL;
+-
+-  /*
+-   * Convert num_entries to version/length format
+-   * to satisfy OPAL.
+-   */
+-  sg->num_entries = (SG_LIST_VERSION << 56) |
+-   (sg->num_entries * sizeof(struct opal_sg_entry) + 16);
+- }
+-
+  pr_alert("FLASH: Image is %u bytes\n", image_data.size);
+  pr_alert("FLASH: Image update requested\n");
+  pr_alert("FLASH: Image will be updated during system reboot\n");
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index 17cfc70..360ad80 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -638,3 +638,66 @@ void opal_shutdown(void)
+ 
+ /* Export this so that test modules can use it */
+ EXPORT_SYMBOL_GPL(opal_invalid_call);
++
++/* Convert a region of vmalloc memory to an opal sg list */
++struct opal_sg_list *opal_vmalloc_to_sg_list(void *vmalloc_addr,
++          unsigned long vmalloc_size)
++{
++ struct opal_sg_list *sg, *first = NULL;
++ unsigned long i = 0;
++
++ sg = kzalloc(PAGE_SIZE, GFP_KERNEL);
++ if (!sg)
++  goto nomem;
++
++ first = sg;
++
++ while (vmalloc_size > 0) {
++  uint64_t data = vmalloc_to_pfn(vmalloc_addr) << PAGE_SHIFT;
++  uint64_t length = min(vmalloc_size, PAGE_SIZE);
++
++  sg->entry[i].data = cpu_to_be64(data);
++  sg->entry[i].length = cpu_to_be64(length);
++  i++;
++
++  if (i >= SG_ENTRIES_PER_NODE) {
++   struct opal_sg_list *next;
++
++   next = kzalloc(PAGE_SIZE, GFP_KERNEL);
++   if (!next)
++    goto nomem;
++
++   sg->length = cpu_to_be64(
++     i * sizeof(struct opal_sg_entry) + 16);
++   i = 0;
++   sg->next = cpu_to_be64(__pa(next));
++   sg = next;
++  }
++
++  vmalloc_addr += length;
++  vmalloc_size -= length;
++ }
++
++ sg->length = cpu_to_be64(i * sizeof(struct opal_sg_entry) + 16);
++
++ return first;
++
++nomem:
++ pr_err("%s : Failed to allocate memory\n", __func__);
++ opal_free_sg_list(first);
++ return NULL;
++}
++
++void opal_free_sg_list(struct opal_sg_list *sg)
++{
++ while (sg) {
++  uint64_t next = be64_to_cpu(sg->next);
++
++  kfree(sg);
++
++  if (next)
++   sg = __va(next);
++  else
++   sg = NULL;
++ }
++}
+-- 
+1.7.1

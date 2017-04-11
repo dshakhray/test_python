@@ -1,0 +1,67 @@
+From c4e0b15dab1e7551bdc84c2768b03e31d881df26 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:00:07 -0400
+Subject: [fs] btrfs: flush the dirty pages of the ordered extent aggressively during logging csum
+
+Message-id: <1407179109-13714-121-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87167
+O-Subject: [RHEL7.1 PATCH 120/422] Btrfs: flush the dirty pages of the ordered extent aggressively during logging csum
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Miao Xie <miaox@cn.fujitsu.com>
+
+commit 23c671a58831a5aaca3b56b915c8394a274a96df
+Author: Miao Xie <miaox@cn.fujitsu.com>
+Date:   Tue Jan 14 20:31:52 2014 +0800
+
+    Btrfs: flush the dirty pages of the ordered extent aggressively during logging csum
+
+    The performance of fsync dropped down suddenly sometimes, the main reason
+    of this problem was that we might only flush part dirty pages in a ordered
+    extent, then got that ordered extent, wait for the csum calcucation. But if
+    no task flushed the left part, we would wait until the flusher flushed them,
+    sometimes we need wait for several seconds, it made the performance drop
+    down suddenly. (On my box, it drop down from 56MB/s to 4-10MB/s)
+
+    This patch improves the above problem by flushing left dirty pages aggressively.
+
+    Test Environment:
+    CPU:  2CPU * 2Cores
+    Memory:  4GB
+    Partition: 20GB(HDD)
+
+    Test Command:
+     # sysbench --num-threads=8 --test=fileio --file-num=1 \
+     > --file-total-size=8G --file-block-size=32768 \
+     > --file-io-mode=sync --file-fsync-freq=100 \
+     > --file-fsync-end=no --max-requests=10000 \
+     > --file-test-mode=rndwr run
+
+    Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index b561e7a..b142b6d 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -3637,7 +3637,11 @@ again:
+    * start over after this.
+    */
+ 
+-  wait_event(ordered->wait, ordered->csum_bytes_left == 0);
++  if (ordered->csum_bytes_left) {
++   btrfs_start_ordered_extent(inode, ordered, 0);
++   wait_event(ordered->wait,
++       ordered->csum_bytes_left == 0);
++  }
+ 
+   list_for_each_entry(sum, &ordered->list, list) {
+    ret = btrfs_csum_file_blocks(trans, log, sum);
+-- 
+1.7.1

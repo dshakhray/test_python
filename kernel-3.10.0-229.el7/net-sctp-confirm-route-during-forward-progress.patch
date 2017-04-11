@@ -1,0 +1,117 @@
+From 5cfa0ab3a3f304bc40e098dec20ee3781bf1ec9e Mon Sep 17 00:00:00 2001
+From: Daniel Borkmann <dborkman@redhat.com>
+Date: Wed, 23 Apr 2014 12:01:56 -0400
+Subject: [net] sctp: confirm route during forward progress
+
+Message-id: <9b9a3249d4a8ba29db27d0e0f326f7c0808a861a.1398254367.git.dborkman@redhat.com>
+Patchwork-id: 79003
+O-Subject: [RHEL7 PATCH net] net: sctp: confirm route during forward progress
+Bugzilla: 1089629
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1089629
+Upstream Status: 8c2f414ad1b3aa3af05791cd7312eb8ff9d80e0d
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7375289
+Tested: verified on beaker
+
+Upstream Commit:
+commit 8c2f414ad1b3aa3af05791cd7312eb8ff9d80e0d
+Author: Daniel Borkmann <dborkman@redhat.com>
+Date:   Tue Jul 9 16:17:04 2013 +0200
+
+    net: sctp: confirm route during forward progress
+
+    This fix has been proposed originally by Vlad Yasevich. He says:
+
+      When SCTP makes forward progress (receives a SACK that acks new chunks,
+      renegs, or answeres 0-window probes) or when HB-ACK arrives, mark
+      the route as confirmed so we don't unnecessarily send NUD probes.
+
+    Having a simple SCTP client/server that exchange data chunks every 1sec,
+    without this patch ARP requests are sent periodically every 40-60sec.
+    With this fix applied, an ARP request is only done once right at the
+    "session" beginning. Also, when clearing the related ARP cache entry
+    manually during the session, a new request is correctly done. I have
+    only "backported" this to net-next and tested that it works, so full
+    credit goes to Vlad.
+
+    Signed-off-by: Vlad Yasevich <vyasevich@gmail.com>
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Acked-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/sctp/outqueue.c b/net/sctp/outqueue.c
+index be35e2d..bd35dc2 100644
+--- a/net/sctp/outqueue.c
++++ b/net/sctp/outqueue.c
+@@ -1345,6 +1345,7 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+  __u8 restart_timer = 0;
+  int bytes_acked = 0;
+  int migrate_bytes = 0;
++ bool forward_progress = false;
+ 
+  /* These state variables are for coherent debug output. --xguo */
+ 
+@@ -1426,6 +1427,7 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+     bytes_acked += sctp_data_size(tchunk);
+     if (!tchunk->transport)
+      migrate_bytes += sctp_data_size(tchunk);
++    forward_progress = true;
+    }
+ 
+    if (TSN_lte(tsn, sack_ctsn)) {
+@@ -1439,6 +1441,7 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+      * current RTO.
+      */
+     restart_timer = 1;
++    forward_progress = true;
+ 
+     if (!tchunk->tsn_gap_acked) {
+      /*
+@@ -1625,6 +1628,7 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+     */
+    transport->error_count = 0;
+    transport->asoc->overall_error_count = 0;
++   forward_progress = true;
+ 
+    /*
+     * While in SHUTDOWN PENDING, we may have started
+@@ -1698,6 +1702,11 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+            jiffies + transport->rto))
+     sctp_transport_hold(transport);
+   }
++
++  if (forward_progress) {
++   if (transport->dst)
++    dst_confirm(transport->dst);
++  }
+  }
+ 
+  list_splice(&tlist, transmitted_queue);
+diff --git a/net/sctp/sm_sideeffect.c b/net/sctp/sm_sideeffect.c
+index 8aab894..a657d87 100644
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@ -733,6 +733,12 @@ static void sctp_cmd_transport_on(sctp_cmd_seq_t *cmds,
+   sctp_assoc_control_transport(asoc, t, SCTP_TRANSPORT_UP,
+           SCTP_HEARTBEAT_SUCCESS);
+ 
++ /* HB-ACK was received for a the proper HB.  Consider this
++  * forward progress.
++  */
++ if (t->dst)
++  dst_confirm(t->dst);
++
+  /* The receiver of the HEARTBEAT ACK should also perform an
+   * RTT measurement for that destination transport address
+   * using the time value carried in the HEARTBEAT ACK chunk.
+-- 
+1.7.1

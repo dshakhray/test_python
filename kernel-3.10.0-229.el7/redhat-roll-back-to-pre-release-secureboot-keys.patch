@@ -1,0 +1,209 @@
+From 3e6c53e6fcdc655c5c669db93530260ddb9e35b4 Mon Sep 17 00:00:00 2001
+From: Jarod Wilson <jarod@redhat.com>
+Date: Wed, 21 May 2014 22:51:05 -0400
+Subject: [redhat] roll back to pre-release secureboot keys
+
+Message-id: <1400712665-53565-1-git-send-email-jarod@redhat.com>
+Patchwork-id: 80098
+O-Subject: [RHEL7 PATCH] [redhat] roll back to pre-release secureboot keys
+Bugzilla:
+RH-Acked-by: Kyle McMartin <kmcmarti@redhat.com>
+
+Restore the pre-release secureboot keys, we want to use them for devel
+builds that aren't released for public testing, and make it easier to
+toggle this on and off in the future by repurposing the released_kernel
+flag in the spec (and Makefile infra). Also did a little bit of
+housecleaning, removing some Fedora/rawhide-specific tidbits.
+
+Toggle RELEASED_KERNEL := 0 in redhat/Makefile.common to swap between the
+pre-release secureboot key and the release one.
+
+Built in brew, ID: 358418, using the pesign target.
+Key was previously tested successfully in secureboot mode, and I have no
+secureboot hardware myself, but I'm sure someone will scream loudly pretty
+early on if I messed anything up. :)
+
+CC: Eric Paris <eparis@redhat.com>
+CC: Peter Jones <pjones@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/redhat/Makefile b/redhat/Makefile
+index 3a30715..62a0b7d 100644
+--- a/redhat/Makefile
++++ b/redhat/Makefile
+@@ -76,7 +76,7 @@ $(TARBALL):
+ 
+ setup-source: rh-clean-sources
+  @cp $(REDHAT)/$(SPECFILE).template $(SOURCES)/$(SPECFILE)
+- @$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(PKGRELEASE) $(RPMVERSION)
++ @$(REDHAT)/genspec.sh $(SOURCES) $(SOURCES)/$(SPECFILE) $(PKGRELEASE) $(RPMVERSION) $(RELEASED_KERNEL)
+  @cp $(SOURCES)/$(SPECFILE) $(SOURCES)/../SPECS/
+ 
+ sources-rh: $(TARBALL)
+diff --git a/redhat/Makefile.common b/redhat/Makefile.common
+index cecb2ce..8a67387 100644
+--- a/redhat/Makefile.common
++++ b/redhat/Makefile.common
+@@ -18,7 +18,7 @@ SOURCES:=$(RPM)/SOURCES
+ TESTPATCH:=$(REDHAT)/linux-kernel-test.patch
+ FILTERDIFF:=/usr/bin/filterdiff -x '*redhat/*' -x '*/.gitignore' -x '*/makefile' -x '*/Makefile'
+ 
+-RELEASED_KERNEL := 1
++RELEASED_KERNEL := 0
+ STAMP_VERSION := $(KVERSION)
+ 
+ LOCVERFILE:=../localversion
+diff --git a/redhat/genspec.sh b/redhat/genspec.sh
+index a1eb777..4376425 100755
+--- a/redhat/genspec.sh
++++ b/redhat/genspec.sh
+@@ -4,13 +4,13 @@ SOURCES=$1
+ SPECFILE=$2
+ PKGRELEASE=$3
+ RPMVERSION=$4
++RELEASED_KERNEL=$5
+ clogf="$SOURCES/changelog"
+ # hide [redhat] entries from changelog
+ HIDE_REDHAT=1;
+ # override LC_TIME to avoid date conflicts when building the srpm
+ LC_TIME=
+ STAMP=$(echo $MARKER | cut -f 1 -d '-' | sed -e "s/v//");
+-RELEASED_KERNEL="1";
+ RPM_VERSION="$RPMVERSION-$PKGRELEASE";
+ 
+ echo >$clogf
+diff --git a/redhat/git/files b/redhat/git/files
+index 340bd8e..31632ad 100644
+--- a/redhat/git/files
++++ b/redhat/git/files
+@@ -4,6 +4,8 @@ extra_certificates
+ x509.genkey
+ rheldup3.x509
+ rhelkpatch1.x509
++redhatsecurebootca2.cer
++redhatsecureboot003.cer
+ securebootca.cer
+ secureboot.cer
+ Makefile.common
+diff --git a/redhat/kernel.spec.template b/redhat/kernel.spec.template
+index 49c9bbb..353dc22 100644
+--- a/redhat/kernel.spec.template
++++ b/redhat/kernel.spec.template
+@@ -5,9 +5,8 @@ Summary: The Linux kernel
+ 
+ # % define buildid .local
+ 
+-# For a stable, released kernel, released_kernel should be 1. For rawhide
+-# and/or a kernel built from an rc or git snapshot, released_kernel should
+-# be 0.
++# For a kernel released for public testing, released_kernel should be 1.
++# For internal testing builds during development, it should be 0.
+ %global released_kernel %%RELEASED_KERNEL%%
+ 
+ %define rpmversion %%RPMVERSION%%
+@@ -48,19 +47,9 @@ Summary: The Linux kernel
+ # kernel-abi-whitelists
+ %define with_kernel_abi_whitelists %{?_with_kernel_abi_whitelists: 0} %{?!_with_kernel_abi_whitelists: 1}
+ 
+-# Build the kernel-doc package, but don't fail the build if it botches.
+-# Here "true" means "continue" and "false" means "fail the build".
+-%if 0%{?released_kernel}
++# In RHEL, we always want the doc build failing to build to be a failure,
++# which means settings this to false.
+ %define doc_build_fail false
+-%else
+-%define doc_build_fail true
+-%endif
+-
+-%define rawhide_skip_docs 0
+-%if 0%{?rawhide_skip_docs}
+-%define with_doc 0
+-%define doc_build_fail true
+-%endif
+ 
+ # Additional options for user-friendly one-off kernel building:
+ #
+@@ -80,7 +69,7 @@ Summary: The Linux kernel
+ 
+ # Set debugbuildsenabled to 1 for production (build separate debug kernels)
+ #  and 0 for rawhide (all kernels are debug kernels).
+-# See also 'make debug' and 'make release'.
++# See also 'make debug' and 'make release'. RHEL only ever does 1.
+ %define debugbuildsenabled 1
+ 
+ %define make_target bzImage
+@@ -338,8 +327,15 @@ Source10: sign-modules
+ %define modsign_cmd %{SOURCE10}
+ Source11: x509.genkey
+ Source12: extra_certificates
++%if %{?released_kernel}
+ Source13: securebootca.cer
+ Source14: secureboot.cer
++%define pesign_name redhatsecureboot301
++%else
++Source13: redhatsecurebootca2.cer
++Source14: redhatsecureboot003.cer
++%define pesign_name redhatsecureboot003
++%endif
+ Source15: rheldup3.x509
+ Source16: rhelkpatch1.x509
+ 
+@@ -819,7 +815,7 @@ BuildKernel() {
+     fi
+ # EFI SecureBoot signing, x86_64-only
+ %ifarch x86_64
+-    %pesign -s -i $KernelImage -o $KernelImage.signed -a %{SOURCE13} -c %{SOURCE14} -n redhatsecureboot301
++    %pesign -s -i $KernelImage -o $KernelImage.signed -a %{SOURCE13} -c %{SOURCE14} -n %{pesign_name}
+     mv $KernelImage.signed $KernelImage
+ %endif
+     $CopyKernel $KernelImage $RPM_BUILD_ROOT/%{image_install_path}/$InstallName-$KernelVer
+diff --git a/redhat/keys/redhatsecureboot003.cer b/redhat/keys/redhatsecureboot003.cer
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1d9ff7066748afebadacd3e64339acd700da69b
+GIT binary patch
+literal 769
+zcmXqLV)|>)#Q1apGZP~d6DPyHZ%Ri#eQaYg;AP{~YV&CO&dbQi&B|b)WvF4G#>O1V
+z!YnKwl$xU8kyxS-oSIx(l&avApI@Tj?5JR*ppleXlBj7QC(dhVY+zw%X<%t&U}_L0
+z&TDKA<QhY{2Kt7&2HFs_RIr&9oSB}NnU}6$3^TBaQ3=^SjI0dIO^o~uKzDO7H8C<W
+z?7g+{ZEv4w%n!zL53hu2Kh=Ld+L*~7C>d0D#H8=x>^Vy|#$0QhQSoo(Q*MS`b5iP#
+zpDEf{>@CP1^g&@-_e{%sw}08XKAKU@<M@PUYwV;F%V`g%PhYrJ@5}{h-?@A3R+{yl
+zIUb)?YZ=Ggd+JH^OY4|6_ba<<XQ(aw@?t_Z|Htf}$BP<lrhVkvmUh59@q5YH%hi2x
+zmbYdq7*D?Zp?<CD%Z}bT`%^!<GySZ2s~+!_YI8oGuVZS-z2EcnCeC&>KhgUCv17r%
+ztMB=mlsL9qyV%`{uHUu)S;SnXywd#vZ_e8<oyhelQs?k<R^}I<^0inpW*HjwvzVTh
+zH#y^988x$aZp>FEW=00a#fk><2C~3lmE~g*V-ZO`y6@Dp$gICPg-4dpIHuZLoz8jz
+zIS_%73JgR>hHj1WrI{D^{&SW;Y#cga(}DU6|DI%aa!>Gj=r0}8_<mQ#@3!Q5=L+`S
+z3!Is`*>qFffuqwW`qwyc9d<d8Q8_<VKPzhOoP?+fo}f~e$SlsC=N?be`{=f7`D)ht
+z7H&)X<4<hYe*eRNgWTLFn-2-ioV1*4RbtVDGe_JMDzfEFqmmU)oHc&^?BN=|?FWOU
+znexv?ZH<}gu(-8kc||B+xl$~{n+=}A^P1<(U*(p2>DuYFDyyF@F}BT~$J+W@cj|=9
+z`z_rMIw#D`J;);@zdf}|O}Rz#PU+7Hh0kTVdhLHNH~AT!ld)a<K3meB&kOf41WcP2
+X;&WOzKkw<DyoPSwlxgnDpHid%Y#&8O
+
+literal 0
+HcmV?d00001
+
+diff --git a/redhat/keys/redhatsecurebootca2.cer b/redhat/keys/redhatsecurebootca2.cer
+new file mode 100644
+index 0000000000000000000000000000000000000000..43502d6bce455d637e4008d57ac0a46136ed4393
+GIT binary patch
+literal 872
+zcmXqLVoot=V)9wQ%*4pV#L3V;Yf^YfR(_WOFB_*;n@8JsUPeZ4Rt5ttLk$BpHs(+k
+zW?}iD)D#7e#1e(z)a25lR0XH}{1OFcM+GAVjil6)L`?%Zab81X0}De-14~0ALxU)B
+zUSo40*BHtr$*d+uC1j^CvNA9?G4eAQG%<29H8C<W?024X?Bu~cpY%ofBBI>a&33Qa
+z+%s9Zc=s~y8qpg(i!y`$cU^MUOcduWDY<;6Y08`RDssi2V>H&cGrfyWlDxyS_leN^
+z>+#ICm5X=Z;E8&1s(tIDdtX#F9)8|!T{!hfpd!;Oqa<zt@3n!MFJ>=373Qy1yo*h@
+zea8xcL&whC7h?Z^<w(Udxmf$=V<o)Xwg0`*`yFQOIMeuj*3q)x&*H7;WyLdXx1JFp
+zVww18!IM3ermpI#m#TgUvt%uObBFt^r%49$+%7J~b^f=a(`+~JT|9V@>xM>;@1>t?
+zGu0NFpDlU)nEkYplL5oM;>%t~j%XRUoZBF>Pe;c6R?Ef78}}F=+iK0k%*epFxUt8e
+zvC}{n7(cRnEMhDojX&PG$Jo97eQs&XzU%95U#?BrtYr`dl2&F3HVACMs$iks5*<?F
+zrU@yv@PNz~W??m8W@P-29AUt;1B@_62LAc8O*?Pi?{sOiDHf49!Rov1^liV^SC1q%
+ztzPNJZ(*|gqi2e5$lW*ZPfm4T>Z5Mz9^I)@fAQ%22Td8dJF?m{>Wls{ZQj$kTehHK
+z%NHA-;K^Gbgf|7p9bLv(XRxd0x%KP^ds-)G2LFsXwet?=tn>Zdi=Q!zy_Y??<*8xY
+zqT7FD-?<)DIh*fh7@KOtl`Iq+&^g(|s<tf6#-A&l|5!@<w|`}#2hOQJ-cfbe@8zZm
+zo`N58^u_jn{<7i^hlxnqlY%3UZbV(5(=1l=`)1Dc4XZoc!`Hg-vRt<Jn&xpw?pNFN
+nqdSf2xz_|A=5VVFIQYQ#{*sdWm3JE&PE20>t-i4JEXQ8}?2KZ0
+
+literal 0
+HcmV?d00001
+
+-- 
+1.7.1

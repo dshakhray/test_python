@@ -1,0 +1,108 @@
+From be6a9198a1cdbd9f02d8f84e36b51f4f3a63b15f Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:21:56 -0400
+Subject: [block] rbd: protect against duplicate client creation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-10-git-send-email-sweil@redhat.com>
+Patchwork-id: 89544
+O-Subject: [PATCH 009/303] rbd: protect against duplicate client creation
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Alex Elder <elder@inktank.com>
+
+If more than one rbd image has the same ceph cluster configuration
+(same options, same set of monitors, same keys) they normally share
+a single rbd client.
+
+When an image is getting mapped, rbd looks to see if an existing
+client can be used, and creates a new one if not.
+
+The lookup and creation are not done under a common lock though, so
+mapping two images concurrently could lead to duplicate clients
+getting set up needlessly.  This isn't a major problem, but it's
+wasteful and different from what's intended.
+
+This patch fixes that by using the control mutex to protect
+both the lookup and (if needed) creation of the client.  It
+was previously used just when creating.
+
+This resolves:
+    http://tracker.ceph.com/issues/3094
+
+Signed-off-by: Alex Elder <elder@inktank.com>
+Reviewed-by: Josh Durgin <josh.durgin@inktank.com>
+(cherry picked from commit 08f75463c15e26e9d67a7c992ce7dd8964c6cbdd)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 032ce74..ad10628 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -520,7 +520,7 @@ static const struct block_device_operations rbd_bd_ops = {
+ 
+ /*
+  * Initialize an rbd client instance.  Success or not, this function
+- * consumes ceph_opts.
++ * consumes ceph_opts.  Caller holds ctl_mutex.
+  */
+ static struct rbd_client *rbd_client_create(struct ceph_options *ceph_opts)
+ {
+@@ -535,30 +535,25 @@ static struct rbd_client *rbd_client_create(struct ceph_options *ceph_opts)
+  kref_init(&rbdc->kref);
+  INIT_LIST_HEAD(&rbdc->node);
+ 
+- mutex_lock_nested(&ctl_mutex, SINGLE_DEPTH_NESTING);
+-
+  rbdc->client = ceph_create_client(ceph_opts, rbdc, 0, 0);
+  if (IS_ERR(rbdc->client))
+-  goto out_mutex;
++  goto out_rbdc;
+  ceph_opts = NULL; /* Now rbdc->client is responsible for ceph_opts */
+ 
+  ret = ceph_open_session(rbdc->client);
+  if (ret < 0)
+-  goto out_err;
++  goto out_client;
+ 
+  spin_lock(&rbd_client_list_lock);
+  list_add_tail(&rbdc->node, &rbd_client_list);
+  spin_unlock(&rbd_client_list_lock);
+ 
+- mutex_unlock(&ctl_mutex);
+  dout("%s: rbdc %p\n", __func__, rbdc);
+ 
+  return rbdc;
+-
+-out_err:
++out_client:
+  ceph_destroy_client(rbdc->client);
+-out_mutex:
+- mutex_unlock(&ctl_mutex);
++out_rbdc:
+  kfree(rbdc);
+ out_opt:
+  if (ceph_opts)
+@@ -682,11 +677,13 @@ static struct rbd_client *rbd_get_client(struct ceph_options *ceph_opts)
+ {
+  struct rbd_client *rbdc;
+ 
++ mutex_lock_nested(&ctl_mutex, SINGLE_DEPTH_NESTING);
+  rbdc = rbd_client_find(ceph_opts);
+  if (rbdc) /* using an existing client */
+   ceph_destroy_options(ceph_opts);
+  else
+   rbdc = rbd_client_create(ceph_opts);
++ mutex_unlock(&ctl_mutex);
+ 
+  return rbdc;
+ }
+-- 
+1.7.1

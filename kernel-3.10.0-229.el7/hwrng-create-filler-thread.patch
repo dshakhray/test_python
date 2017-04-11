@@ -1,0 +1,155 @@
+From b670429abfb02ebbfb94dc888d04b7c830ceae81 Mon Sep 17 00:00:00 2001
+From: Amit Shah <amit.shah@redhat.com>
+Date: Mon, 18 Aug 2014 10:00:25 -0400
+Subject: [hwrng] create filler thread
+
+Message-id: <d173349d2a97f11b8ace246bc7b4bd2f9f430e7c.1408347166.git.amit.shah@redhat.com>
+Patchwork-id: 87839
+O-Subject: [RHEL7.1 kernel PATCH 2/6] hwrng: create filler thread
+Bugzilla: 1129195
+RH-Acked-by: Amos Kong <akong@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Herbert Xu <herbert.xu@redhat.com>
+
+From: Torsten Duwe <duwe@lst.de>
+
+This can be viewed as the in-kernel equivalent of hwrngd;
+like FUSE it is a good thing to have a mechanism in user land,
+but for some reasons (simplicity, secrecy, integrity, speed)
+it may be better to have it in kernel space.
+
+This patch creates a thread once a hwrng registers, and uses
+the previously established add_hwgenerator_randomness() to feed
+its data to the input pool as long as needed. A derating factor
+is used to bias the entropy estimation and to disable this
+mechanism entirely when set to zero.
+
+Signed-off-by: Torsten Duwe <duwe@suse.de>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Acked-by: H. Peter Anvin <hpa@zytor.com>
+(cherry picked from commit be4000bc4644d027c519b6361f5ae3bbfc52c347)
+Signed-off-by: Amit Shah <amit.shah@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+Conflicts:
+ drivers/char/hw_random/core.c
+ Trivial contextual conflict -- also happened upstream in the -next tree
+ as two series were modifying the same location.
+
+diff --git a/drivers/char/hw_random/core.c b/drivers/char/hw_random/core.c
+index 74ee3bd..c2e9db5 100644
+--- a/drivers/char/hw_random/core.c
++++ b/drivers/char/hw_random/core.c
+@@ -39,6 +39,7 @@
+ #include <linux/sched.h>
+ #include <linux/init.h>
+ #include <linux/miscdevice.h>
++#include <linux/kthread.h>
+ #include <linux/delay.h>
+ #include <linux/slab.h>
+ #include <linux/random.h>
+@@ -51,10 +52,18 @@
+ 
+ 
+ static struct hwrng *current_rng;
++static struct task_struct *hwrng_fill;
+ static LIST_HEAD(rng_list);
+ static DEFINE_MUTEX(rng_mutex);
+ static int data_avail;
+-static u8 *rng_buffer;
++static u8 *rng_buffer, *rng_fillbuf;
++static unsigned short current_quality = 700; /* an arbitrary 70% */
++
++module_param(current_quality, ushort, 0644);
++MODULE_PARM_DESC(current_quality,
++   "current hwrng entropy estimation per mill");
++
++static void start_khwrngd(void);
+ 
+ static inline int rng_get_data(struct hwrng *rng, u8 *buffer, size_t size,
+           int wait);
+@@ -84,6 +93,10 @@ static inline int hwrng_init(struct hwrng *rng)
+    return ret;
+  }
+  add_early_randomness(rng);
++
++ if (current_quality > 0 && !hwrng_fill)
++  start_khwrngd();
++
+  return 0;
+ }
+ 
+@@ -320,6 +333,36 @@ err_misc_dereg:
+  goto out;
+ }
+ 
++static int hwrng_fillfn(void *unused)
++{
++ long rc;
++
++ while (!kthread_should_stop()) {
++  if (!current_rng)
++   break;
++  rc = rng_get_data(current_rng, rng_fillbuf,
++      rng_buffer_size(), 1);
++  if (rc <= 0) {
++   pr_warn("hwrng: no data available\n");
++   msleep_interruptible(10000);
++   continue;
++  }
++  add_hwgenerator_randomness((void *)rng_fillbuf, rc,
++        (rc*current_quality)>>10);
++ }
++ hwrng_fill = 0;
++ return 0;
++}
++
++static void start_khwrngd(void)
++{
++ hwrng_fill = kthread_run(hwrng_fillfn, NULL, "hwrng");
++ if (hwrng_fill == ERR_PTR(-ENOMEM)) {
++  pr_err("hwrng_fill thread creation failed");
++  hwrng_fill = NULL;
++ }
++}
++
+ int hwrng_register(struct hwrng *rng)
+ {
+  int err = -EINVAL;
+@@ -338,6 +381,13 @@ int hwrng_register(struct hwrng *rng)
+   if (!rng_buffer)
+    goto out_unlock;
+  }
++ if (!rng_fillbuf) {
++  rng_fillbuf = kmalloc(rng_buffer_size(), GFP_KERNEL);
++  if (!rng_fillbuf) {
++   kfree(rng_buffer);
++   goto out_unlock;
++  }
++ }
+ 
+  /* Must not register two RNGs with the same name. */
+  err = -EEXIST;
+@@ -401,8 +451,11 @@ void hwrng_unregister(struct hwrng *rng)
+     current_rng = NULL;
+   }
+  }
+- if (list_empty(&rng_list))
++ if (list_empty(&rng_list)) {
+   unregister_miscdev();
++  if (hwrng_fill)
++   kthread_stop(hwrng_fill);
++ }
+ 
+  mutex_unlock(&rng_mutex);
+ }
+@@ -413,6 +466,7 @@ static void __exit hwrng_exit(void)
+  mutex_lock(&rng_mutex);
+  BUG_ON(current_rng);
+  kfree(rng_buffer);
++ kfree(rng_fillbuf);
+  mutex_unlock(&rng_mutex);
+ }
+ 
+-- 
+1.7.1

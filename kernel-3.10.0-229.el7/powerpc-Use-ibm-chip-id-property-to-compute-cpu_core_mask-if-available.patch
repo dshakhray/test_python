@@ -1,0 +1,107 @@
+From 697880d481b400a2ab63d80f1a00a6ddf0525028 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:04:45 -0400
+Subject: [powerpc] Use ibm, chip-id property to compute cpu_core_mask if available
+
+Message-id: <1410545655-205645-57-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94096
+O-Subject: [RHEL7 PATCH 056/626] powerpc: Use ibm, chip-id property to compute cpu_core_mask if available
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 256f2d4b463d3030ebc8d2b54f427543814a2bdc
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Mon Aug 12 16:29:33 2013 +1000
+
+    powerpc: Use ibm, chip-id property to compute cpu_core_mask if available
+
+    Some systems have an ibm,chip-id property in the cpu nodes in the
+    device tree.  On these systems, we now use that to compute the
+    cpu_core_mask (i.e. the set of core siblings) rather than looking
+    at cache properties.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Tested-by: Vasant Hegde <hegdevasant@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/smp.c b/arch/powerpc/kernel/smp.c
+index b312b43..c1cf4a1 100644
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@ -610,6 +610,33 @@ int cpu_first_thread_of_core(int core)
+ }
+ EXPORT_SYMBOL_GPL(cpu_first_thread_of_core);
+ 
++static void traverse_siblings_chip_id(int cpu, bool add, int chipid)
++{
++ const struct cpumask *mask;
++ struct device_node *np;
++ int i, plen;
++ const __be32 *prop;
++
++ mask = add ? cpu_online_mask : cpu_present_mask;
++ for_each_cpu(i, mask) {
++  np = of_get_cpu_node(i, NULL);
++  if (!np)
++   continue;
++  prop = of_get_property(np, "ibm,chip-id", &plen);
++  if (prop && plen == sizeof(int) &&
++      of_read_number(prop, 1) == chipid) {
++   if (add) {
++    cpumask_set_cpu(cpu, cpu_core_mask(i));
++    cpumask_set_cpu(i, cpu_core_mask(cpu));
++   } else {
++    cpumask_clear_cpu(cpu, cpu_core_mask(i));
++    cpumask_clear_cpu(i, cpu_core_mask(cpu));
++   }
++  }
++  of_node_put(np);
++ }
++}
++
+ /* Must be called when no change can occur to cpu_present_mask,
+  * i.e. during cpu online or offline.
+  */
+@@ -634,14 +661,29 @@ static struct device_node *cpu_to_l2cache(int cpu)
+ 
+ static void traverse_core_siblings(int cpu, bool add)
+ {
+- struct device_node *l2_cache;
++ struct device_node *l2_cache, *np;
+  const struct cpumask *mask;
+- int i;
++ int i, chip, plen;
++ const __be32 *prop;
++
++ /* First see if we have ibm,chip-id properties in cpu nodes */
++ np = of_get_cpu_node(cpu, NULL);
++ if (np) {
++  chip = -1;
++  prop = of_get_property(np, "ibm,chip-id", &plen);
++  if (prop && plen == sizeof(int))
++   chip = of_read_number(prop, 1);
++  of_node_put(np);
++  if (chip >= 0) {
++   traverse_siblings_chip_id(cpu, add, chip);
++   return;
++  }
++ }
+ 
+  l2_cache = cpu_to_l2cache(cpu);
+  mask = add ? cpu_online_mask : cpu_present_mask;
+  for_each_cpu(i, mask) {
+-  struct device_node *np = cpu_to_l2cache(i);
++  np = cpu_to_l2cache(i);
+   if (!np)
+    continue;
+   if (np == l2_cache) {
+-- 
+1.7.1

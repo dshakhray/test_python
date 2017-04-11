@@ -1,0 +1,86 @@
+From 4d15253f27e6caf357e04839ac1d588abae3f364 Mon Sep 17 00:00:00 2001
+From: Amit Shah <amit.shah@redhat.com>
+Date: Tue, 12 Aug 2014 11:30:55 -0400
+Subject: [char] hwrng: virtio - ensure reads happen after successful probe
+
+Message-id: <0e05734641b1d795b09710a33a22f6cc833727bf.1407842211.git.amit.shah@redhat.com>
+Patchwork-id: 87652
+O-Subject: [RHEL7.1 kernel PATCH 5/9] hwrng: virtio - ensure reads happen after successful probe
+Bugzilla: 1119299
+RH-Acked-by: Amos Kong <akong@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Herbert Xu <herbert.xu@redhat.com>
+
+The hwrng core asks for random data in the hwrng_register() call itself
+from commit d9e7972619.  This doesn't play well with virtio -- the
+DRIVER_OK bit is only set by virtio core on a successful probe, and
+we're not yet out of our probe routine when this call is made.  This
+causes the host to not acknowledge any requests we put in the virtqueue,
+and the insmod or kernel boot process just waits for data to arrive from
+the host, which never happens.
+
+CC: Kees Cook <keescook@chromium.org>
+CC: Jason Cooper <jason@lakedaemon.net>
+CC: Herbert Xu <herbert@gondor.apana.org.au>
+CC: <stable@vger.kernel.org> # For v3.15+
+Reviewed-by: Jason Cooper <jason@lakedaemon.net>
+Signed-off-by: Amit Shah <amit.shah@redhat.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit e052dbf554610e2104c5a7518c4d8374bed701bb)
+Signed-off-by: Amit Shah <amit.shah@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/char/hw_random/core.c b/drivers/char/hw_random/core.c
+index 74ee3bd..ec12890 100644
+--- a/drivers/char/hw_random/core.c
++++ b/drivers/char/hw_random/core.c
+@@ -69,6 +69,12 @@ static void add_early_randomness(struct hwrng *rng)
+  unsigned char bytes[16];
+  int bytes_read;
+ 
++ /*
++  * Currently only virtio-rng cannot return data during device
++  * probe, and that's handled in virtio-rng.c itself.  If there
++  * are more such devices, this call to rng_get_data can be
++  * made conditional here instead of doing it per-device.
++  */
+  bytes_read = rng_get_data(rng, bytes, sizeof(bytes), 1);
+  if (bytes_read > 0)
+   add_device_randomness(bytes, bytes_read);
+diff --git a/drivers/char/hw_random/virtio-rng.c b/drivers/char/hw_random/virtio-rng.c
+index 0b513cd..4b10345 100644
+--- a/drivers/char/hw_random/virtio-rng.c
++++ b/drivers/char/hw_random/virtio-rng.c
+@@ -39,6 +39,8 @@ struct virtrng_info {
+  int index;
+ };
+ 
++static bool probe_done;
++
+ static void random_recv_done(struct virtqueue *vq)
+ {
+  struct virtrng_info *vi = vq->vdev->priv;
+@@ -68,6 +70,13 @@ static int virtio_read(struct hwrng *rng, void *buf, size_t size, bool wait)
+  int ret;
+  struct virtrng_info *vi = (struct virtrng_info *)rng->priv;
+ 
++ /*
++  * Don't ask host for data till we're setup.  This call can
++  * happen during hwrng_register(), after commit d9e7972619.
++  */
++ if (unlikely(!probe_done))
++  return 0;
++
+  if (!vi->busy) {
+   vi->busy = true;
+   init_completion(&vi->have_data);
+@@ -138,6 +147,7 @@ static int probe_common(struct virtio_device *vdev)
+   return err;
+  }
+ 
++ probe_done = true;
+  return 0;
+ }
+ 
+-- 
+1.7.1

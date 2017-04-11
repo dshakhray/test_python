@@ -1,0 +1,384 @@
+From 34a7f046874e8c3313c2acc1b9c718a28f5ef577 Mon Sep 17 00:00:00 2001
+From: John Greene <jogreene@redhat.com>
+Date: Mon, 8 Sep 2014 15:07:42 -0400
+Subject: [ethernet] ixgbevf: merge ixgbevf_tx_map and ixgbevf_tx_queue into a single function
+
+Message-id: <1410188883-6595-28-git-send-email-jogreene@redhat.com>
+Patchwork-id: 92353
+O-Subject: [RHEL7.1 PATCH 27/48] ixgbevf: merge ixgbevf_tx_map and ixgbevf_tx_queue into a single function
+Bugzilla: 1091124
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+
+BZ: 1091124
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7919168
+Tested: In beaker. See BZ for details
+
+This change merges the ixgbevf_tx_map call and the ixgbevf_tx_queue call
+into a single function.  In order to make room for this setting of cmd_type
+and olinfo flags is done in separate functions.
+
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Signed-off-by: Emil Tantilov <emil.s.tantilov@intel.com>
+Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+Signed-off-by: Aaron Brown <aaron.f.brown@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 29d37fa162af3ba70229326f02831e24dcba64eb)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/ixgbevf/defines.h b/drivers/net/ethernet/intel/ixgbevf/defines.h
+index 5426b2d..05e4f32 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/defines.h
++++ b/drivers/net/ethernet/intel/ixgbevf/defines.h
+@@ -183,6 +183,7 @@ typedef u32 ixgbe_link_speed;
+ #define IXGBE_TXD_CMD_DEXT   0x20000000 /* Descriptor extension (0 = legacy) */
+ #define IXGBE_TXD_CMD_VLE    0x40000000 /* Add VLAN tag */
+ #define IXGBE_TXD_STAT_DD    0x00000001 /* Descriptor Done */
++#define IXGBE_TXD_CMD      (IXGBE_TXD_CMD_EOP | IXGBE_TXD_CMD_RS)
+ 
+ /* Transmit Descriptor - Advanced */
+ union ixgbe_adv_tx_desc {
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+index bd12880..c0999bd 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+@@ -233,8 +233,6 @@ static bool ixgbevf_clean_tx_irq(struct ixgbevf_q_vector *q_vector,
+ 
+   /* unmap remaining buffers */
+   while (tx_desc != eop_desc) {
+-   tx_desc->wb.status = 0;
+-
+    tx_buffer++;
+    tx_desc++;
+    i++;
+@@ -254,8 +252,6 @@ static bool ixgbevf_clean_tx_irq(struct ixgbevf_q_vector *q_vector,
+    }
+   }
+ 
+-  tx_desc->wb.status = 0;
+-
+   /* move us one more past the eop_desc for start of next pkt */
+   tx_buffer++;
+   tx_desc++;
+@@ -2940,166 +2936,171 @@ static void ixgbevf_tx_csum(struct ixgbevf_ring *tx_ring,
+        type_tucmd, mss_l4len_idx);
+ }
+ 
+-static int ixgbevf_tx_map(struct ixgbevf_ring *tx_ring,
+-     struct ixgbevf_tx_buffer *first)
++static __le32 ixgbevf_tx_cmd_type(u32 tx_flags)
+ {
+- dma_addr_t dma;
+- struct sk_buff *skb = first->skb;
+- struct ixgbevf_tx_buffer *tx_buffer_info;
+- unsigned int len;
+- unsigned int total = skb->len;
+- unsigned int offset = 0, size;
+- int count = 0;
+- unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
+- unsigned int f;
+- int i;
++ /* set type for advanced descriptor with frame checksum insertion */
++ __le32 cmd_type = cpu_to_le32(IXGBE_ADVTXD_DTYP_DATA |
++          IXGBE_ADVTXD_DCMD_IFCS |
++          IXGBE_ADVTXD_DCMD_DEXT);
+ 
+- i = tx_ring->next_to_use;
++ /* set HW vlan bit if vlan is present */
++ if (tx_flags & IXGBE_TX_FLAGS_VLAN)
++  cmd_type |= cpu_to_le32(IXGBE_ADVTXD_DCMD_VLE);
+ 
+- len = min(skb_headlen(skb), total);
+- while (len) {
+-  tx_buffer_info = &tx_ring->tx_buffer_info[i];
+-  size = min(len, (unsigned int)IXGBE_MAX_DATA_PER_TXD);
++ /* set segmentation enable bits for TSO/FSO */
++ if (tx_flags & IXGBE_TX_FLAGS_TSO)
++  cmd_type |= cpu_to_le32(IXGBE_ADVTXD_DCMD_TSE);
+ 
+-  tx_buffer_info->tx_flags = first->tx_flags;
+-  dma = dma_map_single(tx_ring->dev, skb->data + offset,
+-         size, DMA_TO_DEVICE);
+-  if (dma_mapping_error(tx_ring->dev, dma))
+-   goto dma_error;
++ return cmd_type;
++}
+ 
+-  /* record length, and DMA address */
+-  dma_unmap_len_set(tx_buffer_info, len, size);
+-  dma_unmap_addr_set(tx_buffer_info, dma, dma);
++static void ixgbevf_tx_olinfo_status(union ixgbe_adv_tx_desc *tx_desc,
++         u32 tx_flags, unsigned int paylen)
++{
++ __le32 olinfo_status = cpu_to_le32(paylen << IXGBE_ADVTXD_PAYLEN_SHIFT);
+ 
+-  len -= size;
+-  total -= size;
+-  offset += size;
+-  count++;
+-  i++;
+-  if (i == tx_ring->count)
+-   i = 0;
+- }
++ /* enable L4 checksum for TSO and TX checksum offload */
++ if (tx_flags & IXGBE_TX_FLAGS_CSUM)
++  olinfo_status |= cpu_to_le32(IXGBE_ADVTXD_POPTS_TXSM);
+ 
+- for (f = 0; f < nr_frags; f++) {
+-  const struct skb_frag_struct *frag;
++ /* enble IPv4 checksum for TSO */
++ if (tx_flags & IXGBE_TX_FLAGS_IPV4)
++  olinfo_status |= cpu_to_le32(IXGBE_ADVTXD_POPTS_IXSM);
+ 
+-  frag = &skb_shinfo(skb)->frags[f];
+-  len = min((unsigned int)skb_frag_size(frag), total);
+-  offset = 0;
++ /* use index 1 context for TSO/FSO/FCOE */
++ if (tx_flags & IXGBE_TX_FLAGS_TSO)
++  olinfo_status |= cpu_to_le32(1 << IXGBE_ADVTXD_IDX_SHIFT);
+ 
+-  while (len) {
+-   tx_buffer_info = &tx_ring->tx_buffer_info[i];
+-   size = min(len, (unsigned int)IXGBE_MAX_DATA_PER_TXD);
++ /* Check Context must be set if Tx switch is enabled, which it
++  * always is for case where virtual functions are running
++  */
++ olinfo_status |= cpu_to_le32(IXGBE_ADVTXD_CC);
+ 
+-   dma = skb_frag_dma_map(tx_ring->dev, frag,
+-            offset, size, DMA_TO_DEVICE);
+-   if (dma_mapping_error(tx_ring->dev, dma))
+-    goto dma_error;
++ tx_desc->read.olinfo_status = olinfo_status;
++}
+ 
+-   /* record length, and DMA address */
+-   dma_unmap_len_set(tx_buffer_info, len, size);
+-   dma_unmap_addr_set(tx_buffer_info, dma, dma);
++static void ixgbevf_tx_map(struct ixgbevf_ring *tx_ring,
++      struct ixgbevf_tx_buffer *first,
++      const u8 hdr_len)
++{
++ dma_addr_t dma;
++ struct sk_buff *skb = first->skb;
++ struct ixgbevf_tx_buffer *tx_buffer;
++ union ixgbe_adv_tx_desc *tx_desc;
++ struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[0];
++ unsigned int data_len = skb->data_len;
++ unsigned int size = skb_headlen(skb);
++ unsigned int paylen = skb->len - hdr_len;
++ u32 tx_flags = first->tx_flags;
++ __le32 cmd_type;
++ u16 i = tx_ring->next_to_use;
+ 
+-   len -= size;
+-   total -= size;
+-   offset += size;
+-   count++;
+-   i++;
+-   if (i == tx_ring->count)
+-    i = 0;
+-  }
+-  if (total == 0)
+-   break;
+- }
++ tx_desc = IXGBEVF_TX_DESC(tx_ring, i);
+ 
+- if (i == 0)
+-  i = tx_ring->count - 1;
+- else
+-  i = i - 1;
++ ixgbevf_tx_olinfo_status(tx_desc, tx_flags, paylen);
++ cmd_type = ixgbevf_tx_cmd_type(tx_flags);
+ 
+- first->next_to_watch = IXGBEVF_TX_DESC(tx_ring, i);
+- first->time_stamp = jiffies;
++ dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
++ if (dma_mapping_error(tx_ring->dev, dma))
++  goto dma_error;
+ 
+- return count;
++ /* record length, and DMA address */
++ dma_unmap_len_set(first, len, size);
++ dma_unmap_addr_set(first, dma, dma);
+ 
+-dma_error:
+- dev_err(tx_ring->dev, "TX DMA map failed\n");
++ tx_desc->read.buffer_addr = cpu_to_le64(dma);
+ 
+- /* clear timestamp and dma mappings for failed tx_buffer_info map */
+- tx_buffer_info->dma = 0;
+- count--;
++ for (;;) {
++  while (unlikely(size > IXGBE_MAX_DATA_PER_TXD)) {
++   tx_desc->read.cmd_type_len =
++    cmd_type | cpu_to_le32(IXGBE_MAX_DATA_PER_TXD);
+ 
+- /* clear timestamp and dma mappings for remaining portion of packet */
+- while (count >= 0) {
+-  count--;
+-  i--;
+-  if (i < 0)
+-   i += tx_ring->count;
+-  tx_buffer_info = &tx_ring->tx_buffer_info[i];
+-  ixgbevf_unmap_and_free_tx_resource(tx_ring, tx_buffer_info);
+- }
++   i++;
++   tx_desc++;
++   if (i == tx_ring->count) {
++    tx_desc = IXGBEVF_TX_DESC(tx_ring, 0);
++    i = 0;
++   }
+ 
+- return count;
+-}
++   dma += IXGBE_MAX_DATA_PER_TXD;
++   size -= IXGBE_MAX_DATA_PER_TXD;
+ 
+-static void ixgbevf_tx_queue(struct ixgbevf_ring *tx_ring,
+-        struct ixgbevf_tx_buffer *first,
+-        int count, u8 hdr_len)
+-{
+- union ixgbe_adv_tx_desc *tx_desc = NULL;
+- struct sk_buff *skb = first->skb;
+- struct ixgbevf_tx_buffer *tx_buffer_info;
+- u32 olinfo_status = 0, cmd_type_len = 0;
+- u32 tx_flags = first->tx_flags;
+- unsigned int i;
++   tx_desc->read.buffer_addr = cpu_to_le64(dma);
++   tx_desc->read.olinfo_status = 0;
++  }
+ 
+- u32 txd_cmd = IXGBE_TXD_CMD_EOP | IXGBE_TXD_CMD_RS | IXGBE_TXD_CMD_IFCS;
++  if (likely(!data_len))
++   break;
+ 
+- cmd_type_len |= IXGBE_ADVTXD_DTYP_DATA;
++  tx_desc->read.cmd_type_len = cmd_type | cpu_to_le32(size);
+ 
+- cmd_type_len |= IXGBE_ADVTXD_DCMD_IFCS | IXGBE_ADVTXD_DCMD_DEXT;
++  i++;
++  tx_desc++;
++  if (i == tx_ring->count) {
++   tx_desc = IXGBEVF_TX_DESC(tx_ring, 0);
++   i = 0;
++  }
+ 
+- if (tx_flags & IXGBE_TX_FLAGS_VLAN)
+-  cmd_type_len |= IXGBE_ADVTXD_DCMD_VLE;
++  size = skb_frag_size(frag);
++  data_len -= size;
+ 
+- if (tx_flags & IXGBE_TX_FLAGS_CSUM)
+-  olinfo_status |= IXGBE_ADVTXD_POPTS_TXSM;
++  dma = skb_frag_dma_map(tx_ring->dev, frag, 0, size,
++           DMA_TO_DEVICE);
++  if (dma_mapping_error(tx_ring->dev, dma))
++   goto dma_error;
+ 
+- if (tx_flags & IXGBE_TX_FLAGS_TSO) {
+-  cmd_type_len |= IXGBE_ADVTXD_DCMD_TSE;
++  tx_buffer = &tx_ring->tx_buffer_info[i];
++  dma_unmap_len_set(tx_buffer, len, size);
++  dma_unmap_addr_set(tx_buffer, dma, dma);
+ 
+-  /* use index 1 context for tso */
+-  olinfo_status |= (1 << IXGBE_ADVTXD_IDX_SHIFT);
+-  if (tx_flags & IXGBE_TX_FLAGS_IPV4)
+-   olinfo_status |= IXGBE_ADVTXD_POPTS_IXSM;
++  tx_desc->read.buffer_addr = cpu_to_le64(dma);
++  tx_desc->read.olinfo_status = 0;
++
++  frag++;
+  }
+ 
+- /*
+-  * Check Context must be set if Tx switch is enabled, which it
+-  * always is for case where virtual functions are running
++ /* write last descriptor with RS and EOP bits */
++ cmd_type |= cpu_to_le32(size) | cpu_to_le32(IXGBE_TXD_CMD);
++ tx_desc->read.cmd_type_len = cmd_type;
++
++ /* set the timestamp */
++ first->time_stamp = jiffies;
++
++ /* Force memory writes to complete before letting h/w know there
++  * are new descriptors to fetch.  (Only applicable for weak-ordered
++  * memory model archs, such as IA-64).
++  *
++  * We also need this memory barrier (wmb) to make certain all of the
++  * status bits have been updated before next_to_watch is written.
+   */
+- olinfo_status |= IXGBE_ADVTXD_CC;
++ wmb();
+ 
+- olinfo_status |= ((skb->len - hdr_len) << IXGBE_ADVTXD_PAYLEN_SHIFT);
++ /* set next_to_watch value indicating a packet is present */
++ first->next_to_watch = tx_desc;
+ 
+- i = tx_ring->next_to_use;
+- while (count--) {
+-  dma_addr_t dma;
+-  unsigned int len;
++ i++;
++ if (i == tx_ring->count)
++  i = 0;
+ 
+-  tx_buffer_info = &tx_ring->tx_buffer_info[i];
+-  dma = dma_unmap_addr(tx_buffer_info, dma);
+-  len = dma_unmap_len(tx_buffer_info, len);
+-  tx_desc = IXGBEVF_TX_DESC(tx_ring, i);
+-  tx_desc->read.buffer_addr = cpu_to_le64(dma);
+-  tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type_len | len);
+-  tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
+-  i++;
+-  if (i == tx_ring->count)
+-   i = 0;
+- }
++ tx_ring->next_to_use = i;
+ 
+- tx_desc->read.cmd_type_len |= cpu_to_le32(txd_cmd);
++ /* notify HW of packet */
++ writel(i, tx_ring->tail);
++
++ return;
++dma_error:
++ dev_err(tx_ring->dev, "TX DMA map failed\n");
++
++ /* clear dma mappings for failed tx_buffer_info map */
++ for (;;) {
++  tx_buffer = &tx_ring->tx_buffer_info[i];
++  ixgbevf_unmap_and_free_tx_resource(tx_ring, tx_buffer);
++  if (tx_buffer == first)
++   break;
++  if (i == 0)
++   i = tx_ring->count;
++  i--;
++ }
+ 
+  tx_ring->next_to_use = i;
+ }
+@@ -3192,17 +3193,8 @@ static int ixgbevf_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
+  else
+   ixgbevf_tx_csum(tx_ring, first);
+ 
+- ixgbevf_tx_queue(tx_ring, first,
+-    ixgbevf_tx_map(tx_ring, first), hdr_len);
+-
+- /* Force memory writes to complete before letting h/w
+-  * know there are new descriptors to fetch.  (Only
+-  * applicable for weak-ordered memory model archs,
+-  * such as IA-64).
+-  */
+- wmb();
++ ixgbevf_tx_map(tx_ring, first, hdr_len);
+ 
+- writel(tx_ring->next_to_use, tx_ring->tail);
+  ixgbevf_maybe_stop_tx(tx_ring, DESC_NEEDED);
+ 
+  return NETDEV_TX_OK;
+-- 
+1.7.1

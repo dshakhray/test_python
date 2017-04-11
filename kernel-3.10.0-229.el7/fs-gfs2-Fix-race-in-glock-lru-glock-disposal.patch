@@ -1,0 +1,73 @@
+From 5ffe1cd6a3d9ac34996ced05daf66f905d0f3931 Mon Sep 17 00:00:00 2001
+From: Robert S Peterson <rpeterso@redhat.com>
+Date: Tue, 1 Jul 2014 20:17:49 -0400
+Subject: [fs] gfs2: Fix race in glock lru glock disposal
+
+Message-id: <4a3782265178bf949466917f196e5a7bc3a47ce2.1404245053.git.rpeterso@redhat.com>
+Patchwork-id: 85170
+O-Subject: [RHEL7.1 PATCH 2/2] GFS2: Fix race in glock lru glock disposal
+Bugzilla: 1095835
+RH-Acked-by: Abhijith Das <adas@redhat.com>
+RH-Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+
+We must not leave items on the LRU list with GLF_LOCK set, since
+they can be removed if the glock is brought back into use, which
+may then potentially result in a hang, waiting for GLF_LOCK to
+clear.
+
+It doesn't happen very often, since it requires a glock that has
+not been used for a long time to be brought back into use at the
+same moment that the shrinker is part way through disposing of
+glocks.
+
+The fix is to set GLF_LOCK at a later time, when we already know
+that the other locks can be obtained. Also, we now only release
+the lru_lock in case a resched is needed, rather than on every
+iteration.
+
+rhbz#1095835
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 5fc6766..e7f240b 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -1402,12 +1402,16 @@ __acquires(&lru_lock)
+   gl = list_entry(list->next, struct gfs2_glock, gl_lru);
+   list_del_init(&gl->gl_lru);
+   if (!spin_trylock(&gl->gl_spin)) {
++add_back_to_lru:
+    list_add(&gl->gl_lru, &lru_list);
+    atomic_inc(&lru_count);
+    continue;
+   }
++  if (test_and_set_bit(GLF_LOCK, &gl->gl_flags)) {
++   spin_unlock(&gl->gl_spin);
++   goto add_back_to_lru;
++  }
+   clear_bit(GLF_LRU, &gl->gl_flags);
+-  spin_unlock(&lru_lock);
+   gl->gl_lockref.count++;
+   if (demote_ok(gl))
+    handle_callback(gl, LM_ST_UNLOCKED, 0, false);
+@@ -1416,7 +1420,7 @@ __acquires(&lru_lock)
+   if (queue_delayed_work(glock_workqueue, &gl->gl_work, 0) == 0)
+    gl->gl_lockref.count--;
+   spin_unlock(&gl->gl_spin);
+-  spin_lock(&lru_lock);
++  cond_resched_lock(&lru_lock);
+  }
+ }
+ 
+@@ -1440,7 +1444,7 @@ static void gfs2_scan_glock_lru(int nr)
+   gl = list_entry(lru_list.next, struct gfs2_glock, gl_lru);
+ 
+   /* Test for being demotable */
+-  if (!test_and_set_bit(GLF_LOCK, &gl->gl_flags)) {
++  if (!test_bit(GLF_LOCK, &gl->gl_flags)) {
+    list_move(&gl->gl_lru, &dispose);
+    atomic_dec(&lru_count);
+    nr--;
+-- 
+1.7.1

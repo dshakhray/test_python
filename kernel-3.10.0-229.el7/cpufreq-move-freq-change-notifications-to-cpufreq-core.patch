@@ -1,0 +1,198 @@
+From 7e12493a77adf447878f5189bb8d995a6570a2ad Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:22:52 -0400
+Subject: [cpufreq] move freq change notifications to cpufreq core
+
+Message-id: <1409235879-1283-79-git-send-email-prarit@redhat.com>
+Patchwork-id: 89432
+O-Subject: [RHEL7.1 PATCH BZ 1134639 078/185] cpufreq: move freq change notifications to cpufreq core
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit d4019f0a92ab802f385cc9c8ad3ab7b5449712cb
+Author: Viresh Kumar <viresh.kumar@linaro.org>
+Date:   Wed Aug 14 19:38:24 2013 +0530
+
+    cpufreq: move freq change notifications to cpufreq core
+
+    Most of the drivers do following in their ->target_index() routines:
+
+     struct cpufreq_freqs freqs;
+     freqs.old = old freq...
+     freqs.new = new freq...
+
+     cpufreq_notify_transition(policy, &freqs, CPUFREQ_PRECHANGE);
+
+     /* Change rate here */
+
+     cpufreq_notify_transition(policy, &freqs, CPUFREQ_POSTCHANGE);
+
+    This is replicated over all cpufreq drivers today and there doesn't exists a
+    good enough reason why this shouldn't be moved to cpufreq core instead.
+
+    There are few special cases though, like exynos5440, which doesn't do everything
+    on the call to ->target_index() routine and call some kind of bottom halves for
+    doing this work, work/tasklet/etc..
+
+    They may continue doing notification from their own code as flag:
+    CPUFREQ_ASYNC_NOTIFICATION is already set for them.
+
+    All drivers are also modified in this patch to avoid breaking 'git bisect', as
+    double notification would happen otherwise.
+
+    Acked-by: Hans-Christian Egtvedt <egtvedt@samfundet.no>
+    Acked-by: Jesper Nilsson <jesper.nilsson@axis.com>
+    Acked-by: Linus Walleij <linus.walleij@linaro.org>
+    Acked-by: Russell King <linux@arm.linux.org.uk>
+    Acked-by: Stephen Warren <swarren@nvidia.com>
+    Tested-by: Andrew Lunn <andrew@lunn.ch>
+    Tested-by: Nicolas Pitre <nicolas.pitre@linaro.org>
+    Reviewed-by: Lan Tianyu <tianyu.lan@intel.com>
+    Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/acpi-cpufreq.c b/drivers/cpufreq/acpi-cpufreq.c
+index 1dad805..957b77a 100644
+--- a/drivers/cpufreq/acpi-cpufreq.c
++++ b/drivers/cpufreq/acpi-cpufreq.c
+@@ -428,14 +428,10 @@ static int acpi_cpufreq_target(struct cpufreq_policy *policy,
+ {
+  struct acpi_cpufreq_data *data = per_cpu(acfreq_data, policy->cpu);
+  struct acpi_processor_performance *perf;
+- struct cpufreq_freqs freqs;
+  struct drv_cmd cmd;
+  unsigned int next_perf_state = 0; /* Index into perf table */
+  int result = 0;
+ 
+- pr_debug("acpi_cpufreq_target %d (%d)\n",
+-   data->freq_table[index].frequency, policy->cpu);
+-
+  if (unlikely(data == NULL ||
+       data->acpi_data == NULL || data->freq_table == NULL)) {
+   return -ENODEV;
+@@ -483,23 +479,17 @@ static int acpi_cpufreq_target(struct cpufreq_policy *policy,
+  else
+   cmd.mask = cpumask_of(policy->cpu);
+ 
+- freqs.old = perf->states[perf->state].core_frequency * 1000;
+- freqs.new = data->freq_table[index].frequency;
+- cpufreq_notify_transition(policy, &freqs, CPUFREQ_PRECHANGE);
+-
+  drv_write(&cmd);
+ 
+  if (acpi_pstate_strict) {
+-  if (!check_freqs(cmd.mask, freqs.new, data)) {
++  if (!check_freqs(cmd.mask, data->freq_table[index].frequency,
++     data)) {
+    pr_debug("acpi_cpufreq_target failed (%d)\n",
+     policy->cpu);
+    result = -EAGAIN;
+-   freqs.new = freqs.old;
+   }
+  }
+ 
+- cpufreq_notify_transition(policy, &freqs, CPUFREQ_POSTCHANGE);
+-
+  if (!result)
+   perf->state = next_perf_state;
+ 
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 3c70492..8776fab 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1673,6 +1673,8 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
+   retval = cpufreq_driver->target(policy, target_freq, relation);
+  else if (cpufreq_driver->target_index) {
+   struct cpufreq_frequency_table *freq_table;
++  struct cpufreq_freqs freqs;
++  bool notify;
+   int index;
+ 
+   freq_table = cpufreq_frequency_get_table(policy->cpu);
+@@ -1688,10 +1690,42 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
+    goto out;
+   }
+ 
+-  if (freq_table[index].frequency == policy->cur)
++  if (freq_table[index].frequency == policy->cur) {
+    retval = 0;
+-  else
+-   retval = cpufreq_driver->target_index(policy, index);
++   goto out;
++  }
++
++  notify = !(cpufreq_driver->flags & CPUFREQ_ASYNC_NOTIFICATION);
++
++  if (notify) {
++   freqs.old = policy->cur;
++   freqs.new = freq_table[index].frequency;
++   freqs.flags = 0;
++
++   pr_debug("%s: cpu: %d, oldfreq: %u, new freq: %u\n",
++     __func__, policy->cpu, freqs.old,
++     freqs.new);
++
++   cpufreq_notify_transition(policy, &freqs,
++     CPUFREQ_PRECHANGE);
++  }
++
++  retval = cpufreq_driver->target_index(policy, index);
++  if (retval)
++   pr_err("%s: Failed to change cpu frequency: %d\n",
++     __func__, retval);
++
++  if (notify) {
++   /*
++    * Notify with old freq in case we failed to change
++    * frequency
++    */
++   if (retval)
++    freqs.new = freqs.old;
++
++   cpufreq_notify_transition(policy, &freqs,
++     CPUFREQ_POSTCHANGE);
++  }
+  }
+ 
+ out:
+diff --git a/drivers/cpufreq/p4-clockmod.c b/drivers/cpufreq/p4-clockmod.c
+index 3c23053..3d1cba9 100644
+--- a/drivers/cpufreq/p4-clockmod.c
++++ b/drivers/cpufreq/p4-clockmod.c
+@@ -107,15 +107,8 @@ static struct cpufreq_frequency_table p4clockmod_table[] = {
+ 
+ static int cpufreq_p4_target(struct cpufreq_policy *policy, unsigned int index)
+ {
+- struct cpufreq_freqs freqs;
+  int i;
+ 
+- freqs.old = cpufreq_p4_get(policy->cpu);
+- freqs.new = stock_freq * p4clockmod_table[index].driver_data / 8;
+-
+- /* notifiers */
+- cpufreq_notify_transition(policy, &freqs, CPUFREQ_PRECHANGE);
+-
+  /* run on each logical CPU,
+   * see section 13.15.3 of IA32 Intel Architecture Software
+   * Developer's Manual, Volume 3
+@@ -123,9 +116,6 @@ static int cpufreq_p4_target(struct cpufreq_policy *policy, unsigned int index)
+  for_each_cpu(i, policy->cpus)
+   cpufreq_p4_setdc(i, p4clockmod_table[index].driver_data);
+ 
+- /* notifiers */
+- cpufreq_notify_transition(policy, &freqs, CPUFREQ_POSTCHANGE);
+-
+  return 0;
+ }
+ 
+-- 
+1.7.1

@@ -1,0 +1,99 @@
+From 075ca998641d1536dae945d7d3ec76ea9bca73de Mon Sep 17 00:00:00 2001
+From: Stefan Assmann <sassmann@redhat.com>
+Date: Tue, 2 Sep 2014 13:11:30 -0400
+Subject: [ethernet] i40e/i40evf: add tracking to NVM busy state
+
+Message-id: <1409663591-32531-48-git-send-email-sassmann@redhat.com>
+Patchwork-id: 90521
+O-Subject: [RHEL7.1 PATCH 047/148] i40e/i40evf: add tracking to NVM busy state
+Bugzilla: 1091127
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Shannon Nelson <shannon.nelson@intel.com>
+
+The NVM updates take some time and are asynchronous actions that signal
+their completion with an AdminQ event.  This code tracks when there is
+an NVM update outstanding and won't allow a new update command until a
+completion event is received from the current update.
+
+Change-ID: Ic132fe16bd9dc09b002ed38297a877c1a01553ce
+Signed-off-by: Shannon Nelson <shannon.nelson@intel.com>
+Acked-by: Mitch Williams <mitch.a.williams@intel.com>
+Acked-by: Greg Rose <gregory.v.rose@intel.com>
+Tested-by: Kavindya Deegala <kavindya.s.deegala@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Stefan Assmann <sassmann@redhat.com>
+(cherry picked from commit c9296ad2adc002b520f072902094dea2a7753209)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/i40evf/i40e_adminq.c b/drivers/net/ethernet/intel/i40evf/i40e_adminq.c
+index 5470ce9..c79df25 100644
+--- a/drivers/net/ethernet/intel/i40evf/i40e_adminq.c
++++ b/drivers/net/ethernet/intel/i40evf/i40e_adminq.c
+@@ -28,6 +28,16 @@
+ #include "i40e_prototype.h"
+ 
+ /**
++ * i40e_is_nvm_update_op - return true if this is an NVM update operation
++ * @desc: API request descriptor
++ **/
++static inline bool i40e_is_nvm_update_op(struct i40e_aq_desc *desc)
++{
++ return (desc->opcode == i40e_aqc_opc_nvm_erase) ||
++        (desc->opcode == i40e_aqc_opc_nvm_update);
++}
++
++/**
+  *  i40e_adminq_init_regs - Initialize AdminQ registers
+  *  @hw: pointer to the hardware structure
+  *
+@@ -659,6 +669,12 @@ i40e_status i40evf_asq_send_command(struct i40e_hw *hw,
+   goto asq_send_command_exit;
+  }
+ 
++ if (i40e_is_nvm_update_op(desc) && hw->aq.nvm_busy) {
++  i40e_debug(hw, I40E_DEBUG_AQ_MESSAGE, "AQTX: NVM busy.\n");
++  status = I40E_ERR_NVM;
++  goto asq_send_command_exit;
++ }
++
+  details = I40E_ADMINQ_DETAILS(hw->aq.asq, hw->aq.asq.next_to_use);
+  if (cmd_details) {
+   *details = *cmd_details;
+@@ -786,6 +802,9 @@ i40e_status i40evf_asq_send_command(struct i40e_hw *hw,
+   hw->aq.asq_last_status = (enum i40e_admin_queue_err)retval;
+  }
+ 
++ if (i40e_is_nvm_update_op(desc))
++  hw->aq.nvm_busy = true;
++
+  /* update the error if time out occurred */
+  if ((!cmd_completed) &&
+      (!details->async && !details->postpone)) {
+@@ -880,6 +899,9 @@ i40e_status i40evf_clean_arq_element(struct i40e_hw *hw,
+           e->msg_size);
+  }
+ 
++ if (i40e_is_nvm_update_op(&e->desc))
++  hw->aq.nvm_busy = false;
++
+  /* Restore the original datalen and buffer address in the desc,
+   * FW updates datalen to indicate the event message
+   * size
+diff --git a/drivers/net/ethernet/intel/i40evf/i40e_adminq.h b/drivers/net/ethernet/intel/i40evf/i40e_adminq.h
+index 8f72c31..7d24be5 100644
+--- a/drivers/net/ethernet/intel/i40evf/i40e_adminq.h
++++ b/drivers/net/ethernet/intel/i40evf/i40e_adminq.h
+@@ -87,6 +87,7 @@ struct i40e_adminq_info {
+  u16 fw_min_ver;                 /* firmware minor version */
+  u16 api_maj_ver;                /* api major version */
+  u16 api_min_ver;                /* api minor version */
++ bool nvm_busy;
+ 
+  struct mutex asq_mutex; /* Send queue lock */
+  struct mutex arq_mutex; /* Receive queue lock */
+-- 
+1.7.1

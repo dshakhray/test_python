@@ -1,0 +1,200 @@
+From 8b9dced6cecdbc8816692d79a160e0e2797d574b Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:48:38 -0400
+Subject: [tools] perf/record: Make per-cpu mmaps the default
+
+Message-id: <1408953210-26343-31-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88793
+O-Subject: [PATCH RHEL7.1 BZ1133083 030/322] perf record: Make per-cpu mmaps the default.
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 3aa5939d71fa22a947808ba9c798b8537c35097a
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Fri Nov 15 15:52:29 2013 +0200
+
+description
+===========
+This affects the -p, -t and -u options that previously defaulted to
+per-thread mmaps.
+
+Consequently add an option to select per-thread mmaps to support the old
+behaviour.
+
+Note that per-thread can be used with a workload-only (i.e. none of -p,
+-t, -u, -a or -C is selected) to get a per-thread mmap with no
+inheritance.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/Documentation/perf-record.txt b/tools/perf/Documentation/perf-record.txt
+index 43b42c4..6ac867e 100644
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@ -201,11 +201,11 @@ abort events and some memory events in precise mode on modern Intel CPUs.
+ --transaction::
+ Record transaction flags for transaction related events.
+ 
+---force-per-cpu::
+-Force the use of per-cpu mmaps.  By default, when tasks are specified (i.e. -p,
+--t or -u options) per-thread mmaps are created.  This option overrides that and
+-forces per-cpu mmaps.  A side-effect of that is that inheritance is
+-automatically enabled.  Add the -i option also to disable inheritance.
++--per-thread::
++Use per-thread mmaps.  By default per-cpu mmaps are created.  This option
++overrides that and uses per-thread mmaps.  A side-effect of that is that
++inheritance is automatically disabled.  --per-thread is ignored with a warning
++if combined with -a or -C options.
+ 
+ SEE ALSO
+ --------
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index 7c8020a..f5b18b8 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -800,6 +800,7 @@ static struct perf_record record = {
+   .freq       = 4000,
+   .target       = {
+    .uses_mmap   = true,
++   .default_per_cpu = true,
+   },
+  },
+ };
+@@ -888,8 +889,8 @@ const struct option record_options[] = {
+       "sample by weight (on special events only)"),
+  OPT_BOOLEAN(0, "transaction", &record.opts.sample_transaction,
+       "sample transaction flags (special events only)"),
+- OPT_BOOLEAN(0, "force-per-cpu", &record.opts.target.force_per_cpu,
+-      "force the use of per-cpu mmaps"),
++ OPT_BOOLEAN(0, "per-thread", &record.opts.target.per_thread,
++      "use per-thread mmaps"),
+  OPT_END()
+ };
+ 
+diff --git a/tools/perf/tests/attr/test-record-no-inherit b/tools/perf/tests/attr/test-record-no-inherit
+index 9079a25..44edcb2 100644
+--- a/tools/perf/tests/attr/test-record-no-inherit
++++ b/tools/perf/tests/attr/test-record-no-inherit
+@@ -3,5 +3,5 @@ command = record
+ args    = -i kill >/dev/null 2>&1
+ 
+ [event:base-record]
+-sample_type=259
++sample_type=263
+ inherit=0
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index bbc746a..76fa764 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -819,8 +819,10 @@ int perf_evlist__create_maps(struct perf_evlist *evlist, struct target *target)
+  if (evlist->threads == NULL)
+   return -1;
+ 
+- if (target->force_per_cpu)
+-  evlist->cpus = cpu_map__new(target->cpu_list);
++ if (target->default_per_cpu)
++  evlist->cpus = target->per_thread ?
++     cpu_map__dummy_new() :
++     cpu_map__new(target->cpu_list);
+  else if (target__has_task(target))
+   evlist->cpus = cpu_map__dummy_new();
+  else if (!target__has_cpu(target) && !target->uses_mmap)
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index dad6492..b5fe7f9 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -574,6 +574,7 @@ void perf_evsel__config(struct perf_evsel *evsel,
+  struct perf_evsel *leader = evsel->leader;
+  struct perf_event_attr *attr = &evsel->attr;
+  int track = !evsel->idx; /* only the first counter needs these */
++ bool per_cpu = opts->target.default_per_cpu && !opts->target.per_thread;
+ 
+  attr->sample_id_all = perf_missing_features.sample_id_all ? 0 : 1;
+  attr->inherit     = !opts->no_inherit;
+@@ -647,7 +648,7 @@ void perf_evsel__config(struct perf_evsel *evsel,
+   }
+  }
+ 
+- if (target__has_cpu(&opts->target) || opts->target.force_per_cpu)
++ if (target__has_cpu(&opts->target))
+   perf_evsel__set_sample_bit(evsel, CPU);
+ 
+  if (opts->period)
+@@ -655,7 +656,7 @@ void perf_evsel__config(struct perf_evsel *evsel,
+ 
+  if (!perf_missing_features.sample_id_all &&
+      (opts->sample_time || !opts->no_inherit ||
+-      target__has_cpu(&opts->target) || opts->target.force_per_cpu))
++      target__has_cpu(&opts->target) || per_cpu))
+   perf_evsel__set_sample_bit(evsel, TIME);
+ 
+  if (opts->raw_samples) {
+diff --git a/tools/perf/util/target.c b/tools/perf/util/target.c
+index 3c778a0..e74c596 100644
+--- a/tools/perf/util/target.c
++++ b/tools/perf/util/target.c
+@@ -55,6 +55,13 @@ enum target_errno target__validate(struct target *target)
+    ret = TARGET_ERRNO__UID_OVERRIDE_SYSTEM;
+  }
+ 
++ /* THREAD and SYSTEM/CPU are mutually exclusive */
++ if (target->per_thread && (target->system_wide || target->cpu_list)) {
++  target->per_thread = false;
++  if (ret == TARGET_ERRNO__SUCCESS)
++   ret = TARGET_ERRNO__SYSTEM_OVERRIDE_THREAD;
++ }
++
+  return ret;
+ }
+ 
+@@ -100,6 +107,7 @@ static const char *target__error_str[] = {
+  "UID switch overriding CPU",
+  "PID/TID switch overriding SYSTEM",
+  "UID switch overriding SYSTEM",
++ "SYSTEM/CPU switch overriding PER-THREAD",
+  "Invalid User: %s",
+  "Problems obtaining information for user %s",
+ };
+@@ -131,7 +139,8 @@ int target__strerror(struct target *target, int errnum,
+  msg = target__error_str[idx];
+ 
+  switch (errnum) {
+- case TARGET_ERRNO__PID_OVERRIDE_CPU ... TARGET_ERRNO__UID_OVERRIDE_SYSTEM:
++ case TARGET_ERRNO__PID_OVERRIDE_CPU ...
++      TARGET_ERRNO__SYSTEM_OVERRIDE_THREAD:
+   snprintf(buf, buflen, "%s", msg);
+   break;
+ 
+diff --git a/tools/perf/util/target.h b/tools/perf/util/target.h
+index 2d0c506..31dd2e9 100644
+--- a/tools/perf/util/target.h
++++ b/tools/perf/util/target.h
+@@ -12,7 +12,8 @@ struct target {
+  uid_t      uid;
+  bool      system_wide;
+  bool      uses_mmap;
+- bool      force_per_cpu;
++ bool      default_per_cpu;
++ bool      per_thread;
+ };
+ 
+ enum target_errno {
+@@ -33,6 +34,7 @@ enum target_errno {
+  TARGET_ERRNO__UID_OVERRIDE_CPU,
+  TARGET_ERRNO__PID_OVERRIDE_SYSTEM,
+  TARGET_ERRNO__UID_OVERRIDE_SYSTEM,
++ TARGET_ERRNO__SYSTEM_OVERRIDE_THREAD,
+ 
+  /* for target__parse_uid() */
+  TARGET_ERRNO__INVALID_UID,
+-- 
+1.7.1

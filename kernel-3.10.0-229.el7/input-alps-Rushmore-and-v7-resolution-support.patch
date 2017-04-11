@@ -1,0 +1,127 @@
+From d8098b0840cf6beda03e88d4fbb922f9cbcf70dd Mon Sep 17 00:00:00 2001
+From: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+Date: Tue, 26 Aug 2014 17:19:09 -0400
+Subject: [input] alps: Rushmore and v7 resolution support
+
+Message-id: <1409073549-31548-19-git-send-email-benjamin.tissoires@redhat.com>
+Patchwork-id: 89247
+O-Subject: [PATCH RHEL7 18/18] Input: alps - Rushmore and v7 resolution support
+Bugzilla: 1107819
+RH-Acked-by: Hans de Goede <hdegoede@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1107819
+Upstream: since v3.17
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7882179
+Tested by me on a Toshiba Portege R30 with a v7 Alps touchpad
+
+commit f3f33c6776997db9d377ff3f1b759869f988d25e
+Author: Hans de Goede <hdegoede@redhat.com>
+Date:   Tue Jul 29 11:22:07 2014 -0700
+
+    Input: alps - Rushmore and v7 resolution support
+
+    Add support for querying the physical size from the touchpad for Rushmore
+    and v7 touchpads, and use that to tell userspace the device resolution.
+
+    Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+    Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+
+Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/input/mouse/alps.c b/drivers/input/mouse/alps.c
+index 76d372f..a59a1a6 100644
+--- a/drivers/input/mouse/alps.c
++++ b/drivers/input/mouse/alps.c
+@@ -1792,6 +1792,45 @@ error:
+  return -1;
+ }
+ 
++static int alps_get_v3_v7_resolution(struct psmouse *psmouse, int reg_pitch)
++{
++ int reg, x_pitch, y_pitch, x_electrode, y_electrode, x_phys, y_phys;
++ struct alps_data *priv = psmouse->private;
++
++ reg = alps_command_mode_read_reg(psmouse, reg_pitch);
++ if (reg < 0)
++  return reg;
++
++ x_pitch = (char)(reg << 4) >> 4; /* sign extend lower 4 bits */
++ x_pitch = 50 + 2 * x_pitch; /* In 0.1 mm units */
++
++ y_pitch = (char)reg >> 4; /* sign extend upper 4 bits */
++ y_pitch = 36 + 2 * y_pitch; /* In 0.1 mm units */
++
++ reg = alps_command_mode_read_reg(psmouse, reg_pitch + 1);
++ if (reg < 0)
++  return reg;
++
++ x_electrode = (char)(reg << 4) >> 4; /* sign extend lower 4 bits */
++ x_electrode = 17 + x_electrode;
++
++ y_electrode = (char)reg >> 4; /* sign extend upper 4 bits */
++ y_electrode = 13 + y_electrode;
++
++ x_phys = x_pitch * (x_electrode - 1); /* In 0.1 mm units */
++ y_phys = y_pitch * (y_electrode - 1); /* In 0.1 mm units */
++
++ priv->x_res = priv->x_max * 10 / x_phys; /* units / mm */
++ priv->y_res = priv->y_max * 10 / y_phys; /* units / mm */
++
++ psmouse_dbg(psmouse,
++      "pitch %dx%d num-electrodes %dx%d physical size %dx%d mm res %dx%d\n",
++      x_pitch, y_pitch, x_electrode, y_electrode,
++      x_phys / 10, y_phys / 10, priv->x_res, priv->y_res);
++
++ return 0;
++}
++
+ static int alps_hw_init_rushmore_v3(struct psmouse *psmouse)
+ {
+  struct alps_data *priv = psmouse->private;
+@@ -1812,6 +1851,9 @@ static int alps_hw_init_rushmore_v3(struct psmouse *psmouse)
+      alps_command_mode_write_reg(psmouse, 0xc2cb, 0x00))
+   goto error;
+ 
++ if (alps_get_v3_v7_resolution(psmouse, 0xc2da))
++  goto error;
++
+  reg_val = alps_command_mode_read_reg(psmouse, 0xc2c6);
+  if (reg_val == -1)
+   goto error;
+@@ -1997,6 +2039,9 @@ static int alps_hw_init_v7(struct psmouse *psmouse)
+      alps_command_mode_read_reg(psmouse, 0xc2d9) == -1)
+   goto error;
+ 
++ if (alps_get_v3_v7_resolution(psmouse, 0xc397))
++  goto error;
++
+  if (alps_command_mode_write_reg(psmouse, 0xc2c9, 0x64))
+   goto error;
+ 
+@@ -2230,6 +2275,9 @@ static void alps_set_abs_params_mt(struct alps_data *priv,
+  input_set_abs_params(dev1, ABS_MT_POSITION_X, 0, priv->x_max, 0, 0);
+  input_set_abs_params(dev1, ABS_MT_POSITION_Y, 0, priv->y_max, 0, 0);
+ 
++ input_abs_set_res(dev1, ABS_MT_POSITION_X, priv->x_res);
++ input_abs_set_res(dev1, ABS_MT_POSITION_Y, priv->y_res);
++
+  input_mt_init_slots(dev1, MAX_TOUCHES, INPUT_MT_POINTER |
+   INPUT_MT_DROP_UNUSED | INPUT_MT_TRACK | INPUT_MT_SEMI_MT);
+ 
+diff --git a/drivers/input/mouse/alps.h b/drivers/input/mouse/alps.h
+index a98ac9b..66240b4 100644
+--- a/drivers/input/mouse/alps.h
++++ b/drivers/input/mouse/alps.h
+@@ -174,6 +174,8 @@ struct alps_data {
+  int y_max;
+  int x_bits;
+  int y_bits;
++ unsigned int x_res;
++ unsigned int y_res;
+ 
+  int (*hw_init)(struct psmouse *psmouse);
+  void (*process_packet)(struct psmouse *psmouse);
+-- 
+1.7.1

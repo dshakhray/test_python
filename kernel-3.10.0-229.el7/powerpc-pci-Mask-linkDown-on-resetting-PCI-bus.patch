@@ -1,0 +1,230 @@
+From db296dad38ea7c97dea0f7106f0522261aae985e Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:12:00 -0400
+Subject: [powerpc] pci: Mask linkDown on resetting PCI bus
+
+Message-id: <1410545655-205645-492-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94446
+O-Subject: [RHEL7 PATCH 491/626] powerpc/pci: Mask linkDown on resetting PCI bus
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+RH-Acked-by: Myron Stowe <mstowe@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit d92a208d086063ecc785b4588f74ab42268cbc4b
+Author: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Date:   Thu Apr 24 18:00:24 2014 +1000
+
+    powerpc/pci: Mask linkDown on resetting PCI bus
+
+    The problem was initially reported by Wendy who tried pass through
+    IPR adapter, which was connected to PHB root port directly, to KVM
+    based guest. When doing that, pci_reset_bridge_secondary_bus() was
+    called by VFIO driver and linkDown was detected by the root port.
+    That caused all PEs to be frozen.
+
+    The patch fixes the issue by routing the reset for the secondary bus
+    of root port to underly firmware. For that, one more weak function
+    pci_reset_secondary_bus() is introduced so that the individual platforms
+    can override that and do specific reset for bridge's secondary bus.
+
+    Reported-by: Wendy Xiong <wenxiong@linux.vnet.ibm.com>
+    Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/machdep.h b/arch/powerpc/include/asm/machdep.h
+index 2404260..d851417 100644
+--- a/arch/powerpc/include/asm/machdep.h
++++ b/arch/powerpc/include/asm/machdep.h
+@@ -229,6 +229,9 @@ struct machdep_calls {
+  /* Called during PCI resource reassignment */
+  resource_size_t (*pcibios_window_alignment)(struct pci_bus *, unsigned long type);
+ 
++ /* Reset the secondary bus of bridge */
++ void  (*pcibios_reset_secondary_bus)(struct pci_dev *dev);
++
+  /* Called to shutdown machine specific hardware not already controlled
+   * by other drivers.
+   */
+diff --git a/arch/powerpc/kernel/pci-common.c b/arch/powerpc/kernel/pci-common.c
+index c0f585a..ceb1952 100644
+--- a/arch/powerpc/kernel/pci-common.c
++++ b/arch/powerpc/kernel/pci-common.c
+@@ -21,6 +21,7 @@
+ #include <linux/string.h>
+ #include <linux/init.h>
+ #include <linux/bootmem.h>
++#include <linux/delay.h>
+ #include <linux/export.h>
+ #include <linux/of_address.h>
+ #include <linux/of_pci.h>
+@@ -120,6 +121,25 @@ resource_size_t pcibios_window_alignment(struct pci_bus *bus,
+  return 1;
+ }
+ 
++void pcibios_reset_secondary_bus(struct pci_dev *dev)
++{
++ u16 ctrl;
++
++ if (ppc_md.pcibios_reset_secondary_bus) {
++  ppc_md.pcibios_reset_secondary_bus(dev);
++  return;
++ }
++
++ pci_read_config_word(dev, PCI_BRIDGE_CONTROL, &ctrl);
++ ctrl |= PCI_BRIDGE_CTL_BUS_RESET;
++ pci_write_config_word(dev, PCI_BRIDGE_CONTROL, ctrl);
++ msleep(2);
++
++ ctrl &= ~PCI_BRIDGE_CTL_BUS_RESET;
++ pci_write_config_word(dev, PCI_BRIDGE_CONTROL, ctrl);
++ ssleep(1);
++}
++
+ static resource_size_t pcibios_io_size(const struct pci_controller *hose)
+ {
+ #ifdef CONFIG_PPC64
+diff --git a/arch/powerpc/platforms/powernv/eeh-ioda.c b/arch/powerpc/platforms/powernv/eeh-ioda.c
+index 697d620..753f08e 100644
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@ -481,6 +481,8 @@ static int ioda_eeh_bridge_reset(struct pci_dev *dev, int option)
+ 
+ {
+  struct device_node *dn = pci_device_to_OF_node(dev);
++ struct eeh_dev *edev = of_node_to_eeh_dev(dn);
++ int aer = edev ? edev->aer_cap : 0;
+  u32 ctrl;
+ 
+  pr_debug("%s: Reset PCI bus %04x:%02x with option %d\n",
+@@ -490,24 +492,56 @@ static int ioda_eeh_bridge_reset(struct pci_dev *dev, int option)
+  switch (option) {
+  case EEH_RESET_FUNDAMENTAL:
+  case EEH_RESET_HOT:
++  /* Don't report linkDown event */
++  if (aer) {
++   eeh_ops->read_config(dn, aer + PCI_ERR_UNCOR_MASK,
++          4, &ctrl);
++   ctrl |= PCI_ERR_UNC_SURPDN;
++                        eeh_ops->write_config(dn, aer + PCI_ERR_UNCOR_MASK,
++           4, ctrl);
++                }
++
+   eeh_ops->read_config(dn, PCI_BRIDGE_CONTROL, 2, &ctrl);
+   ctrl |= PCI_BRIDGE_CTL_BUS_RESET;
+   eeh_ops->write_config(dn, PCI_BRIDGE_CONTROL, 2, ctrl);
+-
+   msleep(EEH_PE_RST_HOLD_TIME);
++
+   break;
+  case EEH_RESET_DEACTIVATE:
+   eeh_ops->read_config(dn, PCI_BRIDGE_CONTROL, 2, &ctrl);
+   ctrl &= ~PCI_BRIDGE_CTL_BUS_RESET;
+   eeh_ops->write_config(dn, PCI_BRIDGE_CONTROL, 2, ctrl);
+-
+   msleep(EEH_PE_RST_SETTLE_TIME);
++
++  /* Continue reporting linkDown event */
++  if (aer) {
++   eeh_ops->read_config(dn, aer + PCI_ERR_UNCOR_MASK,
++          4, &ctrl);
++   ctrl &= ~PCI_ERR_UNC_SURPDN;
++   eeh_ops->write_config(dn, aer + PCI_ERR_UNCOR_MASK,
++           4, ctrl);
++  }
++
+   break;
+  }
+ 
+  return 0;
+ }
+ 
++void pnv_pci_reset_secondary_bus(struct pci_dev *dev)
++{
++ struct pci_controller *hose;
++
++ if (pci_is_root_bus(dev->bus)) {
++  hose = pci_bus_to_host(dev->bus);
++  ioda_eeh_root_reset(hose, EEH_RESET_HOT);
++  ioda_eeh_root_reset(hose, EEH_RESET_DEACTIVATE);
++ } else {
++  ioda_eeh_bridge_reset(dev, EEH_RESET_HOT);
++  ioda_eeh_bridge_reset(dev, EEH_RESET_DEACTIVATE);
++ }
++}
++
+ /**
+  * ioda_eeh_reset - Reset the indicated PE
+  * @pe: EEH PE
+diff --git a/arch/powerpc/platforms/powernv/pci-ioda.c b/arch/powerpc/platforms/powernv/pci-ioda.c
+index 110d0d4..9f801c0 100644
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@ -1361,6 +1361,7 @@ void __init pnv_pci_init_ioda_phb(struct device_node *np,
+  ppc_md.pcibios_fixup = pnv_pci_ioda_fixup;
+  ppc_md.pcibios_enable_device_hook = pnv_pci_enable_device_hook;
+  ppc_md.pcibios_window_alignment = pnv_pci_window_alignment;
++ ppc_md.pcibios_reset_secondary_bus = pnv_pci_reset_secondary_bus;
+  pci_add_flags(PCI_REASSIGN_ALL_RSRC);
+ 
+  /* Reset IODA tables to a clean state */
+diff --git a/arch/powerpc/platforms/powernv/pci.h b/arch/powerpc/platforms/powernv/pci.h
+index 3267ddf..b8e57c2 100644
+--- a/arch/powerpc/platforms/powernv/pci.h
++++ b/arch/powerpc/platforms/powernv/pci.h
+@@ -203,6 +203,7 @@ extern void pnv_pci_init_ioda_hub(struct device_node *np);
+ extern void pnv_pci_init_ioda2_phb(struct device_node *np);
+ extern void pnv_pci_ioda_tce_invalidate(struct iommu_table *tbl,
+      __be64 *startp, __be64 *endp);
++extern void pnv_pci_reset_secondary_bus(struct pci_dev *dev);
+ extern int ioda_eeh_phb_reset(struct pci_controller *hose, int option);
+ 
+ #endif /* __POWERNV_PCI_H */
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 50e58c7..e81ae8f 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -3185,14 +3185,7 @@ static int pci_pm_reset(struct pci_dev *dev, int probe)
+  return 0;
+ }
+ 
+-/**
+- * pci_reset_bridge_secondary_bus - Reset the secondary bus on a PCI bridge.
+- * @dev: Bridge device
+- *
+- * Use the bridge control register to assert reset on the secondary bus.
+- * Devices on the secondary bus are left in power-on state.
+- */
+-void pci_reset_bridge_secondary_bus(struct pci_dev *dev)
++void __weak pcibios_reset_secondary_bus(struct pci_dev *dev)
+ {
+  u16 ctrl;
+ 
+@@ -3217,6 +3210,18 @@ void pci_reset_bridge_secondary_bus(struct pci_dev *dev)
+   */
+  ssleep(1);
+ }
++
++/**
++ * pci_reset_bridge_secondary_bus - Reset the secondary bus on a PCI bridge.
++ * @dev: Bridge device
++ *
++ * Use the bridge control register to assert reset on the secondary bus.
++ * Devices on the secondary bus are left in power-on state.
++ */
++void pci_reset_bridge_secondary_bus(struct pci_dev *dev)
++{
++ pcibios_reset_secondary_bus(dev);
++}
+ EXPORT_SYMBOL_GPL(pci_reset_bridge_secondary_bus);
+ 
+ static int pci_parent_bus_reset(struct pci_dev *dev, int probe)
+-- 
+1.7.1

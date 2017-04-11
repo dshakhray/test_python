@@ -1,0 +1,66 @@
+From c38c2822670e0ec5268fa4af814572321ee869c0 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:04:16 -0400
+Subject: [fs] btrfs: free delayed node outside of root->inode_lock
+
+Message-id: <1407179109-13714-370-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87309
+O-Subject: [RHEL7.1 PATCH 369/422] btrfs: free delayed node outside of root->inode_lock
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Jeff Mahoney <jeffm@suse.com>
+
+commit 964930312aec583809a690868119ce716f4ee926
+Author: Jeff Mahoney <jeffm@suse.com>
+Date:   Tue May 27 13:53:20 2014 -0400
+
+    btrfs: free delayed node outside of root->inode_lock
+
+    On heavy workloads, we're seeing soft lockup warnings on
+    root->inode_lock in __btrfs_release_delayed_node. The low hanging fruit
+    is to reduce the size of the critical section.
+
+    Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+    Reviewed-by: David Sterba <dsterba@suse.cz>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index d366622..a7fe3e0 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -149,8 +149,8 @@ again:
+  spin_lock(&root->inode_lock);
+  ret = radix_tree_insert(&root->delayed_nodes_tree, ino, node);
+  if (ret == -EEXIST) {
+-  kmem_cache_free(delayed_node_cache, node);
+   spin_unlock(&root->inode_lock);
++  kmem_cache_free(delayed_node_cache, node);
+   radix_tree_preload_end();
+   goto again;
+  }
+@@ -267,14 +267,17 @@ static void __btrfs_release_delayed_node(
+  mutex_unlock(&delayed_node->mutex);
+ 
+  if (atomic_dec_and_test(&delayed_node->refs)) {
++  bool free = false;
+   struct btrfs_root *root = delayed_node->root;
+   spin_lock(&root->inode_lock);
+   if (atomic_read(&delayed_node->refs) == 0) {
+    radix_tree_delete(&root->delayed_nodes_tree,
+        delayed_node->inode_id);
+-   kmem_cache_free(delayed_node_cache, delayed_node);
++   free = true;
+   }
+   spin_unlock(&root->inode_lock);
++  if (free)
++   kmem_cache_free(delayed_node_cache, delayed_node);
+  }
+ }
+ 
+-- 
+1.7.1

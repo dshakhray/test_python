@@ -1,0 +1,112 @@
+From a3398a2142b5de9f1cc3235f6f2a43183775669f Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Sat, 19 Jul 2014 04:30:04 -0400
+Subject: [eisa] Revert: Initialize device before its resources
+
+Message-id: <20140719043004.19438.64054.stgit@gir.stowe>
+Patchwork-id: 86032
+O-Subject: [RHEL7.1 PATCH 70/81] Revert "EISA: Initialize device before its resources"
+Bugzilla: 1110895
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110895
+Upstream Status: 765ee51f9a3f652959b4c7297d198a28e37952b4
+
+commit 765ee51f9a3f652959b4c7297d198a28e37952b4
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Fri Jan 17 14:57:29 2014 -0700
+
+    Revert "EISA: Initialize device before its resources"
+
+    This reverts commit 26abfeed4341872364386c6a52b9acef8c81a81a.
+
+    In the eisa_probe() force_probe path, if we were unable to request slot
+    resources (e.g., [io 0x800-0x8ff]), we skipped the slot with "Cannot
+    allocate resource for EISA slot %d" before reading the EISA signature in
+    eisa_init_device().
+
+    Commit 26abfeed4341 moved eisa_init_device() earlier, so we tried to read
+    the EISA signature before requesting the slot resources, and this caused
+    hangs during boot.
+
+    Link: https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1251816
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    CC: stable@vger.kernel.org  # v3.10+ a2080d0c561c: Revert "EISA: Log device resources in dmesg"
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/eisa/eisa-bus.c b/drivers/eisa/eisa-bus.c
+index 1b86fe0..612afea 100644
+--- a/drivers/eisa/eisa-bus.c
++++ b/drivers/eisa/eisa-bus.c
+@@ -277,11 +277,13 @@ static int __init eisa_request_resources(struct eisa_root_device *root,
+   }
+   
+   if (slot) {
++   edev->res[i].name  = NULL;
+    edev->res[i].start = SLOT_ADDRESS(root, slot)
+           + (i * 0x400);
+    edev->res[i].end   = edev->res[i].start + 0xff;
+    edev->res[i].flags = IORESOURCE_IO;
+   } else {
++   edev->res[i].name  = NULL;
+    edev->res[i].start = SLOT_ADDRESS(root, slot)
+           + EISA_VENDOR_ID_OFFSET;
+    edev->res[i].end   = edev->res[i].start + 3;
+@@ -327,19 +329,20 @@ static int __init eisa_probe(struct eisa_root_device *root)
+   return -ENOMEM;
+  }
+   
+- if (eisa_init_device(root, edev, 0)) {
++ if (eisa_request_resources(root, edev, 0)) {
++  dev_warn(root->dev,
++           "EISA: Cannot allocate resource for mainboard\n");
+   kfree(edev);
+   if (!root->force_probe)
+-   return -ENODEV;
++   return -EBUSY;
+   goto force_probe;
+  }
+ 
+- if (eisa_request_resources(root, edev, 0)) {
+-  dev_warn(root->dev,
+-           "EISA: Cannot allocate resource for mainboard\n");
++ if (eisa_init_device(root, edev, 0)) {
++  eisa_release_resources(edev);
+   kfree(edev);
+   if (!root->force_probe)
+-   return -EBUSY;
++   return -ENODEV;
+   goto force_probe;
+  }
+ 
+@@ -362,11 +365,6 @@ static int __init eisa_probe(struct eisa_root_device *root)
+    continue;
+   }
+ 
+-  if (eisa_init_device(root, edev, i)) {
+-   kfree(edev);
+-   continue;
+-  }
+-
+   if (eisa_request_resources(root, edev, i)) {
+    dev_warn(root->dev,
+             "Cannot allocate resource for EISA slot %d\n",
+@@ -375,6 +373,12 @@ static int __init eisa_probe(struct eisa_root_device *root)
+    continue;
+   }
+ 
++  if (eisa_init_device(root, edev, i)) {
++   eisa_release_resources(edev);
++   kfree(edev);
++   continue;
++  }
++
+   if (edev->state == (EISA_CONFIG_ENABLED | EISA_CONFIG_FORCED))
+    enabled_str = " (forced enabled)";
+   else if (edev->state == EISA_CONFIG_FORCED)
+-- 
+1.7.1

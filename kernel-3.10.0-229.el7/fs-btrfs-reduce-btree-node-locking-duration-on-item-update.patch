@@ -1,0 +1,124 @@
+From 4299dc6bb5e9fc67fbf5511d4e9fc2ed13312abe Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 18:59:28 -0400
+Subject: [fs] btrfs: reduce btree node locking duration on item update
+
+Message-id: <1407179109-13714-82-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87005
+O-Subject: [RHEL7.1 PATCH 081/422] Btrfs: reduce btree node locking duration on item update
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Filipe David Borba Manana <fdmanana@gmail.com>
+
+commit eb653de15987612444b6cde3b0e67b1edd94625f
+Author: Filipe David Borba Manana <fdmanana@gmail.com>
+Date:   Mon Dec 23 11:53:02 2013 +0000
+
+    Btrfs: reduce btree node locking duration on item update
+
+    If we do a btree search with the goal of updating an existing item
+    without changing its size (ins_len == 0 and cow == 1), then we never
+    need to hold locks on upper level nodes (even when slot == 0) after we
+    COW their child nodes/leaves, as we won't have node splits or merges
+    in this scenario (that is, no key additions, removals or shifts on any
+    nodes or leaves).
+
+    Therefore release the locks immediately after COWing the child nodes/leaves
+    while navigating the btree, even if their parent slot is 0, instead of
+    returning a path to the caller with those nodes locked, which would get
+    released only when the caller releases or frees the path (or if it calls
+    btrfs_unlock_up_safe).
+
+    This is a common scenario, for example when updating inode items in fs
+    trees and block group items in the extent tree.
+
+    The following benchmarks were performed on a quad core machine with 32Gb
+    of ram, using a leaf/node size of 4Kb (to generate deeper fs trees more
+    quickly).
+
+      sysbench --test=fileio --file-num=131072 --file-total-size=8G \
+        --file-test-mode=seqwr --num-threads=512 --file-block-size=8192 \
+        --max-requests=100000 --file-io-mode=sync [prepare|run]
+
+    Before this change:  49.85Mb/s (average of 5 runs)
+    After this change:   50.38Mb/s (average of 5 runs)
+
+    Signed-off-by: Filipe David Borba Manana <fdmanana@gmail.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/ctree.c b/fs/btrfs/ctree.c
+index 062438d..9e9de68 100644
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -2731,6 +2731,7 @@ int btrfs_search_slot(struct btrfs_trans_handle *trans, struct btrfs_root
+  lowest_level = p->lowest_level;
+  WARN_ON(lowest_level && ins_len > 0);
+  WARN_ON(p->nodes[0] != NULL);
++ BUG_ON(!cow && ins_len);
+ 
+  if (ins_len < 0) {
+   lowest_unlock = 2;
+@@ -2839,8 +2840,6 @@ again:
+    }
+   }
+ cow_done:
+-  BUG_ON(!cow && ins_len);
+-
+   p->nodes[level] = b;
+   btrfs_clear_path_blocking(p, NULL, 0);
+ 
+@@ -2850,13 +2849,19 @@ cow_done:
+    * It is safe to drop the lock on our parent before we
+    * go through the expensive btree search on b.
+    *
+-   * If cow is true, then we might be changing slot zero,
+-   * which may require changing the parent.  So, we can't
+-   * drop the lock until after we know which slot we're
+-   * operating on.
++   * If we're inserting or deleting (ins_len != 0), then we might
++   * be changing slot zero, which may require changing the parent.
++   * So, we can't drop the lock until after we know which slot
++   * we're operating on.
+    */
+-  if (!cow)
+-   btrfs_unlock_up_safe(p, level + 1);
++  if (!ins_len && !p->keep_locks) {
++   int u = level + 1;
++
++   if (u < BTRFS_MAX_LEVEL && p->locks[u]) {
++    btrfs_tree_unlock_rw(p->nodes[u], p->locks[u]);
++    p->locks[u] = 0;
++   }
++  }
+ 
+   ret = key_search(b, key, level, &prev_cmp, &slot);
+ 
+@@ -2884,7 +2889,7 @@ cow_done:
+     * which means we must have a write lock
+     * on the parent
+     */
+-   if (slot == 0 && cow &&
++   if (slot == 0 && ins_len &&
+        write_lock_level < level + 1) {
+     write_lock_level = level + 1;
+     btrfs_release_path(p);
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 3c55c2f..8052902 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -3515,7 +3515,6 @@ static noinline int btrfs_update_inode_item(struct btrfs_trans_handle *trans,
+   goto failed;
+  }
+ 
+- btrfs_unlock_up_safe(path, 1);
+  leaf = path->nodes[0];
+  inode_item = btrfs_item_ptr(leaf, path->slots[0],
+         struct btrfs_inode_item);
+-- 
+1.7.1

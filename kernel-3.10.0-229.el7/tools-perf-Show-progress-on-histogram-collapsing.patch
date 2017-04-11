@@ -1,0 +1,187 @@
+From cf1e82e9ef06bdaccc89ab4f090696447ba33d44 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:26:42 -0400
+Subject: [tools] perf: Show progress on histogram collapsing
+
+Message-id: <1408462094-14194-234-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88211
+O-Subject: [PATCH RHEL7.1 BZ1131394 233/325] perf tools: Show progress on histogram collapsing
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit c1fb5651bb40f9efaf32d280f39e06df7e352673
+Author: Namhyung Kim <namhyung.kim@lge.com>
+Date: Fri Oct 11 14:15:38 2013 +0900
+
+description
+===========
+It can take quite amount of time so add progress bar UI to inform user.
+
+[ perf_progress -> ui_progress ]
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-annotate.c b/tools/perf/builtin-annotate.c
+index 17c6b49..6c5ae57 100644
+--- a/tools/perf/builtin-annotate.c
++++ b/tools/perf/builtin-annotate.c
+@@ -247,7 +247,7 @@ static int __cmd_annotate(struct perf_annotate *ann)
+ 
+   if (nr_samples > 0) {
+    total_nr_samples += nr_samples;
+-   hists__collapse_resort(hists);
++   hists__collapse_resort(hists, NULL);
+    hists__output_resort(hists);
+ 
+    if (symbol_conf.event_group &&
+diff --git a/tools/perf/builtin-diff.c b/tools/perf/builtin-diff.c
+index 9c82888..b605009 100644
+--- a/tools/perf/builtin-diff.c
++++ b/tools/perf/builtin-diff.c
+@@ -369,7 +369,7 @@ static void perf_evlist__collapse_resort(struct perf_evlist *evlist)
+  list_for_each_entry(evsel, &evlist->entries, node) {
+   struct hists *hists = &evsel->hists;
+ 
+-  hists__collapse_resort(hists);
++  hists__collapse_resort(hists, NULL);
+  }
+ }
+ 
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index e3598a4..98d3891 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -496,6 +496,7 @@ static int __cmd_report(struct perf_report *rep)
+  struct map *kernel_map;
+  struct kmap *kernel_kmap;
+  const char *help = "For a higher level overview, try: perf report --sort comm,dso";
++ struct ui_progress prog;
+  struct perf_data_file *file = session->file;
+ 
+  signal(SIGINT, sig_handler);
+@@ -558,13 +559,19 @@ static int __cmd_report(struct perf_report *rep)
+  }
+ 
+  nr_samples = 0;
++ list_for_each_entry(pos, &session->evlist->entries, node)
++  nr_samples += pos->hists.nr_entries;
++
++ ui_progress__init(&prog, nr_samples, "Merging related events...");
++
++ nr_samples = 0;
+  list_for_each_entry(pos, &session->evlist->entries, node) {
+   struct hists *hists = &pos->hists;
+ 
+   if (pos->idx == 0)
+    hists->symbol_filter_str = rep->symbol_filter_str;
+ 
+-  hists__collapse_resort(hists);
++  hists__collapse_resort(hists, &prog);
+   nr_samples += hists->stats.nr_events[PERF_RECORD_SAMPLE];
+ 
+   /* Non-group events are considered as leader */
+@@ -576,6 +583,7 @@ static int __cmd_report(struct perf_report *rep)
+    hists__link(leader_hists, hists);
+   }
+  }
++ ui_progress__finish();
+ 
+  if (session_done())
+   return 0;
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index 3ce6784..a6ea956 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -286,7 +286,7 @@ static void perf_top__print_sym_table(struct perf_top *top)
+   return;
+  }
+ 
+- hists__collapse_resort(&top->sym_evsel->hists);
++ hists__collapse_resort(&top->sym_evsel->hists, NULL);
+  hists__output_resort(&top->sym_evsel->hists);
+  hists__decay_entries(&top->sym_evsel->hists,
+         top->hide_user_symbols,
+@@ -552,7 +552,7 @@ static void perf_top__sort_new_samples(void *arg)
+  if (t->evlist->selected != NULL)
+   t->sym_evsel = t->evlist->selected;
+ 
+- hists__collapse_resort(&t->sym_evsel->hists);
++ hists__collapse_resort(&t->sym_evsel->hists, NULL);
+  hists__output_resort(&t->sym_evsel->hists);
+  hists__decay_entries(&t->sym_evsel->hists,
+         t->hide_user_symbols,
+diff --git a/tools/perf/tests/hists_link.c b/tools/perf/tests/hists_link.c
+index 025503a..b51abcb 100644
+--- a/tools/perf/tests/hists_link.c
++++ b/tools/perf/tests/hists_link.c
+@@ -467,7 +467,7 @@ int test__hists_link(void)
+   goto out;
+ 
+  list_for_each_entry(evsel, &evlist->entries, node) {
+-  hists__collapse_resort(&evsel->hists);
++  hists__collapse_resort(&evsel->hists, NULL);
+ 
+   if (verbose > 2)
+    print_hists(&evsel->hists);
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index f0b863e..7e80253 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -399,6 +399,7 @@ static struct hist_entry *add_hist_entry(struct hists *hists,
+  if (!he)
+   return NULL;
+ 
++ hists->nr_entries++;
+  rb_link_node(&he->rb_node_in, parent, p);
+  rb_insert_color(&he->rb_node_in, hists->entries_in);
+ out:
+@@ -604,7 +605,7 @@ static void hists__apply_filters(struct hists *hists, struct hist_entry *he)
+  hists__filter_entry_by_symbol(hists, he);
+ }
+ 
+-void hists__collapse_resort(struct hists *hists)
++void hists__collapse_resort(struct hists *hists, struct ui_progress *prog)
+ {
+  struct rb_root *root;
+  struct rb_node *next;
+@@ -631,6 +632,8 @@ void hists__collapse_resort(struct hists *hists)
+     */
+    hists__apply_filters(hists, n);
+   }
++  if (prog)
++   ui_progress__update(prog, 1);
+  }
+ }
+ 
+diff --git a/tools/perf/util/hist.h b/tools/perf/util/hist.h
+index 876cff1..9d2d022 100644
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@ -6,6 +6,7 @@
+ #include "callchain.h"
+ #include "header.h"
+ #include "color.h"
++#include "ui/progress.h"
+ 
+ extern struct callchain_param callchain_param;
+ 
+@@ -109,7 +110,7 @@ struct hist_entry *__hists__add_mem_entry(struct hists *self,
+        u64 weight);
+ 
+ void hists__output_resort(struct hists *self);
+-void hists__collapse_resort(struct hists *self);
++void hists__collapse_resort(struct hists *self, struct ui_progress *prog);
+ 
+ void hists__decay_entries(struct hists *hists, bool zap_user, bool zap_kernel);
+ void hists__output_recalc_col_len(struct hists *hists, int max_rows);
+-- 
+1.7.1

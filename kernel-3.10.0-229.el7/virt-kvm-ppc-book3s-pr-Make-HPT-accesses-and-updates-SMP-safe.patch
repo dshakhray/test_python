@@ -1,0 +1,323 @@
+From bea4c39556ce0d07a91465110a95c6fae535c8af Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:06:04 -0400
+Subject: [virt] kvm/ppc: book3s pr - Make HPT accesses and updates SMP-safe
+
+Message-id: <1410545655-205645-136-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94151
+O-Subject: [RHEL7 PATCH 135/626] KVM: PPC: Book3S PR: Make HPT accesses and updates SMP-safe
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 9308ab8e2da933d895ebbb903bf459e33ed94dec
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:48 2013 +1000
+
+    KVM: PPC: Book3S PR: Make HPT accesses and updates SMP-safe
+
+    This adds a per-VM mutex to provide mutual exclusion between vcpus
+    for accesses to and updates of the guest hashed page table (HPT).
+    This also makes the code use single-byte writes to the HPT entry
+    when updating of the reference (R) and change (C) bits.  The reason
+    for doing this, rather than writing back the whole HPTE, is that on
+    non-PAPR virtual machines, the guest OS might be writing to the HPTE
+    concurrently, and writing back the whole HPTE might conflict with
+    that.  Also, real hardware does single-byte writes to update R and C.
+
+    The new mutex is taken in kvmppc_mmu_book3s_64_xlate() when reading
+    the HPT and updating R and/or C, and in the PAPR HPT update hcalls
+    (H_ENTER, H_REMOVE, etc.).  Having the mutex means that we don't need
+    to use a hypervisor lock bit in the HPT update hcalls, and we don't
+    need to be careful about the order in which the bytes of the HPTE are
+    updated by those hcalls.
+
+    The other change here is to make emulated TLB invalidations (tlbie)
+    effective across all vcpus.  To do this we call kvmppc_mmu_pte_vflush
+    for all vcpus in kvmppc_ppc_book3s_64_tlbie().
+
+    For 32-bit, this makes the setting of the accessed and dirty bits use
+    single-byte writes, and makes tlbie invalidate shadow HPTEs for all
+    vcpus.
+
+    With this, PR KVM can successfully run SMP guests.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 2c7963b..1f7349d 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -259,6 +259,9 @@ struct kvm_arch {
+  struct kvmppc_vcore *vcores[KVM_MAX_VCORES];
+  int hpt_cma_alloc;
+ #endif /* CONFIG_KVM_BOOK3S_64_HV */
++#ifdef CONFIG_KVM_BOOK3S_PR
++ struct mutex hpt_mutex;
++#endif
+ #ifdef CONFIG_PPC_BOOK3S_64
+  struct list_head spapr_tce_tables;
+  struct list_head rtas_tokens;
+diff --git a/arch/powerpc/kvm/book3s_32_mmu.c b/arch/powerpc/kvm/book3s_32_mmu.c
+index af04553..856af98 100644
+--- a/arch/powerpc/kvm/book3s_32_mmu.c
++++ b/arch/powerpc/kvm/book3s_32_mmu.c
+@@ -271,19 +271,22 @@ static int kvmppc_mmu_book3s_32_xlate_pte(struct kvm_vcpu *vcpu, gva_t eaddr,
+  /* Update PTE C and A bits, so the guest's swapper knows we used the
+     page */
+  if (found) {
+-  u32 oldpte = pteg[i+1];
+-
+-  if (pte->may_read)
+-   pteg[i+1] |= PTEG_FLAG_ACCESSED;
+-  if (pte->may_write)
+-   pteg[i+1] |= PTEG_FLAG_DIRTY;
+-  else
+-   dprintk_pte("KVM: Mapping read-only page!\n");
+-
+-  /* Write back into the PTEG */
+-  if (pteg[i+1] != oldpte)
+-   copy_to_user((void __user *)ptegp, pteg, sizeof(pteg));
+-
++  u32 pte_r = pteg[i+1];
++  char __user *addr = (char __user *) &pteg[i+1];
++
++  /*
++   * Use single-byte writes to update the HPTE, to
++   * conform to what real hardware does.
++   */
++  if (pte->may_read && !(pte_r & PTEG_FLAG_ACCESSED)) {
++   pte_r |= PTEG_FLAG_ACCESSED;
++   put_user(pte_r >> 8, addr + 2);
++  }
++  if (pte->may_write && !(pte_r & PTEG_FLAG_DIRTY)) {
++   /* XXX should only set this for stores */
++   pte_r |= PTEG_FLAG_DIRTY;
++   put_user(pte_r, addr + 3);
++  }
+   return 0;
+  }
+ 
+@@ -348,7 +351,12 @@ static void kvmppc_mmu_book3s_32_mtsrin(struct kvm_vcpu *vcpu, u32 srnum,
+ 
+ static void kvmppc_mmu_book3s_32_tlbie(struct kvm_vcpu *vcpu, ulong ea, bool large)
+ {
+- kvmppc_mmu_pte_flush(vcpu, ea, 0x0FFFF000);
++ int i;
++ struct kvm_vcpu *v;
++
++ /* flush this VA on all cpus */
++ kvm_for_each_vcpu(i, v, vcpu->kvm)
++  kvmppc_mmu_pte_flush(v, ea, 0x0FFFF000);
+ }
+ 
+ static int kvmppc_mmu_book3s_32_esid_to_vsid(struct kvm_vcpu *vcpu, ulong esid,
+diff --git a/arch/powerpc/kvm/book3s_64_mmu.c b/arch/powerpc/kvm/book3s_64_mmu.c
+index 9e6e112..ad9ecfd 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu.c
++++ b/arch/powerpc/kvm/book3s_64_mmu.c
+@@ -257,6 +257,8 @@ static int kvmppc_mmu_book3s_64_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+ 
+  pgsize = slbe->large ? MMU_PAGE_16M : MMU_PAGE_4K;
+ 
++ mutex_lock(&vcpu->kvm->arch.hpt_mutex);
++
+ do_second:
+  ptegp = kvmppc_mmu_book3s_64_get_pteg(vcpu_book3s, slbe, eaddr, second);
+  if (kvm_is_error_hva(ptegp))
+@@ -332,30 +334,37 @@ do_second:
+ 
+  /* Update PTE R and C bits, so the guest's swapper knows we used the
+   * page */
+- if (gpte->may_read) {
+-  /* Set the accessed flag */
++ if (gpte->may_read && !(r & HPTE_R_R)) {
++  /*
++   * Set the accessed flag.
++   * We have to write this back with a single byte write
++   * because another vcpu may be accessing this on
++   * non-PAPR platforms such as mac99, and this is
++   * what real hardware does.
++   */
++  char __user *addr = (char __user *) &pteg[i+1];
+   r |= HPTE_R_R;
++  put_user(r >> 8, addr + 6);
+  }
+- if (data && gpte->may_write) {
++ if (data && gpte->may_write && !(r & HPTE_R_C)) {
+   /* Set the dirty flag -- XXX even if not writing */
++  /* Use a single byte write */
++  char __user *addr = (char __user *) &pteg[i+1];
+   r |= HPTE_R_C;
++  put_user(r, addr + 7);
+  }
+ 
+- /* Write back into the PTEG */
+- if (pteg[i+1] != r) {
+-  pteg[i+1] = r;
+-  copy_to_user((void __user *)ptegp, pteg, sizeof(pteg));
+- }
++ mutex_unlock(&vcpu->kvm->arch.hpt_mutex);
+ 
+  if (!gpte->may_read)
+   return -EPERM;
+  return 0;
+ 
+ no_page_found:
++ mutex_unlock(&vcpu->kvm->arch.hpt_mutex);
+  return -ENOENT;
+ 
+ no_seg_found:
+-
+  dprintk("KVM MMU: Trigger segment fault\n");
+  return -EINVAL;
+ }
+@@ -520,6 +529,8 @@ static void kvmppc_mmu_book3s_64_tlbie(struct kvm_vcpu *vcpu, ulong va,
+            bool large)
+ {
+  u64 mask = 0xFFFFFFFFFULL;
++ long i;
++ struct kvm_vcpu *v;
+ 
+  dprintk("KVM MMU: tlbie(0x%lx)\n", va);
+ 
+@@ -542,7 +553,9 @@ static void kvmppc_mmu_book3s_64_tlbie(struct kvm_vcpu *vcpu, ulong va,
+   if (large)
+    mask = 0xFFFFFF000ULL;
+  }
+- kvmppc_mmu_pte_vflush(vcpu, va >> 12, mask);
++ /* flush this VA on all vcpus */
++ kvm_for_each_vcpu(i, v, vcpu->kvm)
++  kvmppc_mmu_pte_vflush(v, va >> 12, mask);
+ }
+ 
+ #ifdef CONFIG_PPC_64K_PAGES
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 2c2bf77..bd74b67 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -1414,6 +1414,7 @@ int kvmppc_core_init_vm(struct kvm *kvm)
+  INIT_LIST_HEAD(&kvm->arch.spapr_tce_tables);
+  INIT_LIST_HEAD(&kvm->arch.rtas_tokens);
+ #endif
++ mutex_init(&kvm->arch.hpt_mutex);
+ 
+  if (firmware_has_feature(FW_FEATURE_SET_MODE)) {
+   spin_lock(&kvm_global_user_count_lock);
+diff --git a/arch/powerpc/kvm/book3s_pr_papr.c b/arch/powerpc/kvm/book3s_pr_papr.c
+index 38f1899..5efa97b 100644
+--- a/arch/powerpc/kvm/book3s_pr_papr.c
++++ b/arch/powerpc/kvm/book3s_pr_papr.c
+@@ -48,6 +48,7 @@ static int kvmppc_h_pr_enter(struct kvm_vcpu *vcpu)
+  pte_index &= ~7UL;
+  pteg_addr = get_pteg_addr(vcpu, pte_index);
+ 
++ mutex_lock(&vcpu->kvm->arch.hpt_mutex);
+  copy_from_user(pteg, (void __user *)pteg_addr, sizeof(pteg));
+  hpte = pteg;
+ 
+@@ -74,6 +75,7 @@ static int kvmppc_h_pr_enter(struct kvm_vcpu *vcpu)
+  ret = H_SUCCESS;
+ 
+  done:
++ mutex_unlock(&vcpu->kvm->arch.hpt_mutex);
+  kvmppc_set_gpr(vcpu, 3, ret);
+ 
+  return EMULATE_DONE;
+@@ -86,26 +88,31 @@ static int kvmppc_h_pr_remove(struct kvm_vcpu *vcpu)
+  unsigned long avpn = kvmppc_get_gpr(vcpu, 6);
+  unsigned long v = 0, pteg, rb;
+  unsigned long pte[2];
++ long int ret;
+ 
+  pteg = get_pteg_addr(vcpu, pte_index);
++ mutex_lock(&vcpu->kvm->arch.hpt_mutex);
+  copy_from_user(pte, (void __user *)pteg, sizeof(pte));
+ 
++ ret = H_NOT_FOUND;
+  if ((pte[0] & HPTE_V_VALID) == 0 ||
+      ((flags & H_AVPN) && (pte[0] & ~0x7fUL) != avpn) ||
+-     ((flags & H_ANDCOND) && (pte[0] & avpn) != 0)) {
+-  kvmppc_set_gpr(vcpu, 3, H_NOT_FOUND);
+-  return EMULATE_DONE;
+- }
++     ((flags & H_ANDCOND) && (pte[0] & avpn) != 0))
++  goto done;
+ 
+  copy_to_user((void __user *)pteg, &v, sizeof(v));
+ 
+  rb = compute_tlbie_rb(pte[0], pte[1], pte_index);
+  vcpu->arch.mmu.tlbie(vcpu, rb, rb & 1 ? true : false);
+ 
+- kvmppc_set_gpr(vcpu, 3, H_SUCCESS);
++ ret = H_SUCCESS;
+  kvmppc_set_gpr(vcpu, 4, pte[0]);
+  kvmppc_set_gpr(vcpu, 5, pte[1]);
+ 
++ done:
++ mutex_unlock(&vcpu->kvm->arch.hpt_mutex);
++ kvmppc_set_gpr(vcpu, 3, ret);
++
+  return EMULATE_DONE;
+ }
+ 
+@@ -133,6 +140,7 @@ static int kvmppc_h_pr_bulk_remove(struct kvm_vcpu *vcpu)
+  int paramnr = 4;
+  int ret = H_SUCCESS;
+ 
++ mutex_lock(&vcpu->kvm->arch.hpt_mutex);
+  for (i = 0; i < H_BULK_REMOVE_MAX_BATCH; i++) {
+   unsigned long tsh = kvmppc_get_gpr(vcpu, paramnr+(2*i));
+   unsigned long tsl = kvmppc_get_gpr(vcpu, paramnr+(2*i)+1);
+@@ -181,6 +189,7 @@ static int kvmppc_h_pr_bulk_remove(struct kvm_vcpu *vcpu)
+   }
+   kvmppc_set_gpr(vcpu, paramnr+(2*i), tsh);
+  }
++ mutex_unlock(&vcpu->kvm->arch.hpt_mutex);
+  kvmppc_set_gpr(vcpu, 3, ret);
+ 
+  return EMULATE_DONE;
+@@ -193,15 +202,16 @@ static int kvmppc_h_pr_protect(struct kvm_vcpu *vcpu)
+  unsigned long avpn = kvmppc_get_gpr(vcpu, 6);
+  unsigned long rb, pteg, r, v;
+  unsigned long pte[2];
++ long int ret;
+ 
+  pteg = get_pteg_addr(vcpu, pte_index);
++ mutex_lock(&vcpu->kvm->arch.hpt_mutex);
+  copy_from_user(pte, (void __user *)pteg, sizeof(pte));
+ 
++ ret = H_NOT_FOUND;
+  if ((pte[0] & HPTE_V_VALID) == 0 ||
+-     ((flags & H_AVPN) && (pte[0] & ~0x7fUL) != avpn)) {
+-  kvmppc_set_gpr(vcpu, 3, H_NOT_FOUND);
+-  return EMULATE_DONE;
+- }
++     ((flags & H_AVPN) && (pte[0] & ~0x7fUL) != avpn))
++  goto done;
+ 
+  v = pte[0];
+  r = pte[1];
+@@ -216,8 +226,11 @@ static int kvmppc_h_pr_protect(struct kvm_vcpu *vcpu)
+  rb = compute_tlbie_rb(v, r, pte_index);
+  vcpu->arch.mmu.tlbie(vcpu, rb, rb & 1 ? true : false);
+  copy_to_user((void __user *)pteg, pte, sizeof(pte));
++ ret = H_SUCCESS;
+ 
+- kvmppc_set_gpr(vcpu, 3, H_SUCCESS);
++ done:
++ mutex_unlock(&vcpu->kvm->arch.hpt_mutex);
++ kvmppc_set_gpr(vcpu, 3, ret);
+ 
+  return EMULATE_DONE;
+ }
+-- 
+1.7.1

@@ -1,0 +1,102 @@
+From fac81abe48d32e50f305949f765e06bb956297b6 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:07:40 -0400
+Subject: [kernel] cpu/hotplug: Add lockdep annotations to get/put_online_cpus()
+
+Message-id: <1405343292-21004-4-git-send-email-prarit@redhat.com>
+Patchwork-id: 85758
+O-Subject: [RHEL7.1 PATCH BZ 1119078 03/35] CPU hotplug: Add lockdep annotations to get/put_online_cpus()
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit a19423b98704aa85e84097be6d1d44a8615c2340
+Author: Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:04:03 2014 +0530
+
+    CPU hotplug: Add lockdep annotations to get/put_online_cpus()
+
+    Add lockdep annotations for get/put_online_cpus() and
+    cpu_hotplug_begin()/cpu_hotplug_end().
+
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index f355054..8fd14d7 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -19,6 +19,7 @@
+ #include <linux/mutex.h>
+ #include <linux/gfp.h>
+ #include <linux/suspend.h>
++#include <linux/lockdep.h>
+ 
+ #include "smpboot.h"
+ 
+@@ -62,17 +63,30 @@ static struct {
+   * an ongoing cpu hotplug operation.
+   */
+  int refcount;
++
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++ struct lockdep_map dep_map;
++#endif
+ } cpu_hotplug = {
+  .active_writer = NULL,
+  .lock = __MUTEX_INITIALIZER(cpu_hotplug.lock),
+  .refcount = 0,
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++ .dep_map = {.name = "cpu_hotplug.lock" },
++#endif
+ };
+ 
++/* Lockdep annotations for get/put_online_cpus() and cpu_hotplug_begin/end() */
++#define cpuhp_lock_acquire_read() lock_map_acquire_read(&cpu_hotplug.dep_map)
++#define cpuhp_lock_acquire()      lock_map_acquire(&cpu_hotplug.dep_map)
++#define cpuhp_lock_release()      lock_map_release(&cpu_hotplug.dep_map)
++
+ void get_online_cpus(void)
+ {
+  might_sleep();
+  if (cpu_hotplug.active_writer == current)
+   return;
++ cpuhp_lock_acquire_read();
+  mutex_lock(&cpu_hotplug.lock);
+  cpu_hotplug.refcount++;
+  mutex_unlock(&cpu_hotplug.lock);
+@@ -92,6 +106,7 @@ void put_online_cpus(void)
+  if (!--cpu_hotplug.refcount && unlikely(cpu_hotplug.active_writer))
+   wake_up_process(cpu_hotplug.active_writer);
+  mutex_unlock(&cpu_hotplug.lock);
++ cpuhp_lock_release();
+ 
+ }
+ EXPORT_SYMBOL_GPL(put_online_cpus);
+@@ -122,6 +137,7 @@ static void cpu_hotplug_begin(void)
+ {
+  cpu_hotplug.active_writer = current;
+ 
++ cpuhp_lock_acquire();
+  for (;;) {
+   mutex_lock(&cpu_hotplug.lock);
+   if (likely(!cpu_hotplug.refcount))
+@@ -136,6 +152,7 @@ static void cpu_hotplug_done(void)
+ {
+  cpu_hotplug.active_writer = NULL;
+  mutex_unlock(&cpu_hotplug.lock);
++ cpuhp_lock_release();
+ }
+ 
+ /*
+-- 
+1.7.1

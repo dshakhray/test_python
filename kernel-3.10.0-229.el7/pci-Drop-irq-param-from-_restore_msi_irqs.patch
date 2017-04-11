@@ -1,0 +1,173 @@
+From f20c7449d30969575af6715001eadb101b5c6448 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Sat, 19 Jul 2014 04:23:15 -0400
+Subject: [pci] Drop "irq" param from *_restore_msi_irqs()
+
+Message-id: <20140719042315.19438.7610.stgit@gir.stowe>
+Patchwork-id: 85967
+O-Subject: [RHEL7.1 PATCH 05/81] PCI: Drop "irq" param from *_restore_msi_irqs()
+Bugzilla: 1110895
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110895
+Upstream Status: ac8344c4c0bf74c7efaf962cf2a6404331678ce4
+
+commit ac8344c4c0bf74c7efaf962cf2a6404331678ce4
+Author: DuanZhenzhong <zhenzhong.duan@oracle.com>
+Date:   Wed Dec 4 13:09:16 2013 +0800
+
+    PCI: Drop "irq" param from *_restore_msi_irqs()
+
+    Change x86_msi.restore_msi_irqs(struct pci_dev *dev, int irq) to
+    x86_msi.restore_msi_irqs(struct pci_dev *dev).
+
+    restore_msi_irqs() restores multiple MSI-X IRQs, so param 'int irq' is
+    unneeded.  This makes code more consistent between vm and bare metal.
+
+    Dom0 MSI-X restore code can also be optimized as XEN only has a hypercall
+    to restore all MSI-X vectors at one time.
+
+    Tested-by: Sucheta Chakraborty <sucheta.chakraborty@qlogic.com>
+    Signed-off-by: Zhenzhong Duan <zhenzhong.duan@oracle.com>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Acked-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/pci.h b/arch/x86/include/asm/pci.h
+index 7d74432..d44baf4 100644
+--- a/arch/x86/include/asm/pci.h
++++ b/arch/x86/include/asm/pci.h
+@@ -104,7 +104,7 @@ extern void pci_iommu_alloc(void);
+ struct msi_desc;
+ int native_setup_msi_irqs(struct pci_dev *dev, int nvec, int type);
+ void native_teardown_msi_irq(unsigned int irq);
+-void native_restore_msi_irqs(struct pci_dev *dev, int irq);
++void native_restore_msi_irqs(struct pci_dev *dev);
+ int setup_msi_irq(struct pci_dev *dev, struct msi_desc *msidesc,
+     unsigned int irq_base, unsigned int irq_offset);
+ #else
+diff --git a/arch/x86/include/asm/x86_init.h b/arch/x86/include/asm/x86_init.h
+index 0f1be11..e45e4da 100644
+--- a/arch/x86/include/asm/x86_init.h
++++ b/arch/x86/include/asm/x86_init.h
+@@ -181,7 +181,7 @@ struct x86_msi_ops {
+           u8 hpet_id);
+  void (*teardown_msi_irq)(unsigned int irq);
+  void (*teardown_msi_irqs)(struct pci_dev *dev);
+- void (*restore_msi_irqs)(struct pci_dev *dev, int irq);
++ void (*restore_msi_irqs)(struct pci_dev *dev);
+  int  (*setup_hpet_msi)(unsigned int irq, unsigned int id);
+  u32 (*msi_mask_irq)(struct msi_desc *desc, u32 mask, u32 flag);
+  u32 (*msix_mask_irq)(struct msi_desc *desc, u32 flag);
+diff --git a/arch/x86/kernel/x86_init.c b/arch/x86/kernel/x86_init.c
+index 021783b..e48b674 100644
+--- a/arch/x86/kernel/x86_init.c
++++ b/arch/x86/kernel/x86_init.c
+@@ -136,9 +136,9 @@ void arch_teardown_msi_irq(unsigned int irq)
+  x86_msi.teardown_msi_irq(irq);
+ }
+ 
+-void arch_restore_msi_irqs(struct pci_dev *dev, int irq)
++void arch_restore_msi_irqs(struct pci_dev *dev)
+ {
+- x86_msi.restore_msi_irqs(dev, irq);
++ x86_msi.restore_msi_irqs(dev);
+ }
+ u32 arch_msi_mask_irq(struct msi_desc *desc, u32 mask, u32 flag)
+ {
+diff --git a/arch/x86/pci/xen.c b/arch/x86/pci/xen.c
+index 48e8461..cdd869f 100644
+--- a/arch/x86/pci/xen.c
++++ b/arch/x86/pci/xen.c
+@@ -337,7 +337,7 @@ out:
+  return ret;
+ }
+ 
+-static void xen_initdom_restore_msi_irqs(struct pci_dev *dev, int irq)
++static void xen_initdom_restore_msi_irqs(struct pci_dev *dev)
+ {
+  int ret = 0;
+ 
+diff --git a/drivers/pci/msi.c b/drivers/pci/msi.c
+index 662b489..d6c9925 100644
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -132,7 +132,7 @@ void __weak arch_teardown_msi_irqs(struct pci_dev *dev)
+  return default_teardown_msi_irqs(dev);
+ }
+ 
+-void default_restore_msi_irqs(struct pci_dev *dev, int irq)
++static void default_restore_msi_irq(struct pci_dev *dev, int irq)
+ {
+  struct msi_desc *entry;
+ 
+@@ -150,9 +150,9 @@ void default_restore_msi_irqs(struct pci_dev *dev, int irq)
+   write_msi_msg(irq, &entry->msg);
+ }
+ 
+-void __weak arch_restore_msi_irqs(struct pci_dev *dev, int irq)
++void __weak arch_restore_msi_irqs(struct pci_dev *dev)
+ {
+- return default_restore_msi_irqs(dev, irq);
++ return default_restore_msi_irqs(dev);
+ }
+ 
+ static void msi_set_enable(struct pci_dev *dev, int enable)
+@@ -282,6 +282,15 @@ void unmask_msi_irq(struct irq_data *data)
+ 
+ #endif /* CONFIG_GENERIC_HARDIRQS */
+ 
++void default_restore_msi_irqs(struct pci_dev *dev)
++{
++ struct msi_desc *entry;
++
++ list_for_each_entry(entry, &dev->msi_list, list) {
++  default_restore_msi_irq(dev, entry->irq);
++ }
++}
++
+ void __read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+ {
+  BUG_ON(entry->dev->current_state != PCI_D0);
+@@ -452,7 +461,7 @@ static void __pci_restore_msi_state(struct pci_dev *dev)
+ 
+  pci_intx_for_msi(dev, 0);
+  msi_set_enable(dev, 0);
+- arch_restore_msi_irqs(dev, dev->irq);
++ arch_restore_msi_irqs(dev);
+ 
+  pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &control);
+  msi_mask_irq(entry, msi_capable_mask(control), entry->masked);
+@@ -477,8 +486,8 @@ static void __pci_restore_msix_state(struct pci_dev *dev)
+  control |= PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL;
+  pci_write_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, control);
+ 
++ arch_restore_msi_irqs(dev);
+  list_for_each_entry(entry, &dev->msi_list, list) {
+-  arch_restore_msi_irqs(dev, entry->irq);
+   msix_mask_irq(entry, entry->masked);
+  }
+ 
+diff --git a/include/linux/msi.h b/include/linux/msi.h
+index 009b024..92a2f99 100644
+--- a/include/linux/msi.h
++++ b/include/linux/msi.h
+@@ -60,10 +60,10 @@ void arch_teardown_msi_irq(unsigned int irq);
+ int arch_setup_msi_irqs(struct pci_dev *dev, int nvec, int type);
+ void arch_teardown_msi_irqs(struct pci_dev *dev);
+ int arch_msi_check_device(struct pci_dev* dev, int nvec, int type);
+-void arch_restore_msi_irqs(struct pci_dev *dev, int irq);
++void arch_restore_msi_irqs(struct pci_dev *dev);
+ 
+ void default_teardown_msi_irqs(struct pci_dev *dev);
+-void default_restore_msi_irqs(struct pci_dev *dev, int irq);
++void default_restore_msi_irqs(struct pci_dev *dev);
+ u32 default_msi_mask_irq(struct msi_desc *desc, u32 mask, u32 flag);
+ u32 default_msix_mask_irq(struct msi_desc *desc, u32 flag);
+ 
+-- 
+1.7.1

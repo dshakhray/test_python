@@ -1,0 +1,201 @@
+From 20d6ae34a70274554f0b27c78b5674f90641ea84 Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:14 -0400
+Subject: [fs] cifs: Query File System Alignment
+
+Message-id: <1406549822-10376-22-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86783
+O-Subject: [RHEL7.1 PATCH 21/69] [bz1082049]Query File System Alignment
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Steven French <smfrench@gmail.com>
+
+In SMB3 it is now possible to query the file system
+alignment info, and the preferred (for performance)
+sector size and whether the underlying disk
+has no seek penalty (like SSD).
+
+Query this information at mount time for SMB3,
+and make it visible in /proc/fs/cifs/DebugData
+for debugging purposes.
+
+This alignment information and preferred sector
+size info will be helpful for the copy offload
+patches to setup the right chunks in the CopyChunk
+requests.   Presumably the knowledge that the
+underlying disk is SSD could also help us
+make better readahead and writebehind
+decisions (something to look at in the future).
+
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit af6a12ea8d4bb39a87527835b943bde4215897e5)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 9e92ef6..cdafa5a 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -860,6 +860,8 @@ struct cifs_tcon {
+  __u32 maximal_access;
+  __u32 vol_serial_number;
+  __le64 vol_create_time;
++ __u32 ss_flags;  /* sector size flags */
++ __u32 perf_sector_size; /* best sector size for perf */
+ #endif /* CONFIG_CIFS_SMB2 */
+ #ifdef CONFIG_CIFS_FSCACHE
+  u64 resource_id;  /* server resource id */
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index e37849d..cc70d48 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -210,6 +210,36 @@ smb2_negotiate_rsize(struct cifs_tcon *tcon, struct smb_vol *volume_info)
+ }
+ 
+ static void
++smb3_qfs_tcon(const unsigned int xid, struct cifs_tcon *tcon)
++{
++ int rc;
++ __le16 srch_path = 0; /* Null - open root of share */
++ u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
++ struct cifs_open_parms oparms;
++ struct cifs_fid fid;
++
++ oparms.tcon = tcon;
++ oparms.desired_access = FILE_READ_ATTRIBUTES;
++ oparms.disposition = FILE_OPEN;
++ oparms.create_options = 0;
++ oparms.fid = &fid;
++ oparms.reconnect = false;
++
++ rc = SMB2_open(xid, &oparms, &srch_path, &oplock, NULL, NULL);
++ if (rc)
++  return;
++
++ SMB2_QFS_attr(xid, tcon, fid.persistent_fid, fid.volatile_fid,
++   FS_ATTRIBUTE_INFORMATION);
++ SMB2_QFS_attr(xid, tcon, fid.persistent_fid, fid.volatile_fid,
++   FS_DEVICE_INFORMATION);
++ SMB2_QFS_attr(xid, tcon, fid.persistent_fid, fid.volatile_fid,
++   FS_SECTOR_SIZE_INFORMATION); /* SMB3 specific */
++ SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
++ return;
++}
++
++static void
+ smb2_qfs_tcon(const unsigned int xid, struct cifs_tcon *tcon)
+ {
+  int rc;
+@@ -332,7 +362,19 @@ smb2_dump_share_caps(struct seq_file *m, struct cifs_tcon *tcon)
+   seq_puts(m, " ASYMMETRIC,");
+  if (tcon->capabilities == 0)
+   seq_puts(m, " None");
++ if (tcon->ss_flags & SSINFO_FLAGS_ALIGNED_DEVICE)
++  seq_puts(m, " Aligned,");
++ if (tcon->ss_flags & SSINFO_FLAGS_PARTITION_ALIGNED_ON_DEVICE)
++  seq_puts(m, " Partition Aligned,");
++ if (tcon->ss_flags & SSINFO_FLAGS_NO_SEEK_PENALTY)
++  seq_puts(m, " SSD,");
++ if (tcon->ss_flags & SSINFO_FLAGS_TRIM_ENABLED)
++  seq_puts(m, " TRIM-support,");
++
+  seq_printf(m, "\tShare Flags: 0x%x", tcon->share_flags);
++ if (tcon->perf_sector_size)
++  seq_printf(m, "\tOptimal sector size: 0x%x",
++      tcon->perf_sector_size);
+ }
+ 
+ static void
+@@ -1062,7 +1104,7 @@ struct smb_version_operations smb30_operations = {
+  .logoff = SMB2_logoff,
+  .tree_connect = SMB2_tcon,
+  .tree_disconnect = SMB2_tdis,
+- .qfs_tcon = smb2_qfs_tcon,
++ .qfs_tcon = smb3_qfs_tcon,
+  .is_path_accessible = smb2_is_path_accessible,
+  .can_echo = smb2_can_echo,
+  .echo = SMB2_echo,
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 389c8b9..7c20702 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -2374,8 +2374,11 @@ SMB2_QFS_attr(const unsigned int xid, struct cifs_tcon *tcon,
+  } else if (level == FS_ATTRIBUTE_INFORMATION) {
+   max_len = sizeof(FILE_SYSTEM_ATTRIBUTE_INFO);
+   min_len = MIN_FS_ATTR_INFO_SIZE;
++ } else if (level == FS_SECTOR_SIZE_INFORMATION) {
++  max_len = sizeof(struct smb3_fs_ss_info);
++  min_len = sizeof(struct smb3_fs_ss_info);
+  } else {
+-  cifs_dbg(FYI, "Invalid qfsinfo level %d", level);
++  cifs_dbg(FYI, "Invalid qfsinfo level %d\n", level);
+   return -EINVAL;
+  }
+ 
+@@ -2404,6 +2407,13 @@ SMB2_QFS_attr(const unsigned int xid, struct cifs_tcon *tcon,
+  else if (level == FS_DEVICE_INFORMATION)
+   memcpy(&tcon->fsDevInfo, 4 /* RFC1001 len */ + offset
+    + (char *)&rsp->hdr, sizeof(FILE_SYSTEM_DEVICE_INFO));
++ else if (level == FS_SECTOR_SIZE_INFORMATION) {
++  struct smb3_fs_ss_info *ss_info = (struct smb3_fs_ss_info *)
++   (4 /* RFC1001 len */ + offset + (char *)&rsp->hdr);
++  tcon->ss_flags = le32_to_cpu(ss_info->Flags);
++  tcon->perf_sector_size =
++   le32_to_cpu(ss_info->PhysicalBytesPerSectorForPerf);
++ }
+ 
+ qfsattr_exit:
+  free_rsp_buf(resp_buftype, iov.iov_base);
+diff --git a/fs/cifs/smb2pdu.h b/fs/cifs/smb2pdu.h
+index c7c3c82..7e44f18 100644
+--- a/fs/cifs/smb2pdu.h
++++ b/fs/cifs/smb2pdu.h
+@@ -877,14 +877,16 @@ struct smb2_lease_ack {
+ 
+ /* File System Information Classes */
+ #define FS_VOLUME_INFORMATION  1 /* Query */
+-#define FS_LABEL_INFORMATION  2 /* Set */
++#define FS_LABEL_INFORMATION  2 /* Local only */
+ #define FS_SIZE_INFORMATION  3 /* Query */
+ #define FS_DEVICE_INFORMATION  4 /* Query */
+ #define FS_ATTRIBUTE_INFORMATION 5 /* Query */
+ #define FS_CONTROL_INFORMATION  6 /* Query, Set */
+ #define FS_FULL_SIZE_INFORMATION 7 /* Query */
+ #define FS_OBJECT_ID_INFORMATION 8 /* Query, Set */
+-#define FS_DRIVER_PATH_INFORMATION 9 /* Query */
++#define FS_DRIVER_PATH_INFORMATION 9 /* Local only */
++#define FS_VOLUME_FLAGS_INFORMATION 10 /* Local only */
++#define FS_SECTOR_SIZE_INFORMATION 11 /* SMB3 or later. Query */
+ 
+ struct smb2_fs_full_size_info {
+  __le64 TotalAllocationUnits;
+@@ -894,6 +896,22 @@ struct smb2_fs_full_size_info {
+  __le32 BytesPerSector;
+ } __packed;
+ 
++#define SSINFO_FLAGS_ALIGNED_DEVICE  0x00000001
++#define SSINFO_FLAGS_PARTITION_ALIGNED_ON_DEVICE 0x00000002
++#define SSINFO_FLAGS_NO_SEEK_PENALTY  0x00000004
++#define SSINFO_FLAGS_TRIM_ENABLED  0x00000008
++
++/* sector size info struct */
++struct smb3_fs_ss_info {
++ __le32 LogicalBytesPerSector;
++ __le32 PhysicalBytesPerSectorForAtomicity;
++ __le32 PhysicalBytesPerSectorForPerf;
++ __le32 FileSystemEffectivePhysicalBytesPerSectorForAtomicity;
++ __le32 Flags;
++ __le32 ByteOffsetForSectorAlignment;
++ __le32 ByteOffsetForPartitionAlignment;
++} __packed;
++
+ /* partial list of QUERY INFO levels */
+ #define FILE_DIRECTORY_INFORMATION 1
+ #define FILE_FULL_DIRECTORY_INFORMATION 2
+-- 
+1.7.1

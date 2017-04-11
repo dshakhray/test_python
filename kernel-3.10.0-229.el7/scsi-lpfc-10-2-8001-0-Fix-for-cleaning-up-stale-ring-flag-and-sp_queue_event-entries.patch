@@ -1,0 +1,103 @@
+From b71d04a9f0929d6227b888edc6cf516cbd575383 Mon Sep 17 00:00:00 2001
+From: Rob Evers <revers@redhat.com>
+Date: Mon, 23 Jun 2014 21:42:02 -0400
+Subject: [scsi] lpfc 10.2.8001.0: Fix for cleaning up stale ring flag and sp_queue_event entries
+
+Message-id: <1403559726-20488-21-git-send-email-revers@redhat.com>
+Patchwork-id: 84429
+O-Subject: [RHEL7.1 e-stor PATCH 20/24] scsi: lpfc 10.2.8001.0: Fix for cleaning up stale ring flag and sp_queue_event entries.
+Bugzilla: 1088574
+RH-Acked-by: Ewan Milne <emilne@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Dick Kennedy <rkennedy@Emulex.Com>
+
+Submitted by James Smart James.Smart@emulex.com
+
+Fix for cleaning up stale ring flag and sp_queue_event entries.
+
+Signed-off-by: James Smart james.smart@emulex.com
+
+http://marc.info/?l=linux-scsi&m=140067390818963&w=2
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index 79344e7..04745e2 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -820,6 +820,52 @@ lpfc_hba_down_prep(struct lpfc_hba *phba)
+ }
+ 
+ /**
++ * lpfc_sli4_free_sp_events - Cleanup sp_queue_events to free
++ * rspiocb which got deferred
++ *
++ * @phba: pointer to lpfc HBA data structure.
++ *
++ * This routine will cleanup completed slow path events after HBA is reset
++ * when bringing down the SLI Layer.
++ *
++ *
++ * Return codes
++ *   void.
++ **/
++static void
++lpfc_sli4_free_sp_events(struct lpfc_hba *phba)
++{
++ struct lpfc_iocbq *rspiocbq;
++ struct hbq_dmabuf *dmabuf;
++ struct lpfc_cq_event *cq_event;
++
++ spin_lock_irq(&phba->hbalock);
++ phba->hba_flag &= ~HBA_SP_QUEUE_EVT;
++ spin_unlock_irq(&phba->hbalock);
++
++ while (!list_empty(&phba->sli4_hba.sp_queue_event)) {
++  /* Get the response iocb from the head of work queue */
++  spin_lock_irq(&phba->hbalock);
++  list_remove_head(&phba->sli4_hba.sp_queue_event,
++     cq_event, struct lpfc_cq_event, list);
++  spin_unlock_irq(&phba->hbalock);
++
++  switch (bf_get(lpfc_wcqe_c_code, &cq_event->cqe.wcqe_cmpl)) {
++  case CQE_CODE_COMPL_WQE:
++   rspiocbq = container_of(cq_event, struct lpfc_iocbq,
++       cq_event);
++   lpfc_sli_release_iocbq(phba, rspiocbq);
++   break;
++  case CQE_CODE_RECEIVE:
++  case CQE_CODE_RECEIVE_V1:
++   dmabuf = container_of(cq_event, struct hbq_dmabuf,
++           cq_event);
++   lpfc_in_buf_free(phba, &dmabuf->dbuf);
++  }
++ }
++}
++
++/**
+  * lpfc_hba_free_post_buf - Perform lpfc uninitialization after HBA reset
+  * @phba: pointer to lpfc HBA data structure.
+  *
+@@ -981,6 +1027,8 @@ lpfc_hba_down_post_s4(struct lpfc_hba *phba)
+  spin_lock_irqsave(&phba->scsi_buf_list_put_lock, iflag);
+  list_splice(&aborts, &phba->lpfc_scsi_buf_list_put);
+  spin_unlock_irqrestore(&phba->scsi_buf_list_put_lock, iflag);
++
++ lpfc_sli4_free_sp_events(phba);
+  return 0;
+ }
+ 
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index 34ba7aa..f99fe10 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -9244,6 +9244,7 @@ lpfc_sli_queue_setup(struct lpfc_hba *phba)
+   pring->sli.sli3.next_cmdidx  = 0;
+   pring->sli.sli3.local_getidx = 0;
+   pring->sli.sli3.cmdidx = 0;
++  pring->flag = 0;
+   INIT_LIST_HEAD(&pring->txq);
+   INIT_LIST_HEAD(&pring->txcmplq);
+   INIT_LIST_HEAD(&pring->iocb_continueq);
+-- 
+1.7.1

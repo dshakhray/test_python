@@ -1,0 +1,130 @@
+From d7ffa0c1b2c33b9fd59873763cdf37042417e395 Mon Sep 17 00:00:00 2001
+From: Stefan Assmann <sassmann@redhat.com>
+Date: Tue, 26 Aug 2014 14:12:32 -0400
+Subject: [ethernet] igb: separate hardware setting from the set_ts_config ioctl
+
+Message-id: <1409062359-13063-75-git-send-email-sassmann@redhat.com>
+Patchwork-id: 89185
+O-Subject: [RHEL7.1 PATCH 74/81] igb: separate hardware setting from the set_ts_config ioctl
+Bugzilla: 1091121
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jacob Keller <jacob.e.keller@intel.com>
+
+This patch separates the hardware logic from the set function, so that
+we can re-use it during a ptp_reset. This enables the reset to return
+functionality to the last known timestamp mode, rather than resetting
+the value. We initialize the mode to off during the ptp_init cycle.
+
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Stefan Assmann <sassmann@redhat.com>
+(cherry picked from commit 9f62ecf4255ea0fb3e653fc5fc91ef7b38812bb5)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/igb/igb_ptp.c b/drivers/net/ethernet/intel/igb/igb_ptp.c
+index e291be2..794c139 100644
+--- a/drivers/net/ethernet/intel/igb/igb_ptp.c
++++ b/drivers/net/ethernet/intel/igb/igb_ptp.c
+@@ -559,10 +559,11 @@ int igb_ptp_get_ts_config(struct net_device *netdev, struct ifreq *ifr)
+  return copy_to_user(ifr->ifr_data, config, sizeof(*config)) ?
+   -EFAULT : 0;
+ }
++
+ /**
+- * igb_ptp_set_ts_config - control hardware time stamping
+- * @netdev:
+- * @ifreq:
++ * igb_ptp_set_timestamp_mode - setup hardware for timestamping
++ * @adapter: networking device structure
++ * @config: hwtstamp configuration
+  *
+  * Outgoing time stamping can be enabled and disabled. Play nice and
+  * disable it when requested, although it shouldn't case any overhead
+@@ -575,12 +576,11 @@ int igb_ptp_get_ts_config(struct net_device *netdev, struct ifreq *ifr)
+  * type has to be specified. Matching the kind of event packet is
+  * not supported, with the exception of "all V2 events regardless of
+  * level 2 or 4".
+- **/
+-int igb_ptp_set_ts_config(struct net_device *netdev, struct ifreq *ifr)
++ */
++static int igb_ptp_set_timestamp_mode(struct igb_adapter *adapter,
++          struct hwtstamp_config *config)
+ {
+- struct igb_adapter *adapter = netdev_priv(netdev);
+  struct e1000_hw *hw = &adapter->hw;
+- struct hwtstamp_config *config = &adapter->tstamp_config;
+  u32 tsync_tx_ctl = E1000_TSYNCTXCTL_ENABLED;
+  u32 tsync_rx_ctl = E1000_TSYNCRXCTL_ENABLED;
+  u32 tsync_rx_cfg = 0;
+@@ -588,9 +588,6 @@ int igb_ptp_set_ts_config(struct net_device *netdev, struct ifreq *ifr)
+  bool is_l2 = false;
+  u32 regval;
+ 
+- if (copy_from_user(config, ifr->ifr_data, sizeof(*config)))
+-  return -EFAULT;
+-
+  /* reserved for future extensions */
+  if (config->flags)
+   return -EINVAL;
+@@ -725,7 +722,33 @@ int igb_ptp_set_ts_config(struct net_device *netdev, struct ifreq *ifr)
+  regval = rd32(E1000_RXSTMPL);
+  regval = rd32(E1000_RXSTMPH);
+ 
+- return copy_to_user(ifr->ifr_data, config, sizeof(*config)) ?
++ return 0;
++}
++
++/**
++ * igb_ptp_set_ts_config - set hardware time stamping config
++ * @netdev:
++ * @ifreq:
++ *
++ **/
++int igb_ptp_set_ts_config(struct net_device *netdev, struct ifreq *ifr)
++{
++ struct igb_adapter *adapter = netdev_priv(netdev);
++ struct hwtstamp_config config;
++ int err;
++
++ if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
++  return -EFAULT;
++
++ err = igb_ptp_set_timestamp_mode(adapter, &config);
++ if (err)
++  return err;
++
++ /* save these settings for future reference */
++ memcpy(&adapter->tstamp_config, &config,
++        sizeof(adapter->tstamp_config));
++
++ return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
+   -EFAULT : 0;
+ }
+ 
+@@ -820,6 +843,9 @@ void igb_ptp_init(struct igb_adapter *adapter)
+   wr32(E1000_IMS, E1000_IMS_TS);
+  }
+ 
++ adapter->tstamp_config.rx_filter = HWTSTAMP_FILTER_NONE;
++ adapter->tstamp_config.tx_type = HWTSTAMP_TX_OFF;
++
+  adapter->ptp_clock = ptp_clock_register(&adapter->ptp_caps,
+       &adapter->pdev->dev);
+  if (IS_ERR(adapter->ptp_clock)) {
+@@ -884,7 +910,7 @@ void igb_ptp_reset(struct igb_adapter *adapter)
+   return;
+ 
+  /* reset the tstamp_config */
+- memset(&adapter->tstamp_config, 0, sizeof(adapter->tstamp_config));
++ igb_ptp_set_timestamp_mode(adapter, &adapter->tstamp_config);
+ 
+  switch (adapter->hw.mac.type) {
+  case e1000_82576:
+-- 
+1.7.1

@@ -1,0 +1,83 @@
+From 0ed8bdfbb0d7397811eeb92f5f97c5e9900153a2 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:22:59 -0400
+Subject: [cpufreq] Clean up after a failing light-weight initialization
+
+Message-id: <1409235879-1283-86-git-send-email-prarit@redhat.com>
+Patchwork-id: 89412
+O-Subject: [RHEL7.1 PATCH BZ 1134639 085/185] cpufreq: Clean up after a failing light-weight initialization
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit 72368d122c7479aa6e14fbbd334717b8a0c157a6
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Fri Dec 27 01:07:11 2013 +0100
+
+    cpufreq: Clean up after a failing light-weight initialization
+
+    If cpufreq_policy_restore() returns NULL during system resume,
+    __cpufreq_add_dev() should just fall back to the full initialization
+    instead of returning an error, because that may actually make things
+    work.  Moreover, it should not leave stale fallback data behind after
+    it has failed to restore a previously existing policy.
+
+    This change is based on Viresh Kumar's work.
+
+    Fixes: 5302c3fb2e62 ("cpufreq: Perform light-weight init/teardown during suspend/resume")
+    Reported-by: Bjorn Mork <bjorn@mork.no>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Cc: 3.12+ <stable@vger.kernel.org> # 3.12+
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 50414da..b520fc1 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1010,15 +1010,17 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
+  read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ #endif
+ 
+- if (frozen)
+-  /* Restore the saved policy when doing light-weight init */
+-  policy = cpufreq_policy_restore(cpu);
+- else
++ /*
++  * Restore the saved policy when doing light-weight init and fall back
++  * to the full init if that fails.
++  */
++ policy = frozen ? cpufreq_policy_restore(cpu) : NULL;
++ if (!policy) {
++  frozen = false;
+   policy = cpufreq_policy_alloc();
+-
+- if (!policy)
+-  goto nomem_out;
+-
++  if (!policy)
++   goto nomem_out;
++ }
+ 
+  /*
+   * In the resume path, since we restore a saved policy, the assignment
+@@ -1111,8 +1113,11 @@ err_get_freq:
+  if (cpufreq_driver->exit)
+   cpufreq_driver->exit(policy);
+ err_set_policy_cpu:
+- if (frozen)
++ if (frozen) {
++  /* Do not leave stale fallback data behind. */
++  per_cpu(cpufreq_cpu_data_fallback, cpu) = NULL;
+   cpufreq_policy_put_kobj(policy);
++ }
+  cpufreq_policy_free(policy);
+ 
+ nomem_out:
+-- 
+1.7.1

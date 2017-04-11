@@ -1,0 +1,194 @@
+From 393386fecafb56597d59d77ba481b4e046663d7e Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Tue, 18 Mar 2014 17:30:46 -0400
+Subject: [fs] cifs: Add create MFSymlinks to protocol ops struct
+
+Message-id: <1395163848-29977-6-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 78384
+O-Subject: [RHEL7 PATCH 5/7] [bz1077230] cifs: Add create MFSymlinks to protocol ops struct
+Bugzilla: 1077230
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Jeff Layton <jlayton@redhat.com>
+
+Add a new protocol ops function create_mf_symlink and have
+create_mf_symlink() use it.
+
+This patchset moves the MFSymlink operations completely to the
+ops structure so that we only use the right protocol versions when
+querying or creating MFSymlinks.
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit cbb0aba6ff3ff5b64f094f81f4d99d2323c0afcc)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 3b17127..ff518b3 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -372,6 +372,9 @@ struct smb_version_operations {
+  int (*query_mf_symlink)(unsigned int, struct cifs_tcon *,
+     struct cifs_sb_info *, const unsigned char *,
+     char *, unsigned int *);
++ int (*create_mf_symlink)(unsigned int, struct cifs_tcon *,
++     struct cifs_sb_info *, const unsigned char *,
++     char *, unsigned int *);
+  /* if we can do cache read operations */
+  bool (*is_read_op)(__u32);
+  /* set oplock level for the inode */
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index fc37d04..573d3f4 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -499,4 +499,8 @@ int cifs_query_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
+      struct cifs_sb_info *cifs_sb,
+      const unsigned char *path, char *pbuf,
+      unsigned int *pbytes_read);
++int cifs_create_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
++      struct cifs_sb_info *cifs_sb,
++      const unsigned char *path, char *pbuf,
++      unsigned int *pbytes_written);
+ #endif   /* _CIFSPROTO_H */
+diff --git a/fs/cifs/link.c b/fs/cifs/link.c
+index fd5dff3..957f74a 100644
+--- a/fs/cifs/link.c
++++ b/fs/cifs/link.c
+@@ -180,59 +180,31 @@ format_mf_symlink(u8 *buf, unsigned int buf_len, const char *link_str)
+ 
+ static int
+ create_mf_symlink(const unsigned int xid, struct cifs_tcon *tcon,
+-      const char *fromName, const char *toName,
+-      struct cifs_sb_info *cifs_sb)
++    struct cifs_sb_info *cifs_sb, const char *fromName,
++    const char *toName)
+ {
+  int rc;
+- int oplock = 0;
+- int remap;
+- int create_options = CREATE_NOT_DIR;
+- __u16 netfid = 0;
+  u8 *buf;
+  unsigned int bytes_written = 0;
+- struct cifs_io_parms io_parms;
+- struct nls_table *nls_codepage;
+-
+- nls_codepage = cifs_sb->local_nls;
+- remap = cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MAP_SPECIAL_CHR;
+ 
+  buf = kmalloc(CIFS_MF_SYMLINK_FILE_SIZE, GFP_KERNEL);
+  if (!buf)
+   return -ENOMEM;
+ 
+  rc = format_mf_symlink(buf, CIFS_MF_SYMLINK_FILE_SIZE, toName);
+- if (rc != 0) {
+-  kfree(buf);
+-  return rc;
+- }
+-
+- if (backup_cred(cifs_sb))
+-  create_options |= CREATE_OPEN_BACKUP_INTENT;
+-
+- rc = CIFSSMBOpen(xid, tcon, fromName, FILE_CREATE, GENERIC_WRITE,
+-    create_options, &netfid, &oplock, NULL,
+-    nls_codepage, remap);
+- if (rc != 0) {
+-  kfree(buf);
+-  return rc;
+- }
+-
+- io_parms.netfid = netfid;
+- io_parms.pid = current->tgid;
+- io_parms.tcon = tcon;
+- io_parms.offset = 0;
+- io_parms.length = CIFS_MF_SYMLINK_FILE_SIZE;
++ if (rc)
++  goto out;
+ 
+- rc = CIFSSMBWrite(xid, &io_parms, &bytes_written, buf, NULL, 0);
+- CIFSSMBClose(xid, tcon, netfid);
+- kfree(buf);
+- if (rc != 0)
+-  return rc;
++ rc = tcon->ses->server->ops->create_mf_symlink(xid, tcon, cifs_sb,
++     fromName, buf, &bytes_written);
++ if (rc)
++  goto out;
+ 
+  if (bytes_written != CIFS_MF_SYMLINK_FILE_SIZE)
+-  return -EIO;
+-
+- return 0;
++  rc = -EIO;
++out:
++ kfree(buf);
++ return rc;
+ }
+ 
+ static int
+@@ -320,6 +292,39 @@ out:
+ }
+ 
+ int
++cifs_create_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
++         struct cifs_sb_info *cifs_sb, const unsigned char *path,
++         char *pbuf, unsigned int *pbytes_written)
++{
++ int rc;
++ int oplock = 0;
++ __u16 netfid = 0;
++ struct cifs_io_parms io_parms;
++ int create_options = CREATE_NOT_DIR;
++
++ if (backup_cred(cifs_sb))
++  create_options |= CREATE_OPEN_BACKUP_INTENT;
++
++ rc = CIFSSMBOpen(xid, tcon, path, FILE_CREATE, GENERIC_WRITE,
++    create_options, &netfid, &oplock, NULL,
++    cifs_sb->local_nls,
++    cifs_sb->mnt_cifs_flags &
++    CIFS_MOUNT_MAP_SPECIAL_CHR);
++ if (rc)
++  return rc;
++
++ io_parms.netfid = netfid;
++ io_parms.pid = current->tgid;
++ io_parms.tcon = tcon;
++ io_parms.offset = 0;
++ io_parms.length = CIFS_MF_SYMLINK_FILE_SIZE;
++
++ rc = CIFSSMBWrite(xid, &io_parms, pbytes_written, pbuf, NULL, 0);
++ CIFSSMBClose(xid, tcon, netfid);
++ return rc;
++}
++
++int
+ check_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
+    struct cifs_sb_info *cifs_sb, struct cifs_fattr *fattr,
+    const unsigned char *path)
+@@ -548,8 +553,7 @@ cifs_symlink(struct inode *inode, struct dentry *direntry, const char *symname)
+ 
+  /* BB what if DFS and this volume is on different share? BB */
+  if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS)
+-  rc = create_mf_symlink(xid, pTcon, full_path, symname,
+-     cifs_sb);
++  rc = create_mf_symlink(xid, pTcon, cifs_sb, full_path, symname);
+  else if (pTcon->unix_ext)
+   rc = CIFSUnixCreateSymLink(xid, pTcon, full_path, symname,
+         cifs_sb->local_nls);
+diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
+index 3c1fd70..48b4bef 100644
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@ -1023,6 +1023,7 @@ struct smb_version_operations smb1_operations = {
+  .mand_unlock_range = cifs_unlock_range,
+  .push_mand_locks = cifs_push_mandatory_locks,
+  .query_mf_symlink = cifs_query_mf_symlink,
++ .create_mf_symlink = cifs_create_mf_symlink,
+  .is_read_op = cifs_is_read_op,
+ };
+ 
+-- 
+1.7.1

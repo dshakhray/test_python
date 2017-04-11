@@ -1,0 +1,113 @@
+From 98a54de5c62db462a3289671c68df5f1ba7f512d Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:52:52 -0400
+Subject: [tools] perf/callchain: Spare double comparison of callchain first entry
+
+Message-id: <1408953210-26343-285-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88998
+O-Subject: [PATCH RHEL7.1 BZ1133083 284/322] perf callchain: Spare double comparison of callchain first entry
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit b965bb41061ad8d3eafda6e7feef89279fcd3916
+Author: Frederic Weisbecker <fweisbec@gmail.com>
+Date: Tue Jan 14 16:37:15 2014 +0100
+
+description
+===========
+When a new callchain child branch matches an existing one in the rbtree,
+the comparison of its first entry is performed twice:
+
+1) From append_chain_children() on branch lookup
+
+2) If 1) reports a match, append_chain() then compares all entries of
+the new branch against the matching node in the rbtree, and this
+comparison includes the first entry of the new branch again.
+
+Lets shortcut this by performing the whole comparison only from
+append_chain() which then returns the result of the comparison between
+the first entry of the new branch and the iterating node in the rbtree.
+If the first entry matches, the lookup on the current level of siblings
+stops and propagates to the children of the matching nodes.
+
+This results in less comparisons performed by the CPU.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/callchain.c b/tools/perf/util/callchain.c
+index 9eb4f57..662867d 100644
+--- a/tools/perf/util/callchain.c
++++ b/tools/perf/util/callchain.c
+@@ -15,6 +15,8 @@
+ #include <errno.h>
+ #include <math.h>
+ 
++#include "asm/bug.h"
++
+ #include "hist.h"
+ #include "util.h"
+ #include "sort.h"
+@@ -358,19 +360,14 @@ append_chain_children(struct callchain_node *root,
+  /* lookup in childrens */
+  while (*p) {
+   s64 ret;
+-  struct callchain_list *cnode;
+ 
+   parent = *p;
+   rnode = rb_entry(parent, struct callchain_node, rb_node_in);
+-  cnode = list_first_entry(&rnode->val, struct callchain_list,
+-      list);
+ 
+-  /* just check first entry */
+-  ret = match_chain(node, cnode);
+-  if (ret == 0) {
+-   append_chain(rnode, cursor, period);
++  /* If at least first entry matches, rely to children */
++  ret = append_chain(rnode, cursor, period);
++  if (ret == 0)
+    goto inc_children_hit;
+-  }
+ 
+   if (ret < 0)
+    p = &parent->rb_left;
+@@ -396,6 +393,7 @@ append_chain(struct callchain_node *root,
+  u64 start = cursor->pos;
+  bool found = false;
+  u64 matches;
++ int cmp = 0;
+ 
+  /*
+   * Lookup in the current node
+@@ -410,7 +408,8 @@ append_chain(struct callchain_node *root,
+   if (!node)
+    break;
+ 
+-  if (match_chain(node, cnode) != 0)
++  cmp = match_chain(node, cnode);
++  if (cmp)
+    break;
+ 
+   found = true;
+@@ -420,9 +419,10 @@ append_chain(struct callchain_node *root,
+ 
+  /* matches not, relay no the parent */
+  if (!found) {
++  WARN_ONCE(!cmp, "Chain comparison error\n");
+   cursor->curr = curr_snap;
+   cursor->pos = start;
+-  return -1;
++  return cmp;
+  }
+ 
+  matches = cursor->pos - start;
+-- 
+1.7.1

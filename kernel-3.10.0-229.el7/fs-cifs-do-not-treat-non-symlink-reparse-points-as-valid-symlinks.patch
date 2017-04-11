@@ -1,0 +1,177 @@
+From 0c3047fb31b02c2ef6d94763b62906c53337245b Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:00 -0400
+Subject: [fs] cifs: do not treat non-symlink reparse points as valid symlinks
+
+Message-id: <1406549822-10376-8-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86739
+O-Subject: [RHEL7.1 PATCH 07/69] [bz1082049]do not treat non-symlink reparse points as valid symlinks
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Steve French <smfrench@us.ibm.com>
+
+Windows 8 and later can create NFS symlinks (within reparse points)
+which we were assuming were normal NTFS symlinks and thus reporting
+corrupt paths for.  Add check for reparse points to make sure that
+they really are normal symlinks before we try to parse the pathname.
+
+We also should not be parsing other types of reparse points (DFS
+junctions etc) as if they were a  symlink so return EOPNOTSUPP
+on those.  Also fix endian errors (we were not parsing symlink
+lengths as little endian).
+
+This fixes commit d244bf2dfbebfded05f494ffd53659fa7b1e32c1
+which implemented follow link for non-Unix CIFS mounts
+
+CC: Stable <stable@kernel.org>
+Reviewed-by: Andrew Bartlett <abartlet@samba.org>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit c31f330719b7331b2112a5525fe5941a99ac223d)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/cifspdu.h b/fs/cifs/cifspdu.h
+index 948676d..233ef36 100644
+--- a/fs/cifs/cifspdu.h
++++ b/fs/cifs/cifspdu.h
+@@ -1491,15 +1491,30 @@ struct file_notify_information {
+  __u8  FileName[0];
+ } __attribute__((packed));
+ 
+-struct reparse_data {
+- __u32 ReparseTag;
+- __u16 ReparseDataLength;
++/* For IO_REPARSE_TAG_SYMLINK */
++struct reparse_symlink_data {
++ __le32 ReparseTag;
++ __le16 ReparseDataLength;
+  __u16 Reserved;
+- __u16 SubstituteNameOffset;
+- __u16 SubstituteNameLength;
+- __u16 PrintNameOffset;
+- __u16 PrintNameLength;
+- __u32 Flags;
++ __le16 SubstituteNameOffset;
++ __le16 SubstituteNameLength;
++ __le16 PrintNameOffset;
++ __le16 PrintNameLength;
++ __le32 Flags;
++ char PathBuffer[0];
++} __attribute__((packed));
++
++/* For IO_REPARSE_TAG_NFS */
++#define NFS_SPECFILE_LNK 0x00000000014B4E4C
++#define NFS_SPECFILE_CHR 0x0000000000524843
++#define NFS_SPECFILE_BLK 0x00000000004B4C42
++#define NFS_SPECFILE_FIFO 0x000000004F464946
++#define NFS_SPECFILE_SOCK 0x000000004B434F53
++struct reparse_posix_data {
++ __le32 ReparseTag;
++ __le16 ReparseDataLength;
++ __u16 Reserved;
++ __le64 InodeType; /* LNK, FIFO, CHR etc. */
+  char PathBuffer[0];
+ } __attribute__((packed));
+ 
+diff --git a/fs/cifs/cifssmb.c b/fs/cifs/cifssmb.c
+index 9ce29b8..f08efaa 100644
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@ -3083,7 +3083,8 @@ CIFSSMBQuerySymLink(const unsigned int xid, struct cifs_tcon *tcon,
+  bool is_unicode;
+  unsigned int sub_len;
+  char *sub_start;
+- struct reparse_data *reparse_buf;
++ struct reparse_symlink_data *reparse_buf;
++ struct reparse_posix_data *posix_buf;
+  __u32 data_offset, data_count;
+  char *end_of_smb;
+ 
+@@ -3132,20 +3133,47 @@ CIFSSMBQuerySymLink(const unsigned int xid, struct cifs_tcon *tcon,
+   goto qreparse_out;
+  }
+  end_of_smb = 2 + get_bcc(&pSMBr->hdr) + (char *)&pSMBr->ByteCount;
+- reparse_buf = (struct reparse_data *)
++ reparse_buf = (struct reparse_symlink_data *)
+     ((char *)&pSMBr->hdr.Protocol + data_offset);
+  if ((char *)reparse_buf >= end_of_smb) {
+   rc = -EIO;
+   goto qreparse_out;
+  }
+- if ((reparse_buf->PathBuffer + reparse_buf->PrintNameOffset +
+-    reparse_buf->PrintNameLength) > end_of_smb) {
++ if (reparse_buf->ReparseTag == cpu_to_le32(IO_REPARSE_TAG_NFS)) {
++  cifs_dbg(FYI, "NFS style reparse tag\n");
++  posix_buf =  (struct reparse_posix_data *)reparse_buf;
++
++  if (posix_buf->InodeType != cpu_to_le64(NFS_SPECFILE_LNK)) {
++   cifs_dbg(FYI, "unsupported file type 0x%llx\n",
++     le64_to_cpu(posix_buf->InodeType));
++   rc = -EOPNOTSUPP;
++   goto qreparse_out;
++  }
++  is_unicode = true;
++  sub_len = le16_to_cpu(reparse_buf->ReparseDataLength);
++  if (posix_buf->PathBuffer + sub_len > end_of_smb) {
++   cifs_dbg(FYI, "reparse buf beyond SMB\n");
++   rc = -EIO;
++   goto qreparse_out;
++  }
++  *symlinkinfo = cifs_strndup_from_utf16(posix_buf->PathBuffer,
++    sub_len, is_unicode, nls_codepage);
++  goto qreparse_out;
++ } else if (reparse_buf->ReparseTag !=
++   cpu_to_le32(IO_REPARSE_TAG_SYMLINK)) {
++  rc = -EOPNOTSUPP;
++  goto qreparse_out;
++ }
++
++ /* Reparse tag is NTFS symlink */
++ sub_start = le16_to_cpu(reparse_buf->SubstituteNameOffset) +
++    reparse_buf->PathBuffer;
++ sub_len = le16_to_cpu(reparse_buf->SubstituteNameLength);
++ if (sub_start + sub_len > end_of_smb) {
+   cifs_dbg(FYI, "reparse buf beyond SMB\n");
+   rc = -EIO;
+   goto qreparse_out;
+  }
+- sub_start = reparse_buf->SubstituteNameOffset + reparse_buf->PathBuffer;
+- sub_len = reparse_buf->SubstituteNameLength;
+  if (pSMBr->hdr.Flags2 & SMBFLG2_UNICODE)
+   is_unicode = true;
+  else
+diff --git a/fs/cifs/smbfsctl.h b/fs/cifs/smbfsctl.h
+index d952ee4..a4b2391 100644
+--- a/fs/cifs/smbfsctl.h
++++ b/fs/cifs/smbfsctl.h
+@@ -97,9 +97,23 @@
+ #define FSCTL_QUERY_NETWORK_INTERFACE_INFO 0x001401FC /* BB add struct */
+ #define FSCTL_SRV_READ_HASH          0x001441BB /* BB add struct */
+ 
++/* See FSCC 2.1.2.5 */
+ #define IO_REPARSE_TAG_MOUNT_POINT   0xA0000003
+ #define IO_REPARSE_TAG_HSM           0xC0000004
+ #define IO_REPARSE_TAG_SIS           0x80000007
++#define IO_REPARSE_TAG_HSM2          0x80000006
++#define IO_REPARSE_TAG_DRIVER_EXTENDER 0x80000005
++/* Used by the DFS filter. See MS-DFSC */
++#define IO_REPARSE_TAG_DFS           0x8000000A
++/* Used by the DFS filter See MS-DFSC */
++#define IO_REPARSE_TAG_DFSR          0x80000012
++#define IO_REPARSE_TAG_FILTER_MANAGER 0x8000000B
++/* See section MS-FSCC 2.1.2.4 */
++#define IO_REPARSE_TAG_SYMLINK       0xA000000C
++#define IO_REPARSE_TAG_DEDUP         0x80000013
++#define IO_REPARSE_APPXSTREAM      0xC0000014
++/* NFS symlinks, Win 8/SMB3 and later */
++#define IO_REPARSE_TAG_NFS           0x80000014
+ 
+ /* fsctl flags */
+ /* If Flags is set to this value, the request is an FSCTL not ioctl request */
+-- 
+1.7.1

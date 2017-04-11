@@ -1,0 +1,101 @@
+From 0cdd18066d303dd5019ca7d16aba703b70994cb4 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:01:45 -0400
+Subject: [fs] btrfs: fix preallocate vs double nocow write
+
+Message-id: <1407179109-13714-219-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87366
+O-Subject: [RHEL7.1 PATCH 218/422] Btrfs: fix preallocate vs double nocow write
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Miao Xie <miaox@cn.fujitsu.com>
+
+commit 7b2b70851f862b68714f357d2926adbb6c574fdd
+Author: Miao Xie <miaox@cn.fujitsu.com>
+Date:   Thu Feb 27 13:58:05 2014 +0800
+
+    Btrfs: fix preallocate vs double nocow write
+
+    We can not release the reserved metadata space for the first write if we
+    find the write position is pre-allocated. Because the kernel might write
+    the data on the disk before we do the second write but after the can-nocow
+    check, if we release the space for the first write, we might fail to update
+    the metadata because of no space.
+
+    Fix this problem by end nocow write if there is dirty data in the range whose
+    space is pre-allocated.
+
+    Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index cc074eb..c40e33e 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1427,16 +1427,11 @@ static noinline int check_can_nocow(struct inode *inode, loff_t pos,
+ 
+  num_bytes = lockend - lockstart + 1;
+  ret = can_nocow_extent(inode, lockstart, &num_bytes, NULL, NULL, NULL);
+- if (ret <= 0) {
++ if (ret <= 0)
+   ret = 0;
+- } else {
+-  clear_extent_bit(&BTRFS_I(inode)->io_tree, lockstart, lockend,
+-     EXTENT_DIRTY | EXTENT_DELALLOC |
+-     EXTENT_DO_ACCOUNTING | EXTENT_DEFRAG, 0, 0,
+-     NULL, GFP_NOFS);
++ else
+   *write_bytes = min_t(size_t, *write_bytes ,
+          num_bytes - pos + lockstart);
+- }
+ 
+  unlock_extent(&BTRFS_I(inode)->io_tree, lockstart, lockend);
+ 
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index aaedb5d..994dec9 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -6573,6 +6573,7 @@ noinline int can_nocow_extent(struct inode *inode, u64 offset, u64 *len,
+  int ret;
+  struct extent_buffer *leaf;
+  struct btrfs_root *root = BTRFS_I(inode)->root;
++ struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
+  struct btrfs_file_extent_item *fi;
+  struct btrfs_key key;
+  u64 disk_bytenr;
+@@ -6649,6 +6650,20 @@ noinline int can_nocow_extent(struct inode *inode, u64 offset, u64 *len,
+ 
+  if (btrfs_extent_readonly(root, disk_bytenr))
+   goto out;
++
++ num_bytes = min(offset + *len, extent_end) - offset;
++ if (!nocow && found_type == BTRFS_FILE_EXTENT_PREALLOC) {
++  u64 range_end;
++
++  range_end = round_up(offset + num_bytes, root->sectorsize) - 1;
++  ret = test_range_bit(io_tree, offset, range_end,
++         EXTENT_DELALLOC, 0, NULL);
++  if (ret) {
++   ret = -EAGAIN;
++   goto out;
++  }
++ }
++
+  btrfs_release_path(path);
+ 
+  /*
+@@ -6677,7 +6692,6 @@ noinline int can_nocow_extent(struct inode *inode, u64 offset, u64 *len,
+   */
+  disk_bytenr += backref_offset;
+  disk_bytenr += offset - key.offset;
+- num_bytes = min(offset + *len, extent_end) - offset;
+  if (csum_exist_in_range(root, disk_bytenr, num_bytes))
+     goto out;
+  /*
+-- 
+1.7.1

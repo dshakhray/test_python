@@ -1,0 +1,227 @@
+From 8d6d23f9da0a140611ea27bf633e2dc5289acdd4 Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Tue, 3 Jun 2014 13:28:53 -0400
+Subject: [net] netlink: Add variants of capable for use on netlink messages
+
+Message-id: <6681e08ca918beb70b8625aab4856885a771d256.1401801988.git.jbenc@redhat.com>
+Patchwork-id: 82398
+O-Subject: [RHEL7.1 net PATCH v2 5/6] net: Add variants of capable for use on netlink messages
+Bugzilla: 1094272
+CVE: CVE-2014-0181
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1094272
+CVE-2014-0181
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7529840
+
+RHEL backport: merged two upstream commits in order not to break bisect. The
+second one fixes a regression introduced by the first one. There's no point
+in backporting sk_ns_capable as it is unused after the second patch.
+
+commit aa4cf9452f469f16cea8c96283b641b4576d4a7b
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Wed Apr 23 14:28:03 2014 -0700
+
+    net: Add variants of capable for use on netlink messages
+
+    netlink_net_capable - The common case use, for operations that are safe on a network namespace
+    netlink_capable - For operations that are only known to be safe for the global root
+    netlink_ns_capable - The general case of capable used to handle special cases
+
+    __netlink_ns_capable - Same as netlink_ns_capable except taking a netlink_skb_parms instead of
+             the skbuff of a netlink message.
+
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit 2d7a85f4b06e9c27ff629f07a524c48074f07f81
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri May 30 11:04:00 2014 -0700
+
+    netlink: Only check file credentials for implicit destinations
+
+    It was possible to get a setuid root or setcap executable to write to
+    it's stdout or stderr (which has been set made a netlink socket) and
+    inadvertently reconfigure the networking stack.
+
+    To prevent this we check that both the creator of the socket and
+    the currentl applications has permission to reconfigure the network
+    stack.
+
+    Unfortunately this breaks Zebra which always uses sendto/sendmsg
+    and creates it's socket without any privileges.
+
+    To keep Zebra working don't bother checking if the creator of the
+    socket has privilege when a destination address is specified.  Instead
+    rely exclusively on the privileges of the sender of the socket.
+
+    Note from Andy: This is exactly Eric's code except for some comment
+    clarifications and formatting fixes.  Neither I nor, I think, anyone
+    else is thrilled with this approach, but I'm hesitant to wait on a
+    better fix since 3.15 is almost here.
+
+    Note to stable maintainers: This is a mess.  An earlier series of
+    patches in 3.15 fix a rather serious security issue (CVE-2014-0181),
+    but they did so in a way that breaks Zebra.  The offending series
+    includes:
+
+        commit aa4cf9452f469f16cea8c96283b641b4576d4a7b
+        Author: Eric W. Biederman <ebiederm@xmission.com>
+        Date:   Wed Apr 23 14:28:03 2014 -0700
+
+            net: Add variants of capable for use on netlink messages
+
+    If a given kernel version is missing that series of fixes, it's
+    probably worth backporting it and this patch.  if that series is
+    present, then this fix is critical if you care about Zebra.
+
+    Cc: stable@vger.kernel.org
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Andy Lutomirski <luto@amacapital.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+---
+ include/linux/netlink.h  |   14 +++++++--
+ net/netlink/af_netlink.c |   70 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 81 insertions(+), 3 deletions(-)
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/netlink.h b/include/linux/netlink.h
+index d8039f2..4568214 100644
+--- a/include/linux/netlink.h
++++ b/include/linux/netlink.h
+@@ -16,9 +16,10 @@ static inline struct nlmsghdr *nlmsg_hdr(const struct sk_buff *skb)
+ }
+ 
+ enum netlink_skb_flags {
+- NETLINK_SKB_MMAPED = 0x1,  /* Packet data is mmaped */
+- NETLINK_SKB_TX  = 0x2,  /* Packet was sent by userspace */
+- NETLINK_SKB_DELIVERED = 0x4,  /* Packet was delivered */
++ NETLINK_SKB_MMAPED = 0x1, /* Packet data is mmaped */
++ NETLINK_SKB_TX  = 0x2, /* Packet was sent by userspace */
++ NETLINK_SKB_DELIVERED = 0x4, /* Packet was delivered */
++ NETLINK_SKB_DST  = 0x8, /* Dst set in sendto or sendmsg */
+ };
+ 
+ struct netlink_skb_parms {
+@@ -170,4 +171,11 @@ extern int netlink_add_tap(struct netlink_tap *nt);
+ extern int __netlink_remove_tap(struct netlink_tap *nt);
+ extern int netlink_remove_tap(struct netlink_tap *nt);
+ 
++bool __netlink_ns_capable(const struct netlink_skb_parms *nsp,
++     struct user_namespace *ns, int cap);
++bool netlink_ns_capable(const struct sk_buff *skb,
++   struct user_namespace *ns, int cap);
++bool netlink_capable(const struct sk_buff *skb, int cap);
++bool netlink_net_capable(const struct sk_buff *skb, int cap);
++
+ #endif /* __LINUX_NETLINK_H */
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index 196757e..f3bab1b 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -1354,6 +1354,73 @@ retry:
+  return err;
+ }
+ 
++/**
++ * __netlink_ns_capable - General netlink message capability test
++ * @nsp: NETLINK_CB of the socket buffer holding a netlink command from userspace.
++ * @user_ns: The user namespace of the capability to use
++ * @cap: The capability to use
++ *
++ * Test to see if the opener of the socket we received the message
++ * from had when the netlink socket was created and the sender of the
++ * message has has the capability @cap in the user namespace @user_ns.
++ */
++bool __netlink_ns_capable(const struct netlink_skb_parms *nsp,
++   struct user_namespace *user_ns, int cap)
++{
++ return ((nsp->flags & NETLINK_SKB_DST) ||
++  file_ns_capable(nsp->sk->sk_socket->file, user_ns, cap)) &&
++  ns_capable(user_ns, cap);
++}
++EXPORT_SYMBOL(__netlink_ns_capable);
++
++/**
++ * netlink_ns_capable - General netlink message capability test
++ * @skb: socket buffer holding a netlink command from userspace
++ * @user_ns: The user namespace of the capability to use
++ * @cap: The capability to use
++ *
++ * Test to see if the opener of the socket we received the message
++ * from had when the netlink socket was created and the sender of the
++ * message has has the capability @cap in the user namespace @user_ns.
++ */
++bool netlink_ns_capable(const struct sk_buff *skb,
++   struct user_namespace *user_ns, int cap)
++{
++ return __netlink_ns_capable(&NETLINK_CB(skb), user_ns, cap);
++}
++EXPORT_SYMBOL(netlink_ns_capable);
++
++/**
++ * netlink_capable - Netlink global message capability test
++ * @skb: socket buffer holding a netlink command from userspace
++ * @cap: The capability to use
++ *
++ * Test to see if the opener of the socket we received the message
++ * from had when the netlink socket was created and the sender of the
++ * message has has the capability @cap in all user namespaces.
++ */
++bool netlink_capable(const struct sk_buff *skb, int cap)
++{
++ return netlink_ns_capable(skb, &init_user_ns, cap);
++}
++EXPORT_SYMBOL(netlink_capable);
++
++/**
++ * netlink_net_capable - Netlink network namespace message capability test
++ * @skb: socket buffer holding a netlink command from userspace
++ * @cap: The capability to use
++ *
++ * Test to see if the opener of the socket we received the message
++ * from had when the netlink socket was created and the sender of the
++ * message has has the capability @cap over the network namespace of
++ * the socket we received the message from.
++ */
++bool netlink_net_capable(const struct sk_buff *skb, int cap)
++{
++ return netlink_ns_capable(skb, sock_net(skb->sk)->user_ns, cap);
++}
++EXPORT_SYMBOL(netlink_net_capable);
++
+ static inline int netlink_allowed(const struct socket *sock, unsigned int flag)
+ {
+  return (nl_table[sock->sk->sk_protocol].flags & flag) ||
+@@ -2226,6 +2293,7 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
+  struct sk_buff *skb;
+  int err;
+  struct scm_cookie scm;
++ u32 netlink_skb_flags = 0;
+ 
+  if (msg->msg_flags&MSG_OOB)
+   return -EOPNOTSUPP;
+@@ -2247,6 +2315,7 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
+   if ((dst_group || dst_portid) &&
+       !netlink_allowed(sock, NL_CFG_F_NONROOT_SEND))
+    goto out;
++  netlink_skb_flags |= NETLINK_SKB_DST;
+  } else {
+   dst_portid = nlk->dst_portid;
+   dst_group = nlk->dst_group;
+@@ -2276,6 +2345,7 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
+  NETLINK_CB(skb).portid = nlk->portid;
+  NETLINK_CB(skb).dst_group = dst_group;
+  NETLINK_CB(skb).creds = siocb->scm->creds;
++ NETLINK_CB(skb).flags = netlink_skb_flags;
+ 
+  err = -EFAULT;
+  if (memcpy_fromiovec(skb_put(skb, len), msg->msg_iov, len)) {
+-- 
+1.7.1

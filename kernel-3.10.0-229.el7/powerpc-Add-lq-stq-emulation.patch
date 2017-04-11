@@ -1,0 +1,148 @@
+From 2a29d9b25b3f18531ea87445a1680125af81f14c Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:10:27 -0400
+Subject: [powerpc] Add lq/stq emulation
+
+Message-id: <1410545655-205645-399-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94359
+O-Subject: [RHEL7 PATCH 398/626] powerpc: Add lq/stq emulation
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit f83319d71002aec03bd87bc9aabce5f549680f0a
+Author: Anton Blanchard <anton@samba.org>
+Date:   Fri Mar 28 17:01:23 2014 +1100
+
+    powerpc: Add lq/stq emulation
+
+    Recent CPUs support quad word load and store instructions. Add
+    support to the alignment handler for them.
+
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/emulated_ops.h b/arch/powerpc/include/asm/emulated_ops.h
+index f19b847..2d90ee9 100644
+--- a/arch/powerpc/include/asm/emulated_ops.h
++++ b/arch/powerpc/include/asm/emulated_ops.h
+@@ -56,6 +56,7 @@ extern struct ppc_emulated {
+ #ifdef CONFIG_PPC64
+  struct ppc_emulated_entry mfdscr;
+  struct ppc_emulated_entry mtdscr;
++ struct ppc_emulated_entry lq_stq;
+ #endif
+ } ppc_emulated;
+ 
+diff --git a/arch/powerpc/kernel/align.c b/arch/powerpc/kernel/align.c
+index de91f3a..94908af 100644
+--- a/arch/powerpc/kernel/align.c
++++ b/arch/powerpc/kernel/align.c
+@@ -73,7 +73,7 @@ static struct aligninfo aligninfo[128] = {
+  { 8, LD+F },  /* 00 0 1001: lfd */
+  { 4, ST+F+S },  /* 00 0 1010: stfs */
+  { 8, ST+F },  /* 00 0 1011: stfd */
+- INVALID,  /* 00 0 1100 */
++ { 16, LD },  /* 00 0 1100: lq */
+  { 8, LD },  /* 00 0 1101: ld/ldu/lwa */
+  INVALID,  /* 00 0 1110 */
+  { 8, ST },  /* 00 0 1111: std/stdu */
+@@ -140,7 +140,7 @@ static struct aligninfo aligninfo[128] = {
+  { 2, LD+SW },  /* 10 0 1100: lhbrx */
+  { 4, LD+SE },  /* 10 0 1101  lwa */
+  { 2, ST+SW },  /* 10 0 1110: sthbrx */
+- INVALID,  /* 10 0 1111 */
++ { 16, ST },  /* 10 0 1111: stq */
+  INVALID,  /* 10 1 0000 */
+  INVALID,  /* 10 1 0001 */
+  INVALID,  /* 10 1 0010 */
+@@ -385,8 +385,6 @@ static int emulate_fp_pair(unsigned char __user *addr, unsigned int reg,
+  char *ptr1 = (char *) &current->thread.TS_FPR(reg+1);
+  int i, ret, sw = 0;
+ 
+- if (!(flags & F))
+-  return 0;
+  if (reg & 1)
+   return 0; /* invalid form: FRS/FRT must be even */
+  if (flags & SW)
+@@ -406,6 +404,34 @@ static int emulate_fp_pair(unsigned char __user *addr, unsigned int reg,
+  return 1; /* exception handled and fixed up */
+ }
+ 
++#ifdef CONFIG_PPC64
++static int emulate_lq_stq(struct pt_regs *regs, unsigned char __user *addr,
++     unsigned int reg, unsigned int flags)
++{
++ char *ptr0 = (char *)&regs->gpr[reg];
++ char *ptr1 = (char *)&regs->gpr[reg+1];
++ int i, ret, sw = 0;
++
++ if (reg & 1)
++  return 0; /* invalid form: GPR must be even */
++ if (flags & SW)
++  sw = 7;
++ ret = 0;
++ for (i = 0; i < 8; ++i) {
++  if (!(flags & ST)) {
++   ret |= __get_user(ptr0[i^sw], addr + i);
++   ret |= __get_user(ptr1[i^sw], addr + i + 8);
++  } else {
++   ret |= __put_user(ptr0[i^sw], addr + i);
++   ret |= __put_user(ptr1[i^sw], addr + i + 8);
++  }
++ }
++ if (ret)
++  return -EFAULT;
++ return 1; /* exception handled and fixed up */
++}
++#endif /* CONFIG_PPC64 */
++
+ #ifdef CONFIG_SPE
+ 
+ static struct aligninfo spe_aligninfo[32] = {
+@@ -914,10 +940,20 @@ int fix_alignment(struct pt_regs *regs)
+   flush_fp_to_thread(current);
+  }
+ 
+- /* Special case for 16-byte FP loads and stores */
+- if (nb == 16) {
+-  PPC_WARN_ALIGNMENT(fp_pair, regs);
+-  return emulate_fp_pair(addr, reg, flags);
++ if ((nb == 16)) {
++  if (flags & F) {
++   /* Special case for 16-byte FP loads and stores */
++   PPC_WARN_ALIGNMENT(fp_pair, regs);
++   return emulate_fp_pair(addr, reg, flags);
++  } else {
++#ifdef CONFIG_PPC64
++   /* Special case for 16-byte loads and stores */
++   PPC_WARN_ALIGNMENT(lq_stq, regs);
++   return emulate_lq_stq(regs, addr, reg, flags);
++#else
++   return 0;
++#endif
++  }
+  }
+ 
+  PPC_WARN_ALIGNMENT(unaligned, regs);
+diff --git a/arch/powerpc/kernel/traps.c b/arch/powerpc/kernel/traps.c
+index cf983a4..ce4bc8e 100644
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@ -1895,6 +1895,7 @@ struct ppc_emulated ppc_emulated = {
+ #ifdef CONFIG_PPC64
+  WARN_EMULATED_SETUP(mfdscr),
+  WARN_EMULATED_SETUP(mtdscr),
++ WARN_EMULATED_SETUP(lq_stq),
+ #endif
+ };
+ 
+-- 
+1.7.1

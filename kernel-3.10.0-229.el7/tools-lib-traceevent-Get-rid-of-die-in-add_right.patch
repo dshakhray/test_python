@@ -1,0 +1,145 @@
+From d4d55b3b440a0d4ac335cfdc7ca4e8f10f7d2a15 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:50:39 -0400
+Subject: [tools] lib/traceevent: Get rid of die() in add_right()
+
+Message-id: <1408953210-26343-152-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88912
+O-Subject: [PATCH RHEL7.1 BZ1133083 151/322] tools lib traceevent: Get rid of die() in add_right()
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 02d62d6d17b9b718be2878477cdcae95df0d5b4e
+Author: Namhyung Kim <namhyung@kernel.org>
+Date: Thu Dec 12 16:36:09 2013 +0900
+
+description
+===========
+Refactor it to return appropriate pevent_errno value.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/lib/traceevent/event-parse.h b/tools/lib/traceevent/event-parse.h
+index abdfd3c..89e4dfd 100644
+--- a/tools/lib/traceevent/event-parse.h
++++ b/tools/lib/traceevent/event-parse.h
+@@ -358,7 +358,13 @@ enum pevent_flag {
+  _PE(OLD_FTRACE_ARG_FAILED,"failed to allocate field name for ftrace"),\
+  _PE(INVALID_ARG_TYPE, "invalid argument type"),        \
+  _PE(INVALID_EVENT_NAME, "invalid event name"),         \
+- _PE(EVENT_NOT_FOUND, "No event found")
++ _PE(EVENT_NOT_FOUND, "no event found"),         \
++ _PE(SYNTAX_ERROR, "syntax error"),         \
++ _PE(ILLEGAL_RVALUE, "illegal rvalue"),         \
++ _PE(ILLEGAL_LVALUE, "illegal lvalue for string comparison"),      \
++ _PE(INVALID_REGEX, "regex did not compute"),        \
++ _PE(ILLEGAL_STRING_CMP, "illegal comparison for string"),        \
++ _PE(ILLEGAL_INTEGER_CMP,"illegal comparison for integer")
+ 
+ #undef _PE
+ #define _PE(__code, __str) PEVENT_ERRNO__ ## __code
+diff --git a/tools/lib/traceevent/parse-filter.c b/tools/lib/traceevent/parse-filter.c
+index a0ab040..c08ce59 100644
+--- a/tools/lib/traceevent/parse-filter.c
++++ b/tools/lib/traceevent/parse-filter.c
+@@ -473,8 +473,8 @@ create_arg_cmp(enum filter_exp_type etype)
+  return arg;
+ }
+ 
+-static int add_right(struct filter_arg *op, struct filter_arg *arg,
+-       char **error_str)
++static enum pevent_errno
++add_right(struct filter_arg *op, struct filter_arg *arg, char **error_str)
+ {
+  struct filter_arg *left;
+  char *str;
+@@ -505,9 +505,8 @@ static int add_right(struct filter_arg *op, struct filter_arg *arg,
+   case FILTER_ARG_FIELD:
+    break;
+   default:
+-   show_error(error_str,
+-       "Illegal rvalue");
+-   return -1;
++   show_error(error_str, "Illegal rvalue");
++   return PEVENT_ERRNO__ILLEGAL_RVALUE;
+   }
+ 
+   /*
+@@ -554,7 +553,7 @@ static int add_right(struct filter_arg *op, struct filter_arg *arg,
+    if (left->type != FILTER_ARG_FIELD) {
+     show_error(error_str,
+         "Illegal lvalue for string comparison");
+-    return -1;
++    return PEVENT_ERRNO__ILLEGAL_LVALUE;
+    }
+ 
+    /* Make sure this is a valid string compare */
+@@ -573,25 +572,31 @@ static int add_right(struct filter_arg *op, struct filter_arg *arg,
+      show_error(error_str,
+          "RegEx '%s' did not compute",
+          str);
+-     return -1;
++     return PEVENT_ERRNO__INVALID_REGEX;
+     }
+     break;
+    default:
+     show_error(error_str,
+         "Illegal comparison for string");
+-    return -1;
++    return PEVENT_ERRNO__ILLEGAL_STRING_CMP;
+    }
+ 
+    op->type = FILTER_ARG_STR;
+    op->str.type = op_type;
+    op->str.field = left->field.field;
+    op->str.val = strdup(str);
+-   if (!op->str.val)
+-    die("malloc string");
++   if (!op->str.val) {
++    show_error(error_str, "Failed to allocate string filter");
++    return PEVENT_ERRNO__MEM_ALLOC_FAILED;
++   }
+    /*
+     * Need a buffer to copy data for tests
+     */
+-   op->str.buffer = malloc_or_die(op->str.field->size + 1);
++   op->str.buffer = malloc(op->str.field->size + 1);
++   if (!op->str.buffer) {
++    show_error(error_str, "Failed to allocate string filter");
++    return PEVENT_ERRNO__MEM_ALLOC_FAILED;
++   }
+    /* Null terminate this buffer */
+    op->str.buffer[op->str.field->size] = 0;
+ 
+@@ -609,7 +614,7 @@ static int add_right(struct filter_arg *op, struct filter_arg *arg,
+    case FILTER_CMP_NOT_REGEX:
+     show_error(error_str,
+         "Op not allowed with integers");
+-    return -1;
++    return PEVENT_ERRNO__ILLEGAL_INTEGER_CMP;
+ 
+    default:
+     break;
+@@ -629,9 +634,8 @@ static int add_right(struct filter_arg *op, struct filter_arg *arg,
+  return 0;
+ 
+  out_fail:
+- show_error(error_str,
+-     "Syntax error");
+- return -1;
++ show_error(error_str, "Syntax error");
++ return PEVENT_ERRNO__SYNTAX_ERROR;
+ }
+ 
+ static struct filter_arg *
+-- 
+1.7.1

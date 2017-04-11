@@ -1,0 +1,112 @@
+From 4f40171994026e23c9e16974258ae5197b9b3db3 Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Wed, 23 Jul 2014 10:50:03 -0400
+Subject: [virt] s390/virtio_ccw: fix hang in set offline processing
+
+Message-id: <1406112611-9862-16-git-send-email-brueckner@redhat.com>
+Patchwork-id: 86336
+O-Subject: [RHEL7.1 PATCH 15/23] [s390] virtio_ccw: fix hang in set offline processing
+Bugzilla: 1088554
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Description
+-----------
+commit 79629b208fc0484ee448c4acfa3762f0350e97ce
+Author: Heinz Graalfs <graalfs@linux.vnet.ibm.com>
+Commit: Cornelia Huck <cornelia.huck@de.ibm.com>
+
+    virtio_ccw: fix hang in set offline processing
+
+    During set offline processing virtio_grab_drvdata() incorrectly
+    calls dev_set_drvdata() to remove the virtio_ccw_device from the
+    parent ccw_device's driver data. This is wrong and ends up in a
+    hang during virtio_ccw_reset(), as the interrupt handler still
+    has need of the virtio_ccw_device.
+
+    A new field 'going_away' is introduced in struct virtio_ccw_device
+    to control the usage of the ccw_device's driver data pointer in
+    virtio_grab_drvdata().
+
+    Signed-off-by: Heinz Graalfs <graalfs@linux.vnet.ibm.com>
+    Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+    Signed-off-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+
+Bugzilla
+--------
+BZ 1088554
+https://bugzilla.redhat.com/show_bug.cgi?id=1088554
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version v3.15-rc1
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=79629b208fc0484ee448c4acfa3762f0350e97ce
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7725759
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/s390/kvm/virtio_ccw.c b/drivers/s390/kvm/virtio_ccw.c
+index 6a2b5fd..1e1fc67 100644
+--- a/drivers/s390/kvm/virtio_ccw.c
++++ b/drivers/s390/kvm/virtio_ccw.c
+@@ -61,6 +61,7 @@ struct virtio_ccw_device {
+  unsigned long indicators2;
+  struct vq_config_block *config_block;
+  bool is_thinint;
++ bool going_away;
+  void *airq_info;
+ };
+ 
+@@ -995,30 +996,39 @@ static struct virtio_ccw_device *virtio_grab_drvdata(struct ccw_device *cdev)
+ 
+  spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
+  vcdev = dev_get_drvdata(&cdev->dev);
+- if (!vcdev) {
++ if (!vcdev || vcdev->going_away) {
+   spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
+   return NULL;
+  }
+- dev_set_drvdata(&cdev->dev, NULL);
++ vcdev->going_away = true;
+  spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
+  return vcdev;
+ }
+ 
+ static void virtio_ccw_remove(struct ccw_device *cdev)
+ {
++ unsigned long flags;
+  struct virtio_ccw_device *vcdev = virtio_grab_drvdata(cdev);
+ 
+  if (vcdev && cdev->online)
+   unregister_virtio_device(&vcdev->vdev);
++ spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
++ dev_set_drvdata(&cdev->dev, NULL);
++ spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
+  cdev->handler = NULL;
+ }
+ 
+ static int virtio_ccw_offline(struct ccw_device *cdev)
+ {
++ unsigned long flags;
+  struct virtio_ccw_device *vcdev = virtio_grab_drvdata(cdev);
+ 
+- if (vcdev)
++ if (vcdev) {
+   unregister_virtio_device(&vcdev->vdev);
++  spin_lock_irqsave(get_ccwdev_lock(cdev), flags);
++  dev_set_drvdata(&cdev->dev, NULL);
++  spin_unlock_irqrestore(get_ccwdev_lock(cdev), flags);
++ }
+  return 0;
+ }
+ 
+-- 
+1.7.1

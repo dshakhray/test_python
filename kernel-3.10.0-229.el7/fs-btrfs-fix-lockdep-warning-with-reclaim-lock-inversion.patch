@@ -1,0 +1,92 @@
+From fe6e4a5437e967a66b4be6c8101fdfc3a43cb017 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:02:40 -0400
+Subject: [fs] btrfs: fix lockdep warning with reclaim lock inversion
+
+Message-id: <1407179109-13714-274-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87350
+O-Subject: [RHEL7.1 PATCH 273/422] btrfs: fix lockdep warning with reclaim lock inversion
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Jeff Mahoney <jeffm@suse.com>
+
+commit ed55b6ac077fe7f9c6490ff55172c4b563562d7c
+Author: Jeff Mahoney <jeffm@suse.com>
+Date:   Wed Mar 26 14:11:26 2014 -0400
+
+    btrfs: fix lockdep warning with reclaim lock inversion
+
+    When encountering memory pressure, testers have run into the following
+    lockdep warning. It was caused by __link_block_group calling kobject_add
+    with the groups_sem held. kobject_add calls kvasprintf with GFP_KERNEL,
+    which gets us into reclaim context. The kobject doesn't actually need
+    to be added under the lock -- it just needs to ensure that it's only
+    added for the first block group to be linked.
+
+    =========================================================
+    [ INFO: possible irq lock inversion dependency detected ]
+    3.14.0-rc8-default #1 Not tainted
+    ---------------------------------------------------------
+    kswapd0/169 just changed the state of lock:
+     (&delayed_node->mutex){+.+.-.}, at: [<ffffffffa018baea>] __btrfs_release_delayed_node+0x3a/0x200 [btrfs]
+    but this lock took another, RECLAIM_FS-unsafe lock in the past:
+     (&found->groups_sem){+++++.}
+
+    and interrupts could create inverse lock ordering between them.
+
+    other info that might help us debug this:
+     Possible interrupt unsafe locking scenario:
+           CPU0                    CPU1
+           ----                    ----
+      lock(&found->groups_sem);
+                                   local_irq_disable();
+                                   lock(&delayed_node->mutex);
+                                   lock(&found->groups_sem);
+      <Interrupt>
+        lock(&delayed_node->mutex);
+
+     *** DEADLOCK ***
+    2 locks held by kswapd0/169:
+     #0:  (shrinker_rwsem){++++..}, at: [<ffffffff81159e8a>] shrink_slab+0x3a/0x160
+     #1:  (&type->s_umount_key#27){++++..}, at: [<ffffffff811bac6f>] grab_super_passive+0x3f/0x90
+
+    Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 4d2508b..1341163 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -8337,9 +8337,15 @@ static void __link_block_group(struct btrfs_space_info *space_info,
+           struct btrfs_block_group_cache *cache)
+ {
+  int index = get_block_group_index(cache);
++ bool first = false;
+ 
+  down_write(&space_info->groups_sem);
+- if (list_empty(&space_info->block_groups[index])) {
++ if (list_empty(&space_info->block_groups[index]))
++  first = true;
++ list_add_tail(&cache->list, &space_info->block_groups[index]);
++ up_write(&space_info->groups_sem);
++
++ if (first) {
+   struct kobject *kobj = &space_info->block_group_kobjs[index];
+   int ret;
+ 
+@@ -8351,8 +8357,6 @@ static void __link_block_group(struct btrfs_space_info *space_info,
+    kobject_put(&space_info->kobj);
+   }
+  }
+- list_add_tail(&cache->list, &space_info->block_groups[index]);
+- up_write(&space_info->groups_sem);
+ }
+ 
+ static struct btrfs_block_group_cache *
+-- 
+1.7.1

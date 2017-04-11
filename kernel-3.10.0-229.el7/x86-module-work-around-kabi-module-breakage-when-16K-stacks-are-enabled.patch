@@ -1,0 +1,167 @@
+From ac8e42e4cee64773ae9470f115a6774b56390cae Mon Sep 17 00:00:00 2001
+From: Kyle McMartin <kmcmarti@redhat.com>
+Date: Fri, 12 Sep 2014 17:46:57 -0400
+Subject: [x86] module: work around kabi module breakage when 16K stacks are enabled
+
+Message-id: <20140912174656.GW29420@redacted.bos.redhat.com>
+Patchwork-id: 94058
+O-Subject: [RHEL7.1 PATCH 6/6 v4] kabi, x86_64: work around module breakage when 16K stacks are enabled
+Bugzilla: 1108378
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Johannes Weiner <jweiner@redhat.com>
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+
+Changing the kernel stack size alters some fundamental assumptions
+accessing current_thread_info() in modules, since the thread_info struct
+is now at a different offset from the kernel stack base than it
+previously was found at.
+
+To work around this, we keep a shadow copy of the kernel_stack symbol,
+fixed up to contain what would be the expected base address by modules
+compiled with the 8K stack size. Then, when an older module is loaded,
+we check to see if the symbol being referenced is `kernel_stack' and if
+so, fix up the relocation to reference the shadow 8K copy, instead of
+the 16K default.
+
+Signed-off-by: Kyle McMartin <kmcmarti@redhat.com>
+
+---
+
+I'm so sorry for this, I hope someone someday outdoes me for ugliest
+hack ever in RHEL.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index a1df6e8..f9513ef 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -203,6 +203,7 @@ static inline struct thread_info *current_thread_info(void)
+  */
+ #ifndef __ASSEMBLY__
+ DECLARE_PER_CPU(unsigned long, kernel_stack);
++DECLARE_PER_CPU(unsigned long, __kernel_stack_70__);
+ 
+ static inline struct thread_info *current_thread_info(void)
+ {
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 74a58e1..d2c2639 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1087,7 +1087,10 @@ EXPORT_PER_CPU_SYMBOL(current_task);
+ 
+ DEFINE_PER_CPU(unsigned long, kernel_stack) =
+  (unsigned long)&init_thread_union - KERNEL_STACK_OFFSET + THREAD_SIZE;
++DEFINE_PER_CPU(unsigned long, __kernel_stack_70__) =
++ (unsigned long)&init_thread_union - KERNEL_STACK_OFFSET + THREAD_SIZE - 8192;
+ EXPORT_PER_CPU_SYMBOL(kernel_stack);
++EXPORT_PER_CPU_SYMBOL(__kernel_stack_70__);
+ 
+ DEFINE_PER_CPU(char *, irq_stack_ptr) =
+  init_per_cpu_var(irq_stack_union.irq_stack) + IRQ_STACK_SIZE - 64;
+diff --git a/arch/x86/kernel/module.c b/arch/x86/kernel/module.c
+index 216a4d7..7c1efc4 100644
+--- a/arch/x86/kernel/module.c
++++ b/arch/x86/kernel/module.c
+@@ -104,10 +104,17 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+  Elf64_Sym *sym;
+  void *loc;
+  u64 val;
++ bool rhel70 = check_module_rhelversion(me, "7.0");
++ bool warned = false;
+ 
+  DEBUGP("Applying relocate section %u to %u\n",
+         relsec, sechdrs[relsec].sh_info);
++
+  for (i = 0; i < sechdrs[relsec].sh_size / sizeof(*rel); i++) {
++  Elf64_Sym kstack_sym;
++  bool apply_kstack_fixup = false;
++  const char *symname;
++
+   /* This is where to make the change */
+   loc = (void *)sechdrs[sechdrs[relsec].sh_info].sh_addr
+    + rel[i].r_offset;
+@@ -116,11 +123,37 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+      undefined symbols have been resolved.  */
+   sym = (Elf64_Sym *)sechdrs[symindex].sh_addr
+    + ELF64_R_SYM(rel[i].r_info);
++  symname = strtab + sym->st_name;
+ 
+-  DEBUGP("type %d st_value %Lx r_addend %Lx loc %Lx\n",
+-         (int)ELF64_R_TYPE(rel[i].r_info),
++  DEBUGP("symname %s type %d st_value %Lx r_addend %Lx loc %Lx\n",
++         symname, (int)ELF64_R_TYPE(rel[i].r_info),
+          sym->st_value, rel[i].r_addend, (u64)loc);
+ 
++  if (rhel70 && !strcmp(symname, "kernel_stack")) {
++   if (!warned)
++    printk(KERN_INFO "%s: applying kernel_stack fix up\n",
++     me->name);
++   apply_kstack_fixup = true;
++   warned = true;
++  }
++
++  /* kernel_stack is referenced to access current_thread_info in
++   * a variety of places... if we're loading a module which
++   * expects an 8K stack, fix up the symbol reference to look
++   * at a second copy. Nobody should be using this symbol for
++   * any other purpose.
++   */
++  if (apply_kstack_fixup) {
++   const struct kernel_symbol *ksym2;
++   ksym2 = find_symbol("__kernel_stack_70__",
++         NULL, NULL, true, true);
++   if (!IS_ERR(ksym2)) {
++    kstack_sym.st_value = ksym2->value;
++    sym = &kstack_sym;
++   } else
++    return PTR_ERR(ksym2) ?: -ENOEXEC;
++  }
++
+   val = sym->st_value + rel[i].r_addend;
+ 
+   switch (ELF64_R_TYPE(rel[i].r_info)) {
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index 739ac35..2cfcea0 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -359,6 +359,9 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+  this_cpu_write(kernel_stack,
+     (unsigned long)task_stack_page(next_p) +
+     THREAD_SIZE - KERNEL_STACK_OFFSET);
++ this_cpu_write(__kernel_stack_70__,
++    (unsigned long)task_stack_page(next_p) +
++    THREAD_SIZE - 8192 - KERNEL_STACK_OFFSET);
+ 
+  /*
+   * Now maybe reload the debug registers and handle I/O bitmaps
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 31aa398..e2cafd4 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -746,6 +746,9 @@ static int do_boot_cpu(int apicid, int cpu, struct task_struct *idle)
+  per_cpu(kernel_stack, cpu) =
+   (unsigned long)task_stack_page(idle) -
+   KERNEL_STACK_OFFSET + THREAD_SIZE;
++ per_cpu(__kernel_stack_70__, cpu) =
++  (unsigned long)task_stack_page(idle) -
++  KERNEL_STACK_OFFSET + THREAD_SIZE - 8192;
+ #endif
+  early_gdt_descr.address = (unsigned long)get_cpu_gdt_table(cpu);
+  initial_code = (unsigned long)start_secondary;
+diff --git a/arch/x86/xen/smp.c b/arch/x86/xen/smp.c
+index ea9f22f..4c981ab 100644
+--- a/arch/x86/xen/smp.c
++++ b/arch/x86/xen/smp.c
+@@ -418,6 +418,9 @@ static int xen_cpu_up(unsigned int cpu, struct task_struct *idle)
+  per_cpu(kernel_stack, cpu) =
+   (unsigned long)task_stack_page(idle) -
+   KERNEL_STACK_OFFSET + THREAD_SIZE;
++ per_cpu(__kernel_stack_70__, cpu) =
++  (unsigned long)task_stack_page(idle) -
++  KERNEL_STACK_OFFSET + THREAD_SIZE - 8192;
+ #endif
+  xen_setup_runstate_info(cpu);
+  xen_setup_timer(cpu);
+-- 
+1.7.1

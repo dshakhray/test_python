@@ -1,0 +1,111 @@
+From 7e8899b2331e818fe1ed35bbd6ca7e260ea02d86 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:27:43 -0400
+Subject: [tools] perf/trace: Fix segfault on perf trace -i perf.data
+
+Message-id: <1408462094-14194-295-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88234
+O-Subject: [PATCH RHEL7.1 BZ1131394 294/325] perf trace: Fix segfault on perf trace -i perf.data
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 003824e8c27eeb8d3eec54cfab5845ec01ab532e
+Author: Namhyung Kim <namhyung.kim@lge.com>
+Date: Tue Nov 12 15:25:00 2013 +0900
+
+description
+===========
+When replaying a previous record session, it'll get a segfault since it
+doesn't initialize raw_syscalls enter/exit tracepoint's evsel->priv for
+caching the format fields.
+
+So fix it by properly initializing sys_enter/exit evsels that comes from
+reading the perf.data file header.
+
+[ Split the syscall tp field caching part in the previous patch ]
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-trace.c b/tools/perf/builtin-trace.c
+index 3fa1dce..8d6ea8f 100644
+--- a/tools/perf/builtin-trace.c
++++ b/tools/perf/builtin-trace.c
+@@ -1766,16 +1766,6 @@ static int trace__process_sample(struct perf_tool *tool,
+  return err;
+ }
+ 
+-static bool
+-perf_session__has_tp(struct perf_session *session, const char *name)
+-{
+- struct perf_evsel *evsel;
+-
+- evsel = perf_evlist__find_tracepoint_by_name(session->evlist, name);
+-
+- return evsel != NULL;
+-}
+-
+ static int parse_target_str(struct trace *trace)
+ {
+  if (trace->opts.target.pid) {
+@@ -2012,8 +2002,6 @@ out_error:
+ static int trace__replay(struct trace *trace)
+ {
+  const struct perf_evsel_str_handler handlers[] = {
+-  { "raw_syscalls:sys_enter",  trace__sys_enter, },
+-  { "raw_syscalls:sys_exit",   trace__sys_exit, },
+   { "probe:vfs_getname",      trace__vfs_getname, },
+  };
+  struct perf_data_file file = {
+@@ -2021,6 +2009,7 @@ static int trace__replay(struct trace *trace)
+   .mode  = PERF_DATA_MODE_READ,
+  };
+  struct perf_session *session;
++ struct perf_evsel *evsel;
+  int err = -1;
+ 
+  trace->tool.sample   = trace__process_sample;
+@@ -2052,13 +2041,29 @@ static int trace__replay(struct trace *trace)
+  if (err)
+   goto out;
+ 
+- if (!perf_session__has_tp(session, "raw_syscalls:sys_enter")) {
+-  pr_err("Data file does not have raw_syscalls:sys_enter events\n");
++ evsel = perf_evlist__find_tracepoint_by_name(session->evlist,
++           "raw_syscalls:sys_enter");
++ if (evsel == NULL) {
++  pr_err("Data file does not have raw_syscalls:sys_enter event\n");
++  goto out;
++ }
++
++ if (perf_evsel__init_syscall_tp(evsel, trace__sys_enter) < 0 ||
++     perf_evsel__init_sc_tp_ptr_field(evsel, args)) {
++  pr_err("Error during initialize raw_syscalls:sys_enter event\n");
++  goto out;
++ }
++
++ evsel = perf_evlist__find_tracepoint_by_name(session->evlist,
++           "raw_syscalls:sys_exit");
++ if (evsel == NULL) {
++  pr_err("Data file does not have raw_syscalls:sys_exit event\n");
+   goto out;
+  }
+ 
+- if (!perf_session__has_tp(session, "raw_syscalls:sys_exit")) {
+-  pr_err("Data file does not have raw_syscalls:sys_exit events\n");
++ if (perf_evsel__init_syscall_tp(evsel, trace__sys_exit) < 0 ||
++     perf_evsel__init_sc_tp_uint_field(evsel, ret)) {
++  pr_err("Error during initialize raw_syscalls:sys_exit event\n");
+   goto out;
+  }
+ 
+-- 
+1.7.1

@@ -1,0 +1,145 @@
+From f96560b9443e4ec89b20a17e7a64f9e5fb3bb472 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Wed, 6 Aug 2014 03:49:52 -0400
+Subject: [pci] Mark resources as IORESOURCE_UNSET if we can't assign them
+
+Message-id: <20140806034952.1438.19583.stgit@gir.stowe>
+Patchwork-id: 87463
+O-Subject: [RHEL7.1 PATCH 54/69] PCI: Mark resources as IORESOURCE_UNSET if we can't assign them
+Bugzilla: 1110896
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110896
+Upstream Status: bd064f0a231af336218838474ea45a64f1672190
+
+commit bd064f0a231af336218838474ea45a64f1672190
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Wed Feb 26 11:25:58 2014 -0700
+
+    PCI: Mark resources as IORESOURCE_UNSET if we can't assign them
+
+    When assigning addresses to resources, mark them with IORESOURCE_UNSET
+    before we start and clear IORESOURCE_UNSET if assignment is successful.
+    That means that if we print the resource during assignment, we will show
+    the size, not a meaningless address.
+
+    Also, clear IORESOURCE_UNSET if we do assign an address, so we print the
+    address when it is valid.
+
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index bd3b59e..d108894 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -4281,6 +4281,7 @@ void pci_reassigndev_resource_alignment(struct pci_dev *dev)
+     "Rounding up size of resource #%d to %#llx.\n",
+     i, (unsigned long long)size);
+   }
++  r->flags |= IORESOURCE_UNSET;
+   r->end = size - 1;
+   r->start = 0;
+  }
+@@ -4294,6 +4295,7 @@ void pci_reassigndev_resource_alignment(struct pci_dev *dev)
+    r = &dev->resource[i];
+    if (!(r->flags & IORESOURCE_MEM))
+     continue;
++   r->flags |= IORESOURCE_UNSET;
+    r->end = resource_size(r) - 1;
+    r->start = 0;
+   }
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 5697c59..71cb4cd 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -300,6 +300,7 @@ static void quirk_s3_64M(struct pci_dev *dev)
+  struct resource *r = &dev->resource[0];
+ 
+  if ((r->start & 0x3ffffff) || r->end != r->start + 0x3ffffff) {
++  r->flags |= IORESOURCE_UNSET;
+   r->start = 0;
+   r->end = 0x3ffffff;
+  }
+@@ -941,6 +942,8 @@ DECLARE_PCI_FIXUP_RESUME_EARLY(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_FE_GATE_700C
+ static void quirk_dunord(struct pci_dev *dev)
+ {
+  struct resource *r = &dev->resource [1];
++
++ r->flags |= IORESOURCE_UNSET;
+  r->start = 0;
+  r->end = 0xffffff;
+ }
+@@ -1744,6 +1747,7 @@ static void quirk_tc86c001_ide(struct pci_dev *dev)
+  struct resource *r = &dev->resource[0];
+ 
+  if (r->start & 0x8) {
++  r->flags |= IORESOURCE_UNSET;
+   r->start = 0;
+   r->end = 0xf;
+  }
+@@ -1773,6 +1777,7 @@ static void quirk_plx_pci9050(struct pci_dev *dev)
+    dev_info(&dev->dev,
+      "Re-allocating PLX PCI 9050 BAR %u to length 256 to avoid bit 7 bug\n",
+      bar);
++   r->flags |= IORESOURCE_UNSET;
+    r->start = 0;
+    r->end = 0xff;
+   }
+diff --git a/drivers/pci/rom.c b/drivers/pci/rom.c
+index 5d59572..c183945 100644
+--- a/drivers/pci/rom.c
++++ b/drivers/pci/rom.c
+@@ -197,8 +197,10 @@ void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom)
+ void pci_cleanup_rom(struct pci_dev *pdev)
+ {
+  struct resource *res = &pdev->resource[PCI_ROM_RESOURCE];
++
+  if (res->flags & IORESOURCE_ROM_COPY) {
+   kfree((void*)(unsigned long)res->start);
++  res->flags |= IORESOURCE_UNSET;
+   res->flags &= ~IORESOURCE_ROM_COPY;
+   res->start = 0;
+   res->end = 0;
+diff --git a/drivers/pci/setup-res.c b/drivers/pci/setup-res.c
+index 5c060b1..0474b02 100644
+--- a/drivers/pci/setup-res.c
++++ b/drivers/pci/setup-res.c
+@@ -263,6 +263,7 @@ int pci_assign_resource(struct pci_dev *dev, int resno)
+  resource_size_t align, size;
+  int ret;
+ 
++ res->flags |= IORESOURCE_UNSET;
+  align = pci_resource_alignment(dev, res);
+  if (!align) {
+   dev_info(&dev->dev, "BAR %d: can't assign %pR "
+@@ -282,6 +283,7 @@ int pci_assign_resource(struct pci_dev *dev, int resno)
+   ret = pci_revert_fw_address(res, dev, resno, size);
+ 
+  if (!ret) {
++  res->flags &= ~IORESOURCE_UNSET;
+   res->flags &= ~IORESOURCE_STARTALIGN;
+   dev_info(&dev->dev, "BAR %d: assigned %pR\n", resno, res);
+   if (resno < PCI_BRIDGE_RESOURCES)
+@@ -297,6 +299,7 @@ int pci_reassign_resource(struct pci_dev *dev, int resno, resource_size_t addsiz
+  resource_size_t new_size;
+  int ret;
+ 
++ res->flags |= IORESOURCE_UNSET;
+  if (!res->parent) {
+   dev_info(&dev->dev, "BAR %d: can't reassign an unassigned resource %pR "
+     "\n", resno, res);
+@@ -307,6 +310,7 @@ int pci_reassign_resource(struct pci_dev *dev, int resno, resource_size_t addsiz
+  new_size = resource_size(res) + addsize;
+  ret = _pci_assign_resource(dev, resno, new_size, min_align);
+  if (!ret) {
++  res->flags &= ~IORESOURCE_UNSET;
+   res->flags &= ~IORESOURCE_STARTALIGN;
+   dev_info(&dev->dev, "BAR %d: reassigned %pR\n", resno, res);
+   if (resno < PCI_BRIDGE_RESOURCES)
+-- 
+1.7.1

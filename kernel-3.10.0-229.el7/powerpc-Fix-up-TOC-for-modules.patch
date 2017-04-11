@@ -1,0 +1,101 @@
+From b5279293b96f477abda6a0443b5623487598baba Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:11:00 -0400
+Subject: [powerpc] Fix up TOC. for modules
+
+Message-id: <1410545655-205645-432-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94560
+O-Subject: [RHEL7 PATCH 431/626] powerpc: Fix up TOC. for modules.
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 4edebbeae3085e71f75584b6582495459e2e6cb2
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Tue Mar 18 19:59:26 2014 +1030
+
+    powerpc: Fix up TOC. for modules.
+
+    The kernel resolved the '.TOC.' to a fake symbol, so we need to fix it up
+    to point to our .toc section plus 0x8000.
+
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+kabi reason:  a boolean byte was added just for powerpc.  Of course this
+struct is embedded all the way to struct module.  I found a hole at the
+end of the struct and used a byte from there to add the extra field.
+
+Therefore the kabi impact should be low.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/module.h b/arch/powerpc/include/asm/module.h
+index 49fa55b..f54a230 100644
+--- a/arch/powerpc/include/asm/module.h
++++ b/arch/powerpc/include/asm/module.h
+@@ -53,6 +53,11 @@ struct mod_arch_specific {
+  struct list_head bug_list;
+  struct bug_entry *bug_table;
+  unsigned int num_bugs;
++#ifndef __GENKSYMS__
++#ifdef __powerpc64__
++ bool toc_fixed;   /* Have we fixed up .TOC.? */
++#endif
++#endif
+ };
+ 
+ /*
+diff --git a/arch/powerpc/kernel/module_64.c b/arch/powerpc/kernel/module_64.c
+index a8694d4..f6544d7 100644
+--- a/arch/powerpc/kernel/module_64.c
++++ b/arch/powerpc/kernel/module_64.c
+@@ -196,6 +196,24 @@ static void dedotify(Elf64_Sym *syms, unsigned int numsyms, char *strtab)
+  }
+ }
+ 
++static Elf64_Sym *find_dot_toc(Elf64_Shdr *sechdrs,
++          const char *strtab,
++          unsigned int symindex)
++{
++ unsigned int i, numsyms;
++ Elf64_Sym *syms;
++
++ syms = (Elf64_Sym *)sechdrs[symindex].sh_addr;
++ numsyms = sechdrs[symindex].sh_size / sizeof(Elf64_Sym);
++
++ for (i = 1; i < numsyms; i++) {
++  if (syms[i].st_shndx == SHN_UNDEF
++      && strcmp(strtab + syms[i].st_name, ".TOC.") == 0)
++   return &syms[i];
++ }
++ return NULL;
++}
++
+ int module_frob_arch_sections(Elf64_Ehdr *hdr,
+          Elf64_Shdr *sechdrs,
+          char *secstrings,
+@@ -337,6 +355,17 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 
+  DEBUGP("Applying ADD relocate section %u to %u\n", relsec,
+         sechdrs[relsec].sh_info);
++
++ /* First time we're called, we can fix up .TOC. */
++ if (!me->arch.toc_fixed) {
++  sym = find_dot_toc(sechdrs, strtab, symindex);
++  /* It's theoretically possible that a module doesn't want a
++   * .TOC. so don't fail it just for that. */
++  if (sym)
++   sym->st_value = my_r2(sechdrs, me);
++  me->arch.toc_fixed = true;
++ }
++
+  for (i = 0; i < sechdrs[relsec].sh_size / sizeof(*rela); i++) {
+   /* This is where to make the change */
+   location = (void *)sechdrs[sechdrs[relsec].sh_info].sh_addr
+-- 
+1.7.1

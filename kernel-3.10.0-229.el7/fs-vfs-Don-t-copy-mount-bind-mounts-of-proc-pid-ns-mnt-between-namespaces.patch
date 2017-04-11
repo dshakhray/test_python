@@ -1,0 +1,177 @@
+From e2c596862e5d4d49c0980ba3cce77cd87d0883a5 Mon Sep 17 00:00:00 2001
+From: Aristeu Rozanski <aris@redhat.com>
+Date: Wed, 9 Jul 2014 13:18:47 -0400
+Subject: [fs] vfs: Don't copy mount bind mounts of /proc/<pid>/ns/mnt between namespaces
+
+Message-id: <20140709131846.GB30303@redhat.com>
+Patchwork-id: 85531
+O-Subject: [RHEL7 PATCH] vfs: Don't copy mount bind mounts of /proc/<pid>/ns/mnt between namespaces
+Bugzilla: 1098632
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+BZ#1098632
+brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=7678360
+Tested: locally with reproducer
+upstream: 4ce5d2b1a8fde84c0eebe70652cf28b9beda6b4e
+
+Files inside /proc/<pid>/ns/* are bind mounted in the parent namespace in
+order to keep a reference to that namespace so there's no need to keep a
+process running inside to keep it alive. Said namespaces can be joined using
+setns().
+
+Thanks to Jiri Jaburek for pointing the problem and the solution.
+
+ commit 4ce5d2b1a8fde84c0eebe70652cf28b9beda6b4e
+ Author: Eric W. Biederman <ebiederm@xmission.com>
+ Date:   Sat Mar 30 01:35:18 2013 -0700
+
+     vfs: Don't copy mount bind mounts of /proc/<pid>/ns/mnt between namespaces
+
+     Don't copy bind mounts of /proc/<pid>/ns/mnt between namespaces.
+     These files hold references to a mount namespace and copying them
+     between namespaces could result in a reference counting loop.
+
+     The current mnt_ns_loop test prevents loops on the assumption that
+     mounts don't cross between namespaces.  Unfortunately unsharing a
+     mount namespace and shared substrees can both cause mounts to
+     propogate between mount namespaces.
+
+     Add two flags CL_COPY_UNBINDABLE and CL_COPY_MNT_NS_FILE are added to
+     control this behavior, and CL_COPY_ALL is redefined as both of them.
+
+     Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+
+Signed-off-by: Aristeu Rozanski <aris@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 20c4dd7..6b3a48e 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1363,14 +1363,11 @@ SYSCALL_DEFINE1(oldumount, char __user *, name)
+ 
+ #endif
+ 
+-static bool mnt_ns_loop(struct path *path)
++static bool is_mnt_ns_file(struct dentry *dentry)
+ {
+- /* Could bind mounting the mount namespace inode cause a
+-  * mount namespace loop?
+-  */
+- struct inode *inode = path->dentry->d_inode;
++ /* Is this a proxy for a mount namespace? */
++ struct inode *inode = dentry->d_inode;
+  struct proc_ns *ei;
+- struct mnt_namespace *mnt_ns;
+ 
+  if (!proc_ns_inode(inode))
+   return false;
+@@ -1379,7 +1376,19 @@ static bool mnt_ns_loop(struct path *path)
+  if (ei->ns_ops != &mntns_operations)
+   return false;
+ 
+- mnt_ns = ei->ns;
++ return true;
++}
++
++static bool mnt_ns_loop(struct dentry *dentry)
++{
++ /* Could bind mounting the mount namespace inode cause a
++  * mount namespace loop?
++  */
++ struct mnt_namespace *mnt_ns;
++ if (!is_mnt_ns_file(dentry))
++  return false;
++
++ mnt_ns = get_proc_ns(dentry->d_inode)->ns;
+  return current->nsproxy->mnt_ns->seq >= mnt_ns->seq;
+ }
+ 
+@@ -1388,7 +1397,10 @@ struct mount *copy_tree(struct mount *mnt, struct dentry *dentry,
+ {
+  struct mount *res, *p, *q, *r, *parent;
+ 
+- if (!(flag & CL_COPY_ALL) && IS_MNT_UNBINDABLE(mnt))
++ if (!(flag & CL_COPY_UNBINDABLE) && IS_MNT_UNBINDABLE(mnt))
++  return ERR_PTR(-EINVAL);
++
++ if (!(flag & CL_COPY_MNT_NS_FILE) && is_mnt_ns_file(dentry))
+   return ERR_PTR(-EINVAL);
+ 
+  res = q = clone_mnt(mnt, dentry, flag);
+@@ -1404,7 +1416,13 @@ struct mount *copy_tree(struct mount *mnt, struct dentry *dentry,
+    continue;
+ 
+   for (s = r; s; s = next_mnt(s, r)) {
+-   if (!(flag & CL_COPY_ALL) && IS_MNT_UNBINDABLE(s)) {
++   if (!(flag & CL_COPY_UNBINDABLE) &&
++       IS_MNT_UNBINDABLE(s)) {
++    s = skip_mnt_tree(s);
++    continue;
++   }
++   if (!(flag & CL_COPY_MNT_NS_FILE) &&
++       is_mnt_ns_file(s->mnt.mnt_root)) {
+     s = skip_mnt_tree(s);
+     continue;
+    }
+@@ -1729,7 +1747,7 @@ static int do_loopback(struct path *path, const char *old_name,
+   return err;
+ 
+  err = -EINVAL;
+- if (mnt_ns_loop(&old_path))
++ if (mnt_ns_loop(old_path.dentry))
+   goto out; 
+ 
+  mp = lock_mount(path);
+@@ -1748,7 +1766,7 @@ static int do_loopback(struct path *path, const char *old_name,
+   goto out2;
+ 
+  if (recurse)
+-  mnt = copy_tree(old, old_path.dentry, 0);
++  mnt = copy_tree(old, old_path.dentry, CL_COPY_MNT_NS_FILE);
+  else
+   mnt = clone_mnt(old, old_path.dentry, 0);
+ 
+@@ -2405,7 +2423,7 @@ static struct mnt_namespace *dup_mnt_ns(struct mnt_namespace *mnt_ns,
+ 
+  namespace_lock();
+  /* First pass: copy the tree topology */
+- copy_flags = CL_COPY_ALL | CL_EXPIRE;
++ copy_flags = CL_COPY_UNBINDABLE | CL_EXPIRE;
+  if (user_ns != mnt_ns->user_ns)
+   copy_flags |= CL_SHARED_TO_SLAVE | CL_UNPRIVILEGED;
+  new = copy_tree(old, old->mnt.mnt_root, copy_flags);
+@@ -2440,6 +2458,10 @@ static struct mnt_namespace *dup_mnt_ns(struct mnt_namespace *mnt_ns,
+   }
+   p = next_mnt(p, old);
+   q = next_mnt(q, new);
++  if (!q)
++   break;
++  while (p->mnt.mnt_root != q->mnt.mnt_root)
++   p = next_mnt(p, old);
+  }
+  namespace_unlock();
+ 
+diff --git a/fs/pnode.h b/fs/pnode.h
+index 6334172..65e04f6 100644
+--- a/fs/pnode.h
++++ b/fs/pnode.h
+@@ -22,11 +22,14 @@
+ 
+ #define CL_EXPIRE      0x01
+ #define CL_SLAVE       0x02
+-#define CL_COPY_ALL   0x04
++#define CL_COPY_UNBINDABLE 0x04
+ #define CL_MAKE_SHARED   0x08
+ #define CL_PRIVATE   0x10
+ #define CL_SHARED_TO_SLAVE 0x20
+ #define CL_UNPRIVILEGED  0x40
++#define CL_COPY_MNT_NS_FILE 0x80
++
++#define CL_COPY_ALL  (CL_COPY_UNBINDABLE | CL_COPY_MNT_NS_FILE)
+ 
+ static inline void set_mnt_shared(struct mount *mnt)
+ {
+-- 
+1.7.1

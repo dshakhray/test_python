@@ -1,0 +1,273 @@
+From ba4c1e81b96489447c2b3b818b8d70896a42a2f9 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:06:05 -0400
+Subject: [virt] kvm/ppc: book3s pr - Allocate kvm_vcpu structs from kvm_vcpu_cache
+
+Message-id: <1410545655-205645-137-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94146
+O-Subject: [RHEL7 PATCH 136/626] KVM: PPC: Book3S PR: Allocate kvm_vcpu structs from kvm_vcpu_cache
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 3ff955024d186c512ee91263df9c850d6ae34a12
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:49 2013 +1000
+
+    KVM: PPC: Book3S PR: Allocate kvm_vcpu structs from kvm_vcpu_cache
+
+    This makes PR KVM allocate its kvm_vcpu structs from the kvm_vcpu_cache
+    rather than having them embedded in the kvmppc_vcpu_book3s struct,
+    which is allocated with vzalloc.  The reason is to reduce the
+    differences between PR and HV KVM in order to make is easier to have
+    them coexist in one kernel binary.
+
+    With this, the kvm_vcpu struct has a pointer to the kvmppc_vcpu_book3s
+    struct.  The pointer to the kvmppc_book3s_shadow_vcpu struct has moved
+    from the kvmppc_vcpu_book3s struct to the kvm_vcpu struct, and is only
+    present for 32-bit, since it is only used for 32-bit.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    [agraf: squash in compile fix from Aneesh]
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 6bf20b4..603fba4 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -70,8 +70,6 @@ struct hpte_cache {
+ };
+ 
+ struct kvmppc_vcpu_book3s {
+- struct kvm_vcpu vcpu;
+- struct kvmppc_book3s_shadow_vcpu *shadow_vcpu;
+  struct kvmppc_sid_map sid_map[SID_MAP_NUM];
+  struct {
+   u64 esid;
+@@ -194,7 +192,7 @@ extern int kvmppc_h_pr(struct kvm_vcpu *vcpu, unsigned long cmd);
+ 
+ static inline struct kvmppc_vcpu_book3s *to_book3s(struct kvm_vcpu *vcpu)
+ {
+- return container_of(vcpu, struct kvmppc_vcpu_book3s, vcpu);
++ return vcpu->arch.book3s;
+ }
+ 
+ extern void kvm_return_point(void);
+diff --git a/arch/powerpc/include/asm/kvm_book3s_32.h b/arch/powerpc/include/asm/kvm_book3s_32.h
+index ce0ef6c..c720e0b 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_32.h
++++ b/arch/powerpc/include/asm/kvm_book3s_32.h
+@@ -22,7 +22,7 @@
+ 
+ static inline struct kvmppc_book3s_shadow_vcpu *svcpu_get(struct kvm_vcpu *vcpu)
+ {
+- return to_book3s(vcpu)->shadow_vcpu;
++ return vcpu->arch.shadow_vcpu;
+ }
+ 
+ static inline void svcpu_put(struct kvmppc_book3s_shadow_vcpu *svcpu)
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 1f7349d..f482594 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -91,6 +91,9 @@ struct lppaca;
+ struct slb_shadow;
+ struct dtl_entry;
+ 
++struct kvmppc_vcpu_book3s;
++struct kvmppc_book3s_shadow_vcpu;
++
+ struct kvm_vm_stat {
+  u32 remote_tlb_flush;
+ };
+@@ -413,6 +416,10 @@ struct kvm_vcpu_arch {
+  int slb_max;  /* 1 + index of last valid entry in slb[] */
+  int slb_nr;  /* total number of entries in SLB */
+  struct kvmppc_mmu mmu;
++ struct kvmppc_vcpu_book3s *book3s;
++#endif
++#ifdef CONFIG_PPC_BOOK3S_32
++ struct kvmppc_book3s_shadow_vcpu *shadow_vcpu;
+ #endif
+ 
+  ulong gpr[32];
+diff --git a/arch/powerpc/kvm/book3s_32_mmu.c b/arch/powerpc/kvm/book3s_32_mmu.c
+index 856af98..b14af6d 100644
+--- a/arch/powerpc/kvm/book3s_32_mmu.c
++++ b/arch/powerpc/kvm/book3s_32_mmu.c
+@@ -111,10 +111,11 @@ static void kvmppc_mmu_book3s_32_reset_msr(struct kvm_vcpu *vcpu)
+  kvmppc_set_msr(vcpu, 0);
+ }
+ 
+-static hva_t kvmppc_mmu_book3s_32_get_pteg(struct kvmppc_vcpu_book3s *vcpu_book3s,
++static hva_t kvmppc_mmu_book3s_32_get_pteg(struct kvm_vcpu *vcpu,
+           u32 sre, gva_t eaddr,
+           bool primary)
+ {
++ struct kvmppc_vcpu_book3s *vcpu_book3s = to_book3s(vcpu);
+  u32 page, hash, pteg, htabmask;
+  hva_t r;
+ 
+@@ -132,7 +133,7 @@ static hva_t kvmppc_mmu_book3s_32_get_pteg(struct kvmppc_vcpu_book3s *vcpu_book3
+   kvmppc_get_pc(&vcpu_book3s->vcpu), eaddr, vcpu_book3s->sdr1, pteg,
+   sr_vsid(sre));
+ 
+- r = gfn_to_hva(vcpu_book3s->vcpu.kvm, pteg >> PAGE_SHIFT);
++ r = gfn_to_hva(vcpu->kvm, pteg >> PAGE_SHIFT);
+  if (kvm_is_error_hva(r))
+   return r;
+  return r | (pteg & ~PAGE_MASK);
+@@ -203,7 +204,6 @@ static int kvmppc_mmu_book3s_32_xlate_pte(struct kvm_vcpu *vcpu, gva_t eaddr,
+          struct kvmppc_pte *pte, bool data,
+          bool primary)
+ {
+- struct kvmppc_vcpu_book3s *vcpu_book3s = to_book3s(vcpu);
+  u32 sre;
+  hva_t ptegp;
+  u32 pteg[16];
+@@ -218,7 +218,7 @@ static int kvmppc_mmu_book3s_32_xlate_pte(struct kvm_vcpu *vcpu, gva_t eaddr,
+ 
+  pte->vpage = kvmppc_mmu_book3s_32_ea_to_vp(vcpu, eaddr, data);
+ 
+- ptegp = kvmppc_mmu_book3s_32_get_pteg(vcpu_book3s, sre, eaddr, primary);
++ ptegp = kvmppc_mmu_book3s_32_get_pteg(vcpu, sre, eaddr, primary);
+  if (kvm_is_error_hva(ptegp)) {
+   printk(KERN_INFO "KVM: Invalid PTEG!\n");
+   goto no_page_found;
+diff --git a/arch/powerpc/kvm/book3s_64_mmu.c b/arch/powerpc/kvm/book3s_64_mmu.c
+index ad9ecfd..c110145 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu.c
++++ b/arch/powerpc/kvm/book3s_64_mmu.c
+@@ -130,11 +130,11 @@ static u32 kvmppc_mmu_book3s_64_get_page(struct kvmppc_slb *slbe, gva_t eaddr)
+  return ((eaddr & kvmppc_slb_offset_mask(slbe)) >> p);
+ }
+ 
+-static hva_t kvmppc_mmu_book3s_64_get_pteg(
+-    struct kvmppc_vcpu_book3s *vcpu_book3s,
++static hva_t kvmppc_mmu_book3s_64_get_pteg(struct kvm_vcpu *vcpu,
+     struct kvmppc_slb *slbe, gva_t eaddr,
+     bool second)
+ {
++ struct kvmppc_vcpu_book3s *vcpu_book3s = to_book3s(vcpu);
+  u64 hash, pteg, htabsize;
+  u32 ssize;
+  hva_t r;
+@@ -159,10 +159,10 @@ static hva_t kvmppc_mmu_book3s_64_get_pteg(
+ 
+  /* When running a PAPR guest, SDR1 contains a HVA address instead
+            of a GPA */
+- if (vcpu_book3s->vcpu.arch.papr_enabled)
++ if (vcpu->arch.papr_enabled)
+   r = pteg;
+  else
+-  r = gfn_to_hva(vcpu_book3s->vcpu.kvm, pteg >> PAGE_SHIFT);
++  r = gfn_to_hva(vcpu->kvm, pteg >> PAGE_SHIFT);
+ 
+  if (kvm_is_error_hva(r))
+   return r;
+@@ -208,7 +208,6 @@ static int decode_pagesize(struct kvmppc_slb *slbe, u64 r)
+ static int kvmppc_mmu_book3s_64_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+     struct kvmppc_pte *gpte, bool data)
+ {
+- struct kvmppc_vcpu_book3s *vcpu_book3s = to_book3s(vcpu);
+  struct kvmppc_slb *slbe;
+  hva_t ptegp;
+  u64 pteg[16];
+@@ -260,7 +259,7 @@ static int kvmppc_mmu_book3s_64_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+  mutex_lock(&vcpu->kvm->arch.hpt_mutex);
+ 
+ do_second:
+- ptegp = kvmppc_mmu_book3s_64_get_pteg(vcpu_book3s, slbe, eaddr, second);
++ ptegp = kvmppc_mmu_book3s_64_get_pteg(vcpu, slbe, eaddr, second);
+  if (kvm_is_error_hva(ptegp))
+   goto no_page_found;
+ 
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index bd74b67..e329dd7 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -66,7 +66,7 @@ void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ #endif
+  vcpu->cpu = smp_processor_id();
+ #ifdef CONFIG_PPC_BOOK3S_32
+- current->thread.kvm_shadow_vcpu = to_book3s(vcpu)->shadow_vcpu;
++ current->thread.kvm_shadow_vcpu = vcpu->arch.shadow_vcpu;
+ #endif
+ }
+ 
+@@ -1123,17 +1123,22 @@ struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
+  int err = -ENOMEM;
+  unsigned long p;
+ 
++ vcpu = kmem_cache_zalloc(kvm_vcpu_cache, GFP_KERNEL);
++ if (!vcpu)
++  goto out;
++
+  vcpu_book3s = vzalloc(sizeof(struct kvmppc_vcpu_book3s));
+  if (!vcpu_book3s)
+-  goto out;
++  goto free_vcpu;
++ vcpu->arch.book3s = vcpu_book3s;
+ 
+ #ifdef CONFIG_KVM_BOOK3S_32
+- vcpu_book3s->shadow_vcpu =
+-  kzalloc(sizeof(*vcpu_book3s->shadow_vcpu), GFP_KERNEL);
+- if (!vcpu_book3s->shadow_vcpu)
+-  goto free_vcpu;
++ vcpu->arch.shadow_vcpu =
++  kzalloc(sizeof(*vcpu->arch.shadow_vcpu), GFP_KERNEL);
++ if (!vcpu->arch.shadow_vcpu)
++  goto free_vcpu3s;
+ #endif
+- vcpu = &vcpu_book3s->vcpu;
++
+  err = kvm_vcpu_init(vcpu, kvm, id);
+  if (err)
+   goto free_shadow_vcpu;
+@@ -1173,10 +1178,12 @@ uninit_vcpu:
+  kvm_vcpu_uninit(vcpu);
+ free_shadow_vcpu:
+ #ifdef CONFIG_KVM_BOOK3S_32
+- kfree(vcpu_book3s->shadow_vcpu);
+-free_vcpu:
++ kfree(vcpu->arch.shadow_vcpu);
++free_vcpu3s:
+ #endif
+  vfree(vcpu_book3s);
++free_vcpu:
++ kmem_cache_free(kvm_vcpu_cache, vcpu);
+ out:
+  return ERR_PTR(err);
+ }
+@@ -1187,8 +1194,11 @@ void kvmppc_core_vcpu_free(struct kvm_vcpu *vcpu)
+ 
+  free_page((unsigned long)vcpu->arch.shared & PAGE_MASK);
+  kvm_vcpu_uninit(vcpu);
+- kfree(vcpu_book3s->shadow_vcpu);
++#ifdef CONFIG_KVM_BOOK3S_32
++ kfree(vcpu->arch.shadow_vcpu);
++#endif
+  vfree(vcpu_book3s);
++ kmem_cache_free(kvm_vcpu_cache, vcpu);
+ }
+ 
+ int kvmppc_vcpu_run(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
+@@ -1444,8 +1454,7 @@ static int kvmppc_book3s_init(void)
+ {
+  int r;
+ 
+- r = kvm_init(NULL, sizeof(struct kvmppc_vcpu_book3s), 0,
+-       THIS_MODULE);
++ r = kvm_init(NULL, sizeof(struct kvm_vcpu), 0, THIS_MODULE);
+ 
+  if (r)
+   return r;
+-- 
+1.7.1

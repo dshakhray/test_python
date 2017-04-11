@@ -1,0 +1,73 @@
+From e92a90711ccc2b6c1479e531e5f15d50821e26a2 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 28 Aug 2014 03:06:14 -0400
+Subject: [acpi] hotplug: Fix panic on eject to ejected device
+
+Message-id: <20140828030614.2117.73288.stgit@gir.stowe>
+Patchwork-id: 89314
+O-Subject: [RHEL7.1 PATCH 26/30] ACPI / hotplug: Fix panic on eject to ejected device
+Bugzilla: 1128632
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1128632
+Upstream Status: 8fcfb99c8e29c73dd8945b6105ef54ca4eeb171e
+
+commit 8fcfb99c8e29c73dd8945b6105ef54ca4eeb171e
+Author: Toshi Kani <toshi.kani@hp.com>
+Date:   Tue Feb 4 17:48:28 2014 -0700
+
+    ACPI / hotplug: Fix panic on eject to ejected device
+
+    When an eject request is sent to an ejected ACPI device, the following
+    panic occurs:
+
+     ACPI: \_SB_.SCK3.CPU3: ACPI_NOTIFY_EJECT_REQUEST event
+     BUG: unable to handle kernel NULL pointer dereference at 0000000000000070
+     IP: [<ffffffff813a7cfe>] acpi_device_hotplug+0x10b/0x33b
+        :
+     Call Trace:
+     [<ffffffff813a24da>] acpi_hotplug_work_fn+0x1c/0x27
+     [<ffffffff8109cbe5>] process_one_work+0x175/0x430
+     [<ffffffff8109d7db>] worker_thread+0x11b/0x3a0
+
+    This is becase device->handler is NULL in acpi_device_hotplug().
+    This case was used to fail in acpi_hotplug_notify_cb() as the target
+    had no acpi_deivce.  However, acpi_device now exists after ejection.
+
+    Added a check to verify if acpi_device->handler is valid for an
+    eject request in acpi_hotplug_notify_cb().  Note that handler passed
+    from an argument is still valid while acpi_device->handler is NULL.
+
+    Fixes: 202317a573b2 (ACPI / scan: Add acpi_device objects for all device nodes in the namespace)
+    Signed-off-by: Toshi Kani <toshi.kani@hp.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index ba62d05..bc06fa8 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -390,7 +390,6 @@ static void acpi_device_hotplug(void *data, u32 src)
+ static void acpi_hotplug_notify_cb(acpi_handle handle, u32 type, void *data)
+ {
+  u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+- struct acpi_scan_handler *handler = data;
+  struct acpi_device *adev;
+  acpi_status status;
+ 
+@@ -406,7 +405,10 @@ static void acpi_hotplug_notify_cb(acpi_handle handle, u32 type, void *data)
+   break;
+  case ACPI_NOTIFY_EJECT_REQUEST:
+   acpi_handle_debug(handle, "ACPI_NOTIFY_EJECT_REQUEST event\n");
+-  if (!handler->hotplug.enabled) {
++  if (!adev->handler)
++   goto err_out;
++
++  if (!adev->handler->hotplug.enabled) {
+    acpi_handle_err(handle, "Eject disabled\n");
+    ost_code = ACPI_OST_SC_EJECT_NOT_SUPPORTED;
+    goto err_out;
+-- 
+1.7.1

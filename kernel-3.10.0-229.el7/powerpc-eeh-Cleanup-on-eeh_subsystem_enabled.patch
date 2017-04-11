@@ -1,0 +1,167 @@
+From 9ad760d45a70ff69296a2e8ea9f6d93a2d8e8ee5 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:08:42 -0400
+Subject: [powerpc] eeh: Cleanup on eeh_subsystem_enabled
+
+Message-id: <1410545655-205645-294-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94240
+O-Subject: [RHEL7 PATCH 293/626] powerpc/eeh: Cleanup on eeh_subsystem_enabled
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 2ec5a0adf60c23bb6b0a95d3b96a8c1ff1e1aa5a
+Author: Gavin Shan <shangw@linux.vnet.ibm.com>
+Date:   Wed Feb 12 15:24:55 2014 +0800
+
+    powerpc/eeh: Cleanup on eeh_subsystem_enabled
+
+    The patch cleans up variable eeh_subsystem_enabled so that we needn't
+    refer the variable directly from external. Instead, we will use
+    function eeh_enabled() and eeh_set_enable() to operate the variable.
+
+    Signed-off-by: Gavin Shan <shangw@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index 9e39ceb..d4dd41f 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -172,10 +172,20 @@ struct eeh_ops {
+ };
+ 
+ extern struct eeh_ops *eeh_ops;
+-extern int eeh_subsystem_enabled;
++extern bool eeh_subsystem_enabled;
+ extern raw_spinlock_t confirm_error_lock;
+ extern int eeh_probe_mode;
+ 
++static inline bool eeh_enabled(void)
++{
++ return eeh_subsystem_enabled;
++}
++
++static inline void eeh_set_enable(bool mode)
++{
++ eeh_subsystem_enabled = mode;
++}
++
+ #define EEH_PROBE_MODE_DEV (1<<0) /* From PCI device */
+ #define EEH_PROBE_MODE_DEVTREE (1<<1) /* From device tree */
+ 
+@@ -246,7 +256,7 @@ void eeh_remove_device(struct pci_dev *);
+  * If this macro yields TRUE, the caller relays to eeh_check_failure()
+  * which does further tests out of line.
+  */
+-#define EEH_POSSIBLE_ERROR(val, type) ((val) == (type)~0 && eeh_subsystem_enabled)
++#define EEH_POSSIBLE_ERROR(val, type) ((val) == (type)~0 && eeh_enabled())
+ 
+ /*
+  * Reads from a device which has been isolated by EEH will return
+@@ -257,6 +267,13 @@ void eeh_remove_device(struct pci_dev *);
+ 
+ #else /* !CONFIG_EEH */
+ 
++static inline bool eeh_enabled(void)
++{
++        return false;
++}
++
++static inline void eeh_set_enable(bool mode) { }
++
+ static inline int eeh_init(void)
+ {
+  return 0;
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index 4a83202..a69a4ad 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -89,7 +89,7 @@
+ /* Platform dependent EEH operations */
+ struct eeh_ops *eeh_ops = NULL;
+ 
+-int eeh_subsystem_enabled;
++bool eeh_subsystem_enabled = false;
+ EXPORT_SYMBOL(eeh_subsystem_enabled);
+ 
+ /*
+@@ -365,7 +365,7 @@ int eeh_dev_check_failure(struct eeh_dev *edev)
+ 
+  eeh_stats.total_mmio_ffs++;
+ 
+- if (!eeh_subsystem_enabled)
++ if (!eeh_enabled())
+   return 0;
+ 
+  if (!edev) {
+@@ -823,7 +823,7 @@ int eeh_init(void)
+    return ret;
+  }
+ 
+- if (eeh_subsystem_enabled)
++ if (eeh_enabled())
+   pr_info("EEH: PCI Enhanced I/O Error Handling Enabled\n");
+  else
+   pr_warning("EEH: No capable adapters found\n");
+@@ -898,7 +898,7 @@ void eeh_add_device_late(struct pci_dev *dev)
+  struct device_node *dn;
+  struct eeh_dev *edev;
+ 
+- if (!dev || !eeh_subsystem_enabled)
++ if (!dev || !eeh_enabled())
+   return;
+ 
+  pr_debug("EEH: Adding device %s\n", pci_name(dev));
+@@ -1006,7 +1006,7 @@ void eeh_remove_device(struct pci_dev *dev)
+ {
+  struct eeh_dev *edev;
+ 
+- if (!dev || !eeh_subsystem_enabled)
++ if (!dev || !eeh_enabled())
+   return;
+  edev = pci_dev_to_eeh_dev(dev);
+ 
+@@ -1046,7 +1046,7 @@ void eeh_remove_device(struct pci_dev *dev)
+ 
+ static int proc_eeh_show(struct seq_file *m, void *v)
+ {
+- if (0 == eeh_subsystem_enabled) {
++ if (!eeh_enabled()) {
+   seq_printf(m, "EEH Subsystem is globally disabled\n");
+   seq_printf(m, "eeh_total_mmio_ffs=%llu\n", eeh_stats.total_mmio_ffs);
+  } else {
+diff --git a/arch/powerpc/platforms/powernv/eeh-powernv.c b/arch/powerpc/platforms/powernv/eeh-powernv.c
+index a79fddc..a59788e 100644
+--- a/arch/powerpc/platforms/powernv/eeh-powernv.c
++++ b/arch/powerpc/platforms/powernv/eeh-powernv.c
+@@ -145,7 +145,7 @@ static int powernv_eeh_dev_probe(struct pci_dev *dev, void *flag)
+   * Enable EEH explicitly so that we will do EEH check
+   * while accessing I/O stuff
+   */
+- eeh_subsystem_enabled = 1;
++ eeh_set_enable(true);
+ 
+  /* Save memory bars */
+  eeh_save_bars(edev);
+diff --git a/arch/powerpc/platforms/pseries/eeh_pseries.c b/arch/powerpc/platforms/pseries/eeh_pseries.c
+index 9ef3cc8..8a8f047 100644
+--- a/arch/powerpc/platforms/pseries/eeh_pseries.c
++++ b/arch/powerpc/platforms/pseries/eeh_pseries.c
+@@ -265,7 +265,7 @@ static void *pseries_eeh_of_probe(struct device_node *dn, void *flag)
+    enable = 1;
+ 
+   if (enable) {
+-   eeh_subsystem_enabled = 1;
++   eeh_set_enable(true);
+    eeh_add_to_parent_pe(edev);
+ 
+    pr_debug("%s: EEH enabled on %s PHB#%d-PE#%x, config addr#%x\n",
+-- 
+1.7.1

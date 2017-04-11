@@ -1,0 +1,101 @@
+From 283b10ef796600379e3fe82a3474b5e561c53dab Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:35:16 -0400
+Subject: [block] blk-mq: make ->flush_rq fully transparent to drivers
+
+Message-id: <1402670238-13916-29-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83781
+O-Subject: [RHEL7.1 PATCH 028/150] blk-mq: make ->flush_rq fully transparent to drivers
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit 8727af4b9d45c7503042e3fbd926c1a173876e9c
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon Apr 14 10:30:08 2014 +0200
+
+    blk-mq: make ->flush_rq fully transparent to drivers
+
+    Drivers shouldn't have to care about the block layer setting aside a
+    request to implement the flush state machine.  We already override the
+    mq context and tag to make it more transparent, but so far haven't deal
+    with the driver private data in the request.  Make sure to override this
+    as well, and while we're at it add a proper helper sitting in blk-mq.c
+    that implements the full impersonation.
+
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index e4b9d54..b1ca34e 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -307,16 +307,8 @@ static bool blk_kick_flush(struct request_queue *q)
+  q->flush_pending_idx ^= 1;
+ 
+  blk_rq_init(q, q->flush_rq);
+- if (q->mq_ops) {
+-  /*
+-   * Reuse the tag value from the fist waiting request,
+-   * with blk-mq the tag is generated during request
+-   * allocation and drivers can rely on it being inside
+-   * the range they asked for.
+-   */
+-  q->flush_rq->mq_ctx = first_rq->mq_ctx;
+-  q->flush_rq->tag = first_rq->tag;
+- }
++ if (q->mq_ops)
++  blk_mq_clone_flush_request(q->flush_rq, first_rq);
+ 
+  q->flush_rq->cmd_type = REQ_TYPE_FS;
+  q->flush_rq->cmd_flags = WRITE_FLUSH | REQ_FLUSH_SEQ;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index d9d0984..e644fee 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -275,6 +275,26 @@ void blk_mq_free_request(struct request *rq)
+  __blk_mq_free_request(hctx, ctx, rq);
+ }
+ 
++/*
++ * Clone all relevant state from a request that has been put on hold in
++ * the flush state machine into the preallocated flush request that hangs
++ * off the request queue.
++ *
++ * For a driver the flush request should be invisible, that's why we are
++ * impersonating the original request here.
++ */
++void blk_mq_clone_flush_request(struct request *flush_rq,
++  struct request *orig_rq)
++{
++ struct blk_mq_hw_ctx *hctx =
++  orig_rq->q->mq_ops->map_queue(orig_rq->q, orig_rq->mq_ctx->cpu);
++
++ flush_rq->mq_ctx = orig_rq->mq_ctx;
++ flush_rq->tag = orig_rq->tag;
++ memcpy(blk_mq_rq_to_pdu(flush_rq), blk_mq_rq_to_pdu(orig_rq),
++  hctx->cmd_size);
++}
++
+ bool blk_mq_end_io_partial(struct request *rq, int error, unsigned int nr_bytes)
+ {
+  if (blk_update_request(rq, error, blk_rq_bytes(rq)))
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 238379a..7964dad 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -27,6 +27,8 @@ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async);
+ void blk_mq_init_flush(struct request_queue *q);
+ void blk_mq_drain_queue(struct request_queue *q);
+ void blk_mq_free_queue(struct request_queue *q);
++void blk_mq_clone_flush_request(struct request *flush_rq,
++  struct request *orig_rq);
+ 
+ /*
+  * CPU hotplug helpers
+-- 
+1.7.1

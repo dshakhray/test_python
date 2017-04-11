@@ -1,0 +1,187 @@
+From f265ae11e4510742fe5d4f61fe59444e1b6a2aed Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:11:55 -0400
+Subject: [powerpc] eeh: Allow to disable EEH
+
+Message-id: <1410545655-205645-487-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94688
+O-Subject: [RHEL7 PATCH 486/626] powerpc/eeh: Allow to disable EEH
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 7f52a526f64c69c913f0027fbf43821ff0b3a7d7
+Author: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Date:   Thu Apr 24 18:00:18 2014 +1000
+
+    powerpc/eeh: Allow to disable EEH
+
+    The patch introduces bootarg "eeh=off" to disable EEH functinality.
+    Also, it creates /sys/kerenl/debug/powerpc/eeh_enable to disable
+    or enable EEH functionality. By default, we have the functionality
+    enabled.
+
+    For PowerNV platform, we will restore to have the conventional
+    mechanism of clearing frozen PE during PCI config access if we're
+    going to disable EEH functionality. Conversely, we will rely on
+    EEH for error recovery.
+
+    The patch also fixes the issue that we missed to cover the case
+    of disabled EEH functionality in function ioda_eeh_event(). Those
+    events driven by interrupt should be cleared to avoid endless
+    reporting.
+
+    Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index c5508a7..3764fb7 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/debugfs.h>
+ #include <linux/sched.h>
+ #include <linux/init.h>
+ #include <linux/list.h>
+@@ -132,6 +133,15 @@ static struct eeh_stats eeh_stats;
+ 
+ #define IS_BRIDGE(class_code) (((class_code)<<16) == PCI_BASE_CLASS_BRIDGE)
+ 
++static int __init eeh_setup(char *str)
++{
++ if (!strcmp(str, "off"))
++  eeh_subsystem_flags |= EEH_FORCE_DISABLED;
++
++ return 1;
++}
++__setup("eeh=", eeh_setup);
++
+ /**
+  * eeh_gather_pci_data - Copy assorted PCI config space registers to buff
+  * @edev: device to report data for
+@@ -1104,10 +1114,45 @@ static const struct file_operations proc_eeh_operations = {
+  .release   = single_release,
+ };
+ 
++#ifdef CONFIG_DEBUG_FS
++static int eeh_enable_dbgfs_set(void *data, u64 val)
++{
++ if (val)
++  eeh_subsystem_flags &= ~EEH_FORCE_DISABLED;
++ else
++  eeh_subsystem_flags |= EEH_FORCE_DISABLED;
++
++ /* Notify the backend */
++ if (eeh_ops->post_init)
++  eeh_ops->post_init();
++
++ return 0;
++}
++
++static int eeh_enable_dbgfs_get(void *data, u64 *val)
++{
++ if (eeh_enabled())
++  *val = 0x1ul;
++ else
++  *val = 0x0ul;
++ return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(eeh_enable_dbgfs_ops, eeh_enable_dbgfs_get,
++   eeh_enable_dbgfs_set, "0x%llx\n");
++#endif
++
+ static int __init eeh_init_proc(void)
+ {
+- if (machine_is(pseries) || machine_is(powernv))
++ if (machine_is(pseries) || machine_is(powernv)) {
+   proc_create("powerpc/eeh", 0, NULL, &proc_eeh_operations);
++#ifdef CONFIG_DEBUG_FS
++  debugfs_create_file("eeh_enable", 0600,
++                                    powerpc_debugfs_root, NULL,
++                                    &eeh_enable_dbgfs_ops);
++#endif
++ }
++
+  return 0;
+ }
+ __initcall(eeh_init_proc);
+diff --git a/arch/powerpc/platforms/powernv/eeh-ioda.c b/arch/powerpc/platforms/powernv/eeh-ioda.c
+index dc52da2..b0f320d 100644
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@ -42,11 +42,19 @@ static int ioda_eeh_event(struct notifier_block *nb,
+ {
+  uint64_t changed_evts = (uint64_t)change;
+ 
+- /* We simply send special EEH event */
+- if ((changed_evts & OPAL_EVENT_PCI_ERROR) &&
+-     (events & OPAL_EVENT_PCI_ERROR) &&
+-     eeh_enabled())
++ /*
++  * We simply send special EEH event if EEH has
++  * been enabled, or clear pending events in
++  * case that we enable EEH soon
++  */
++ if (!(changed_evts & OPAL_EVENT_PCI_ERROR) ||
++     !(events & OPAL_EVENT_PCI_ERROR))
++  return 0;
++
++ if (eeh_enabled())
+   eeh_send_failure_event(NULL);
++ else
++  opal_notifier_update_evt(OPAL_EVENT_PCI_ERROR, 0x0ul);
+ 
+  return 0;
+ }
+@@ -141,7 +149,9 @@ static int ioda_eeh_post_init(struct pci_controller *hose)
+  }
+ 
+ #ifdef CONFIG_DEBUG_FS
+- if (phb->dbgfs) {
++ if (!phb->has_dbgfs && phb->dbgfs) {
++  phb->has_dbgfs = 1;
++
+   debugfs_create_file("err_injct_outbound", 0600,
+         phb->dbgfs, hose,
+         &ioda_eeh_outb_dbgfs_ops);
+@@ -154,7 +164,14 @@ static int ioda_eeh_post_init(struct pci_controller *hose)
+  }
+ #endif
+ 
+- phb->flags |= PNV_PHB_FLAG_EEH;
++ /* If EEH is enabled, we're going to rely on that.
++  * Otherwise, we restore to conventional mechanism
++  * to clear frozen PE during PCI config access.
++  */
++ if (eeh_enabled())
++  phb->flags |= PNV_PHB_FLAG_EEH;
++ else
++  phb->flags &= ~PNV_PHB_FLAG_EEH;
+ 
+  return 0;
+ }
+diff --git a/arch/powerpc/platforms/powernv/pci.h b/arch/powerpc/platforms/powernv/pci.h
+index cb4ca70..3267ddf 100644
+--- a/arch/powerpc/platforms/powernv/pci.h
++++ b/arch/powerpc/platforms/powernv/pci.h
+@@ -100,6 +100,7 @@ struct pnv_phb {
+ #endif
+ 
+ #ifdef CONFIG_DEBUG_FS
++ int   has_dbgfs;
+  struct dentry  *dbgfs;
+ #endif
+ 
+-- 
+1.7.1

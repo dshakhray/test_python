@@ -1,0 +1,186 @@
+From b433b3879d2a93dae27bf8b7fc3c096f6e9f5788 Mon Sep 17 00:00:00 2001
+From: Stefan Assmann <sassmann@redhat.com>
+Date: Tue, 2 Sep 2014 11:39:08 -0400
+Subject: [ethernet] i40e: Helper routine for Rx/Tx queue enable/disable wait
+
+Message-id: <1409658042-22689-188-git-send-email-sassmann@redhat.com>
+Patchwork-id: 90383
+O-Subject: [RHEL7.1 PATCH 187/281] i40e: Helper routine for Rx/Tx queue enable/disable wait
+Bugzilla: 1091126
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Neerav Parikh <neerav.parikh@intel.com>
+
+Introduce helper routines that would wait for the Rx/Tx queue
+to reach the enable or disable state as requested.
+
+Change-ID: I518d9d0e2afef3f45107af3b46e9af402ff587c3
+Signed-off-by: Neerav Parikh <neerav.parikh@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Stefan Assmann <sassmann@redhat.com>
+(cherry picked from commit 23527308d6519c551c8296146f3edf3ad1cd123a)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/i40e/i40e.h b/drivers/net/ethernet/intel/i40e/i40e.h
+index 6598584..fce7e4d 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@ -84,6 +84,7 @@
+ #define I40E_AQ_WORK_LIMIT            16
+ #define I40E_MAX_USER_PRIORITY        8
+ #define I40E_DEFAULT_MSG_ENABLE       4
++#define I40E_QUEUE_WAIT_RETRY_LIMIT   10
+ 
+ #define I40E_NVM_VERSION_LO_SHIFT  0
+ #define I40E_NVM_VERSION_LO_MASK   (0xff << I40E_NVM_VERSION_LO_SHIFT)
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_main.c b/drivers/net/ethernet/intel/i40e/i40e_main.c
+index 87c538d..e0076c1 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -3232,6 +3232,35 @@ static void i40e_netpoll(struct net_device *netdev)
+ #endif
+ 
+ /**
++ * i40e_pf_txq_wait - Wait for a PF's Tx queue to be enabled or disabled
++ * @pf: the PF being configured
++ * @pf_q: the PF queue
++ * @enable: enable or disable state of the queue
++ *
++ * This routine will wait for the given Tx queue of the PF to reach the
++ * enabled or disabled state.
++ * Returns -ETIMEDOUT in case of failing to reach the requested state after
++ * multiple retries; else will return 0 in case of success.
++ **/
++static int i40e_pf_txq_wait(struct i40e_pf *pf, int pf_q, bool enable)
++{
++ int i;
++ u32 tx_reg;
++
++ for (i = 0; i < I40E_QUEUE_WAIT_RETRY_LIMIT; i++) {
++  tx_reg = rd32(&pf->hw, I40E_QTX_ENA(pf_q));
++  if (enable == !!(tx_reg & I40E_QTX_ENA_QENA_STAT_MASK))
++   break;
++
++  udelay(10);
++ }
++ if (i >= I40E_QUEUE_WAIT_RETRY_LIMIT)
++  return -ETIMEDOUT;
++
++ return 0;
++}
++
++/**
+  * i40e_vsi_control_tx - Start or stop a VSI's rings
+  * @vsi: the VSI being configured
+  * @enable: start or stop the rings
+@@ -3240,7 +3269,7 @@ static int i40e_vsi_control_tx(struct i40e_vsi *vsi, bool enable)
+ {
+  struct i40e_pf *pf = vsi->back;
+  struct i40e_hw *hw = &pf->hw;
+- int i, j, pf_q;
++ int i, j, pf_q, ret = 0;
+  u32 tx_reg;
+ 
+  pf_q = vsi->base_queue;
+@@ -3273,22 +3302,46 @@ static int i40e_vsi_control_tx(struct i40e_vsi *vsi, bool enable)
+   wr32(hw, I40E_QTX_ENA(pf_q), tx_reg);
+ 
+   /* wait for the change to finish */
+-  for (j = 0; j < 10; j++) {
+-   tx_reg = rd32(hw, I40E_QTX_ENA(pf_q));
+-   if (enable == !!(tx_reg & I40E_QTX_ENA_QENA_STAT_MASK))
+-    break;
+-
+-   udelay(10);
+-  }
+-  if (j >= 10) {
+-   dev_info(&pf->pdev->dev, "Tx ring %d %sable timeout\n",
+-     pf_q, (enable ? "en" : "dis"));
+-   return -ETIMEDOUT;
++  ret = i40e_pf_txq_wait(pf, pf_q, enable);
++  if (ret) {
++   dev_info(&pf->pdev->dev,
++     "%s: VSI seid %d Tx ring %d %sable timeout\n",
++     __func__, vsi->seid, pf_q,
++     (enable ? "en" : "dis"));
++   break;
+   }
+  }
+ 
+  if (hw->revision_id == 0)
+   mdelay(50);
++ return ret;
++}
++
++/**
++ * i40e_pf_rxq_wait - Wait for a PF's Rx queue to be enabled or disabled
++ * @pf: the PF being configured
++ * @pf_q: the PF queue
++ * @enable: enable or disable state of the queue
++ *
++ * This routine will wait for the given Rx queue of the PF to reach the
++ * enabled or disabled state.
++ * Returns -ETIMEDOUT in case of failing to reach the requested state after
++ * multiple retries; else will return 0 in case of success.
++ **/
++static int i40e_pf_rxq_wait(struct i40e_pf *pf, int pf_q, bool enable)
++{
++ int i;
++ u32 rx_reg;
++
++ for (i = 0; i < I40E_QUEUE_WAIT_RETRY_LIMIT; i++) {
++  rx_reg = rd32(&pf->hw, I40E_QRX_ENA(pf_q));
++  if (enable == !!(rx_reg & I40E_QRX_ENA_QENA_STAT_MASK))
++   break;
++
++  udelay(10);
++ }
++ if (i >= I40E_QUEUE_WAIT_RETRY_LIMIT)
++  return -ETIMEDOUT;
+ 
+  return 0;
+ }
+@@ -3302,7 +3355,7 @@ static int i40e_vsi_control_rx(struct i40e_vsi *vsi, bool enable)
+ {
+  struct i40e_pf *pf = vsi->back;
+  struct i40e_hw *hw = &pf->hw;
+- int i, j, pf_q;
++ int i, j, pf_q, ret = 0;
+  u32 rx_reg;
+ 
+  pf_q = vsi->base_queue;
+@@ -3327,22 +3380,17 @@ static int i40e_vsi_control_rx(struct i40e_vsi *vsi, bool enable)
+   wr32(hw, I40E_QRX_ENA(pf_q), rx_reg);
+ 
+   /* wait for the change to finish */
+-  for (j = 0; j < 10; j++) {
+-   rx_reg = rd32(hw, I40E_QRX_ENA(pf_q));
+-
+-   if (enable == !!(rx_reg & I40E_QRX_ENA_QENA_STAT_MASK))
+-    break;
+-
+-   udelay(10);
+-  }
+-  if (j >= 10) {
+-   dev_info(&pf->pdev->dev, "Rx ring %d %sable timeout\n",
+-     pf_q, (enable ? "en" : "dis"));
+-   return -ETIMEDOUT;
++  ret = i40e_pf_rxq_wait(pf, pf_q, enable);
++  if (ret) {
++   dev_info(&pf->pdev->dev,
++     "%s: VSI seid %d Rx ring %d %sable timeout\n",
++     __func__, vsi->seid, pf_q,
++     (enable ? "en" : "dis"));
++   break;
+   }
+  }
+ 
+- return 0;
++ return ret;
+ }
+ 
+ /**
+-- 
+1.7.1

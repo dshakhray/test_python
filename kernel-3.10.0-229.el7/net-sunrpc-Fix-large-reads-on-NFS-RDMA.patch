@@ -1,0 +1,57 @@
+From 88a73004ba9c75206612ed119d30247fb4d7e643 Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@redhat.com>
+Date: Mon, 21 Apr 2014 12:17:56 -0400
+Subject: [net] sunrpc: Fix large reads on NFS/RDMA
+
+Message-id: <1398082678-3620-3-git-send-email-jlayton@redhat.com>
+Patchwork-id: 78975
+O-Subject: [RHEL7.1 PATCH 2/4] [BZ#1048477] SUNRPC: Fix large reads on NFS/RDMA
+Bugzilla: 1048477
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Chuck Lever <chuck.lever@oracle.com>
+
+After commit a11a2bf4, "SUNRPC: Optimise away unnecessary data
+moves in xdr_align_pages", Thu Aug 2 13:21:43 2012, READs larger
+than a few hundred bytes via NFS/RDMA stopped working.  This
+commit exposed a long-standing bug in rpcrdma_inline_fixup().
+
+I reproduce this with an rsize=4096 mount using the cthon04
+basic tests.  Test 5 fails with an EIO error.
+
+For my reproducer, kernel log shows:
+
+  NFS: server cheating in read reply: count 4096 > recvd 0
+
+rpcrdma_inline_fixup() is zeroing the xdr_stream::page_len
+field, and xdr_align_pages() is now returning that value to
+the READ XDR decoder function.
+
+That field is set up by xdr_inline_pages() by the READ XDR
+encoder function.  As far as I can tell, it is supposed to
+be left alone after that, as it describes the dimensions of
+the reply xdr_stream, not the contents of that stream.
+
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1048477
+Upstream: 2b7bbc963da8d076f263574af4138b5df2e1581f
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index e03725b..96ead52 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -649,9 +649,7 @@ rpcrdma_inline_fixup(struct rpc_rqst *rqst, char *srcp, int copy_len, int pad)
+     break;
+    page_base = 0;
+   }
+-  rqst->rq_rcv_buf.page_len = olen - copy_len;
+- } else
+-  rqst->rq_rcv_buf.page_len = 0;
++ }
+ 
+  if (copy_len && rqst->rq_rcv_buf.tail[0].iov_len) {
+   curlen = copy_len;
+-- 
+1.7.1

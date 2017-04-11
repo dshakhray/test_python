@@ -1,0 +1,117 @@
+From 12e74f84164c1385f59b19ae9a98e9295c916873 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:08:09 -0400
+Subject: [hwmon] via-cputemp: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-33-git-send-email-prarit@redhat.com>
+Patchwork-id: 85773
+O-Subject: [RHEL7.1 PATCH BZ 1119078 32/35] hwmon, via-cputemp: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit 2480b6a3e5e80d778455f8138ae6d6efb568cd59
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:11:33 2014 +0530
+
+    hwmon, via-cputemp: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the hwmon via-cputemp code by using this latter form of callback
+    registration.
+
+    Cc: Jean Delvare <jdelvare@suse.de>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Guenter Roeck <linux@roeck-us.net>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Dean Nelson <dnelson@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/hwmon/via-cputemp.c b/drivers/hwmon/via-cputemp.c
+index 38944e9..8df43c5 100644
+--- a/drivers/hwmon/via-cputemp.c
++++ b/drivers/hwmon/via-cputemp.c
+@@ -319,7 +319,7 @@ static int __init via_cputemp_init(void)
+  if (err)
+   goto exit;
+ 
+- get_online_cpus();
++ cpu_notifier_register_begin();
+  for_each_online_cpu(i) {
+   struct cpuinfo_x86 *c = &cpu_data(i);
+ 
+@@ -339,14 +339,14 @@ static int __init via_cputemp_init(void)
+ 
+ #ifndef CONFIG_HOTPLUG_CPU
+  if (list_empty(&pdev_list)) {
+-  put_online_cpus();
++  cpu_notifier_register_done();
+   err = -ENODEV;
+   goto exit_driver_unreg;
+  }
+ #endif
+ 
+- register_hotcpu_notifier(&via_cputemp_cpu_notifier);
+- put_online_cpus();
++ __register_hotcpu_notifier(&via_cputemp_cpu_notifier);
++ cpu_notifier_register_done();
+  return 0;
+ 
+ #ifndef CONFIG_HOTPLUG_CPU
+@@ -361,8 +361,8 @@ static void __exit via_cputemp_exit(void)
+ {
+  struct pdev_entry *p, *n;
+ 
+- get_online_cpus();
+- unregister_hotcpu_notifier(&via_cputemp_cpu_notifier);
++ cpu_notifier_register_begin();
++ __unregister_hotcpu_notifier(&via_cputemp_cpu_notifier);
+  mutex_lock(&pdev_list_mutex);
+  list_for_each_entry_safe(p, n, &pdev_list, list) {
+   platform_device_unregister(p->pdev);
+@@ -370,7 +370,7 @@ static void __exit via_cputemp_exit(void)
+   kfree(p);
+  }
+  mutex_unlock(&pdev_list_mutex);
+- put_online_cpus();
++ cpu_notifier_register_done();
+  platform_driver_unregister(&via_cputemp_driver);
+ }
+ 
+-- 
+1.7.1

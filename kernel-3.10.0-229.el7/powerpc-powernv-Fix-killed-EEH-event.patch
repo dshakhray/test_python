@@ -1,0 +1,139 @@
+From fcbb313b75eb5eb891f6e4eb2464b3606f5b3469 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:13:20 -0400
+Subject: [powerpc] powernv: Fix killed EEH event
+
+Message-id: <1410545655-205645-572-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94449
+O-Subject: [RHEL7 PATCH 571/626] powerpc/powernv: Fix killed EEH event
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 5c7a35e3e25232aef8d7aee484436f8cbe3b9b94
+Author: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Date:   Wed Jun 4 17:31:52 2014 +1000
+
+    powerpc/powernv: Fix killed EEH event
+
+    On PowerNV platform, EEH errors are reported by IO accessors or poller
+    driven by interrupt. After the PE is isolated, we won't produce EEH
+    event for the PE. The current implementation has possibility of EEH
+    event lost in this way:
+
+    The interrupt handler queues one "special" event, which drives the poller.
+    EEH thread doesn't pick the special event yet. IO accessors kicks in, the
+    frozen PE is marked as "isolated" and EEH event is queued to the list.
+    EEH thread runs because of special event and purge all existing EEH events.
+    However, we never produce an other EEH event for the frozen PE. Eventually,
+    the PE is marked as "isolated" and we don't have EEH event to recover it.
+
+    The patch fixes the issue to keep EEH events for PEs that have been
+    marked as "isolated" with the help of additional "force" help to
+    eeh_remove_event().
+
+    Reported-by: Rolf Brudeseth <rolfb@us.ibm.com>
+    Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/eeh_event.h b/arch/powerpc/include/asm/eeh_event.h
+index 89d5670..1e551a2 100644
+--- a/arch/powerpc/include/asm/eeh_event.h
++++ b/arch/powerpc/include/asm/eeh_event.h
+@@ -33,7 +33,7 @@ struct eeh_event {
+ 
+ int eeh_event_init(void);
+ int eeh_send_failure_event(struct eeh_pe *pe);
+-void eeh_remove_event(struct eeh_pe *pe);
++void eeh_remove_event(struct eeh_pe *pe, bool force);
+ void eeh_handle_event(struct eeh_pe *pe);
+ 
+ #endif /* __KERNEL__ */
+diff --git a/arch/powerpc/kernel/eeh_driver.c b/arch/powerpc/kernel/eeh_driver.c
+index 8bb40e7..420da61 100644
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@ -770,7 +770,7 @@ static void eeh_handle_special_event(void)
+    eeh_serialize_lock(&flags);
+ 
+    /* Purge all events */
+-   eeh_remove_event(NULL);
++   eeh_remove_event(NULL, true);
+ 
+    list_for_each_entry(hose, &hose_list, list_node) {
+     phb_pe = eeh_phb_pe_get(hose);
+@@ -789,7 +789,7 @@ static void eeh_handle_special_event(void)
+    eeh_serialize_lock(&flags);
+ 
+    /* Purge all events of the PHB */
+-   eeh_remove_event(pe);
++   eeh_remove_event(pe, true);
+ 
+    if (rc == EEH_NEXT_ERR_DEAD_PHB)
+     eeh_pe_state_mark(pe, EEH_PE_ISOLATED);
+diff --git a/arch/powerpc/kernel/eeh_event.c b/arch/powerpc/kernel/eeh_event.c
+index 72d748b..4eefb6e 100644
+--- a/arch/powerpc/kernel/eeh_event.c
++++ b/arch/powerpc/kernel/eeh_event.c
+@@ -152,24 +152,33 @@ int eeh_send_failure_event(struct eeh_pe *pe)
+ /**
+  * eeh_remove_event - Remove EEH event from the queue
+  * @pe: Event binding to the PE
++ * @force: Event will be removed unconditionally
+  *
+  * On PowerNV platform, we might have subsequent coming events
+  * is part of the former one. For that case, those subsequent
+  * coming events are totally duplicated and unnecessary, thus
+  * they should be removed.
+  */
+-void eeh_remove_event(struct eeh_pe *pe)
++void eeh_remove_event(struct eeh_pe *pe, bool force)
+ {
+  unsigned long flags;
+  struct eeh_event *event, *tmp;
+ 
++ /*
++  * If we have NULL PE passed in, we have dead IOC
++  * or we're sure we can report all existing errors
++  * by the caller.
++  *
++  * With "force", the event with associated PE that
++  * have been isolated, the event won't be removed
++  * to avoid event lost.
++  */
+  spin_lock_irqsave(&eeh_eventlist_lock, flags);
+  list_for_each_entry_safe(event, tmp, &eeh_eventlist, list) {
+-  /*
+-   * If we don't have valid PE passed in, that means
+-   * we already have event corresponding to dead IOC
+-   * and all events should be purged.
+-   */
++  if (!force && event->pe &&
++      (event->pe->state & EEH_PE_ISOLATED))
++   continue;
++
+   if (!pe) {
+    list_del(&event->list);
+    kfree(event);
+diff --git a/arch/powerpc/platforms/powernv/eeh-ioda.c b/arch/powerpc/platforms/powernv/eeh-ioda.c
+index 5711f6f..9c00209 100644
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@ -717,7 +717,7 @@ static int ioda_eeh_next_error(struct eeh_pe **pe)
+   * And we should keep the cached OPAL notifier event sychronized
+   * between the kernel and firmware.
+   */
+- eeh_remove_event(NULL);
++ eeh_remove_event(NULL, false);
+  opal_notifier_update_evt(OPAL_EVENT_PCI_ERROR, 0x0ul);
+ 
+  list_for_each_entry(hose, &hose_list, list_node) {
+-- 
+1.7.1

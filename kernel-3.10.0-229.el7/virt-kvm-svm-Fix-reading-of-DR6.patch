@@ -1,0 +1,173 @@
+From e7d14dfc5843f82264c48c984fefc20bd2c29f97 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:38:40 -0400
+Subject: [virt] kvm/svm: Fix reading of DR6
+
+Message-id: <1406040016-3289-126-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86204
+O-Subject: [RHEL7 PATCH v2 125/221] KVM: SVM: Fix reading of DR6
+Bugzilla: 1079841 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jan Kiszka <jan.kiszka@siemens.com>
+
+In contrast to VMX, SVM dose not automatically transfer DR6 into the
+VCPU's arch.dr6. So if we face a DR6 read, we must consult a new vendor
+hook to obtain the current value. And as SVM now picks the DR6 state
+from its VMCB, we also need a set callback in order to write updates of
+DR6 back.
+
+Fixes a regression of 020df0794f.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 73aaf249ee2287b4686ff079dcbdbbb658156e64)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index eed9ca2..d0d22a2 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -702,6 +702,8 @@ struct kvm_x86_ops {
+  void (*set_idt)(struct kvm_vcpu *vcpu, struct desc_ptr *dt);
+  void (*get_gdt)(struct kvm_vcpu *vcpu, struct desc_ptr *dt);
+  void (*set_gdt)(struct kvm_vcpu *vcpu, struct desc_ptr *dt);
++ u64 (*get_dr6)(struct kvm_vcpu *vcpu);
++ void (*set_dr6)(struct kvm_vcpu *vcpu, unsigned long value);
+  void (*set_dr7)(struct kvm_vcpu *vcpu, unsigned long value);
+  void (*cache_reg)(struct kvm_vcpu *vcpu, enum kvm_reg reg);
+  unsigned long (*get_rflags)(struct kvm_vcpu *vcpu);
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 476296b..51f792e 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -1671,6 +1671,19 @@ static void new_asid(struct vcpu_svm *svm, struct svm_cpu_data *sd)
+  mark_dirty(svm->vmcb, VMCB_ASID);
+ }
+ 
++static u64 svm_get_dr6(struct kvm_vcpu *vcpu)
++{
++ return to_svm(vcpu)->vmcb->save.dr6;
++}
++
++static void svm_set_dr6(struct kvm_vcpu *vcpu, unsigned long value)
++{
++ struct vcpu_svm *svm = to_svm(vcpu);
++
++ svm->vmcb->save.dr6 = value;
++ mark_dirty(svm->vmcb, VMCB_DR);
++}
++
+ static void svm_set_dr7(struct kvm_vcpu *vcpu, unsigned long value)
+ {
+  struct vcpu_svm *svm = to_svm(vcpu);
+@@ -4287,6 +4300,8 @@ static struct kvm_x86_ops svm_x86_ops = {
+  .set_idt = svm_set_idt,
+  .get_gdt = svm_get_gdt,
+  .set_gdt = svm_set_gdt,
++ .get_dr6 = svm_get_dr6,
++ .set_dr6 = svm_set_dr6,
+  .set_dr7 = svm_set_dr7,
+  .cache_reg = svm_cache_reg,
+  .get_rflags = svm_get_rflags,
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index f520142..25ed5a2 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -5149,6 +5149,15 @@ static int handle_dr(struct kvm_vcpu *vcpu)
+  return 1;
+ }
+ 
++static u64 vmx_get_dr6(struct kvm_vcpu *vcpu)
++{
++ return vcpu->arch.dr6;
++}
++
++static void vmx_set_dr6(struct kvm_vcpu *vcpu, unsigned long val)
++{
++}
++
+ static void vmx_set_dr7(struct kvm_vcpu *vcpu, unsigned long val)
+ {
+  vmcs_writel(GUEST_DR7, val);
+@@ -8555,6 +8564,8 @@ static struct kvm_x86_ops vmx_x86_ops = {
+  .set_idt = vmx_set_idt,
+  .get_gdt = vmx_get_gdt,
+  .set_gdt = vmx_set_gdt,
++ .get_dr6 = vmx_get_dr6,
++ .set_dr6 = vmx_set_dr6,
+  .set_dr7 = vmx_set_dr7,
+  .cache_reg = vmx_cache_reg,
+  .get_rflags = vmx_get_rflags,
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index dbe0f11..9b28850 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -724,6 +724,12 @@ unsigned long kvm_get_cr8(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_get_cr8);
+ 
++static void kvm_update_dr6(struct kvm_vcpu *vcpu)
++{
++ if (!(vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP))
++  kvm_x86_ops->set_dr6(vcpu, vcpu->arch.dr6);
++}
++
+ static void kvm_update_dr7(struct kvm_vcpu *vcpu)
+ {
+  unsigned long dr7;
+@@ -752,6 +758,7 @@ static int __kvm_set_dr(struct kvm_vcpu *vcpu, int dr, unsigned long val)
+   if (val & 0xffffffff00000000ULL)
+    return -1; /* #GP */
+   vcpu->arch.dr6 = (val & DR6_VOLATILE) | DR6_FIXED_1;
++  kvm_update_dr6(vcpu);
+   break;
+  case 5:
+   if (kvm_read_cr4_bits(vcpu, X86_CR4_DE))
+@@ -793,7 +800,10 @@ static int _kvm_get_dr(struct kvm_vcpu *vcpu, int dr, unsigned long *val)
+    return 1;
+   /* fall through */
+  case 6:
+-  *val = vcpu->arch.dr6;
++  if (vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP)
++   *val = vcpu->arch.dr6;
++  else
++   *val = kvm_x86_ops->get_dr6(vcpu);
+   break;
+  case 5:
+   if (kvm_read_cr4_bits(vcpu, X86_CR4_DE))
+@@ -2994,8 +3004,11 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ static void kvm_vcpu_ioctl_x86_get_debugregs(struct kvm_vcpu *vcpu,
+           struct kvm_debugregs *dbgregs)
+ {
++ unsigned long val;
++
+  memcpy(dbgregs->db, vcpu->arch.db, sizeof(vcpu->arch.db));
+- dbgregs->dr6 = vcpu->arch.dr6;
++ _kvm_get_dr(vcpu, 6, &val);
++ dbgregs->dr6 = val;
+  dbgregs->dr7 = vcpu->arch.dr7;
+  dbgregs->flags = 0;
+  memset(&dbgregs->reserved, 0, sizeof(dbgregs->reserved));
+@@ -3009,6 +3022,7 @@ static int kvm_vcpu_ioctl_x86_set_debugregs(struct kvm_vcpu *vcpu,
+ 
+  memcpy(vcpu->arch.db, dbgregs->db, sizeof(vcpu->arch.db));
+  vcpu->arch.dr6 = dbgregs->dr6;
++ kvm_update_dr6(vcpu);
+  vcpu->arch.dr7 = dbgregs->dr7;
+  kvm_update_dr7(vcpu);
+ 
+@@ -6754,6 +6768,7 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu)
+ 
+  memset(vcpu->arch.db, 0, sizeof(vcpu->arch.db));
+  vcpu->arch.dr6 = DR6_FIXED_1;
++ kvm_update_dr6(vcpu);
+  vcpu->arch.dr7 = DR7_FIXED_1;
+  kvm_update_dr7(vcpu);
+ 
+-- 
+1.7.1

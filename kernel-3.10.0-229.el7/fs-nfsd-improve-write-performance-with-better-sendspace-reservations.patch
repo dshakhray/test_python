@@ -1,0 +1,94 @@
+From 59531ac91b6ffcc44294e09c108448606e934c32 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Mon, 23 Jun 2014 21:49:17 -0400
+Subject: [fs] nfsd: improve write performance with better sendspace reservations
+
+Message-id: <1403560314-32525-16-git-send-email-bfields@redhat.com>
+Patchwork-id: 84452
+O-Subject: [Patch RHEL7 015/172] nfsd4: improve write performance with better sendspace reservations
+Bugzilla: 1111719
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+Currently the rpc code conservatively refuses to accept rpc's from a
+client if the sum of its worst-case estimates of the replies it owes
+that client exceed the send buffer space.
+
+Unfortunately our estimate of the worst-case reply for an NFSv4 compound
+is always the maximum read size.  This can unnecessarily limit the
+number of operations we handle concurrently, for example in the case
+most operations are writes (which have small replies).
+
+We can do a little better if we check which ops the compound contains.
+
+This is still a rough estimate, we'll need to improve on it some day.
+
+Reported-by: Shyam Kaushik <shyamnfs1@gmail.com>
+Tested-by: Shyam Kaushik <shyamnfs1@gmail.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 6ff40decff0ef35a5d755ec60182d7f803356dfb
+Bugzilla: 1111719
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c
+index 93ab22d..1763b97 100644
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@ -1598,12 +1598,39 @@ nfsd4_opnum_in_range(struct nfsd4_compoundargs *argp, struct nfsd4_op *op)
+  return true;
+ }
+ 
++/*
++ * Return a rough estimate of the maximum possible reply size.  Note the
++ * estimate includes rpc headers so is meant to be passed to
++ * svc_reserve, not svc_reserve_auth.
++ *
++ * Also note the current compound encoding permits only one operation to
++ * use pages beyond the first one, so the maximum possible length is the
++ * maximum over these values, not the sum.
++ */
++static int nfsd4_max_reply(u32 opnum)
++{
++ switch (opnum) {
++ case OP_READLINK:
++ case OP_READDIR:
++  /*
++   * Both of these ops take a single page for data and put
++   * the head and tail in another page:
++   */
++  return 2 * PAGE_SIZE;
++ case OP_READ:
++  return INT_MAX;
++ default:
++  return PAGE_SIZE;
++ }
++}
++
+ static __be32
+ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
+ {
+  DECODE_HEAD;
+  struct nfsd4_op *op;
+  bool cachethis = false;
++ int max_reply = PAGE_SIZE;
+  int i;
+ 
+  READ_BUF(4);
+@@ -1653,10 +1680,14 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
+    * op in the compound wants to be cached:
+    */
+   cachethis |= nfsd4_cache_this_op(op);
++
++  max_reply = max(max_reply, nfsd4_max_reply(op->opnum));
+  }
+  /* Sessions make the DRC unnecessary: */
+  if (argp->minorversion)
+   cachethis = false;
++ if (max_reply != INT_MAX)
++  svc_reserve(argp->rqstp, max_reply);
+  argp->rqstp->rq_cachetype = cachethis ? RC_REPLBUFF : RC_NOCACHE;
+ 
+  DECODE_TAIL;
+-- 
+1.7.1

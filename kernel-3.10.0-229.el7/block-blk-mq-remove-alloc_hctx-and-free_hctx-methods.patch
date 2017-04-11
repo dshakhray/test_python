@@ -1,0 +1,184 @@
+From 82c2391dd19e1f8f52a1369e1163a186d6a8da4d Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:36:21 -0400
+Subject: [block] blk-mq: remove alloc_hctx and free_hctx methods
+
+Message-id: <1402670238-13916-94-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83835
+O-Subject: [RHEL7.1 PATCH 093/150] blk-mq: remove alloc_hctx and free_hctx methods
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit cdef54dd85ad66e77262ea57796a3e81683dd5d6
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Wed May 28 18:11:06 2014 +0200
+
+    blk-mq: remove alloc_hctx and free_hctx methods
+
+    There is no need for drivers to control hardware context allocation
+    now that we do the context to node mapping in common code.
+
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 5cc4b87..f27fe44 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1335,21 +1335,6 @@ struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q, const int cpu)
+ }
+ EXPORT_SYMBOL(blk_mq_map_queue);
+ 
+-struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *set,
+-         unsigned int hctx_index,
+-         int node)
+-{
+- return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, node);
+-}
+-EXPORT_SYMBOL(blk_mq_alloc_single_hw_queue);
+-
+-void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *hctx,
+-     unsigned int hctx_index)
+-{
+- kfree(hctx);
+-}
+-EXPORT_SYMBOL(blk_mq_free_single_hw_queue);
+-
+ static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+   struct blk_mq_tags *tags, unsigned int hctx_idx)
+ {
+@@ -1590,7 +1575,7 @@ static void blk_mq_free_hw_queues(struct request_queue *q,
+ 
+  queue_for_each_hw_ctx(q, hctx, i) {
+   free_cpumask_var(hctx->cpumask);
+-  set->ops->free_hctx(hctx, i);
++  kfree(hctx);
+  }
+ }
+ 
+@@ -1811,7 +1796,8 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+  for (i = 0; i < set->nr_hw_queues; i++) {
+   int node = blk_mq_hw_queue_to_node(map, i);
+ 
+-  hctxs[i] = set->ops->alloc_hctx(set, i, node);
++  hctxs[i] = kzalloc_node(sizeof(struct blk_mq_hw_ctx),
++     GFP_KERNEL, node);
+   if (!hctxs[i])
+    goto err_hctxs;
+ 
+@@ -1898,7 +1884,7 @@ err_hctxs:
+   if (!hctxs[i])
+    break;
+   free_cpumask_var(hctxs[i]->cpumask);
+-  set->ops->free_hctx(hctxs[i], i);
++  kfree(hctxs[i]);
+  }
+ err_map:
+  kfree(hctxs);
+@@ -1983,9 +1969,7 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+  if (set->queue_depth < set->reserved_tags + BLK_MQ_TAG_MIN)
+   return -EINVAL;
+ 
+- if (!set->nr_hw_queues ||
+-     !set->ops->queue_rq || !set->ops->map_queue ||
+-     !set->ops->alloc_hctx || !set->ops->free_hctx)
++ if (!set->nr_hw_queues || !set->ops->queue_rq || !set->ops->map_queue)
+   return -EINVAL;
+ 
+ 
+diff --git a/drivers/block/null_blk.c b/drivers/block/null_blk.c
+index a1b82ef..d2aa4a1 100644
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@ -321,18 +321,6 @@ static int null_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
+  return BLK_MQ_RQ_QUEUE_OK;
+ }
+ 
+-static struct blk_mq_hw_ctx *null_alloc_hctx(struct blk_mq_tag_set *set,
+-          unsigned int hctx_index,
+-          int node)
+-{
+- return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, node);
+-}
+-
+-static void null_free_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_index)
+-{
+- kfree(hctx);
+-}
+-
+ static void null_init_queue(struct nullb *nullb, struct nullb_queue *nq)
+ {
+  BUG_ON(!nullb);
+@@ -360,17 +348,6 @@ static struct blk_mq_ops null_mq_ops = {
+  .map_queue      = blk_mq_map_queue,
+  .init_hctx = null_init_hctx,
+  .complete = null_softirq_done_fn,
+- .alloc_hctx = blk_mq_alloc_single_hw_queue,
+- .free_hctx = blk_mq_free_single_hw_queue,
+-};
+-
+-static struct blk_mq_ops null_mq_ops_pernode = {
+- .queue_rq       = null_queue_rq,
+- .map_queue      = blk_mq_map_queue,
+- .init_hctx = null_init_hctx,
+- .complete = null_softirq_done_fn,
+- .alloc_hctx = null_alloc_hctx,
+- .free_hctx = null_free_hctx,
+ };
+ 
+ static void null_del_dev(struct nullb *nullb)
+@@ -493,10 +470,7 @@ static int null_add_dev(void)
+   goto out_free_nullb;
+ 
+  if (queue_mode == NULL_Q_MQ) {
+-  if (use_per_node_hctx)
+-   nullb->tag_set.ops = &null_mq_ops_pernode;
+-  else
+-   nullb->tag_set.ops = &null_mq_ops;
++  nullb->tag_set.ops = &null_mq_ops;
+   nullb->tag_set.nr_hw_queues = submit_queues;
+   nullb->tag_set.queue_depth = hw_queue_depth;
+   nullb->tag_set.numa_node = home_node;
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 8e00a2d..013f9cb 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -79,9 +79,6 @@ struct blk_mq_tag_set {
+ 
+ typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+ typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+-typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_tag_set *,
+-  unsigned int, int);
+-typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+ typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ typedef int (init_request_fn)(void *, struct request *, unsigned int,
+@@ -108,12 +105,6 @@ struct blk_mq_ops {
+  softirq_done_fn  *complete;
+ 
+  /*
+-  * Override for hctx allocations (should probably go)
+-  */
+- alloc_hctx_fn  *alloc_hctx;
+- free_hctx_fn  *free_hctx;
+-
+- /*
+   * Called when the block layer side of a hardware queue has been
+   * set up, allowing the driver to allocate/init matching structures.
+   * Ditto for exit/teardown.
+@@ -166,7 +157,6 @@ struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+ 
+ struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+ struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+-void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+ 
+ void blk_mq_end_io(struct request *rq, int error);
+ void __blk_mq_end_io(struct request *rq, int error);
+-- 
+1.7.1

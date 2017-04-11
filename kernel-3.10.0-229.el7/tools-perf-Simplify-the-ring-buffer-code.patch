@@ -1,0 +1,94 @@
+From 4c22e5b5e6c7481ae33b34d1de8d95781dd0020e Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:23:08 -0400
+Subject: [tools] perf: Simplify the ring-buffer code
+
+Message-id: <1408462094-14194-20-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88009
+O-Subject: [PATCH RHEL7.1 BZ1131394 019/325] perf: Simplify the ring-buffer code
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 26c86da8821f7b64fced498674990318bc34c8de
+Author: Peter Zijlstra <peterz@infradead.org>
+Date: Thu Oct 31 10:19:59 2013 +0100
+
+description
+===========
+By using CIRC_SPACE() we can obviate the need for perf_output_space().
+
+Shrinks the size of perf_output_begin() by 17 bytes on
+x86_64-defconfig.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 9c2ddfb..6929c58 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -12,40 +12,10 @@
+ #include <linux/perf_event.h>
+ #include <linux/vmalloc.h>
+ #include <linux/slab.h>
++#include <linux/circ_buf.h>
+ 
+ #include "internal.h"
+ 
+-static bool perf_output_space(struct ring_buffer *rb, unsigned long tail,
+-         unsigned long offset, unsigned long head)
+-{
+- unsigned long sz = perf_data_size(rb);
+- unsigned long mask = sz - 1;
+-
+- /*
+-  * check if user-writable
+-  * overwrite : over-write its own tail
+-  * !overwrite: buffer possibly drops events.
+-  */
+- if (rb->overwrite)
+-  return true;
+-
+- /*
+-  * verify that payload is not bigger than buffer
+-  * otherwise masking logic may fail to detect
+-  * the "not enough space" condition
+-  */
+- if ((head - offset) > sz)
+-  return false;
+-
+- offset = (offset - tail) & mask;
+- head   = (head   - tail) & mask;
+-
+- if ((int)(head - offset) < 0)
+-  return false;
+-
+- return true;
+-}
+-
+ static void perf_output_wakeup(struct perf_output_handle *handle)
+ {
+  atomic_set(&handle->rb->poll, POLL_IN);
+@@ -181,9 +151,10 @@ int perf_output_begin(struct perf_output_handle *handle,
+   tail = ACCESS_ONCE(rb->user_page->data_tail);
+   smp_mb();
+   offset = head = local_read(&rb->head);
+-  head += size;
+-  if (unlikely(!perf_output_space(rb, tail, offset, head)))
++  if (!rb->overwrite &&
++      unlikely(CIRC_SPACE(head, tail, perf_data_size(rb)) < size))
+    goto fail;
++  head += size;
+  } while (local_cmpxchg(&rb->head, offset, head) != offset);
+ 
+  if (head - local_read(&rb->wakeup) > rb->watermark)
+-- 
+1.7.1

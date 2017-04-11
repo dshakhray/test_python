@@ -1,0 +1,120 @@
+From 2a2ac56714078b0ac7e635f2bd13f14a653be98c Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:52:14 -0400
+Subject: [tools] perf/record: Add --initial-delay option
+
+Message-id: <1408953210-26343-247-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88884
+O-Subject: [PATCH RHEL7.1 BZ1133083 246/322] perf record: Add --initial-delay option
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 6619a53ef7572b9eaf7aa71ff7f74c0d06b3817b
+Author: Andi Kleen <ak@linux.intel.com>
+Date: Sat Jan 11 13:38:27 2014 -0800
+
+description
+===========
+perf stat has a --delay option to delay measuring the workload.
+
+This is useful to skip measuring the startup phase of the program, which
+is often very different from the main workload.
+
+The same is useful for perf record when sampling.
+
+--no-delay was already taken, so add a --initial-delay
+to perf record too.
+-D was already taken for record, so there is only a long option.
+
+v2: Don't disable group members (Namhyung Kim)
+v3: port to latest perf/core
+    rename to --initial-delay to avoid conflict with --no-delay
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/Documentation/perf-record.txt b/tools/perf/Documentation/perf-record.txt
+index c407897..82bffac 100644
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@ -209,6 +209,10 @@ overrides that and uses per-thread mmaps.  A side-effect of that is that
+ inheritance is automatically disabled.  --per-thread is ignored with a warning
+ if combined with -a or -C options.
+ 
++--initial-delay msecs::
++After starting the program, wait msecs before measuring. This is useful to
++filter out the startup phase of the program, which is often very different.
++
+ SEE ALSO
+ --------
+ linkperf:perf-stat[1], linkperf:perf-list[1]
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index 8860015..07d4cf8 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -499,7 +499,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
+   * (apart from group members) have enable_on_exec=1 set,
+   * so don't spoil it by prematurely enabling them.
+   */
+- if (!target__none(&opts->target))
++ if (!target__none(&opts->target) && !opts->initial_delay)
+   perf_evlist__enable(rec->evlist);
+ 
+  /*
+@@ -508,6 +508,11 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
+  if (forks)
+   perf_evlist__start_workload(rec->evlist);
+ 
++ if (opts->initial_delay) {
++  usleep(opts->initial_delay * 1000);
++  perf_evlist__enable(rec->evlist);
++ }
++
+  for (;;) {
+   int hits = rec->samples;
+ 
+@@ -877,6 +882,8 @@ const struct option record_options[] = {
+  OPT_CALLBACK('G', "cgroup", &record.evlist, "name",
+        "monitor event in cgroup name only",
+        parse_cgroups),
++ OPT_UINTEGER(0, "initial-delay", &record.opts.initial_delay,
++    "ms to wait before starting measurement after program start"),
+  OPT_STRING('u', "uid", &record.opts.target.uid_str, "user",
+      "user to profile"),
+ 
+diff --git a/tools/perf/perf.h b/tools/perf/perf.h
+index b1cc84b..af1ce6e 100644
+--- a/tools/perf/perf.h
++++ b/tools/perf/perf.h
+@@ -269,6 +269,7 @@ struct record_opts {
+  u64      user_interval;
+  u16      stack_dump_size;
+  bool      sample_transaction;
++ unsigned     initial_delay;
+ };
+ 
+ #endif
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index ade8d9c..cd4630a 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -658,7 +658,8 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
+   * Setting enable_on_exec for independent events and
+   * group leaders for traced executed by perf.
+   */
+- if (target__none(&opts->target) && perf_evsel__is_group_leader(evsel))
++ if (target__none(&opts->target) && perf_evsel__is_group_leader(evsel) &&
++  !opts->initial_delay)
+   attr->enable_on_exec = 1;
+ }
+ 
+-- 
+1.7.1

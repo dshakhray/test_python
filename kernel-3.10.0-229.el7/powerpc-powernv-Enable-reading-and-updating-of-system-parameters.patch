@@ -1,0 +1,414 @@
+From 9e45338ff58e5363a52bc4371bf21d715c88cc48 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:11 -0400
+Subject: [powerpc] powernv: Enable reading and updating of system parameters
+
+Message-id: <1410545655-205645-323-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94265
+O-Subject: [RHEL7 PATCH 322/626] powerpc/powernv: Enable reading and updating of system parameters
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 4029cd66545f0a45258eda5313b7559bfeaaaae4
+Author: Neelesh Gupta <neelegup@linux.vnet.ibm.com>
+Date:   Fri Mar 7 11:02:09 2014 +0530
+
+    powerpc/powernv: Enable reading and updating of system parameters
+
+    This patch enables reading and updating of system parameters through
+    OPAL call.
+
+    Signed-off-by: Neelesh Gupta <neelegup@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+ create mode 100644 arch/powerpc/platforms/powernv/opal-sysparam.c
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 69deac9..8ee694c 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -168,8 +168,10 @@ extern int opal_enter_rtas(struct rtas_args *args,
+ #define OPAL_DUMP_ACK    84
+ #define OPAL_GET_MSG    85
+ #define OPAL_CHECK_ASYNC_COMPLETION  86
+-#define OPAL_DUMP_RESEND   91
+ #define OPAL_SYNC_HOST_REBOOT   87
++#define OPAL_GET_PARAM    89
++#define OPAL_SET_PARAM    90
++#define OPAL_DUMP_RESEND   91
+ #define OPAL_DUMP_INFO2    94
+ 
+ #ifndef __ASSEMBLY__
+@@ -411,6 +413,13 @@ enum OpalLPCAddressType {
+  OPAL_LPC_FW = 2,
+ };
+ 
++/* System parameter permission */
++enum OpalSysparamPerm {
++ OPAL_SYSPARAM_READ      = 0x1,
++ OPAL_SYSPARAM_WRITE     = 0x2,
++ OPAL_SYSPARAM_RW        = (OPAL_SYSPARAM_READ | OPAL_SYSPARAM_WRITE),
++};
++
+ struct opal_msg {
+  uint32_t msg_type;
+  uint32_t reserved;
+@@ -860,6 +869,10 @@ int64_t opal_dump_resend_notification(void);
+ int64_t opal_get_msg(uint64_t buffer, size_t size);
+ int64_t opal_check_completion(uint64_t buffer, size_t size, uint64_t token);
+ int64_t opal_sync_host_reboot(void);
++int64_t opal_get_param(uint64_t token, uint32_t param_id, uint64_t buffer,
++  size_t length);
++int64_t opal_set_param(uint64_t token, uint32_t param_id, uint64_t buffer,
++  size_t length);
+ 
+ /* Internal functions */
+ extern int early_init_dt_scan_opal(unsigned long node, const char *uname, int depth, void *data);
+@@ -901,6 +914,7 @@ extern void opal_nvram_init(void);
+ extern void opal_flash_init(void);
+ extern int opal_elog_init(void);
+ extern void opal_platform_dump_init(void);
++extern void opal_sys_param_init(void);
+ 
+ extern int opal_machine_check(struct pt_regs *regs);
+ extern bool opal_mce_check_early_recovery(struct pt_regs *regs);
+diff --git a/arch/powerpc/platforms/powernv/Makefile b/arch/powerpc/platforms/powernv/Makefile
+index 3f9309c..760b499 100644
+--- a/arch/powerpc/platforms/powernv/Makefile
++++ b/arch/powerpc/platforms/powernv/Makefile
+@@ -1,6 +1,6 @@
+ obj-y   += setup.o opal-takeover.o opal-wrappers.o opal.o opal-async.o
+ obj-y   += opal-rtc.o opal-nvram.o opal-lpc.o opal-flash.o
+-obj-y   += rng.o opal-elog.o opal-dump.o
++obj-y   += rng.o opal-elog.o opal-dump.o opal-sysparam.o
+ 
+ obj-$(CONFIG_SMP) += smp.o
+ obj-$(CONFIG_PCI) += pci.o pci-p5ioc2.o pci-ioda.o
+diff --git a/arch/powerpc/platforms/powernv/opal-sysparam.c b/arch/powerpc/platforms/powernv/opal-sysparam.c
+new file mode 100644
+index 0000000..0bd249a
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/opal-sysparam.c
+@@ -0,0 +1,290 @@
++/*
++ * PowerNV system parameter code
++ *
++ * Copyright (C) 2013 IBM
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/kobject.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/of.h>
++#include <linux/gfp.h>
++#include <linux/stat.h>
++#include <asm/opal.h>
++
++#define MAX_PARAM_DATA_LEN 64
++
++static DEFINE_MUTEX(opal_sysparam_mutex);
++static struct kobject *sysparam_kobj;
++static void *param_data_buf;
++
++struct param_attr {
++ struct list_head list;
++ u32 param_id;
++ u32 param_size;
++ struct kobj_attribute kobj_attr;
++};
++
++static int opal_get_sys_param(u32 param_id, u32 length, void *buffer)
++{
++ struct opal_msg msg;
++ int ret, token;
++
++ token = opal_async_get_token_interruptible();
++ if (token < 0) {
++  if (token != -ERESTARTSYS)
++   pr_err("%s: Couldn't get the token, returning\n",
++     __func__);
++  ret = token;
++  goto out;
++ }
++
++ ret = opal_get_param(token, param_id, (u64)buffer, length);
++ if (ret != OPAL_ASYNC_COMPLETION)
++  goto out_token;
++
++ ret = opal_async_wait_response(token, &msg);
++ if (ret) {
++  pr_err("%s: Failed to wait for the async response, %d\n",
++    __func__, ret);
++  goto out_token;
++ }
++
++ ret = msg.params[1];
++
++out_token:
++ opal_async_release_token(token);
++out:
++ return ret;
++}
++
++static int opal_set_sys_param(u32 param_id, u32 length, void *buffer)
++{
++ struct opal_msg msg;
++ int ret, token;
++
++ token = opal_async_get_token_interruptible();
++ if (token < 0) {
++  if (token != -ERESTARTSYS)
++   pr_err("%s: Couldn't get the token, returning\n",
++     __func__);
++  ret = token;
++  goto out;
++ }
++
++ ret = opal_set_param(token, param_id, (u64)buffer, length);
++
++ if (ret != OPAL_ASYNC_COMPLETION)
++  goto out_token;
++
++ ret = opal_async_wait_response(token, &msg);
++ if (ret) {
++  pr_err("%s: Failed to wait for the async response, %d\n",
++    __func__, ret);
++  goto out_token;
++ }
++
++ ret = msg.params[1];
++
++out_token:
++ opal_async_release_token(token);
++out:
++ return ret;
++}
++
++static ssize_t sys_param_show(struct kobject *kobj,
++  struct kobj_attribute *kobj_attr, char *buf)
++{
++ struct param_attr *attr = container_of(kobj_attr, struct param_attr,
++   kobj_attr);
++ int ret;
++
++ mutex_lock(&opal_sysparam_mutex);
++ ret = opal_get_sys_param(attr->param_id, attr->param_size,
++   param_data_buf);
++ if (ret)
++  goto out;
++
++ memcpy(buf, param_data_buf, attr->param_size);
++
++out:
++ mutex_unlock(&opal_sysparam_mutex);
++ return ret ? ret : attr->param_size;
++}
++
++static ssize_t sys_param_store(struct kobject *kobj,
++  struct kobj_attribute *kobj_attr, const char *buf, size_t count)
++{
++ struct param_attr *attr = container_of(kobj_attr, struct param_attr,
++   kobj_attr);
++ int ret;
++
++ mutex_lock(&opal_sysparam_mutex);
++ memcpy(param_data_buf, buf, count);
++ ret = opal_set_sys_param(attr->param_id, attr->param_size,
++   param_data_buf);
++ mutex_unlock(&opal_sysparam_mutex);
++ return ret ? ret : count;
++}
++
++void __init opal_sys_param_init(void)
++{
++ struct device_node *sysparam;
++ struct param_attr *attr;
++ u32 *id, *size;
++ int count, i;
++ u8 *perm;
++
++ if (!opal_kobj) {
++  pr_warn("SYSPARAM: opal kobject is not available\n");
++  goto out;
++ }
++
++ sysparam_kobj = kobject_create_and_add("sysparams", opal_kobj);
++ if (!sysparam_kobj) {
++  pr_err("SYSPARAM: Failed to create sysparam kobject\n");
++  goto out;
++ }
++
++ /* Allocate big enough buffer for any get/set transactions */
++ param_data_buf = kzalloc(MAX_PARAM_DATA_LEN, GFP_KERNEL);
++ if (!param_data_buf) {
++  pr_err("SYSPARAM: Failed to allocate memory for param data "
++    "buf\n");
++  goto out_kobj_put;
++ }
++
++ sysparam = of_find_node_by_path("/ibm,opal/sysparams");
++ if (!sysparam) {
++  pr_err("SYSPARAM: Opal sysparam node not found\n");
++  goto out_param_buf;
++ }
++
++ if (!of_device_is_compatible(sysparam, "ibm,opal-sysparams")) {
++  pr_err("SYSPARAM: Opal sysparam node not compatible\n");
++  goto out_node_put;
++ }
++
++ /* Number of parameters exposed through DT */
++ count = of_property_count_strings(sysparam, "param-name");
++ if (count < 0) {
++  pr_err("SYSPARAM: No string found of property param-name in "
++    "the node %s\n", sysparam->name);
++  goto out_node_put;
++ }
++
++ id = kzalloc(sizeof(*id) * count, GFP_KERNEL);
++ if (!id) {
++  pr_err("SYSPARAM: Failed to allocate memory to read parameter "
++    "id\n");
++  goto out_node_put;
++ }
++
++ size = kzalloc(sizeof(*size) * count, GFP_KERNEL);
++ if (!size) {
++  pr_err("SYSPARAM: Failed to allocate memory to read parameter "
++    "size\n");
++  goto out_free_id;
++ }
++
++ perm = kzalloc(sizeof(*perm) * count, GFP_KERNEL);
++ if (!perm) {
++  pr_err("SYSPARAM: Failed to allocate memory to read supported "
++    "action on the parameter");
++  goto out_free_size;
++ }
++
++ if (of_property_read_u32_array(sysparam, "param-id", id, count)) {
++  pr_err("SYSPARAM: Missing property param-id in the DT\n");
++  goto out_free_perm;
++ }
++
++ if (of_property_read_u32_array(sysparam, "param-len", size, count)) {
++  pr_err("SYSPARAM: Missing propery param-len in the DT\n");
++  goto out_free_perm;
++ }
++
++
++ if (of_property_read_u8_array(sysparam, "param-perm", perm, count)) {
++  pr_err("SYSPARAM: Missing propery param-perm in the DT\n");
++  goto out_free_perm;
++ }
++
++ attr = kzalloc(sizeof(*attr) * count, GFP_KERNEL);
++ if (!attr) {
++  pr_err("SYSPARAM: Failed to allocate memory for parameter "
++    "attributes\n");
++  goto out_free_perm;
++ }
++
++ /* For each of the parameters, populate the parameter attributes */
++ for (i = 0; i < count; i++) {
++  sysfs_attr_init(&attr[i].kobj_attr.attr);
++  attr[i].param_id = id[i];
++  attr[i].param_size = size[i];
++  if (of_property_read_string_index(sysparam, "param-name", i,
++    &attr[i].kobj_attr.attr.name))
++   continue;
++
++  /* If the parameter is read-only or read-write */
++  switch (perm[i] & 3) {
++  case OPAL_SYSPARAM_READ:
++   attr[i].kobj_attr.attr.mode = S_IRUGO;
++   break;
++  case OPAL_SYSPARAM_WRITE:
++   attr[i].kobj_attr.attr.mode = S_IWUGO;
++   break;
++  case OPAL_SYSPARAM_RW:
++   attr[i].kobj_attr.attr.mode = S_IRUGO | S_IWUGO;
++   break;
++  default:
++   break;
++  }
++
++  attr[i].kobj_attr.show = sys_param_show;
++  attr[i].kobj_attr.store = sys_param_store;
++
++  if (sysfs_create_file(sysparam_kobj, &attr[i].kobj_attr.attr)) {
++   pr_err("SYSPARAM: Failed to create sysfs file %s\n",
++     attr[i].kobj_attr.attr.name);
++   goto out_free_attr;
++  }
++ }
++
++ kfree(perm);
++ kfree(size);
++ kfree(id);
++ of_node_put(sysparam);
++ return;
++
++out_free_attr:
++ kfree(attr);
++out_free_perm:
++ kfree(perm);
++out_free_size:
++ kfree(size);
++out_free_id:
++ kfree(id);
++out_node_put:
++ of_node_put(sysparam);
++out_param_buf:
++ kfree(param_data_buf);
++out_kobj_put:
++ kobject_put(sysparam_kobj);
++out:
++ return;
++}
+diff --git a/arch/powerpc/platforms/powernv/opal-wrappers.S b/arch/powerpc/platforms/powernv/opal-wrappers.S
+index 329b5be..e6c49b6 100644
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@ -141,3 +141,5 @@ OPAL_CALL(opal_get_msg,    OPAL_GET_MSG);
+ OPAL_CALL(opal_check_completion,  OPAL_CHECK_ASYNC_COMPLETION);
+ OPAL_CALL(opal_dump_resend_notification, OPAL_DUMP_RESEND);
+ OPAL_CALL(opal_sync_host_reboot,  OPAL_SYNC_HOST_REBOOT);
++OPAL_CALL(opal_get_param,   OPAL_GET_PARAM);
++OPAL_CALL(opal_set_param,   OPAL_SET_PARAM);
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index 2e269c2..e92f2f6 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -572,6 +572,8 @@ static int __init opal_init(void)
+   opal_flash_init();
+   /* Setup platform dump extract interface */
+   opal_platform_dump_init();
++  /* Setup system parameters interface */
++  opal_sys_param_init();
+  }
+ 
+  return 0;
+-- 
+1.7.1

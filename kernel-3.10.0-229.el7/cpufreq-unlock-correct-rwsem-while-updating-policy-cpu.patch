@@ -1,0 +1,84 @@
+From cf39b8076da10dfbb0357254b0da84e5aa342ca0 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:22:20 -0400
+Subject: [cpufreq] unlock correct rwsem while updating policy->cpu
+
+Message-id: <1409235879-1283-47-git-send-email-prarit@redhat.com>
+Patchwork-id: 89513
+O-Subject: [RHEL7.1 PATCH BZ 1134639 046/185] cpufreq: unlock correct rwsem while updating policy->cpu
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit 8efd57657d8ef666810b55e609da72de92314dc4
+Author: Viresh Kumar <viresh.kumar@linaro.org>
+Date:   Tue Sep 17 10:22:11 2013 +0530
+
+    cpufreq: unlock correct rwsem while updating policy->cpu
+
+    Current code looks like this:
+
+            WARN_ON(lock_policy_rwsem_write(cpu));
+            update_policy_cpu(policy, new_cpu);
+            unlock_policy_rwsem_write(cpu);
+
+    {lock|unlock}_policy_rwsem_write(cpu) takes/releases policy->cpu's rwsem.
+    Because cpu is changing with the call to update_policy_cpu(), the
+    unlock_policy_rwsem_write() will release the incorrect lock.
+
+    The right solution would be to release the same lock as was taken earlier. Also
+    update_policy_cpu() was also called from cpufreq_add_dev() without any locks and
+    so its better if we move this locking to inside update_policy_cpu().
+
+    This patch fixes a regression introduced in 3.12 by commit f9ba680d23
+    (cpufreq: Extract the handover of policy cpu to a helper function).
+
+    Reported-and-tested-by: Jon Medhurst<tixy@linaro.org>
+    Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index a2f6e34..f9e4c52 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -952,9 +952,20 @@ static void update_policy_cpu(struct cpufreq_policy *policy, unsigned int cpu)
+  if (cpu == policy->cpu)
+   return;
+ 
++ /*
++  * Take direct locks as lock_policy_rwsem_write wouldn't work here.
++  * Also lock for last cpu is enough here as contention will happen only
++  * after policy->cpu is changed and after it is changed, other threads
++  * will try to acquire lock for new cpu. And policy is already updated
++  * by then.
++  */
++ down_write(&per_cpu(cpu_policy_rwsem, policy->cpu));
++
+  policy->last_cpu = policy->cpu;
+  policy->cpu = cpu;
+ 
++ up_write(&per_cpu(cpu_policy_rwsem, policy->last_cpu));
++
+ #ifdef CONFIG_CPU_FREQ_TABLE
+  cpufreq_frequency_table_update_policy_cpu(policy);
+ #endif
+@@ -1198,9 +1209,7 @@ static int __cpufreq_remove_dev_prepare(struct device *dev,
+ 
+   new_cpu = cpufreq_nominate_new_policy_cpu(policy, cpu, frozen);
+   if (new_cpu >= 0) {
+-   WARN_ON(lock_policy_rwsem_write(cpu));
+    update_policy_cpu(policy, new_cpu);
+-   unlock_policy_rwsem_write(cpu);
+ 
+    if (!frozen) {
+     pr_debug("%s: policy Kobject moved to cpu: %d "
+-- 
+1.7.1

@@ -1,0 +1,303 @@
+From a1e24ac55fe070ab66f215ce3fd57521b968c615 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:25:40 -0400
+Subject: [tools] perf/trace: Add summary option to dump syscall statistics
+
+Message-id: <1408462094-14194-172-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88147
+O-Subject: [PATCH RHEL7.1 BZ1131394 171/325] perf trace: Add summary option to dump syscall statistics
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit bf2575c121ca11247ef07fd02b43f7430834f7b1
+Author: David Ahern <dsahern@gmail.com>
+Date: Tue Oct 8 21:26:53 2013 -0600
+
+description
+===========
+When enabled dumps a summary of all syscalls by task with the usual
+statistics -- min, max, average and relative stddev. For example,
+
+make - 26341 :       3344   [ 17.4% ]      0.000 ms
+
+                read :   52    0.000     4.802     0.644   30.08
+               write :   20    0.004     0.036     0.010   21.72
+                open :   24    0.003     0.046     0.014   23.68
+               close :   64    0.002     0.055     0.008   22.53
+                stat : 2714    0.002     0.222     0.004    4.47
+               fstat :   18    0.001     0.041     0.006   46.26
+                mmap :   30    0.003     0.009     0.006    5.71
+            mprotect :    8    0.006     0.039     0.016   32.16
+              munmap :   12    0.007     0.077     0.020   38.25
+                 brk :   48    0.002     0.014     0.004   10.18
+        rt_sigaction :   18    0.002     0.002     0.002    2.11
+      rt_sigprocmask :   60    0.002     0.128     0.010   32.88
+              access :    2    0.006     0.006     0.006    0.00
+                pipe :   12    0.004     0.048     0.013   35.98
+               vfork :   34    0.448     0.980     0.692    3.04
+              execve :   20    0.000     0.387     0.046   56.66
+               wait4 :   34    0.017  9923.287   593.221   68.45
+               fcntl :    8    0.001     0.041     0.013   48.79
+            getdents :   48    0.002     0.079     0.013   19.62
+              getcwd :    2    0.005     0.005     0.005    0.00
+               chdir :    2    0.070     0.070     0.070    0.00
+           getrlimit :    2    0.045     0.045     0.045    0.00
+          arch_prctl :    2    0.002     0.002     0.002    0.00
+           setrlimit :    2    0.002     0.002     0.002    0.00
+              openat :   94    0.003     0.005     0.003    2.11
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/Documentation/perf-trace.txt b/tools/perf/Documentation/perf-trace.txt
+index 1a22486..54139c6 100644
+--- a/tools/perf/Documentation/perf-trace.txt
++++ b/tools/perf/Documentation/perf-trace.txt
+@@ -93,6 +93,10 @@ the thread executes on the designated CPUs. Default is to monitor all CPUs.
+ --comm::
+         Show process COMM right beside its ID, on by default, disable with --no-comm.
+ 
++--summary::
++ Show a summary of syscalls by thread with min, max, and average times (in
++    msec) and relative stddev.
++
+ SEE ALSO
+ --------
+ linkperf:perf-record[1], linkperf:perf-script[1]
+diff --git a/tools/perf/builtin-trace.c b/tools/perf/builtin-trace.c
+index 26d4dd0..03c5c4e 100644
+--- a/tools/perf/builtin-trace.c
++++ b/tools/perf/builtin-trace.c
+@@ -10,6 +10,7 @@
+ #include "util/strlist.h"
+ #include "util/intlist.h"
+ #include "util/thread_map.h"
++#include "util/stat.h"
+ 
+ #include <libaudit.h>
+ #include <stdlib.h>
+@@ -909,6 +910,8 @@ struct thread_trace {
+   int   max;
+   char   **table;
+  } paths;
++
++ struct intlist *syscall_stats;
+ };
+ 
+ static struct thread_trace *thread_trace__new(void)
+@@ -918,6 +921,8 @@ static struct thread_trace *thread_trace__new(void)
+  if (ttrace)
+   ttrace->paths.max = -1;
+ 
++ ttrace->syscall_stats = intlist__new(NULL);
++
+  return ttrace;
+ }
+ 
+@@ -964,6 +969,7 @@ struct trace {
+  struct intlist  *pid_list;
+  bool   sched;
+  bool   multiple_threads;
++ bool   summary;
+  bool   show_comm;
+  double   duration_filter;
+  double   runtime_ms;
+@@ -1291,10 +1297,8 @@ typedef int (*tracepoint_handler)(struct trace *trace, struct perf_evsel *evsel,
+       struct perf_sample *sample);
+ 
+ static struct syscall *trace__syscall_info(struct trace *trace,
+-        struct perf_evsel *evsel,
+-        struct perf_sample *sample)
++        struct perf_evsel *evsel, int id)
+ {
+- int id = perf_evsel__intval(evsel, sample, "id");
+ 
+  if (id < 0) {
+ 
+@@ -1335,6 +1339,32 @@ out_cant_read:
+  return NULL;
+ }
+ 
++static void thread__update_stats(struct thread_trace *ttrace,
++     int id, struct perf_sample *sample)
++{
++ struct int_node *inode;
++ struct stats *stats;
++ u64 duration = 0;
++
++ inode = intlist__findnew(ttrace->syscall_stats, id);
++ if (inode == NULL)
++  return;
++
++ stats = inode->priv;
++ if (stats == NULL) {
++  stats = malloc(sizeof(struct stats));
++  if (stats == NULL)
++   return;
++  init_stats(stats);
++  inode->priv = stats;
++ }
++
++ if (ttrace->entry_time && sample->time > ttrace->entry_time)
++  duration = sample->time - ttrace->entry_time;
++
++ update_stats(stats, duration);
++}
++
+ static int trace__sys_enter(struct trace *trace, struct perf_evsel *evsel,
+        struct perf_sample *sample)
+ {
+@@ -1342,7 +1372,8 @@ static int trace__sys_enter(struct trace *trace, struct perf_evsel *evsel,
+  void *args;
+  size_t printed = 0;
+  struct thread *thread;
+- struct syscall *sc = trace__syscall_info(trace, evsel, sample);
++ int id = perf_evsel__intval(evsel, sample, "id");
++ struct syscall *sc = trace__syscall_info(trace, evsel, id);
+  struct thread_trace *ttrace;
+ 
+  if (sc == NULL)
+@@ -1394,7 +1425,8 @@ static int trace__sys_exit(struct trace *trace, struct perf_evsel *evsel,
+  int ret;
+  u64 duration = 0;
+  struct thread *thread;
+- struct syscall *sc = trace__syscall_info(trace, evsel, sample);
++ int id = perf_evsel__intval(evsel, sample, "id");
++ struct syscall *sc = trace__syscall_info(trace, evsel, id);
+  struct thread_trace *ttrace;
+ 
+  if (sc == NULL)
+@@ -1408,6 +1440,9 @@ static int trace__sys_exit(struct trace *trace, struct perf_evsel *evsel,
+  if (ttrace == NULL)
+   return -1;
+ 
++ if (trace->summary)
++  thread__update_stats(ttrace, id, sample);
++
+  ret = perf_evsel__intval(evsel, sample, "ret");
+ 
+  ttrace = thread->priv;
+@@ -1574,6 +1609,8 @@ static int trace__record(int argc, const char **argv)
+  return cmd_record(i, rec_argv, NULL);
+ }
+ 
++static size_t trace__fprintf_thread_summary(struct trace *trace, FILE *fp);
++
+ static int trace__run(struct trace *trace, int argc, const char **argv)
+ {
+  struct perf_evlist *evlist = perf_evlist__new();
+@@ -1705,6 +1742,9 @@ next_event:
+  goto again;
+ 
+ out_unmap_evlist:
++ if (!err && trace->summary)
++  trace__fprintf_thread_summary(trace, trace->output);
++
+  perf_evlist__munmap(evlist);
+ out_close_evlist:
+  perf_evlist__close(evlist);
+@@ -1800,6 +1840,9 @@ static int trace__replay(struct trace *trace)
+  if (err)
+   pr_err("Failed to process events, error %d", err);
+ 
++ else if (trace->summary)
++  trace__fprintf_thread_summary(trace, trace->output);
++
+ out:
+  perf_session__delete(session);
+ 
+@@ -1810,10 +1853,53 @@ static size_t trace__fprintf_threads_header(FILE *fp)
+ {
+  size_t printed;
+ 
+- printed  = fprintf(fp, "\n _____________________________________________________________________\n");
+- printed += fprintf(fp," __)    Summary of events    (__\n\n");
+- printed += fprintf(fp,"              [ task - pid ]     [ events ] [ ratio ]  [ runtime ]\n");
+- printed += fprintf(fp," _____________________________________________________________________\n\n");
++ printed  = fprintf(fp, "\n _____________________________________________________________________________\n");
++ printed += fprintf(fp, " __)    Summary of events    (__\n\n");
++ printed += fprintf(fp, "              [ task - pid ]     [ events ] [ ratio ]  [ runtime ]\n");
++ printed += fprintf(fp, "                                  syscall  count    min     max    avg  stddev\n");
++ printed += fprintf(fp, "                                                   msec    msec   msec     %%\n");
++ printed += fprintf(fp, " _____________________________________________________________________________\n\n");
++
++ return printed;
++}
++
++static size_t thread__dump_stats(struct thread_trace *ttrace,
++     struct trace *trace, FILE *fp)
++{
++ struct stats *stats;
++ size_t printed = 0;
++ struct syscall *sc;
++ struct int_node *inode = intlist__first(ttrace->syscall_stats);
++
++ if (inode == NULL)
++  return 0;
++
++ printed += fprintf(fp, "\n");
++
++ /* each int_node is a syscall */
++ while (inode) {
++  stats = inode->priv;
++  if (stats) {
++   double min = (double)(stats->min) / NSEC_PER_MSEC;
++   double max = (double)(stats->max) / NSEC_PER_MSEC;
++   double avg = avg_stats(stats);
++   double pct;
++   u64 n = (u64) stats->n;
++
++   pct = avg ? 100.0 * stddev_stats(stats)/avg : 0.0;
++   avg /= NSEC_PER_MSEC;
++
++   sc = &trace->syscalls.table[inode->i];
++   printed += fprintf(fp, "%24s  %14s : ", "", sc->name);
++   printed += fprintf(fp, "%5" PRIu64 "  %8.3f  %8.3f",
++        n, min, max);
++   printed += fprintf(fp, "  %8.3f  %6.2f\n", avg, pct);
++  }
++
++  inode = intlist__next(inode);
++ }
++
++ printed += fprintf(fp, "\n\n");
+ 
+  return printed;
+ }
+@@ -1852,6 +1938,7 @@ static int trace__fprintf_one_thread(struct thread *thread, void *priv)
+  printed += fprintf(fp, " - %-5d :%11lu   [", thread->tid, ttrace->nr_events);
+  printed += color_fprintf(fp, color, "%5.1f%%", ratio);
+  printed += fprintf(fp, " ] %10.3f ms\n", ttrace->runtime_ms);
++ printed += thread__dump_stats(ttrace, trace, fp);
+ 
+  data->printed += printed;
+ 
+@@ -1955,6 +2042,8 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
+  OPT_INCR('v', "verbose", &verbose, "be more verbose"),
+  OPT_BOOLEAN('T', "time", &trace.full_time,
+       "Show full timestamp, not time relative to first start"),
++ OPT_BOOLEAN(0, "summary", &trace.summary,
++      "Show syscall summary with statistics"),
+  OPT_END()
+  };
+  int err;
+@@ -2010,9 +2099,6 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
+  else
+   err = trace__run(&trace, argc, argv);
+ 
+- if (trace.sched && !err)
+-  trace__fprintf_thread_summary(&trace, trace.output);
+-
+ out_close:
+  if (output_name != NULL)
+   fclose(trace.output);
+-- 
+1.7.1

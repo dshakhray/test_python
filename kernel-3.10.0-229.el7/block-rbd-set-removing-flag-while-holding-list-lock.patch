@@ -1,0 +1,124 @@
+From ffca068b2a6c591da4a396627bd4091db1c1ea36 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:21:58 -0400
+Subject: [block] rbd: set removing flag while holding list lock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-12-git-send-email-sweil@redhat.com>
+Patchwork-id: 89560
+O-Subject: [PATCH 011/303] rbd: set removing flag while holding list lock
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Alex Elder <elder@inktank.com>
+
+When unmapping a device, its id is supplied, and that is used to
+look up which rbd device should be unmapped.  Looking up the
+device involves searching the rbd device list while holding
+a spinlock that protects access to that list.
+
+Currently all of this is done under protection of the control lock,
+but that protection is going away soon.  To ensure the rbd_dev is
+still valid (still on the list) while setting its REMOVING flag, do
+so while still holding the list lock.  To do so, get rid of
+__rbd_get_dev(), and open code what it did in the one place it
+was used.
+
+Signed-off-by: Alex Elder <elder@inktank.com>
+Reviewed-by: Josh Durgin <josh.durgin@inktank.com>
+(cherry picked from commit 751cc0e3cfabdda87c4c21519253c6751e97a8d4)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index ad10628..eb80536 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -5090,23 +5090,6 @@ err_out_module:
+  return (ssize_t)rc;
+ }
+ 
+-static struct rbd_device *__rbd_get_dev(unsigned long dev_id)
+-{
+- struct list_head *tmp;
+- struct rbd_device *rbd_dev;
+-
+- spin_lock(&rbd_dev_list_lock);
+- list_for_each(tmp, &rbd_dev_list) {
+-  rbd_dev = list_entry(tmp, struct rbd_device, node);
+-  if (rbd_dev->dev_id == dev_id) {
+-   spin_unlock(&rbd_dev_list_lock);
+-   return rbd_dev;
+-  }
+- }
+- spin_unlock(&rbd_dev_list_lock);
+- return NULL;
+-}
+-
+ static void rbd_dev_device_release(struct device *dev)
+ {
+  struct rbd_device *rbd_dev = dev_to_rbd_dev(dev);
+@@ -5151,7 +5134,8 @@ static ssize_t rbd_remove(struct bus_type *bus,
+      size_t count)
+ {
+  struct rbd_device *rbd_dev = NULL;
+- int target_id;
++ struct list_head *tmp;
++ int dev_id;
+  unsigned long ul;
+  int ret;
+ 
+@@ -5160,26 +5144,33 @@ static ssize_t rbd_remove(struct bus_type *bus,
+   return ret;
+ 
+  /* convert to int; abort if we lost anything in the conversion */
+- target_id = (int) ul;
+- if (target_id != ul)
++ dev_id = (int)ul;
++ if (dev_id != ul)
+   return -EINVAL;
+ 
+  mutex_lock_nested(&ctl_mutex, SINGLE_DEPTH_NESTING);
+ 
+- rbd_dev = __rbd_get_dev(target_id);
+- if (!rbd_dev) {
+-  ret = -ENOENT;
+-  goto done;
++ ret = -ENOENT;
++ spin_lock(&rbd_dev_list_lock);
++ list_for_each(tmp, &rbd_dev_list) {
++  rbd_dev = list_entry(tmp, struct rbd_device, node);
++  if (rbd_dev->dev_id == dev_id) {
++   ret = 0;
++   break;
++  }
+  }
+-
+- spin_lock_irq(&rbd_dev->lock);
+- if (rbd_dev->open_count)
+-  ret = -EBUSY;
+- else
+-  set_bit(RBD_DEV_FLAG_REMOVING, &rbd_dev->flags);
+- spin_unlock_irq(&rbd_dev->lock);
++ if (!ret) {
++  spin_lock_irq(&rbd_dev->lock);
++  if (rbd_dev->open_count)
++   ret = -EBUSY;
++  else
++   set_bit(RBD_DEV_FLAG_REMOVING, &rbd_dev->flags);
++  spin_unlock_irq(&rbd_dev->lock);
++ }
++ spin_unlock(&rbd_dev_list_lock);
+  if (ret < 0)
+   goto done;
++
+  rbd_bus_del_dev(rbd_dev);
+  ret = rbd_dev_header_watch_sync(rbd_dev, false);
+  if (ret)
+-- 
+1.7.1

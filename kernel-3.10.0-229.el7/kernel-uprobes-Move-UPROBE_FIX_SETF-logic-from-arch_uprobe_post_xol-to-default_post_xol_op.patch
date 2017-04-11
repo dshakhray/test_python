@@ -1,0 +1,103 @@
+From 78f6abeced1f711a036d1dce78c806f87738ef03 Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Mon, 16 Jun 2014 16:02:06 -0400
+Subject: [kernel] uprobes: Move UPROBE_FIX_SETF logic from arch_uprobe_post_xol() to default_post_xol_op()
+
+Message-id: <20140616160206.GA15495@redhat.com>
+Patchwork-id: 84083
+O-Subject: [PATCH RHEL7 BZ 1073627 25/36] uprobes/x86: Move UPROBE_FIX_SETF logic from arch_uprobe_post_xol() to default_post_xol_op()
+Bugzilla: 1073627
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+RHBZ: 1073627
+
+UPROBE_FIX_SETF is only needed to handle "popf" correctly but it is
+processed by the generic arch_uprobe_post_xol() code. This doesn't
+allows us to make ->fixups private for default_xol_ops.
+
+1 Change default_post_xol_op(UPROBE_FIX_SETF) to set ->saved_tf = T.
+
+   "popf" always reads the flags from stack, it doesn't matter if TF
+   was set or not before single-step. Ignoring the naming, this is
+   even more logical, "saved_tf" means "owned by application" and we
+   do not own this flag after "popf".
+
+2. Change arch_uprobe_post_xol() to save ->saved_tf into the local
+   "bool send_sigtrap" before ->post_xol().
+
+3. Change arch_uprobe_post_xol() to ignore UPROBE_FIX_SETF and just
+   check ->saved_tf after ->post_xol().
+
+With this patch ->fixups and ->rip_rela_target_address are only used
+by default_xol_ops hooks, we are ready to remove them from the common
+part of arch_uprobe.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+(cherry picked from commit 220ef8dc9a7a63fe202aacd3fc61e5104f6dd98c)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index 2efb93f..b2bca29 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -441,6 +441,9 @@ static int default_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs
+    return -ERESTART;
+   }
+  }
++ /* popf; tell the caller to not touch TF */
++ if (auprobe->fixups & UPROBE_FIX_SETF)
++  utask->autask.saved_tf = true;
+ 
+  return 0;
+ }
+@@ -757,15 +760,15 @@ bool arch_uprobe_xol_was_trapped(struct task_struct *t)
+ int arch_uprobe_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+ {
+  struct uprobe_task *utask = current->utask;
++ bool send_sigtrap = utask->autask.saved_tf;
++ int err = 0;
+ 
+  WARN_ON_ONCE(current->thread.trap_nr != UPROBE_TRAP_NR);
+  current->thread.trap_nr = utask->autask.saved_trap_nr;
+ 
+  if (auprobe->ops->post_xol) {
+-  int err = auprobe->ops->post_xol(auprobe, regs);
++  err = auprobe->ops->post_xol(auprobe, regs);
+   if (err) {
+-   if (!utask->autask.saved_tf)
+-    regs->flags &= ~X86_EFLAGS_TF;
+    /*
+     * Restore ->ip for restart or post mortem analysis.
+     * ->post_xol() must not return -ERESTART unless this
+@@ -773,8 +776,8 @@ int arch_uprobe_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+     */
+    regs->ip = utask->vaddr;
+    if (err == -ERESTART)
+-    return 0;
+-   return err;
++    err = 0;
++   send_sigtrap = false;
+   }
+  }
+  /*
+@@ -782,12 +785,13 @@ int arch_uprobe_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+   * so we can get an extra SIGTRAP if we do not clear TF. We need
+   * to examine the opcode to make it right.
+   */
+- if (utask->autask.saved_tf)
++ if (send_sigtrap)
+   send_sig(SIGTRAP, current, 0);
+- else if (!(auprobe->fixups & UPROBE_FIX_SETF))
++
++ if (!utask->autask.saved_tf)
+   regs->flags &= ~X86_EFLAGS_TF;
+ 
+- return 0;
++ return err;
+ }
+ 
+ /* callback routine for handling exceptions. */
+-- 
+1.7.1

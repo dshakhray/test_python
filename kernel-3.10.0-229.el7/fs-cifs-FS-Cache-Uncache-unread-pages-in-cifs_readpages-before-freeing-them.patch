@@ -1,0 +1,117 @@
+From 7d80d6064861619e2c372902bf540cfc252a272b Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:15:57 -0400
+Subject: [fs] cifs: FS-Cache: Uncache unread pages in cifs_readpages() before freeing them
+
+Message-id: <1406549822-10376-5-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86776
+O-Subject: [RHEL7.1 PATCH 04/69] [bz1082049]CIFS: FS-Cache: Uncache unread pages in cifs_readpages() before freeing them
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: David Howells <dhowells@redhat.com>
+
+In cifs_readpages(), we may decide we don't want to read a page after all -
+but the page may already have passed through fscache_read_or_alloc_pages() and
+thus have marks and reservations set.  Thus we have to call
+fscache_readpages_cancel() or fscache_uncache_page() on the pages we're
+returning to clear the marks.
+
+NFS, AFS and 9P should be unaffected by this as they call read_cache_pages()
+which does the cleanup for you.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 54afa99057ee2ffd3df0f5e891298bbbb65ea63c)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index f1ccb35..89c2efe 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -3292,6 +3292,9 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
+  /*
+   * Reads as many pages as possible from fscache. Returns -ENOBUFS
+   * immediately if the cookie is negative
++  *
++  * After this point, every page in the list might have PG_fscache set,
++  * so we will need to clean that up off of every page we don't use.
+   */
+  rc = cifs_readpages_from_fscache(mapping->host, mapping, page_list,
+       &num_pages);
+@@ -3414,6 +3417,11 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
+   kref_put(&rdata->refcount, cifs_readdata_release);
+  }
+ 
++ /* Any pages that have been shown to fscache but didn't get added to
++  * the pagecache must be uncached before they get returned to the
++  * allocator.
++  */
++ cifs_fscache_readpages_cancel(mapping->host, page_list);
+  return rc;
+ }
+ 
+diff --git a/fs/cifs/fscache.c b/fs/cifs/fscache.c
+index 2f4bc5a..b3258f3 100644
+--- a/fs/cifs/fscache.c
++++ b/fs/cifs/fscache.c
+@@ -223,6 +223,13 @@ void __cifs_readpage_to_fscache(struct inode *inode, struct page *page)
+   fscache_uncache_page(CIFS_I(inode)->fscache, page);
+ }
+ 
++void __cifs_fscache_readpages_cancel(struct inode *inode, struct list_head *pages)
++{
++ cifs_dbg(FYI, "%s: (fsc: %p, i: %p)\n",
++   __func__, CIFS_I(inode)->fscache, inode);
++ fscache_readpages_cancel(CIFS_I(inode)->fscache, pages);
++}
++
+ void __cifs_fscache_invalidate_page(struct page *page, struct inode *inode)
+ {
+  struct cifsInodeInfo *cifsi = CIFS_I(inode);
+diff --git a/fs/cifs/fscache.h b/fs/cifs/fscache.h
+index 6353932..24794b6 100644
+--- a/fs/cifs/fscache.h
++++ b/fs/cifs/fscache.h
+@@ -54,6 +54,7 @@ extern int __cifs_readpages_from_fscache(struct inode *,
+       struct address_space *,
+       struct list_head *,
+       unsigned *);
++extern void __cifs_fscache_readpages_cancel(struct inode *, struct list_head *);
+ 
+ extern void __cifs_readpage_to_fscache(struct inode *, struct page *);
+ 
+@@ -91,6 +92,13 @@ static inline void cifs_readpage_to_fscache(struct inode *inode,
+   __cifs_readpage_to_fscache(inode, page);
+ }
+ 
++static inline void cifs_fscache_readpages_cancel(struct inode *inode,
++       struct list_head *pages)
++{
++ if (CIFS_I(inode)->fscache)
++  return __cifs_fscache_readpages_cancel(inode, pages);
++}
++
+ #else /* CONFIG_CIFS_FSCACHE */
+ static inline int cifs_fscache_register(void) { return 0; }
+ static inline void cifs_fscache_unregister(void) {}
+@@ -131,6 +139,11 @@ static inline int cifs_readpages_from_fscache(struct inode *inode,
+ static inline void cifs_readpage_to_fscache(struct inode *inode,
+    struct page *page) {}
+ 
++static inline void cifs_fscache_readpages_cancel(struct inode *inode,
++       struct list_head *pages)
++{
++}
++
+ #endif /* CONFIG_CIFS_FSCACHE */
+ 
+ #endif /* _CIFS_FSCACHE_H */
+-- 
+1.7.1

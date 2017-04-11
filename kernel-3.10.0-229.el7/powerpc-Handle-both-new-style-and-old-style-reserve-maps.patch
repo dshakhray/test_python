@@ -1,0 +1,128 @@
+From c140831b8c6645f52858b9ccdddf7da9b6b0b1d1 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:04:06 -0400
+Subject: [powerpc] Handle both new style and old style reserve maps
+
+Message-id: <1410545655-205645-18-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94065
+O-Subject: [RHEL7 PATCH 017/626] powerpc: Handle both new style and old style reserve maps
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit c039e3a8ddd52139d0f81711ecd757772f868b22
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Tue Jul 2 08:13:52 2013 +1000
+
+    powerpc: Handle both new style and old style reserve maps
+
+    When Jeremy introduced the new device-tree based reserve map, he made
+    the code in early_reserve_mem_dt() bail out if it found one, thus not
+    reserving the initrd nor processing the old style map.
+
+    I hit problems with variants of kexec that didn't put the initrd in
+    the new style map either. While these could/will be fixed, I believe
+    we should be safe here and rather reserve more than not enough.
+
+    We could have a firmware passing stuff via the new style map, and
+    in the middle, a kexec that knows nothing about it and adding other
+    things to the old style map.
+
+    I don't see a big issue with processing both and reserving everything
+    that needs to be. memblock_reserve() supports overlaps fine these days.
+
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/prom.c b/arch/powerpc/kernel/prom.c
+index b45ef0c..dd2f93f 100644
+--- a/arch/powerpc/kernel/prom.c
++++ b/arch/powerpc/kernel/prom.c
+@@ -561,7 +561,7 @@ void __init early_init_dt_setup_initrd_arch(unsigned long start,
+ }
+ #endif
+ 
+-static bool __init early_reserve_mem_dt(void)
++static void __init early_reserve_mem_dt(void)
+ {
+  unsigned long i, len, dt_root;
+  const __be32 *prop;
+@@ -571,7 +571,9 @@ static bool __init early_reserve_mem_dt(void)
+  prop = of_get_flat_dt_prop(dt_root, "reserved-ranges", &len);
+ 
+  if (!prop)
+-  return false;
++  return;
++
++ DBG("Found new-style reserved-ranges\n");
+ 
+  /* Each reserved range is an (address,size) pair, 2 cells each,
+   * totalling 4 cells per range. */
+@@ -581,11 +583,11 @@ static bool __init early_reserve_mem_dt(void)
+   base = of_read_number(prop + (i * 4) + 0, 2);
+   size = of_read_number(prop + (i * 4) + 2, 2);
+ 
+-  if (size)
++  if (size) {
++   DBG("reserving: %llx -> %llx\n", base, size);
+    memblock_reserve(base, size);
++  }
+  }
+-
+- return true;
+ }
+ 
+ static void __init early_reserve_mem(void)
+@@ -603,20 +605,16 @@ static void __init early_reserve_mem(void)
+  self_size = be32_to_cpu(initial_boot_params->totalsize);
+  memblock_reserve(self_base, self_size);
+ 
+- /*
+-  * Try looking for reserved-regions property in the DT first; if
+-  * it's present, it'll contain all of the necessary reservation
+-  * info
+-  */
+- if (early_reserve_mem_dt())
+-  return;
++ /* Look for the new "reserved-regions" property in the DT */
++ early_reserve_mem_dt();
+ 
+ #ifdef CONFIG_BLK_DEV_INITRD
+- /* then reserve the initrd, if any */
+- if (initrd_start && (initrd_end > initrd_start))
++ /* Then reserve the initrd, if any */
++ if (initrd_start && (initrd_end > initrd_start)) {
+   memblock_reserve(_ALIGN_DOWN(__pa(initrd_start), PAGE_SIZE),
+    _ALIGN_UP(initrd_end, PAGE_SIZE) -
+    _ALIGN_DOWN(initrd_start, PAGE_SIZE));
++ }
+ #endif /* CONFIG_BLK_DEV_INITRD */
+ 
+ #ifdef CONFIG_PPC32
+@@ -628,6 +626,8 @@ static void __init early_reserve_mem(void)
+   u32 base_32, size_32;
+   __be32 *reserve_map_32 = (__be32 *)reserve_map;
+ 
++  DBG("Found old 32-bit reserve map\n");
++
+   while (1) {
+    base_32 = be32_to_cpup(reserve_map_32++);
+    size_32 = be32_to_cpup(reserve_map_32++);
+@@ -642,6 +642,9 @@ static void __init early_reserve_mem(void)
+   return;
+  }
+ #endif
++ DBG("Processing reserve map\n");
++
++ /* Handle the reserve map in the fdt blob if it exists */
+  while (1) {
+   base = be64_to_cpup(reserve_map++);
+   size = be64_to_cpup(reserve_map++);
+-- 
+1.7.1

@@ -1,0 +1,86 @@
+From 921436d04d77538304a4a7b07c709de8ae916cb6 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:33:17 -0400
+Subject: [fs] nfs: Don't update the open stateid unless it is newer than the old one
+
+Message-id: <1403796815-28580-12-git-send-email-steved@redhat.com>
+Patchwork-id: 84855
+O-Subject: [RHEL7.1 PATCH 11/29] NFSv4: Don't update the open stateid unless it is newer than the old one
+Bugzilla: 1111170
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+This patch is in preparation for the NFSv4.1 parallel open capability.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upsteam Id: e999e80ee9fc47f1febbec6823deda3537dbbd22
+Bugzilla: 1111170
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
+index a5b27c2..df81fcc 100644
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -500,6 +500,16 @@ static inline bool nfs4_stateid_match(const nfs4_stateid *dst, const nfs4_statei
+  return memcmp(dst, src, sizeof(*dst)) == 0;
+ }
+ 
++static inline bool nfs4_stateid_match_other(const nfs4_stateid *dst, const nfs4_stateid *src)
++{
++ return memcmp(dst->other, src->other, NFS4_STATEID_OTHER_SIZE) == 0;
++}
++
++static inline bool nfs4_stateid_is_newer(const nfs4_stateid *s1, const nfs4_stateid *s2)
++{
++ return (s32)(be32_to_cpu(s1->seqid) - be32_to_cpu(s2->seqid)) > 0;
++}
++
+ static inline bool nfs4_valid_open_stateid(const struct nfs4_state *state)
+ {
+  return test_bit(NFS_STATE_RECOVERY_FAILED, &state->flags) == 0;
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 11a4c73..020c26f 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -1138,12 +1138,20 @@ static void update_open_stateflags(struct nfs4_state *state, fmode_t fmode)
+  nfs4_state_set_mode_locked(state, state->state | fmode);
+ }
+ 
++static bool nfs_need_update_open_stateid(struct nfs4_state *state,
++  nfs4_stateid *stateid)
++{
++ if (test_and_set_bit(NFS_OPEN_STATE, &state->flags) == 0)
++  return true;
++ if (!nfs4_stateid_match_other(stateid, &state->open_stateid))
++  return true;
++ if (nfs4_stateid_is_newer(stateid, &state->open_stateid))
++  return true;
++ return false;
++}
++
+ static void nfs_set_open_stateid_locked(struct nfs4_state *state, nfs4_stateid *stateid, fmode_t fmode)
+ {
+- if (test_bit(NFS_DELEGATED_STATE, &state->flags) == 0)
+-  nfs4_stateid_copy(&state->stateid, stateid);
+- nfs4_stateid_copy(&state->open_stateid, stateid);
+- set_bit(NFS_OPEN_STATE, &state->flags);
+  switch (fmode) {
+   case FMODE_READ:
+    set_bit(NFS_O_RDONLY_STATE, &state->flags);
+@@ -1154,6 +1162,11 @@ static void nfs_set_open_stateid_locked(struct nfs4_state *state, nfs4_stateid *
+   case FMODE_READ|FMODE_WRITE:
+    set_bit(NFS_O_RDWR_STATE, &state->flags);
+  }
++ if (!nfs_need_update_open_stateid(state, stateid))
++  return;
++ if (test_bit(NFS_DELEGATED_STATE, &state->flags) == 0)
++  nfs4_stateid_copy(&state->stateid, stateid);
++ nfs4_stateid_copy(&state->open_stateid, stateid);
+ }
+ 
+ static void nfs_set_open_stateid(struct nfs4_state *state, nfs4_stateid *stateid, fmode_t fmode)
+-- 
+1.7.1

@@ -1,0 +1,151 @@
+From cc2c427a8fda567a5f240e129d3da05b42535154 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:39:48 -0400
+Subject: [virt] kvm/nvmx: rearrange get_vmx_mem_address
+
+Message-id: <1406040016-3289-194-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86272
+O-Subject: [RHEL7 PATCH v2 193/221] KVM: nVMX: rearrange get_vmx_mem_address
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Bandan Das <bsd@redhat.com>
+
+Our common function for vmptr checks (in 2/4) needs to fetch
+the memory address
+
+Signed-off-by: Bandan Das <bsd@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 19677e32fe7d6913e07ce80f6f3dc7663ac7fe67)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 72b8012..917a15e 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -5792,6 +5792,59 @@ static enum hrtimer_restart vmx_preemption_timer_fn(struct hrtimer *timer)
+ }
+ 
+ /*
++ * Decode the memory-address operand of a vmx instruction, as recorded on an
++ * exit caused by such an instruction (run by a guest hypervisor).
++ * On success, returns 0. When the operand is invalid, returns 1 and throws
++ * #UD or #GP.
++ */
++static int get_vmx_mem_address(struct kvm_vcpu *vcpu,
++     unsigned long exit_qualification,
++     u32 vmx_instruction_info, gva_t *ret)
++{
++ /*
++  * According to Vol. 3B, "Information for VM Exits Due to Instruction
++  * Execution", on an exit, vmx_instruction_info holds most of the
++  * addressing components of the operand. Only the displacement part
++  * is put in exit_qualification (see 3B, "Basic VM-Exit Information").
++  * For how an actual address is calculated from all these components,
++  * refer to Vol. 1, "Operand Addressing".
++  */
++ int  scaling = vmx_instruction_info & 3;
++ int  addr_size = (vmx_instruction_info >> 7) & 7;
++ bool is_reg = vmx_instruction_info & (1u << 10);
++ int  seg_reg = (vmx_instruction_info >> 15) & 7;
++ int  index_reg = (vmx_instruction_info >> 18) & 0xf;
++ bool index_is_valid = !(vmx_instruction_info & (1u << 22));
++ int  base_reg       = (vmx_instruction_info >> 23) & 0xf;
++ bool base_is_valid  = !(vmx_instruction_info & (1u << 27));
++
++ if (is_reg) {
++  kvm_queue_exception(vcpu, UD_VECTOR);
++  return 1;
++ }
++
++ /* Addr = segment_base + offset */
++ /* offset = base + [index * scale] + displacement */
++ *ret = vmx_get_segment_base(vcpu, seg_reg);
++ if (base_is_valid)
++  *ret += kvm_register_read(vcpu, base_reg);
++ if (index_is_valid)
++  *ret += kvm_register_read(vcpu, index_reg)<<scaling;
++ *ret += exit_qualification; /* holds the displacement */
++
++ if (addr_size == 1) /* 32 bit */
++  *ret &= 0xffffffff;
++
++ /*
++  * TODO: throw #GP (and return 1) in various cases that the VM*
++  * instructions require it - e.g., offset beyond segment limit,
++  * unusable or unreadable/unwritable segment, non-canonical 64-bit
++  * address, and so on. Currently these are not checked.
++  */
++ return 0;
++}
++
++/*
+  * Emulate the VMXON instruction.
+  * Currently, we just remember that VMX is active, and do not save or even
+  * inspect the argument to VMXON (the so-called "VMXON pointer") because we
+@@ -5951,59 +6004,6 @@ static int handle_vmoff(struct kvm_vcpu *vcpu)
+  return 1;
+ }
+ 
+-/*
+- * Decode the memory-address operand of a vmx instruction, as recorded on an
+- * exit caused by such an instruction (run by a guest hypervisor).
+- * On success, returns 0. When the operand is invalid, returns 1 and throws
+- * #UD or #GP.
+- */
+-static int get_vmx_mem_address(struct kvm_vcpu *vcpu,
+-     unsigned long exit_qualification,
+-     u32 vmx_instruction_info, gva_t *ret)
+-{
+- /*
+-  * According to Vol. 3B, "Information for VM Exits Due to Instruction
+-  * Execution", on an exit, vmx_instruction_info holds most of the
+-  * addressing components of the operand. Only the displacement part
+-  * is put in exit_qualification (see 3B, "Basic VM-Exit Information").
+-  * For how an actual address is calculated from all these components,
+-  * refer to Vol. 1, "Operand Addressing".
+-  */
+- int  scaling = vmx_instruction_info & 3;
+- int  addr_size = (vmx_instruction_info >> 7) & 7;
+- bool is_reg = vmx_instruction_info & (1u << 10);
+- int  seg_reg = (vmx_instruction_info >> 15) & 7;
+- int  index_reg = (vmx_instruction_info >> 18) & 0xf;
+- bool index_is_valid = !(vmx_instruction_info & (1u << 22));
+- int  base_reg       = (vmx_instruction_info >> 23) & 0xf;
+- bool base_is_valid  = !(vmx_instruction_info & (1u << 27));
+-
+- if (is_reg) {
+-  kvm_queue_exception(vcpu, UD_VECTOR);
+-  return 1;
+- }
+-
+- /* Addr = segment_base + offset */
+- /* offset = base + [index * scale] + displacement */
+- *ret = vmx_get_segment_base(vcpu, seg_reg);
+- if (base_is_valid)
+-  *ret += kvm_register_read(vcpu, base_reg);
+- if (index_is_valid)
+-  *ret += kvm_register_read(vcpu, index_reg)<<scaling;
+- *ret += exit_qualification; /* holds the displacement */
+-
+- if (addr_size == 1) /* 32 bit */
+-  *ret &= 0xffffffff;
+-
+- /*
+-  * TODO: throw #GP (and return 1) in various cases that the VM*
+-  * instructions require it - e.g., offset beyond segment limit,
+-  * unusable or unreadable/unwritable segment, non-canonical 64-bit
+-  * address, and so on. Currently these are not checked.
+-  */
+- return 0;
+-}
+-
+ /* Emulate the VMCLEAR instruction */
+ static int handle_vmclear(struct kvm_vcpu *vcpu)
+ {
+-- 
+1.7.1

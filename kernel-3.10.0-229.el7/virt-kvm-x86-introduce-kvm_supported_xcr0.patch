@@ -1,0 +1,140 @@
+From 6a6a2f731d35cc7aa373908e8e09f5781e87df79 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:39:03 -0400
+Subject: [virt] kvm/x86: introduce kvm_supported_xcr0()
+
+Message-id: <1406040016-3289-149-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86227
+O-Subject: [RHEL7 PATCH v2 148/221] KVM: x86: introduce kvm_supported_xcr0()
+Bugzilla: 1076194 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+XSAVE support for KVM is already using host_xcr0 & KVM_SUPPORTED_XCR0 as
+a "dynamic" version of KVM_SUPPORTED_XCR0.
+
+However, this is not enough because the MPX bits should not be presented
+to the guest unless kvm_x86_ops confirms the support.  So, replace all
+instances of host_xcr0 & KVM_SUPPORTED_XCR0 with a new function
+kvm_supported_xcr0() that also has this check.
+
+Note that here:
+
+  if (xstate_bv & ~KVM_SUPPORTED_XCR0)
+   return -EINVAL;
+  if (xstate_bv & ~host_cr0)
+   return -EINVAL;
+
+the code is equivalent to
+
+  if ((xstate_bv & ~KVM_SUPPORTED_XCR0) ||
+      (xstate_bv & ~host_cr0)
+   return -EINVAL;
+
+i.e. "xstate_bv & (~KVM_SUPPORTED_XCR0 | ~host_cr0)" which is in turn
+equal to "xstate_bv & ~(KVM_SUPPORTED_XCR0 & host_cr0)".  So we should
+also use the new function there.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4ff417320c2dfc984ec1939a7da888976441a881)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index 6f71c0a..89906d3 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -43,6 +43,16 @@ static u32 xstate_required_size(u64 xstate_bv)
+  return ret;
+ }
+ 
++u64 kvm_supported_xcr0(void)
++{
++ u64 xcr0 = KVM_SUPPORTED_XCR0 & host_xcr0;
++
++ if (!kvm_x86_ops->mpx_supported || !kvm_x86_ops->mpx_supported())
++  xcr0 &= ~(XSTATE_BNDREGS | XSTATE_BNDCSR);
++
++ return xcr0;
++}
++
+ void kvm_update_cpuid(struct kvm_vcpu *vcpu)
+ {
+  struct kvm_cpuid_entry2 *best;
+@@ -73,7 +83,7 @@ void kvm_update_cpuid(struct kvm_vcpu *vcpu)
+  } else {
+   vcpu->arch.guest_supported_xcr0 =
+    (best->eax | ((u64)best->edx << 32)) &
+-   host_xcr0 & KVM_SUPPORTED_XCR0;
++   kvm_supported_xcr0();
+   vcpu->arch.guest_xstate_size = best->ebx =
+    xstate_required_size(vcpu->arch.xcr0);
+  }
+@@ -210,13 +220,6 @@ static void do_cpuid_1_ent(struct kvm_cpuid_entry2 *entry, u32 function,
+  entry->flags = 0;
+ }
+ 
+-static bool supported_xcr0_bit(unsigned bit)
+-{
+- u64 mask = ((u64)1 << bit);
+-
+- return mask & KVM_SUPPORTED_XCR0 & host_xcr0;
+-}
+-
+ #define F(x) bit(X86_FEATURE_##x)
+ 
+ static int __do_cpuid_ent_emulated(struct kvm_cpuid_entry2 *entry,
+@@ -437,16 +440,18 @@ static inline int __do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
+  }
+  case 0xd: {
+   int idx, i;
++  u64 supported = kvm_supported_xcr0();
+ 
+-  entry->eax &= host_xcr0 & KVM_SUPPORTED_XCR0;
+-  entry->edx &= (host_xcr0 & KVM_SUPPORTED_XCR0) >> 32;
++  entry->eax &= supported;
++  entry->edx &= supported >> 32;
+   entry->flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+   for (idx = 1, i = 1; idx < 64; ++idx) {
++   u64 mask = ((u64)1 << idx);
+    if (*nent >= maxnent)
+     goto out;
+ 
+    do_cpuid_1_ent(&entry[i], function, idx);
+-   if (entry[i].eax == 0 || !supported_xcr0_bit(idx))
++   if (entry[i].eax == 0 || !(supported & mask))
+     continue;
+    entry[i].flags |=
+           KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 8f774c3..0bcf1a5 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3079,9 +3079,7 @@ static int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
+    * CPUID leaf 0xD, index 0, EDX:EAX.  This is for compatibility
+    * with old userspace.
+    */
+-  if (xstate_bv & ~KVM_SUPPORTED_XCR0)
+-   return -EINVAL;
+-  if (xstate_bv & ~host_xcr0)
++  if (xstate_bv & ~kvm_supported_xcr0())
+    return -EINVAL;
+   memcpy(&vcpu->arch.guest_fpu.state->xsave,
+    guest_xsave->region, vcpu->arch.guest_xstate_size);
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 8da5823..dc16a82 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -125,6 +125,8 @@ int kvm_write_guest_virt_system(struct x86_emulate_ctxt *ctxt,
+ #define KVM_SUPPORTED_XCR0 (XSTATE_FP | XSTATE_SSE | XSTATE_YMM)
+ extern u64 host_xcr0;
+ 
++extern u64 kvm_supported_xcr0(void);
++
+ extern unsigned int min_timer_period_us;
+ 
+ extern struct static_key kvm_no_apic_vcpu;
+-- 
+1.7.1

@@ -1,0 +1,139 @@
+From b195a7f711e9ed8287f98fa7ed1a493bf4a4f3ce Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:37:18 -0400
+Subject: [virt] kvm/nvmx: Fix read/write to MSR_IA32_FEATURE_CONTROL
+
+Message-id: <1406040016-3289-44-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86122
+O-Subject: [RHEL7 PATCH v2 043/221] KVM: nVMX: Fix read/write to MSR_IA32_FEATURE_CONTROL
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Nadav Har'El <nyh@math.technion.ac.il>
+
+Fix read/write to IA32_FEATURE_CONTROL MSR in nested environment.
+
+This patch simulate this MSR in nested_vmx and the default value is
+0x0. BIOS should set it to 0x5 before VMXON. After setting the lock
+bit, write to it will cause #GP(0).
+
+Another QEMU patch is also needed to handle emulation of reset
+and migration. Reset to vCPU should clear this MSR and migration
+should reserve value of it.
+
+This patch is based on Nadav's previous commit.
+http://permalink.gmane.org/gmane.comp.emulators.kvm.devel/88478
+
+Signed-off-by: Nadav Har'El <nyh@math.technion.ac.il>
+Signed-off-by: Arthur Chunqi Li <yzt356@gmail.com>
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+(cherry picked from commit b3897a49e22fc173efa77527a447c714f753f681)
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index d2c4b0c..0385463 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -373,6 +373,7 @@ struct nested_vmx {
+   * we must keep them pinned while L2 runs.
+   */
+  struct page *apic_access_page;
++ u64 msr_ia32_feature_control;
+ };
+ 
+ #define POSTED_INTR_ON  0
+@@ -2282,8 +2283,11 @@ static int vmx_get_vmx_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 *pdata)
+ 
+  switch (msr_index) {
+  case MSR_IA32_FEATURE_CONTROL:
+-  *pdata = 0;
+-  break;
++  if (nested_vmx_allowed(vcpu)) {
++   *pdata = to_vmx(vcpu)->nested.msr_ia32_feature_control;
++   break;
++  }
++  return 0;
+  case MSR_IA32_VMX_BASIC:
+   /*
+    * This MSR reports some information about VMX support. We
+@@ -2356,14 +2360,24 @@ static int vmx_get_vmx_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 *pdata)
+  return 1;
+ }
+ 
+-static int vmx_set_vmx_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 data)
++static int vmx_set_vmx_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ {
++ u32 msr_index = msr_info->index;
++ u64 data = msr_info->data;
++ bool host_initialized = msr_info->host_initiated;
++
+  if (!nested_vmx_allowed(vcpu))
+   return 0;
+ 
+- if (msr_index == MSR_IA32_FEATURE_CONTROL)
+-  /* TODO: the right thing. */
++ if (msr_index == MSR_IA32_FEATURE_CONTROL) {
++  if (!host_initialized &&
++    to_vmx(vcpu)->nested.msr_ia32_feature_control
++    & FEATURE_CONTROL_LOCKED)
++   return 0;
++  to_vmx(vcpu)->nested.msr_ia32_feature_control = data;
+   return 1;
++ }
++
+  /*
+   * No need to treat VMX capability MSRs specially: If we don't handle
+   * them, handle_wrmsr will #GP(0), which is correct (they are readonly)
+@@ -2494,7 +2508,7 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+    return 1;
+   /* Otherwise falls through */
+  default:
+-  if (vmx_set_vmx_msr(vcpu, msr_index, data))
++  if (vmx_set_vmx_msr(vcpu, msr_info))
+    break;
+   msr = find_msr_entry(vmx, msr_index);
+   if (msr) {
+@@ -5633,6 +5647,8 @@ static int handle_vmon(struct kvm_vcpu *vcpu)
+  struct kvm_segment cs;
+  struct vcpu_vmx *vmx = to_vmx(vcpu);
+  struct vmcs *shadow_vmcs;
++ const u64 VMXON_NEEDED_FEATURES = FEATURE_CONTROL_LOCKED
++  | FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX;
+ 
+  /* The Intel VMX Instruction Reference lists a bunch of bits that
+   * are prerequisite to running VMXON, most notably cr4.VMXE must be
+@@ -5661,6 +5677,13 @@ static int handle_vmon(struct kvm_vcpu *vcpu)
+   skip_emulated_instruction(vcpu);
+   return 1;
+  }
++
++ if ((vmx->nested.msr_ia32_feature_control & VMXON_NEEDED_FEATURES)
++   != VMXON_NEEDED_FEATURES) {
++  kvm_inject_gp(vcpu, 0);
++  return 1;
++ }
++
+  if (enable_shadow_vmcs) {
+   shadow_vmcs = alloc_vmcs();
+   if (!shadow_vmcs)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 9faf6d4..7e39043 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -865,7 +865,8 @@ static u32 msrs_to_save[] = {
+ #ifdef CONFIG_X86_64
+  MSR_CSTAR, MSR_KERNEL_GS_BASE, MSR_SYSCALL_MASK, MSR_LSTAR,
+ #endif
+- MSR_IA32_TSC, MSR_IA32_CR_PAT, MSR_VM_HSAVE_PA
++ MSR_IA32_TSC, MSR_IA32_CR_PAT, MSR_VM_HSAVE_PA,
++ MSR_IA32_FEATURE_CONTROL
+ };
+ 
+ static unsigned num_msrs_to_save;
+-- 
+1.7.1

@@ -1,0 +1,114 @@
+From 18a6e3b236ba2835680ca6b3521a116e1edcfb6c Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 18:58:25 -0400
+Subject: [fs] btrfs: publish device membership in sysfs
+
+Message-id: <1407179109-13714-19-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87354
+O-Subject: [RHEL7.1 PATCH 018/422] btrfs: publish device membership in sysfs
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Jeff Mahoney <jeffm@suse.com>
+
+commit 29e5be240a3caf175364fdeecb0441dff500d5d9
+Author: Jeff Mahoney <jeffm@suse.com>
+Date:   Fri Nov 1 13:07:05 2013 -0400
+
+    btrfs: publish device membership in sysfs
+
+    Now that we have the infrastructure for per-super attributes, we can
+    publish device membership in /sys/fs/btrfs/<fsid>/devices. The information
+    is published as symlinks to the block devices.
+
+    Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+    Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index f608306..dbe9b31 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1530,6 +1530,7 @@ struct btrfs_fs_info {
+ 
+  struct kobject super_kobj;
+  struct kobject *space_info_kobj;
++ struct kobject *device_dir_kobj;
+  struct completion kobj_unregister;
+  int do_barriers;
+  int closing;
+diff --git a/fs/btrfs/sysfs.c b/fs/btrfs/sysfs.c
+index e060958..ec63153 100644
+--- a/fs/btrfs/sysfs.c
++++ b/fs/btrfs/sysfs.c
+@@ -23,11 +23,13 @@
+ #include <linux/buffer_head.h>
+ #include <linux/kobject.h>
+ #include <linux/bug.h>
++#include <linux/genhd.h>
+ 
+ #include "ctree.h"
+ #include "disk-io.h"
+ #include "transaction.h"
+ #include "sysfs.h"
++#include "volumes.h"
+ 
+ static inline struct btrfs_fs_info *to_fs_info(struct kobject *kobj);
+ 
+@@ -374,6 +376,8 @@ static inline struct btrfs_fs_info *to_fs_info(struct kobject *kobj)
+ void btrfs_sysfs_remove_one(struct btrfs_fs_info *fs_info)
+ {
+  sysfs_remove_files(fs_info->space_info_kobj, allocation_attrs);
++ kobject_del(fs_info->device_dir_kobj);
++ kobject_put(fs_info->device_dir_kobj);
+  kobject_del(fs_info->space_info_kobj);
+  kobject_put(fs_info->space_info_kobj);
+  kobject_del(&fs_info->super_kobj);
+@@ -507,6 +511,30 @@ static int add_unknown_feature_attrs(struct btrfs_fs_info *fs_info)
+  return 0;
+ }
+ 
++static int add_device_membership(struct btrfs_fs_info *fs_info)
++{
++ int error = 0;
++ struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
++ struct btrfs_device *dev;
++
++ fs_info->device_dir_kobj = kobject_create_and_add("devices",
++      &fs_info->super_kobj);
++ if (!fs_info->device_dir_kobj)
++  return -ENOMEM;
++
++ list_for_each_entry(dev, &fs_devices->devices, dev_list) {
++  struct hd_struct *disk = dev->bdev->bd_part;
++  struct kobject *disk_kobj = &part_to_dev(disk)->kobj;
++
++  error = sysfs_create_link(fs_info->device_dir_kobj,
++       disk_kobj, disk_kobj->name);
++  if (error)
++   break;
++ }
++
++ return error;
++}
++
+ /* /sys/fs/btrfs/ entry */
+ static struct kset *btrfs_kset;
+ 
+@@ -528,6 +556,10 @@ int btrfs_sysfs_add_one(struct btrfs_fs_info *fs_info)
+  if (error)
+   goto failure;
+ 
++ error = add_device_membership(fs_info);
++ if (error)
++  goto failure;
++
+  fs_info->space_info_kobj = kobject_create_and_add("allocation",
+         &fs_info->super_kobj);
+  if (!fs_info->space_info_kobj) {
+-- 
+1.7.1

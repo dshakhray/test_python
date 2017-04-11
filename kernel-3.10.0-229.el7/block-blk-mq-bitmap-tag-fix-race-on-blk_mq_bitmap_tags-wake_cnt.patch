@@ -1,0 +1,89 @@
+From 4a9d39074d6e3c77f468543eb062744238dbac7c Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Wed, 18 Jun 2014 20:04:23 -0400
+Subject: [block] blk-mq: bitmap tag, fix race on blk_mq_bitmap_tags::wake_cnt
+
+Message-id: <1403121864-7956-7-git-send-email-snitzer@redhat.com>
+Patchwork-id: 84267
+O-Subject: [RHEL7.1 PATCH 157/150] blk-mq: bitmap tag: fix race on blk_mq_bitmap_tags::wake_cnt
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit 2971c35f35886b87af54675313a2afef937c1b0c
+Author: Alexander Gordeev <agordeev@redhat.com>
+Date:   Thu Jun 12 17:05:37 2014 +0200
+
+    blk-mq: bitmap tag: fix race on blk_mq_bitmap_tags::wake_cnt
+
+    This piece of code in bt_clear_tag() function is racy:
+
+     bs = bt_wake_ptr(bt);
+     if (bs && atomic_dec_and_test(&bs->wait_cnt)) {
+      atomic_set(&bs->wait_cnt, bt->wake_cnt);
+       wake_up(&bs->wait);
+     }
+
+    Since nothing prevents bt_wake_ptr() from returning the very
+    same 'bs' address on multiple CPUs, the following scenario is
+    possible:
+
+        CPU1                                CPU2
+        ----                                ----
+
+    0.  bs = bt_wake_ptr(bt);               bs = bt_wake_ptr(bt);
+    1.  atomic_dec_and_test(&bs->wait_cnt)
+    2.                                      atomic_dec_and_test(&bs->wait_cnt)
+    3.  atomic_set(&bs->wait_cnt, bt->wake_cnt);
+
+    If the decrement in [1] yields zero then for some amount of time
+    the decrement in [2] results in a negative/overflow value, which
+    is not expected. The follow-up assignment in [3] overwrites the
+    invalid value with the batch value (and likely prevents the issue
+    from being severe) which is still incorrect and should be a lesser.
+
+    Cc: Ming Lei <tom.leiming@gmail.com>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 6deb130..08fc671 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -344,6 +344,7 @@ static void bt_clear_tag(struct blk_mq_bitmap_tags *bt, unsigned int tag)
+ {
+  const int index = TAG_TO_INDEX(bt, tag);
+  struct bt_wait_state *bs;
++ int wait_cnt;
+ 
+  /*
+   * The unlock memory barrier need to order access to req in free
+@@ -352,10 +353,19 @@ static void bt_clear_tag(struct blk_mq_bitmap_tags *bt, unsigned int tag)
+  clear_bit_unlock(TAG_TO_BIT(bt, tag), &bt->map[index].word);
+ 
+  bs = bt_wake_ptr(bt);
+- if (bs && atomic_dec_and_test(&bs->wait_cnt)) {
+-  atomic_set(&bs->wait_cnt, bt->wake_cnt);
++ if (!bs)
++  return;
++
++ wait_cnt = atomic_dec_return(&bs->wait_cnt);
++ if (wait_cnt == 0) {
++wake:
++  atomic_add(bt->wake_cnt, &bs->wait_cnt);
+   bt_index_atomic_inc(&bt->wake_index);
+   wake_up(&bs->wait);
++ } else if (wait_cnt < 0) {
++  wait_cnt = atomic_inc_return(&bs->wait_cnt);
++  if (!wait_cnt)
++   goto wake;
+  }
+ }
+ 
+-- 
+1.7.1

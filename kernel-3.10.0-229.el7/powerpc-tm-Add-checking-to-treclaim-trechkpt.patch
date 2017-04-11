@@ -1,0 +1,140 @@
+From 177446c3397b95a67c9828e4d8f523775892ba4c Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:12:26 -0400
+Subject: [powerpc] tm: Add checking to treclaim/trechkpt
+
+Message-id: <1410545655-205645-518-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94505
+O-Subject: [RHEL7 PATCH 517/626] powerpc/tm: Add checking to treclaim/trechkpt
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 7f06f21d40a638e1ca759ceda0f21cd81082607e
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Fri Mar 28 16:40:34 2014 +1100
+
+    powerpc/tm: Add checking to treclaim/trechkpt
+
+    If we do a treclaim and we are not in TM suspend mode, it results in a TM bad
+    thing (ie. a 0x700 program check).  Similarly if we do a trechkpt and we have
+    an active transaction or TEXASR Failure Summary (FS) is not set, we also take a
+    TM bad thing.
+
+    This should never happen, but if it does (ie. a kernel bug), the cause is
+    almost impossible to debug as the GPR state is mostly userspace and hence we
+    don't get a call chain.
+
+    This adds some checks in these cases case a BUG_ON() (in asm) in case we ever
+    hit these cases.  It moves the register saving around to preserve r1 till later
+    also.
+
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/reg.h b/arch/powerpc/include/asm/reg.h
+index a1f28d0..0a1e340 100644
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -215,6 +215,7 @@
+ #define SPRN_TEXASR 0x82 /* Transaction EXception & Summary */
+ #define   TEXASR_FS __MASK(63-36) /* Transaction Failure Summary */
+ #define SPRN_TEXASRU 0x83 /* ''    ''    ''  Upper 32  */
++#define   TEXASR_FS     __MASK(63-36) /* TEXASR Failure Summary */
+ #define SPRN_TFHAR 0x80 /* Transaction Failure Handler Addr */
+ #define SPRN_CTRLF 0x088
+ #define SPRN_CTRLT 0x098
+diff --git a/arch/powerpc/kernel/tm.S b/arch/powerpc/kernel/tm.S
+index 9631266..ee061c3 100644
+--- a/arch/powerpc/kernel/tm.S
++++ b/arch/powerpc/kernel/tm.S
+@@ -10,6 +10,7 @@
+ #include <asm/ppc-opcode.h>
+ #include <asm/ptrace.h>
+ #include <asm/reg.h>
++#include <asm/bug.h>
+ 
+ #ifdef CONFIG_VSX
+ /* See fpu.S, this is borrowed from there */
+@@ -174,6 +175,13 @@ dont_backup_vec:
+  stfd    fr0,FPSTATE_FPSCR(r7)
+ 
+ dont_backup_fp:
++ /* Do sanity check on MSR to make sure we are suspended */
++ li r7, (MSR_TS_S)@higher
++ srdi r6, r14, 32
++ and r6, r6, r7
++1: tdeqi   r6, 0
++ EMIT_BUG_ENTRY 1b,__FILE__,__LINE__,0
++
+  /* The moment we treclaim, ALL of our GPRs will switch
+   * to user register state.  (FPRs, CCR etc. also!)
+   * Use an sprg and a tm_scratch in the PACA to shuffle.
+@@ -382,13 +390,11 @@ restore_gprs:
+  /* ******************** CR,LR,CCR,MSR ********** */
+  ld r4, _CTR(r7)
+  ld r5, _LINK(r7)
+- ld r6, _CCR(r7)
+  ld r8, _XER(r7)
+ 
+- mtctr   r4
+- mtlr    r5
+- mtcr    r6
+- mtxer   r8
++ mtctr r4
++ mtlr r5
++ mtxer r8
+ 
+  /* ******************** TAR ******************** */
+  ld r4, THREAD_TM_TAR(r3)
+@@ -403,7 +409,8 @@ restore_gprs:
+  li r4, 0
+  mtmsrd r4, 1
+ 
+- REST_4GPRS(0, r7)   /* GPR0-3 */
++ REST_GPR(0, r7)    /* GPR0 */
++ REST_2GPRS(2, r7)   /* GPR2-3 */
+  REST_GPR(4, r7)    /* GPR4 */
+  REST_4GPRS(8, r7)   /* GPR8-11 */
+  REST_2GPRS(12, r7)   /* GPR12-13 */
+@@ -415,6 +422,31 @@ restore_gprs:
+  mtspr SPRN_DSCR, r5
+  mtspr SPRN_PPR, r6
+ 
++ /* Do final sanity check on TEXASR to make sure FS is set.  Do this
++  * here before we load up the userspace r1 so any bugs we hit will get
++  * a call chain */
++ mfspr r5, SPRN_TEXASR
++ srdi r5, r5, 16
++ li r6, (TEXASR_FS)@h
++ and r6, r6, r5
++1: tdeqi r6, 0
++ EMIT_BUG_ENTRY 1b,__FILE__,__LINE__,0
++
++ /* Do final sanity check on MSR to make sure we are not transactional
++  * or suspended
++  */
++ mfmsr   r6
++ li r5, (MSR_TS_MASK)@higher
++ srdi r6, r6, 32
++ and r6, r6, r5
++1: tdnei   r6, 0
++ EMIT_BUG_ENTRY 1b,__FILE__,__LINE__,0
++
++ /* Restore CR */
++ ld r6, _CCR(r7)
++ mtcr    r6
++
++ REST_GPR(1, r7)    /* GPR1 */
+  REST_GPR(5, r7)    /* GPR5-7 */
+  REST_GPR(6, r7)
+  ld r7, GPR7(r7)
+-- 
+1.7.1

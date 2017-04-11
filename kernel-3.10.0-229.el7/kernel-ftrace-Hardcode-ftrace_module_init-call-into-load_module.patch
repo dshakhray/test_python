@@ -1,0 +1,184 @@
+From 5402b3fecaeb379cc79abfb823bebe3c5041b57c Mon Sep 17 00:00:00 2001
+From: Takahiro MUNEDA <tmuneda@redhat.com>
+Date: Wed, 14 May 2014 17:24:49 -0400
+Subject: [kernel] ftrace: Hardcode ftrace_module_init() call into load_module()
+
+Message-id: <1400088289-49498-3-git-send-email-tmuneda@redhat.com>
+Patchwork-id: 79808
+O-Subject: [RHEL7.1 Patch 2/2] ftrace/module: Hardcode ftrace_module_init() call into load_module()
+Bugzilla: 1061553
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steven Rostedt <srostedt@redhat.com>
+
+From: "Steven Rostedt (Red Hat)" <rostedt@goodmis.org>
+
+RHBZ#:
+------
+https://bugzilla.redhat.com/show_bug.cgi?id=1061553
+
+Upstream Status:
+----------------
+http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=a949ae560a511fe4e3adf48fa44fefded93e5c2b
+
+Brew:
+-----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7439102
+
+Test Status:
+------------
+Tested by Fujitsu and me
+
+>From a949ae560a511fe4e3adf48fa44fefded93e5c2b
+From: "Steven Rostedt (Red Hat)" <rostedt@goodmis.org>
+Date: Thu, 24 Apr 2014 10:40:12 -0400
+Subject: [RHEL7.1 Patch 2/2] ftrace/module: Hardcode ftrace_module_init() call
+ into load_module()
+
+ A race exists between module loading and enabling of function tracer.
+
+  CPU 1    CPU 2
+  -----    -----
+   load_module()
+    module->state = MODULE_STATE_COMING
+
+     register_ftrace_function()
+      mutex_lock(&ftrace_lock);
+      ftrace_startup()
+       update_ftrace_function();
+        ftrace_arch_code_modify_prepare()
+         set_all_module_text_rw();
+        <enables-ftrace>
+         ftrace_arch_code_modify_post_process()
+          set_all_module_text_ro();
+
+     [ here all module text is set to RO,
+       including the module that is
+       loading!! ]
+
+    blocking_notifier_call_chain(MODULE_STATE_COMING);
+     ftrace_init_module()
+
+      [ tries to modify code, but it's RO, and fails!
+        ftrace_bug() is called]
+
+ When this race happens, ftrace_bug() will produces a nasty warning and
+ all of the function tracing features will be disabled until reboot.
+
+ The simple solution is to treate module load the same way the core
+ kernel is treated at boot. To hardcode the ftrace function modification
+ of converting calls to mcount into nops. This is done in init/main.c
+ there's no reason it could not be done in load_module(). This gives
+ a better control of the changes and doesn't tie the state of the
+ module to its notifiers as much. Ftrace is special, it needs to be
+ treated as such.
+
+ The reason this would work, is that the ftrace_module_init() would be
+ called while the module is in MODULE_STATE_UNFORMED, which is ignored
+ by the set_all_module_text_ro() call.
+
+ Link: http://lkml.kernel.org/r/1395637826-3312-1-git-send-email-indou.takao@jp.fujitsu.com
+
+ Reported-by: Takao Indoh <indou.takao@jp.fujitsu.com>
+ Acked-by: Rusty Russell <rusty@rustcorp.com.au>
+ Cc: stable@vger.kernel.org # 2.6.38+
+ Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+
+cc: srostedt@redhat.com
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/ftrace.h b/include/linux/ftrace.h
+index dd57211..498aefd 100644
+--- a/include/linux/ftrace.h
++++ b/include/linux/ftrace.h
+@@ -524,6 +524,7 @@ static inline int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_a
+ extern int ftrace_arch_read_dyn_info(char *buf, int size);
+ 
+ extern int skip_trace(unsigned long ip);
++extern void ftrace_module_init(struct module *mod);
+ 
+ extern void ftrace_disable_daemon(void);
+ extern void ftrace_enable_daemon(void);
+@@ -533,6 +534,7 @@ static inline int ftrace_force_update(void) { return 0; }
+ static inline void ftrace_disable_daemon(void) { }
+ static inline void ftrace_enable_daemon(void) { }
+ static inline void ftrace_release_mod(struct module *mod) {}
++static inline void ftrace_module_init(struct module *mod) {}
+ static inline __init int register_ftrace_command(struct ftrace_func_command *cmd)
+ {
+  return -EINVAL;
+diff --git a/kernel/module.c b/kernel/module.c
+index 83eea21..1192791 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -3295,6 +3295,9 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ 
+  dynamic_debug_setup(info->debug, info->num_debug);
+ 
++ /* Ftrace init must be called in the MODULE_STATE_UNFORMED state */
++ ftrace_module_init(mod);
++
+  /* Finally it's fully formed, ready to start executing. */
+  err = complete_formation(mod, info);
+  if (err)
+diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
+index 4fecb3f..011fc45 100644
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -4140,16 +4140,11 @@ static void ftrace_init_module(struct module *mod,
+  ftrace_process_locs(mod, start, end);
+ }
+ 
+-static int ftrace_module_notify_enter(struct notifier_block *self,
+-          unsigned long val, void *data)
++void ftrace_module_init(struct module *mod)
+ {
+- struct module *mod = data;
+-
+- if (val == MODULE_STATE_COMING)
+-  ftrace_init_module(mod, mod->ftrace_callsites,
+-       mod->ftrace_callsites +
+-       mod->num_ftrace_callsites);
+- return 0;
++ ftrace_init_module(mod, mod->ftrace_callsites,
++      mod->ftrace_callsites +
++      mod->num_ftrace_callsites);
+ }
+ 
+ static int ftrace_module_notify_exit(struct notifier_block *self,
+@@ -4163,11 +4158,6 @@ static int ftrace_module_notify_exit(struct notifier_block *self,
+  return 0;
+ }
+ #else
+-static int ftrace_module_notify_enter(struct notifier_block *self,
+-          unsigned long val, void *data)
+-{
+- return 0;
+-}
+ static int ftrace_module_notify_exit(struct notifier_block *self,
+          unsigned long val, void *data)
+ {
+@@ -4175,11 +4165,6 @@ static int ftrace_module_notify_exit(struct notifier_block *self,
+ }
+ #endif /* CONFIG_MODULES */
+ 
+-struct notifier_block ftrace_module_enter_nb = {
+- .notifier_call = ftrace_module_notify_enter,
+- .priority = INT_MAX, /* Run before anything that can use kprobes */
+-};
+-
+ struct notifier_block ftrace_module_exit_nb = {
+  .notifier_call = ftrace_module_notify_exit,
+  .priority = INT_MIN, /* Run after anything that can remove kprobes */
+@@ -4216,10 +4201,6 @@ void __init ftrace_init(void)
+       __start_mcount_loc,
+       __stop_mcount_loc);
+ 
+- ret = register_module_notifier(&ftrace_module_enter_nb);
+- if (ret)
+-  pr_warning("Failed to register trace ftrace module enter notifier\n");
+-
+  ret = register_module_notifier(&ftrace_module_exit_nb);
+  if (ret)
+   pr_warning("Failed to register trace ftrace module exit notifier\n");
+-- 
+1.7.1

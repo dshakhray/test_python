@@ -1,0 +1,148 @@
+From a756490e7302415ec634f72059cac994de10b81b Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:04:52 -0400
+Subject: [powerpc] refactor of_get_cpu_node to support other architectures
+
+Message-id: <1410545655-205645-64-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94098
+O-Subject: [RHEL7 PATCH 063/626] powerpc: refactor of_get_cpu_node to support other architectures
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 819d596568d82ffb85b0b5989a1567810fe66098
+Author: Sudeep KarkadaNagesha <sudeep.karkadanagesha@arm.com>
+Date:   Thu Aug 15 13:34:18 2013 +0100
+
+    powerpc: refactor of_get_cpu_node to support other architectures
+
+    Currently different drivers requiring to access cpu device node are
+    parsing the device tree themselves. Since the ordering in the DT need
+    not match the logical cpu ordering, the parsing logic needs to consider
+    that. However, this has resulted in lots of code duplication and in some
+    cases even incorrect logic.
+
+    It's better to consolidate them by adding support for getting cpu
+    device node for a given logical cpu index in DT core library. However
+    logical to physical index mapping can be architecture specific.
+
+    PowerPC has it's own implementation to get the cpu node for a given
+    logical index.
+
+    This patch refactors the current implementation of of_get_cpu_node.
+    This in preparation to move the implementation to DT core library.
+    It separates out the logical to physical mapping so that a default
+    matching of the physical id to the logical cpu index can be added
+    when moved to common code. Architecture specific code can override it.
+
+    Cc: Rob Herring <rob.herring@calxeda.com>
+    Cc: Grant Likely <grant.likely@linaro.org>
+    Acked-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Signed-off-by: Sudeep KarkadaNagesha <sudeep.karkadanagesha@arm.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/prom.c b/arch/powerpc/kernel/prom.c
+index 49a77c2..2f28e90 100644
+--- a/arch/powerpc/kernel/prom.c
++++ b/arch/powerpc/kernel/prom.c
+@@ -893,45 +893,63 @@ static int __init prom_reconfig_setup(void)
+ __initcall(prom_reconfig_setup);
+ #endif
+ 
++bool arch_match_cpu_phys_id(int cpu, u64 phys_id)
++{
++ return (int)phys_id == get_hard_smp_processor_id(cpu);
++}
++
++static bool __of_find_n_match_cpu_property(struct device_node *cpun,
++   const char *prop_name, int cpu, unsigned int *thread)
++{
++ const __be32 *cell;
++ int ac, prop_len, tid;
++ u64 hwid;
++
++ ac = of_n_addr_cells(cpun);
++ cell = of_get_property(cpun, prop_name, &prop_len);
++ if (!cell)
++  return false;
++ prop_len /= sizeof(*cell);
++ for (tid = 0; tid < prop_len; tid++) {
++  hwid = of_read_number(cell, ac);
++  if (arch_match_cpu_phys_id(cpu, hwid)) {
++   if (thread)
++    *thread = tid;
++   return true;
++  }
++  cell += ac;
++ }
++ return false;
++}
++
+ /* Find the device node for a given logical cpu number, also returns the cpu
+  * local thread number (index in ibm,interrupt-server#s) if relevant and
+  * asked for (non NULL)
+  */
+ struct device_node *of_get_cpu_node(int cpu, unsigned int *thread)
+ {
+- int hardid;
+- struct device_node *np;
++ struct device_node *cpun, *cpus;
+ 
+- hardid = get_hard_smp_processor_id(cpu);
++ cpus = of_find_node_by_path("/cpus");
++ if (!cpus) {
++  pr_warn("Missing cpus node, bailing out\n");
++  return NULL;
++ }
+ 
+- for_each_node_by_type(np, "cpu") {
+-  const __be32 *intserv;
+-  unsigned int plen, t;
++ for_each_child_of_node(cpus, cpun) {
++  if (of_node_cmp(cpun->type, "cpu"))
++   continue;
+ 
+-  /* Check for ibm,ppc-interrupt-server#s. If it doesn't exist
+-   * fallback to "reg" property and assume no threads
++  /* Check for non-standard "ibm,ppc-interrupt-server#s" property
++   * for thread ids on PowerPC. If it doesn't exist fallback to
++   * standard "reg" property.
+    */
+-  intserv = of_get_property(np, "ibm,ppc-interrupt-server#s",
+-    &plen);
+-  if (intserv == NULL) {
+-   const __be32 *reg = of_get_property(np, "reg", NULL);
+-   if (reg == NULL)
+-    continue;
+-   if (be32_to_cpup(reg) == hardid) {
+-    if (thread)
+-     *thread = 0;
+-    return np;
+-   }
+-  } else {
+-   plen /= sizeof(u32);
+-   for (t = 0; t < plen; t++) {
+-    if (hardid == be32_to_cpu(intserv[t])) {
+-     if (thread)
+-      *thread = t;
+-     return np;
+-    }
+-   }
+-  }
++  if (__of_find_n_match_cpu_property(cpun,
++    "ibm,ppc-interrupt-server#s", cpu, thread))
++   return cpun;
++
++  if (__of_find_n_match_cpu_property(cpun, "reg", cpu, thread))
++   return cpun;
+  }
+  return NULL;
+ }
+-- 
+1.7.1

@@ -1,0 +1,99 @@
+From a72c4f94202a3c796fe8fa42316457eb08aaf2f0 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 18:59:49 -0400
+Subject: [fs] btrfs: make fsync latency less sucky
+
+Message-id: <1407179109-13714-103-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87010
+O-Subject: [RHEL7.1 PATCH 102/422] Btrfs: make fsync latency less sucky
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Josef Bacik <jbacik@fb.com>
+
+commit 5039eddc19aee8c894191c24f2dde4e645ca1bbb
+Author: Josef Bacik <jbacik@fb.com>
+Date:   Wed Jan 15 13:34:13 2014 -0500
+
+    Btrfs: make fsync latency less sucky
+
+    Looking into some performance related issues with large amounts of metadata
+    revealed that we can have some pretty huge swings in fsync() performance.  If we
+    have a lot of delayed refs backed up (as you will tend to do with lots of
+    metadata) fsync() will wander off and try to run some of those delayed refs
+    which can result in reading from disk and such.  Since the actual act of fsync()
+    doesn't create any delayed refs there is no need to make it throttle on delayed
+    ref stuff, that will be handled by other people.  With this patch we get much
+    smoother fsync performance with large amounts of metadata.  Thanks,
+
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 2daa37a..304a2ef 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1931,12 +1931,24 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+  if (file->private_data)
+   btrfs_ioctl_trans_end(file);
+ 
++ /*
++  * We use start here because we will need to wait on the IO to complete
++  * in btrfs_sync_log, which could require joining a transaction (for
++  * example checking cross references in the nocow path).  If we use join
++  * here we could get into a situation where we're waiting on IO to
++  * happen that is blocked on a transaction trying to commit.  With start
++  * we inc the extwriter counter, so we wait for all extwriters to exit
++  * before we start blocking join'ers.  This comment is to keep somebody
++  * from thinking they are super smart and changing this to
++  * btrfs_join_transaction *cough*Josef*cough*.
++  */
+  trans = btrfs_start_transaction(root, 0);
+  if (IS_ERR(trans)) {
+   ret = PTR_ERR(trans);
+   mutex_unlock(&inode->i_mutex);
+   goto out;
+  }
++ trans->sync = true;
+ 
+  ret = btrfs_log_dentry_safe(trans, root, dentry);
+  if (ret < 0) {
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index da2ac4c..b16352c 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -474,6 +474,7 @@ again:
+  h->type = type;
+  h->allocating_chunk = false;
+  h->reloc_reserved = false;
++ h->sync = false;
+  INIT_LIST_HEAD(&h->qgroup_ref_list);
+  INIT_LIST_HEAD(&h->new_bgs);
+ 
+@@ -713,7 +714,7 @@ static int __btrfs_end_transaction(struct btrfs_trans_handle *trans,
+   btrfs_create_pending_block_groups(trans, root);
+ 
+  trans->delayed_ref_updates = 0;
+- if (btrfs_should_throttle_delayed_refs(trans, root)) {
++ if (!trans->sync && btrfs_should_throttle_delayed_refs(trans, root)) {
+   cur = max_t(unsigned long, cur, 1);
+   trans->delayed_ref_updates = 0;
+   btrfs_run_delayed_refs(trans, root, cur);
+diff --git a/fs/btrfs/transaction.h b/fs/btrfs/transaction.h
+index d05b601..6ac037e 100644
+--- a/fs/btrfs/transaction.h
++++ b/fs/btrfs/transaction.h
+@@ -93,6 +93,7 @@ struct btrfs_trans_handle {
+  short adding_csums;
+  bool allocating_chunk;
+  bool reloc_reserved;
++ bool sync;
+  unsigned int type;
+  /*
+   * this root is only needed to validate that the root passed to
+-- 
+1.7.1

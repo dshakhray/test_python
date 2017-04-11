@@ -1,0 +1,161 @@
+From 1328aa263596b188edad49a827866ff4240478e8 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:37:39 -0400
+Subject: [virt] kvm/nept: MMU context for nested EPT
+
+Message-id: <1406040016-3289-65-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86143
+O-Subject: [RHEL7 PATCH v2 064/221] nEPT: MMU context for nested EPT
+Bugzilla: 1048496 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Nadav Har'El <nyh@il.ibm.com>
+
+KVM's existing shadow MMU code already supports nested TDP. To use it, we
+need to set up a new "MMU context" for nested EPT, and create a few callbacks
+for it (nested_ept_*()). This context should also use the EPT versions of
+the page table access functions (defined in the previous patch).
+Then, we need to switch back and forth between this nested context and the
+regular MMU context when switching between L1 and L2 (when L1 runs this L2
+with EPT).
+
+Reviewed-by: Xiao Guangrong <xiaoguangrong@linux.vnet.ibm.com>
+Signed-off-by: Nadav Har'El <nyh@il.ibm.com>
+Signed-off-by: Jun Nakajima <jun.nakajima@intel.com>
+Signed-off-by: Xinhao Xu <xinhao.xu@intel.com>
+Signed-off-by: Yang Zhang <yang.z.zhang@Intel.com>
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 155a97a3d7c78b46cef6f1a973c831bc5a4f82bb)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index cc3ea5e..facdfe1 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3804,6 +3804,33 @@ int kvm_init_shadow_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context)
+ }
+ EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+ 
++int kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context,
++  bool execonly)
++{
++ ASSERT(vcpu);
++ ASSERT(!VALID_PAGE(vcpu->arch.mmu.root_hpa));
++
++ context->shadow_root_level = kvm_x86_ops->get_tdp_level();
++
++ context->nx = true;
++ context->new_cr3 = paging_new_cr3;
++ context->page_fault = ept_page_fault;
++ context->gva_to_gpa = ept_gva_to_gpa;
++ context->sync_page = ept_sync_page;
++ context->invlpg = ept_invlpg;
++ context->update_pte = ept_update_pte;
++ context->free = paging_free;
++ context->root_level = context->shadow_root_level;
++ context->root_hpa = INVALID_PAGE;
++ context->direct_map = false;
++
++ update_permission_bitmask(vcpu, context, true);
++ reset_rsvds_bits_mask_ept(vcpu, context, execonly);
++
++ return 0;
++}
++EXPORT_SYMBOL_GPL(kvm_init_shadow_ept_mmu);
++
+ static int init_kvm_softmmu(struct kvm_vcpu *vcpu)
+ {
+  int r = kvm_init_shadow_mmu(vcpu, vcpu->arch.walk_mmu);
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 5b59c57..77e044a 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -71,6 +71,8 @@ enum {
+ 
+ int handle_mmio_page_fault_common(struct kvm_vcpu *vcpu, u64 addr, bool direct);
+ int kvm_init_shadow_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context);
++int kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context,
++  bool execonly);
+ 
+ static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
+ {
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index b3f68dc..20d0ddf 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -1046,6 +1046,11 @@ static inline bool nested_cpu_has_virtual_nmis(struct vmcs12 *vmcs12,
+  return vmcs12->pin_based_vm_exec_control & PIN_BASED_VIRTUAL_NMIS;
+ }
+ 
++static inline int nested_cpu_has_ept(struct vmcs12 *vmcs12)
++{
++ return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENABLE_EPT);
++}
++
+ static inline bool is_exception(u32 intr_info)
+ {
+  return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VALID_MASK))
+@@ -7377,6 +7382,33 @@ static void nested_ept_inject_page_fault(struct kvm_vcpu *vcpu,
+  vmcs12->guest_physical_address = fault->address;
+ }
+ 
++/* Callbacks for nested_ept_init_mmu_context: */
++
++static unsigned long nested_ept_get_cr3(struct kvm_vcpu *vcpu)
++{
++ /* return the page table to be shadowed - in our case, EPT12 */
++ return get_vmcs12(vcpu)->ept_pointer;
++}
++
++static int nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
++{
++ int r = kvm_init_shadow_ept_mmu(vcpu, &vcpu->arch.mmu,
++   nested_vmx_ept_caps & VMX_EPT_EXECUTE_ONLY_BIT);
++
++ vcpu->arch.mmu.set_cr3           = vmx_set_cr3;
++ vcpu->arch.mmu.get_cr3           = nested_ept_get_cr3;
++ vcpu->arch.mmu.inject_page_fault = nested_ept_inject_page_fault;
++
++ vcpu->arch.walk_mmu              = &vcpu->arch.nested_mmu;
++
++ return r;
++}
++
++static void nested_ept_uninit_mmu_context(struct kvm_vcpu *vcpu)
++{
++ vcpu->arch.walk_mmu = &vcpu->arch.mmu;
++}
++
+ /*
+  * prepare_vmcs02 is called when the L1 guest hypervisor runs its nested
+  * L2 guest. L1 has a vmcs for L2 (vmcs12), and this function "merges" it
+@@ -7597,6 +7629,11 @@ static void prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+   vmx_flush_tlb(vcpu);
+  }
+ 
++ if (nested_cpu_has_ept(vmcs12)) {
++  kvm_mmu_unload(vcpu);
++  nested_ept_init_mmu_context(vcpu);
++ }
++
+  if (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_EFER)
+   vcpu->arch.efer = vmcs12->guest_ia32_efer;
+  else if (vmcs12->vm_entry_controls & VM_ENTRY_IA32E_MODE)
+@@ -8069,7 +8106,9 @@ static void load_vmcs12_host_state(struct kvm_vcpu *vcpu,
+  vcpu->arch.cr4_guest_owned_bits = ~vmcs_readl(CR4_GUEST_HOST_MASK);
+  kvm_set_cr4(vcpu, vmcs12->host_cr4);
+ 
+- /* shadow page tables on either EPT or shadow page tables */
++ if (nested_cpu_has_ept(vmcs12))
++  nested_ept_uninit_mmu_context(vcpu);
++
+  kvm_set_cr3(vcpu, vmcs12->host_cr3);
+  kvm_mmu_reset_context(vcpu);
+ 
+-- 
+1.7.1

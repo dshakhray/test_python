@@ -1,0 +1,129 @@
+From 5ddb1e32fd7ffc49b9f8b45d27724d1b38454410 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:11:44 -0400
+Subject: [powerpc] eeh: Remove EEH_PE_PHB_DEAD
+
+Message-id: <1410545655-205645-476-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94508
+O-Subject: [RHEL7 PATCH 475/626] powerpc/eeh: Remove EEH_PE_PHB_DEAD
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 9e0493756076692a8b6095fbee9c4f8dcbbe597a
+Author: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Date:   Thu Apr 24 18:00:07 2014 +1000
+
+    powerpc/eeh: Remove EEH_PE_PHB_DEAD
+
+    The PE state (for eeh_pe instance) EEH_PE_PHB_DEAD is duplicate to
+    EEH_PE_ISOLATED. Originally, those PHBs (PHB PE) with EEH_PE_PHB_DEAD
+    would be removed from the system. However, it's safe to replace
+    that with EEH_PE_ISOLATED.
+
+    The patch also clear EEH_PE_RECOVERING after fenced PHB has been handled,
+    either failure or success. It makes the PHB PE state consistent with:
+
+     PHB functions normally    NONE
+     PHB has been removed    EEH_PE_ISOLATED
+     PHB fenced, recovery in progress  EEH_PE_ISOLATED | RECOVERING
+
+    Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index d1ab2bc..5d59c8c 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -63,7 +63,6 @@ struct device_node;
+ 
+ #define EEH_PE_ISOLATED  (1 << 0) /* Isolated PE  */
+ #define EEH_PE_RECOVERING (1 << 1) /* Recovering PE */
+-#define EEH_PE_PHB_DEAD  (1 << 2) /* Dead PHB  */
+ 
+ #define EEH_PE_KEEP  (1 << 8) /* Keep PE on hotplug */
+ 
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index 3797f3d..d985e5d 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -233,7 +233,6 @@ void eeh_slot_error_detail(struct eeh_pe *pe, int severity)
+ {
+  size_t loglen = 0;
+  struct eeh_dev *edev, *tmp;
+- bool valid_cfg_log = true;
+ 
+  /*
+   * When the PHB is fenced or dead, it's pointless to collect
+@@ -241,12 +240,7 @@ void eeh_slot_error_detail(struct eeh_pe *pe, int severity)
+   * 0xFF's. For ER, we still retrieve the data from the PCI
+   * config space.
+   */
+- if (eeh_probe_mode_dev() &&
+-     (pe->type & EEH_PE_PHB) &&
+-     (pe->state & (EEH_PE_ISOLATED | EEH_PE_PHB_DEAD)))
+-  valid_cfg_log = false;
+-
+- if (valid_cfg_log) {
++ if (!(pe->type & EEH_PE_PHB)) {
+   eeh_pci_enable(pe, EEH_OPT_THAW_MMIO);
+   eeh_ops->configure_bridge(pe);
+   eeh_pe_restore_bars(pe);
+@@ -310,7 +304,7 @@ static int eeh_phb_check_failure(struct eeh_pe *pe)
+ 
+  /* If the PHB has been in problematic state */
+  eeh_serialize_lock(&flags);
+- if (phb_pe->state & (EEH_PE_ISOLATED | EEH_PE_PHB_DEAD)) {
++ if (phb_pe->state & EEH_PE_ISOLATED) {
+   ret = 0;
+   goto out;
+  }
+diff --git a/arch/powerpc/kernel/eeh_driver.c b/arch/powerpc/kernel/eeh_driver.c
+index bb61ca5..1ddc046 100644
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@ -682,8 +682,7 @@ static void eeh_handle_special_event(void)
+     phb_pe = eeh_phb_pe_get(hose);
+     if (!phb_pe) continue;
+ 
+-    eeh_pe_state_mark(phb_pe,
+-     EEH_PE_ISOLATED | EEH_PE_PHB_DEAD);
++    eeh_pe_state_mark(phb_pe, EEH_PE_ISOLATED);
+    }
+ 
+    eeh_serialize_unlock(flags);
+@@ -699,8 +698,7 @@ static void eeh_handle_special_event(void)
+    eeh_remove_event(pe);
+ 
+    if (rc == EEH_NEXT_ERR_DEAD_PHB)
+-    eeh_pe_state_mark(pe,
+-     EEH_PE_ISOLATED | EEH_PE_PHB_DEAD);
++    eeh_pe_state_mark(pe, EEH_PE_ISOLATED);
+    else
+     eeh_pe_state_mark(pe,
+      EEH_PE_ISOLATED | EEH_PE_RECOVERING);
+@@ -724,12 +722,14 @@ static void eeh_handle_special_event(void)
+   if (rc == EEH_NEXT_ERR_FROZEN_PE ||
+       rc == EEH_NEXT_ERR_FENCED_PHB) {
+    eeh_handle_normal_event(pe);
++   eeh_pe_state_clear(pe, EEH_PE_RECOVERING);
+   } else {
+    pci_lock_rescan_remove();
+    list_for_each_entry(hose, &hose_list, list_node) {
+     phb_pe = eeh_phb_pe_get(hose);
+     if (!phb_pe ||
+-        !(phb_pe->state & EEH_PE_PHB_DEAD))
++        !(phb_pe->state & EEH_PE_ISOLATED) ||
++        (phb_pe->state & EEH_PE_RECOVERING))
+      continue;
+ 
+     /* Notify all devices to be down */
+-- 
+1.7.1

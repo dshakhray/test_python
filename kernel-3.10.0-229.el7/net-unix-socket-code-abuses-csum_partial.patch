@@ -1,0 +1,107 @@
+From 4a9148df96fd29acfab7ca61807b3f20e841b800 Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hsowa@redhat.com>
+Date: Sun, 8 Jun 2014 16:45:02 -0400
+Subject: [net] unix socket code abuses csum_partial
+
+Message-id: <9e7720980a236eda03eb1109c5dc748399b25d07.1402245667.git.hsowa@redhat.com>
+Patchwork-id: 83087
+O-Subject: [RHEL7.1 PATCH net] net: unix socket code abuses csum_partial
+Bugzilla: 1106402
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1106402
+Upstream Status: 0a13404dd3bf4ea870e3d96270b5a382edca85c0
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7552897
+Tested: verified on ppc64 beaker instance with testcase from changelog
+
+No conflicts.
+
+Upstream Commit:
+commit 0a13404dd3bf4ea870e3d96270b5a382edca85c0
+Author: Anton Blanchard <anton@samba.org>
+Date:   Wed Mar 5 14:29:58 2014 +1100
+
+    net: unix socket code abuses csum_partial
+
+    The unix socket code is using the result of csum_partial to
+    hash into a lookup table:
+
+     unix_hash_fold(csum_partial(sunaddr, len, 0));
+
+    csum_partial is only guaranteed to produce something that can be
+    folded into a checksum, as its prototype explains:
+
+     * returns a 32-bit number suitable for feeding into itself
+     * or csum_tcpudp_magic
+
+    The 32bit value should not be used directly.
+
+    Depending on the alignment, the ppc64 csum_partial will return
+    different 32bit partial checksums that will fold into the same
+    16bit checksum.
+
+    This difference causes the following testcase (courtesy of
+    Gustavo) to sometimes fail:
+
+    #include <sys/socket.h>
+    #include <stdio.h>
+
+    int main()
+    {
+     int fd = socket(PF_LOCAL, SOCK_STREAM|SOCK_CLOEXEC, 0);
+
+     int i = 1;
+     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &i, 4);
+
+     struct sockaddr addr;
+     addr.sa_family = AF_LOCAL;
+     bind(fd, &addr, 2);
+
+     listen(fd, 128);
+
+     struct sockaddr_storage ss;
+     socklen_t sslen = (socklen_t)sizeof(ss);
+     getsockname(fd, (struct sockaddr*)&ss, &sslen);
+
+     fd = socket(PF_LOCAL, SOCK_STREAM|SOCK_CLOEXEC, 0);
+
+     if (connect(fd, (struct sockaddr*)&ss, sslen) == -1){
+      perror(NULL);
+      return 1;
+     }
+     printf("OK\n");
+     return 0;
+    }
+
+    As suggested by davem, fix this by using csum_fold to fold the
+    partial 32bit checksum into a 16bit checksum before using it.
+
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Hannes Frederic Sowa <hsowa@redhat.com>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index 6c66e8d..8e33cac 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -161,9 +161,8 @@ static inline void unix_set_secdata(struct scm_cookie *scm, struct sk_buff *skb)
+ 
+ static inline unsigned int unix_hash_fold(__wsum n)
+ {
+- unsigned int hash = (__force unsigned int)n;
++ unsigned int hash = (__force unsigned int)csum_fold(n);
+ 
+- hash ^= hash>>16;
+  hash ^= hash>>8;
+  return hash&(UNIX_HASH_SIZE-1);
+ }
+-- 
+1.7.1

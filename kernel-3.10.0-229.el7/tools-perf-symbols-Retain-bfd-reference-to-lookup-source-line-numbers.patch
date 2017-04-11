@@ -1,0 +1,155 @@
+From 97fc68716bb0aeaaab780d20e5ae1a56c0b709ba Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:49:14 -0400
+Subject: [tools] perf/symbols: Retain bfd reference to lookup source line numbers
+
+Message-id: <1408953210-26343-67-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88764
+O-Subject: [PATCH RHEL7.1 BZ1133083 066/322] perf symbols: Retain bfd reference to lookup source line numbers
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 454ff00f969e515c4cbfd52718ec5e01c7d9aeef
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Tue Dec 3 09:23:07 2013 +0200
+
+description
+===========
+Closng and re-opening for every lookup when using libbfd to lookup
+source file name and line number is very very slow.  Instead keep the
+reference on struct dso.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index af4c687..68aa55a 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -469,6 +469,7 @@ void dso__delete(struct dso *dso)
+  if (dso->lname_alloc)
+   free(dso->long_name);
+  dso_cache__free(&dso->cache);
++ dso__free_a2l(dso);
+  free(dso);
+ }
+ 
+diff --git a/tools/perf/util/dso.h b/tools/perf/util/dso.h
+index 9ac666a..d8613dc 100644
+--- a/tools/perf/util/dso.h
++++ b/tools/perf/util/dso.h
+@@ -77,6 +77,7 @@ struct dso {
+  struct rb_root  symbols[MAP__NR_TYPES];
+  struct rb_root  symbol_names[MAP__NR_TYPES];
+  struct rb_root  cache;
++ void   *a2l;
+  enum dso_kernel_type kernel;
+  enum dso_swap_type needs_swap;
+  enum dso_binary_type symtab_type;
+@@ -166,4 +167,6 @@ static inline bool dso__is_kcore(struct dso *dso)
+         dso->data_type == DSO_BINARY_TYPE__GUEST_KCORE;
+ }
+ 
++void dso__free_a2l(struct dso *dso);
++
+ #endif /* __PERF_DSO */
+diff --git a/tools/perf/util/srcline.c b/tools/perf/util/srcline.c
+index 4c8e816..25b85b2 100644
+--- a/tools/perf/util/srcline.c
++++ b/tools/perf/util/srcline.c
+@@ -146,18 +146,24 @@ static void addr2line_cleanup(struct a2l_data *a2l)
+ }
+ 
+ static int addr2line(const char *dso_name, unsigned long addr,
+-       char **file, unsigned int *line)
++       char **file, unsigned int *line, struct dso *dso)
+ {
+  int ret = 0;
+- struct a2l_data *a2l;
++ struct a2l_data *a2l = dso->a2l;
++
++ if (!a2l) {
++  dso->a2l = addr2line_init(dso_name);
++  a2l = dso->a2l;
++ }
+ 
+- a2l = addr2line_init(dso_name);
+  if (a2l == NULL) {
+   pr_warning("addr2line_init failed for %s\n", dso_name);
+   return 0;
+  }
+ 
+  a2l->addr = addr;
++ a2l->found = false;
++
+  bfd_map_over_sections(a2l->abfd, find_address_in_section, a2l);
+ 
+  if (a2l->found && a2l->filename) {
+@@ -168,14 +174,26 @@ static int addr2line(const char *dso_name, unsigned long addr,
+    ret = 1;
+  }
+ 
+- addr2line_cleanup(a2l);
+  return ret;
+ }
+ 
++void dso__free_a2l(struct dso *dso)
++{
++ struct a2l_data *a2l = dso->a2l;
++
++ if (!a2l)
++  return;
++
++ addr2line_cleanup(a2l);
++
++ dso->a2l = NULL;
++}
++
+ #else /* HAVE_LIBBFD_SUPPORT */
+ 
+ static int addr2line(const char *dso_name, unsigned long addr,
+-       char **file, unsigned int *line_nr)
++       char **file, unsigned int *line_nr,
++       struct dso *dso __maybe_unused)
+ {
+  FILE *fp;
+  char cmd[PATH_MAX];
+@@ -219,6 +237,11 @@ out:
+  pclose(fp);
+  return ret;
+ }
++
++void dso__free_a2l(struct dso *dso __maybe_unused)
++{
++}
++
+ #endif /* HAVE_LIBBFD_SUPPORT */
+ 
+ char *get_srcline(struct dso *dso, unsigned long addr)
+@@ -237,7 +260,7 @@ char *get_srcline(struct dso *dso, unsigned long addr)
+  if (!strncmp(dso_name, "/tmp/perf-", 10))
+   goto out;
+ 
+- if (!addr2line(dso_name, addr, &file, &line))
++ if (!addr2line(dso_name, addr, &file, &line, dso))
+   goto out;
+ 
+  if (asprintf(&srcline, "%s:%u", file, line) < 0)
+@@ -248,6 +271,7 @@ char *get_srcline(struct dso *dso, unsigned long addr)
+ 
+ out:
+  dso->has_srcline = 0;
++ dso__free_a2l(dso);
+  return SRCLINE_UNKNOWN;
+ }
+ 
+-- 
+1.7.1

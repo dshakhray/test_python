@@ -1,0 +1,72 @@
+From 5df61e694791030fb27a29cd8a1f0b192d65c925 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:54:01 -0400
+Subject: [fs] nfs: support page groups in nfs_read_completion
+
+Message-id: <1403798077-28799-43-git-send-email-steved@redhat.com>
+Patchwork-id: 84945
+O-Subject: [RHEL7.1 PATCH 42/78] nfs: support page groups in nfs_read_completion
+Bugzilla: 1113248
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+nfs_read_completion relied on the fact that there was a 1:1 mapping
+of page to nfs_request, but this has now changed.
+
+Regions not covered by a request have already been zeroed elsewhere.
+
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 68072992c8f6ace57fe80b6fb5d57b3ae887a09d
+Bugzilla: 1113248
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/read.c b/fs/nfs/read.c
+index 53d5b83..e818a47 100644
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@ -130,7 +130,6 @@ static void nfs_page_group_set_uptodate(struct nfs_page *req)
+   SetPageUptodate(req->wb_page);
+ }
+ 
+-/* Note io was page aligned */
+ static void nfs_read_completion(struct nfs_pgio_header *hdr)
+ {
+  unsigned long bytes = 0;
+@@ -140,14 +139,25 @@ static void nfs_read_completion(struct nfs_pgio_header *hdr)
+  while (!list_empty(&hdr->pages)) {
+   struct nfs_page *req = nfs_list_entry(hdr->pages.next);
+   struct page *page = req->wb_page;
++  unsigned long start = req->wb_pgbase;
++  unsigned long end = req->wb_pgbase + req->wb_bytes;
+ 
+   if (test_bit(NFS_IOHDR_EOF, &hdr->flags)) {
+-   if (bytes > hdr->good_bytes)
+-    zero_user(page, 0, PAGE_SIZE);
+-   else if (hdr->good_bytes - bytes < PAGE_SIZE)
+-    zero_user_segment(page,
+-     hdr->good_bytes & ~PAGE_MASK,
+-     PAGE_SIZE);
++   /* note: regions of the page not covered by a
++    * request are zeroed in nfs_readpage_async /
++    * readpage_async_filler */
++   if (bytes > hdr->good_bytes) {
++    /* nothing in this request was good, so zero
++     * the full extent of the request */
++    zero_user_segment(page, start, end);
++
++   } else if (hdr->good_bytes - bytes < req->wb_bytes) {
++    /* part of this request has good bytes, but
++     * not all. zero the bad bytes */
++    start += hdr->good_bytes - bytes;
++    WARN_ON(start < req->wb_pgbase);
++    zero_user_segment(page, start, end);
++   }
+   }
+   bytes += req->wb_bytes;
+   if (test_bit(NFS_IOHDR_ERROR, &hdr->flags)) {
+-- 
+1.7.1

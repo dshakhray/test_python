@@ -1,0 +1,165 @@
+From 29c217a022c9d164573f86a24a590ad28eac198b Mon Sep 17 00:00:00 2001
+From: Rob Evers <revers@redhat.com>
+Date: Wed, 20 Aug 2014 18:08:54 -0400
+Subject: [scsi] be2iscsi: Fix updating the boot enteries in sysfs
+
+Message-id: <1408558136-21958-3-git-send-email-revers@redhat.com>
+Patchwork-id: 88412
+O-Subject: [RHEL7.1 e-stor PATCH 3/5] scsi: be2iscsi: Fix updating the boot enteries in sysfs
+Bugzilla: 1130072
+RH-Acked-by: Ewan Milne <emilne@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: John Soni Jose <sony.john-n@emulex.com>
+
+http://marc.info/?l=linux-scsi&m=140747402205706&w=2
+
+Tested at Emulex
+
+ During port async event driver should check if there is any boot target
+ configured on the adapter. Update sysfs enteries with the boot target
+ parameters.
+
+Signed-off-by: Minh Tran <minhduc.tran@emulex.com>
+Signed-off-by: John Soni Jose <sony.john-n@emulex.com>
+Signed-off-by: Jayamohan Kallickal <jayamohan.kallickal@emulex.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/be2iscsi/be_cmds.c b/drivers/scsi/be2iscsi/be_cmds.c
+index ea4477f..339e22e 100644
+--- a/drivers/scsi/be2iscsi/be_cmds.c
++++ b/drivers/scsi/be2iscsi/be_cmds.c
+@@ -275,6 +275,19 @@ bool is_link_state_evt(u32 trailer)
+     ASYNC_EVENT_CODE_LINK_STATE);
+ }
+ 
++static bool is_iscsi_evt(u32 trailer)
++{
++ return (((trailer >> ASYNC_TRAILER_EVENT_CODE_SHIFT) &
++    ASYNC_TRAILER_EVENT_CODE_MASK) ==
++    ASYNC_EVENT_CODE_ISCSI);
++}
++
++static int iscsi_evt_type(u32 trailer)
++{
++ return ((trailer >> ASYNC_TRAILER_EVENT_TYPE_SHIFT) &
++   ASYNC_TRAILER_EVENT_TYPE_MASK);
++}
++
+ static inline bool be_mcc_compl_is_new(struct be_mcc_compl *compl)
+ {
+  if (compl->flags != 0) {
+@@ -438,7 +451,7 @@ void beiscsi_async_link_state_process(struct beiscsi_hba *phba,
+  } else if ((evt->port_link_status & ASYNC_EVENT_LINK_UP) ||
+       ((evt->port_link_status & ASYNC_EVENT_LOGICAL) &&
+        (evt->port_fault == BEISCSI_PHY_LINK_FAULT_NONE))) {
+-  phba->state = BE_ADAPTER_LINK_UP;
++  phba->state = BE_ADAPTER_LINK_UP | BE_ADAPTER_CHECK_BOOT;
+ 
+   beiscsi_log(phba, KERN_ERR,
+        BEISCSI_LOG_CONFIG | BEISCSI_LOG_INIT,
+@@ -461,7 +474,28 @@ int beiscsi_process_mcc(struct beiscsi_hba *phba)
+     /* Interpret compl as a async link evt */
+     beiscsi_async_link_state_process(phba,
+        (struct be_async_event_link_state *) compl);
+-   else
++   else if (is_iscsi_evt(compl->flags)) {
++    switch (iscsi_evt_type(compl->flags)) {
++    case ASYNC_EVENT_NEW_ISCSI_TGT_DISC:
++    case ASYNC_EVENT_NEW_ISCSI_CONN:
++    case ASYNC_EVENT_NEW_TCP_CONN:
++     phba->state |= BE_ADAPTER_CHECK_BOOT;
++     beiscsi_log(phba, KERN_ERR,
++          BEISCSI_LOG_CONFIG |
++          BEISCSI_LOG_MBOX,
++          "BC_%d : Async iscsi Event, flags "
++          "handled = 0x%08x\n",
++          compl->flags);
++     break;
++    default:
++     beiscsi_log(phba, KERN_ERR,
++          BEISCSI_LOG_CONFIG |
++          BEISCSI_LOG_MBOX,
++          "BC_%d : Unsupported Async iscsi "
++          "Event, flags = 0x%08x\n",
++          compl->flags);
++    }
++   } else
+     beiscsi_log(phba, KERN_ERR,
+          BEISCSI_LOG_CONFIG |
+          BEISCSI_LOG_MBOX,
+diff --git a/drivers/scsi/be2iscsi/be_cmds.h b/drivers/scsi/be2iscsi/be_cmds.h
+index ccda0b6..9889743 100644
+--- a/drivers/scsi/be2iscsi/be_cmds.h
++++ b/drivers/scsi/be2iscsi/be_cmds.h
+@@ -118,6 +118,14 @@ struct be_mcc_compl {
+ #define ASYNC_TRAILER_EVENT_CODE_SHIFT 8 /* bits 8 - 15 */
+ #define ASYNC_TRAILER_EVENT_CODE_MASK 0xFF
+ #define ASYNC_EVENT_CODE_LINK_STATE 0x1
++#define ASYNC_EVENT_CODE_ISCSI  0x4
++
++#define ASYNC_TRAILER_EVENT_TYPE_SHIFT 16 /* bits 16 - 23 */
++#define ASYNC_TRAILER_EVENT_TYPE_MASK 0xF
++#define ASYNC_EVENT_NEW_ISCSI_TGT_DISC 0x4
++#define ASYNC_EVENT_NEW_ISCSI_CONN 0x5
++#define ASYNC_EVENT_NEW_TCP_CONN 0x7
++
+ struct be_async_event_trailer {
+  u32 code;
+ };
+diff --git a/drivers/scsi/be2iscsi/be_main.c b/drivers/scsi/be2iscsi/be_main.c
+index 50479ee..8253fcf 100644
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@ -4429,6 +4429,10 @@ static int beiscsi_setup_boot_info(struct beiscsi_hba *phba)
+ {
+  struct iscsi_boot_kobj *boot_kobj;
+ 
++ /* it has been created previously */
++ if (phba->boot_kset)
++  return 0;
++
+  /* get boot info using mgmt cmd */
+  if (beiscsi_get_boot_info(phba))
+   /* Try to see if we can carry on without this */
+@@ -5388,6 +5392,14 @@ static void be_eqd_update(struct beiscsi_hba *phba)
+  }
+ }
+ 
++static void be_check_boot_session(struct beiscsi_hba *phba)
++{
++ if (beiscsi_setup_boot_info(phba))
++  beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
++       "BM_%d : Could not set up "
++       "iSCSI boot info on async event.\n");
++}
++
+ /*
+  * beiscsi_hw_health_check()- Check adapter health
+  * @work: work item to check HW health
+@@ -5403,6 +5415,11 @@ beiscsi_hw_health_check(struct work_struct *work)
+ 
+  be_eqd_update(phba);
+ 
++ if (phba->state & BE_ADAPTER_CHECK_BOOT) {
++  phba->state &= ~BE_ADAPTER_CHECK_BOOT;
++  be_check_boot_session(phba);
++ }
++
+  beiscsi_ue_detect(phba);
+ 
+  schedule_delayed_work(&phba->beiscsi_hw_check_task,
+diff --git a/drivers/scsi/be2iscsi/be_main.h b/drivers/scsi/be2iscsi/be_main.h
+index b827a5a..29beb32 100644
+--- a/drivers/scsi/be2iscsi/be_main.h
++++ b/drivers/scsi/be2iscsi/be_main.h
+@@ -104,6 +104,7 @@
+ #define BE_ADAPTER_LINK_DOWN 0x002
+ #define BE_ADAPTER_PCI_ERR 0x004
+ #define BE_ADAPTER_STATE_SHUTDOWN 0x008
++#define BE_ADAPTER_CHECK_BOOT 0x010
+ 
+ 
+ #define BEISCSI_CLEAN_UNLOAD 0x01
+-- 
+1.7.1

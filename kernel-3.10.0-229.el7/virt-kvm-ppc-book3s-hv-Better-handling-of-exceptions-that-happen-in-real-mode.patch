@@ -1,0 +1,144 @@
+From 6e7b614304d44fc30c2d55e7f51c445bb38d0308 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:06:11 -0400
+Subject: [virt] kvm/ppc: book3s hv - Better handling of exceptions that happen in real mode
+
+Message-id: <1410545655-205645-143-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94153
+O-Subject: [RHEL7 PATCH 142/626] KVM: PPC: Book3S HV: Better handling of exceptions that happen in real mode
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 44a3add86311bb9d060d795bcdcdc9b8c7a35bd0
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Oct 4 21:45:04 2013 +1000
+
+    KVM: PPC: Book3S HV: Better handling of exceptions that happen in real mode
+
+    When an interrupt or exception happens in the guest that comes to the
+    host, the CPU goes to hypervisor real mode (MMU off) to handle the
+    exception but doesn't change the MMU context.  After saving a few
+    registers, we then clear the "in guest" flag.  If, for any reason,
+    we get an exception in the real-mode code, that then gets handled
+    by the normal kernel exception handlers, which turn the MMU on.  This
+    is disastrous if the MMU is still set to the guest context, since we
+    end up executing instructions from random places in the guest kernel
+    with hypervisor privilege.
+
+    In order to catch this situation, we define a new value for the "in guest"
+    flag, KVM_GUEST_MODE_HOST_HV, to indicate that we are in hypervisor real
+    mode with guest MMU context.  If the "in guest" flag is set to this value,
+    we branch off to an emergency handler.  For the moment, this just does
+    a branch to self to stop the CPU from doing anything further.
+
+    While we're here, we define another new flag value to indicate that we
+    are in a HV guest, as distinct from a PR guest.  This will be useful
+    when we have a kernel that can support both PR and HV guests concurrently.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_asm.h b/arch/powerpc/include/asm/kvm_asm.h
+index e2d4d46..1bd92fd 100644
+--- a/arch/powerpc/include/asm/kvm_asm.h
++++ b/arch/powerpc/include/asm/kvm_asm.h
+@@ -138,6 +138,8 @@
+ #define KVM_GUEST_MODE_NONE 0
+ #define KVM_GUEST_MODE_GUEST 1
+ #define KVM_GUEST_MODE_SKIP 2
++#define KVM_GUEST_MODE_GUEST_HV 3
++#define KVM_GUEST_MODE_HOST_HV 4
+ 
+ #define KVM_INST_FETCH_FAILED -1
+ 
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 615ea6d..b07385b 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -387,6 +387,9 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+  mtspr SPRN_DAR, r5
+  mtspr SPRN_DSISR, r6
+ 
++ li r6, KVM_GUEST_MODE_HOST_HV
++ stb r6, HSTATE_IN_GUEST(r13)
++
+ BEGIN_FTR_SECTION
+  /* Restore AMR and UAMOR, set AMOR to all 1s */
+  ld r5,VCPU_AMR(r4)
+@@ -690,7 +693,7 @@ fast_guest_return:
+  mtspr SPRN_HSRR1,r11
+ 
+  /* Activate guest mode, so faults get handled by KVM */
+- li r9, KVM_GUEST_MODE_GUEST
++ li r9, KVM_GUEST_MODE_GUEST_HV
+  stb r9, HSTATE_IN_GUEST(r13)
+ 
+  /* Enter guest */
+@@ -750,6 +753,14 @@ kvmppc_interrupt:
+   */
+  /* abuse host_r2 as third scratch area; we get r2 from PACATOC(r13) */
+  std r9, HSTATE_HOST_R2(r13)
++
++ lbz r9, HSTATE_IN_GUEST(r13)
++ cmpwi r9, KVM_GUEST_MODE_HOST_HV
++ beq kvmppc_bad_host_intr
++ /* We're now back in the host but in guest MMU context */
++ li r9, KVM_GUEST_MODE_HOST_HV
++ stb r9, HSTATE_IN_GUEST(r13)
++
+  ld r9, HSTATE_KVM_VCPU(r13)
+ 
+  /* Save registers */
+@@ -801,10 +812,6 @@ END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR)
+  std r3, VCPU_GPR(R13)(r9)
+  std r4, VCPU_LR(r9)
+ 
+- /* Unset guest mode */
+- li r0, KVM_GUEST_MODE_NONE
+- stb r0, HSTATE_IN_GUEST(r13)
+-
+  stw r12,VCPU_TRAP(r9)
+ 
+  /* Save HEIR (HV emulation assist reg) in last_inst
+@@ -1198,6 +1205,10 @@ BEGIN_FTR_SECTION
+  mtspr SPRN_AMR,r6
+ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ 
++ /* Unset guest mode */
++ li r0, KVM_GUEST_MODE_NONE
++ stb r0, HSTATE_IN_GUEST(r13)
++
+  /* Switch DSCR back to host value */
+ BEGIN_FTR_SECTION
+  mfspr r8, SPRN_DSCR
+@@ -1400,7 +1411,7 @@ fast_interrupt_c_return:
+  stw r8, VCPU_LAST_INST(r9)
+ 
+  /* Unset guest mode. */
+- li r0, KVM_GUEST_MODE_NONE
++ li r0, KVM_GUEST_MODE_HOST_HV
+  stb r0, HSTATE_IN_GUEST(r13)
+  b guest_exit_cont
+ 
+@@ -1949,3 +1960,11 @@ END_FTR_SECTION_IFSET(CPU_FTR_ALTIVEC)
+  lwz r7,VCPU_VRSAVE(r4)
+  mtspr SPRN_VRSAVE,r7
+  blr
++
++/*
++ * We come here if we get any exception or interrupt while we are
++ * executing host real mode code while in guest MMU context.
++ * For now just spin, but we should do something better.
++ */
++kvmppc_bad_host_intr:
++ b .
+-- 
+1.7.1

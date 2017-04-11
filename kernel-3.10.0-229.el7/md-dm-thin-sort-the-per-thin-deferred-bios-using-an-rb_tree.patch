@@ -1,0 +1,234 @@
+From 93cde6cb919f06f310b2e88afe30f47ab780d651 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 16 May 2014 20:13:27 -0400
+Subject: [md] dm-thin: sort the per thin deferred bios using an rb_tree
+
+Message-id: <1400271213-25480-4-git-send-email-snitzer@redhat.com>
+Patchwork-id: 79872
+O-Subject: [RHEL7.1 PATCH 3/9] dm thin: sort the per thin deferred bios using an rb_tree
+Bugzilla: 1098643
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+RH-Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+
+BZ: 1098643
+
+Upstream commit 67324ea18812bc952ef96892fbd5817b9050413f
+Author: Mike Snitzer <snitzer@redhat.com>
+Date:   Fri Mar 21 18:33:41 2014 -0400
+
+    dm thin: sort the per thin deferred bios using an rb_tree
+
+    A thin-pool will allocate blocks using FIFO order for all thin devices
+    which share the thin-pool.  Because of this simplistic allocation the
+    thin-pool's space can become fragmented quite easily; especially when
+    multiple threads are requesting blocks in parallel.
+
+    Sort each thin device's deferred_bio_list based on logical sector to
+    help reduce fragmentation of the thin-pool's ondisk layout.
+
+    The following tables illustrate the realized gains/potential offered by
+    sorting each thin device's deferred_bio_list.  An "io size"-sized random
+    read of the device would result in "seeks/io" fragments being read, with
+    an average "distance/seek" between each fragment.
+
+    Data was written to a single thin device using multiple threads via
+    iozone (8 threads, 64K for both the block_size and io_size).
+
+    unsorted:
+
+         io size   seeks/io distance/seek
+      --------------------------------------
+              4k    0.000   0b
+             16k    0.013   11m
+             64k    0.065   11m
+            256k    0.274   10m
+              1m    1.109   10m
+              4m    4.411   10m
+             16m    17.097  11m
+             64m    60.055  13m
+            256m    148.798 25m
+              1g    809.929 21m
+
+    sorted:
+
+         io size   seeks/io distance/seek
+      --------------------------------------
+              4k    0.000   0b
+             16k    0.000   1g
+             64k    0.001   1g
+            256k    0.003   1g
+              1m    0.011   1g
+              4m    0.045   1g
+             16m    0.181   1g
+             64m    0.747   1011m
+            256m    3.299   1g
+              1g    14.373  1g
+
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Acked-by: Joe Thornber <ejt@redhat.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index 598af6f..f8c70cd 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -16,6 +16,7 @@
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
++#include <linux/rbtree.h>
+ 
+ #define DM_MSG_PREFIX "thin"
+ 
+@@ -230,6 +231,7 @@ struct thin_c {
+  spinlock_t lock;
+  struct bio_list deferred_bio_list;
+  struct bio_list retry_on_resume_list;
++ struct rb_root sort_bio_list; /* sorted list of deferred bios */
+ };
+ 
+ /*----------------------------------------------------------------*/
+@@ -371,6 +373,7 @@ struct dm_thin_endio_hook {
+  struct dm_deferred_entry *shared_read_entry;
+  struct dm_deferred_entry *all_io_entry;
+  struct dm_thin_new_mapping *overwrite_mapping;
++ struct rb_node rb_node;
+ };
+ 
+ static void requeue_bio_list(struct thin_c *tc, struct bio_list *master)
+@@ -1361,12 +1364,77 @@ static int need_commit_due_to_time(struct pool *pool)
+         jiffies > pool->last_commit_jiffies + COMMIT_PERIOD;
+ }
+ 
++#define thin_pbd(node) rb_entry((node), struct dm_thin_endio_hook, rb_node)
++#define thin_bio(pbd) dm_bio_from_per_bio_data((pbd), sizeof(struct dm_thin_endio_hook))
++
++static void __thin_bio_rb_add(struct thin_c *tc, struct bio *bio)
++{
++ struct rb_node **rbp, *parent;
++ struct dm_thin_endio_hook *pbd;
++ sector_t bi_sector = bio->bi_sector;
++
++ rbp = &tc->sort_bio_list.rb_node;
++ parent = NULL;
++ while (*rbp) {
++  parent = *rbp;
++  pbd = thin_pbd(parent);
++
++  if (bi_sector < thin_bio(pbd)->bi_sector)
++   rbp = &(*rbp)->rb_left;
++  else
++   rbp = &(*rbp)->rb_right;
++ }
++
++ pbd = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
++ rb_link_node(&pbd->rb_node, parent, rbp);
++ rb_insert_color(&pbd->rb_node, &tc->sort_bio_list);
++}
++
++static void __extract_sorted_bios(struct thin_c *tc)
++{
++ struct rb_node *node;
++ struct dm_thin_endio_hook *pbd;
++ struct bio *bio;
++
++ for (node = rb_first(&tc->sort_bio_list); node; node = rb_next(node)) {
++  pbd = thin_pbd(node);
++  bio = thin_bio(pbd);
++
++  bio_list_add(&tc->deferred_bio_list, bio);
++  rb_erase(&pbd->rb_node, &tc->sort_bio_list);
++ }
++
++ WARN_ON(!RB_EMPTY_ROOT(&tc->sort_bio_list));
++}
++
++static void __sort_thin_deferred_bios(struct thin_c *tc)
++{
++ struct bio *bio;
++ struct bio_list bios;
++
++ bio_list_init(&bios);
++ bio_list_merge(&bios, &tc->deferred_bio_list);
++ bio_list_init(&tc->deferred_bio_list);
++
++ /* Sort deferred_bio_list using rb-tree */
++ while ((bio = bio_list_pop(&bios)))
++  __thin_bio_rb_add(tc, bio);
++
++ /*
++  * Transfer the sorted bios in sort_bio_list back to
++  * deferred_bio_list to allow lockless submission of
++  * all bios.
++  */
++ __extract_sorted_bios(tc);
++}
++
+ static void process_thin_deferred_bios(struct thin_c *tc)
+ {
+  struct pool *pool = tc->pool;
+  unsigned long flags;
+  struct bio *bio;
+  struct bio_list bios;
++ struct blk_plug plug;
+ 
+  if (tc->requeue_mode) {
+   requeue_bio_list(tc, &tc->deferred_bio_list);
+@@ -1376,10 +1444,20 @@ static void process_thin_deferred_bios(struct thin_c *tc)
+  bio_list_init(&bios);
+ 
+  spin_lock_irqsave(&tc->lock, flags);
++
++ if (bio_list_empty(&tc->deferred_bio_list)) {
++  spin_unlock_irqrestore(&tc->lock, flags);
++  return;
++ }
++
++ __sort_thin_deferred_bios(tc);
++
+  bio_list_merge(&bios, &tc->deferred_bio_list);
+  bio_list_init(&tc->deferred_bio_list);
++
+  spin_unlock_irqrestore(&tc->lock, flags);
+ 
++ blk_start_plug(&plug);
+  while ((bio = bio_list_pop(&bios))) {
+   /*
+    * If we've got no free new_mapping structs, and processing
+@@ -1399,6 +1477,7 @@ static void process_thin_deferred_bios(struct thin_c *tc)
+   else
+    pool->process_bio(tc, bio);
+  }
++ blk_finish_plug(&plug);
+ }
+ 
+ static void process_deferred_bios(struct pool *pool)
+@@ -2958,7 +3037,7 @@ static struct target_type pool_target = {
+  .name = "thin-pool",
+  .features = DM_TARGET_SINGLETON | DM_TARGET_ALWAYS_WRITEABLE |
+       DM_TARGET_IMMUTABLE,
+- .version = {1, 11, 0},
++ .version = {1, 12, 0},
+  .module = THIS_MODULE,
+  .ctr = pool_ctr,
+  .dtr = pool_dtr,
+@@ -3034,6 +3113,7 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
+  spin_lock_init(&tc->lock);
+  bio_list_init(&tc->deferred_bio_list);
+  bio_list_init(&tc->retry_on_resume_list);
++ tc->sort_bio_list = RB_ROOT;
+ 
+  if (argc == 3) {
+   r = dm_get_device(ti, argv[2], FMODE_READ, &origin_dev);
+@@ -3281,7 +3361,7 @@ static int thin_iterate_devices(struct dm_target *ti,
+ 
+ static struct target_type thin_target = {
+  .name = "thin",
+- .version = {1, 11, 0},
++ .version = {1, 12, 0},
+  .module = THIS_MODULE,
+  .ctr = thin_ctr,
+  .dtr = thin_dtr,
+-- 
+1.7.1

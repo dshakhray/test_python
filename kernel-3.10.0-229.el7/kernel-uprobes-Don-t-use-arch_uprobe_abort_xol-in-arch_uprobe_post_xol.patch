@@ -1,0 +1,82 @@
+From 88916cdda7ee69cd0f93954475cedf909433a692 Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Mon, 16 Jun 2014 16:02:04 -0400
+Subject: [kernel] uprobes: Don't use arch_uprobe_abort_xol() in arch_uprobe_post_xol()
+
+Message-id: <20140616160204.GA15492@redhat.com>
+Patchwork-id: 84085
+O-Subject: [PATCH RHEL7 BZ 1073627 24/36] uprobes/x86: Don't use arch_uprobe_abort_xol() in arch_uprobe_post_xol()
+Bugzilla: 1073627
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+RHBZ: 1073627
+
+014940bad8e4 "uprobes/x86: Send SIGILL if arch_uprobe_post_xol() fails"
+changed arch_uprobe_post_xol() to use arch_uprobe_abort_xol() if ->post_xol
+fails. This was correct and helped to avoid the additional complications,
+we need to clear X86_EFLAGS_TF in this case.
+
+However, now that we have uprobe_xol_ops->abort() hook it would be better
+to avoid arch_uprobe_abort_xol() here. ->post_xol() should likely do what
+->abort() does anyway, we should not do the same work twice. Currently only
+handle_riprel_post_xol() can be called twice, this is unnecessary but safe.
+Still this is not clean and can lead to the problems in future.
+
+Change arch_uprobe_post_xol() to clear X86_EFLAGS_TF and restore ->ip by
+hand and avoid arch_uprobe_abort_xol(). This temporary uglifies the usage
+of autask.saved_tf, we will cleanup this later.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+(cherry picked from commit 6ded5f3848bfd3227ee208aa38f8bf8d7209d4e3)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index b3c2a92..2efb93f 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -759,22 +759,24 @@ int arch_uprobe_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+  struct uprobe_task *utask = current->utask;
+ 
+  WARN_ON_ONCE(current->thread.trap_nr != UPROBE_TRAP_NR);
++ current->thread.trap_nr = utask->autask.saved_trap_nr;
+ 
+  if (auprobe->ops->post_xol) {
+   int err = auprobe->ops->post_xol(auprobe, regs);
+   if (err) {
+-   arch_uprobe_abort_xol(auprobe, regs);
++   if (!utask->autask.saved_tf)
++    regs->flags &= ~X86_EFLAGS_TF;
+    /*
+-    * Restart the probed insn. ->post_xol() must ensure
+-    * this is really possible if it returns -ERESTART.
++    * Restore ->ip for restart or post mortem analysis.
++    * ->post_xol() must not return -ERESTART unless this
++    * is really possible.
+     */
++   regs->ip = utask->vaddr;
+    if (err == -ERESTART)
+     return 0;
+    return err;
+   }
+  }
+-
+- current->thread.trap_nr = utask->autask.saved_trap_nr;
+  /*
+   * arch_uprobe_pre_xol() doesn't save the state of TIF_BLOCKSTEP
+   * so we can get an extra SIGTRAP if we do not clear TF. We need
+@@ -819,9 +821,8 @@ int arch_uprobe_exception_notify(struct notifier_block *self, unsigned long val,
+ 
+ /*
+  * This function gets called when XOL instruction either gets trapped or
+- * the thread has a fatal signal, or if arch_uprobe_post_xol() failed.
+- * Reset the instruction pointer to its probed address for the potential
+- * restart or for post mortem analysis.
++ * the thread has a fatal signal. Reset the instruction pointer to its
++ * probed address for the potential restart or for post mortem analysis.
+  */
+ void arch_uprobe_abort_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+ {
+-- 
+1.7.1

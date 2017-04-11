@@ -1,0 +1,153 @@
+From 224cb7ed030c9bc0b8aa850e8bfe8af2e11c5105 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:38:51 -0400
+Subject: [virt] kvm/x86: Validate guest writes to MSR_IA32_APICBASE
+
+Message-id: <1406040016-3289-137-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86215
+O-Subject: [RHEL7 PATCH v2 136/221] KVM: x86: Validate guest writes to MSR_IA32_APICBASE
+Bugzilla: 1110125 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jan Kiszka <jan.kiszka@siemens.com>
+
+Check for invalid state transitions on guest-initiated updates of
+MSR_IA32_APICBASE. This address both enabling of the x2APIC when it is
+not supported and all invalid transitions as described in SDM section
+10.12.5. It also checks that no reserved bit is set in APICBASE by the
+guest.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+[Use cpuid_maxphyaddr instead of guest_cpuid_get_phys_bits. - Paolo]
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 58cb628dbe24ce21b884729aebe15acb903dbfb5)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/cpuid.h b/arch/x86/kvm/cpuid.h
+index f1e4895..a2a1bb7 100644
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@ -72,4 +72,12 @@ static inline bool guest_cpuid_has_pcid(struct kvm_vcpu *vcpu)
+  return best && (best->ecx & bit(X86_FEATURE_PCID));
+ }
+ 
++static inline bool guest_cpuid_has_x2apic(struct kvm_vcpu *vcpu)
++{
++ struct kvm_cpuid_entry2 *best;
++
++ best = kvm_find_cpuid_entry(vcpu, 1, 0);
++ return best && (best->ecx & bit(X86_FEATURE_X2APIC));
++}
++
+ #endif
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index c8b0d0d..6a11845 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -65,7 +65,7 @@ bool kvm_irq_delivery_to_apic_fast(struct kvm *kvm, struct kvm_lapic *src,
+   struct kvm_lapic_irq *irq, int *r, unsigned long *dest_map);
+ 
+ u64 kvm_get_apic_base(struct kvm_vcpu *vcpu);
+-void kvm_set_apic_base(struct kvm_vcpu *vcpu, u64 data);
++int kvm_set_apic_base(struct kvm_vcpu *vcpu, struct msr_data *msr_info);
+ void kvm_apic_post_state_restore(struct kvm_vcpu *vcpu,
+   struct kvm_lapic_state *s);
+ int kvm_lapic_find_highest_irr(struct kvm_vcpu *vcpu);
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index c9ceb5e..3927528 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -4392,7 +4392,7 @@ static int vmx_vcpu_setup(struct vcpu_vmx *vmx)
+ static void vmx_vcpu_reset(struct kvm_vcpu *vcpu)
+ {
+  struct vcpu_vmx *vmx = to_vmx(vcpu);
+- u64 msr;
++ struct msr_data apic_base_msr;
+ 
+  vmx->rmode.vm86_active = 0;
+ 
+@@ -4400,10 +4400,11 @@ static void vmx_vcpu_reset(struct kvm_vcpu *vcpu)
+ 
+  vmx->vcpu.arch.regs[VCPU_REGS_RDX] = get_rdx_init_val();
+  kvm_set_cr8(&vmx->vcpu, 0);
+- msr = 0xfee00000 | MSR_IA32_APICBASE_ENABLE;
++ apic_base_msr.data = 0xfee00000 | MSR_IA32_APICBASE_ENABLE;
+  if (kvm_vcpu_is_bsp(&vmx->vcpu))
+-  msr |= MSR_IA32_APICBASE_BSP;
+- kvm_set_apic_base(&vmx->vcpu, msr);
++  apic_base_msr.data |= MSR_IA32_APICBASE_BSP;
++ apic_base_msr.host_initiated = true;
++ kvm_set_apic_base(&vmx->vcpu, &apic_base_msr);
+ 
+  vmx_segment_cache_clear(vmx);
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b085d21..520b9b3 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -259,10 +259,26 @@ u64 kvm_get_apic_base(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_get_apic_base);
+ 
+-void kvm_set_apic_base(struct kvm_vcpu *vcpu, u64 data)
+-{
+- /* TODO: reserve bits check */
+- kvm_lapic_set_base(vcpu, data);
++int kvm_set_apic_base(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
++{
++ u64 old_state = vcpu->arch.apic_base &
++  (MSR_IA32_APICBASE_ENABLE | X2APIC_ENABLE);
++ u64 new_state = msr_info->data &
++  (MSR_IA32_APICBASE_ENABLE | X2APIC_ENABLE);
++ u64 reserved_bits = ((~0ULL) << cpuid_maxphyaddr(vcpu)) |
++  0x2ff | (guest_cpuid_has_x2apic(vcpu) ? 0 : X2APIC_ENABLE);
++
++ if (!msr_info->host_initiated &&
++     ((msr_info->data & reserved_bits) != 0 ||
++      new_state == X2APIC_ENABLE ||
++      (new_state == MSR_IA32_APICBASE_ENABLE &&
++       old_state == (MSR_IA32_APICBASE_ENABLE | X2APIC_ENABLE)) ||
++      (new_state == (MSR_IA32_APICBASE_ENABLE | X2APIC_ENABLE) &&
++       old_state == 0)))
++  return 1;
++
++ kvm_lapic_set_base(vcpu, msr_info->data);
++ return 0;
+ }
+ EXPORT_SYMBOL_GPL(kvm_set_apic_base);
+ 
+@@ -2042,8 +2058,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+  case 0x200 ... 0x2ff:
+   return set_msr_mtrr(vcpu, msr, data);
+  case MSR_IA32_APICBASE:
+-  kvm_set_apic_base(vcpu, data);
+-  break;
++  return kvm_set_apic_base(vcpu, msr_info);
+  case APIC_BASE_MSR ... APIC_BASE_MSR + 0x3ff:
+   return kvm_x2apic_msr_write(vcpu, msr, data);
+  case MSR_IA32_TSCDEADLINE:
+@@ -6451,6 +6466,7 @@ EXPORT_SYMBOL_GPL(kvm_task_switch);
+ int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
+       struct kvm_sregs *sregs)
+ {
++ struct msr_data apic_base_msr;
+  int mmu_reset_needed = 0;
+  int pending_vec, max_bits, idx;
+  struct desc_ptr dt;
+@@ -6474,7 +6490,9 @@ int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
+ 
+  mmu_reset_needed |= vcpu->arch.efer != sregs->efer;
+  kvm_x86_ops->set_efer(vcpu, sregs->efer);
+- kvm_set_apic_base(vcpu, sregs->apic_base);
++ apic_base_msr.data = sregs->apic_base;
++ apic_base_msr.host_initiated = true;
++ kvm_set_apic_base(vcpu, &apic_base_msr);
+ 
+  mmu_reset_needed |= kvm_read_cr0(vcpu) != sregs->cr0;
+  kvm_x86_ops->set_cr0(vcpu, sregs->cr0);
+-- 
+1.7.1

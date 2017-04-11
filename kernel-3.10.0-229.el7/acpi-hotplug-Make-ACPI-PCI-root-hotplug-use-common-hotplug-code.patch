@@ -1,0 +1,311 @@
+From 6a3a35126d467393f293c341b7f7651b9adaca17 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 28 Aug 2014 03:05:31 -0400
+Subject: [acpi] hotplug: Make ACPI PCI root hotplug use common hotplug code
+
+Message-id: <20140828030531.2117.64602.stgit@gir.stowe>
+Patchwork-id: 89307
+O-Subject: [RHEL7.1 PATCH 19/30] ACPI / hotplug: Make ACPI PCI root hotplug use common hotplug code
+Bugzilla: 1128632
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1128632
+Upstream Status: 3338db0057ed9f554050bd06863731c515d79672
+
+commit 3338db0057ed9f554050bd06863731c515d79672
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Fri Nov 22 21:55:20 2013 +0100
+
+    ACPI / hotplug: Make ACPI PCI root hotplug use common hotplug code
+
+    Rework the common ACPI device hotplug code so that it is suitable
+    for PCI host bridge hotplug and switch the PCI host bridge scan
+    handler to using the common hotplug code.
+
+    This allows quite a few lines of code that are not necessary any more
+    to be dropped from the PCI host bridge scan handler and removes
+    arbitrary differences in behavior between PCI host bridge hotplug
+    and ACPI-based hotplug of other components, like CPUs and memory.
+
+    Also acpi_device_hotplug() can be static now.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/internal.h b/drivers/acpi/internal.h
+index 692237f..a21c08e 100644
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -27,7 +27,6 @@ int init_acpi_device_notify(void);
+ int acpi_scan_init(void);
+ void acpi_pci_root_init(void);
+ void acpi_pci_link_init(void);
+-void acpi_pci_root_hp_init(void);
+ void acpi_processor_init(void);
+ void acpi_platform_init(void);
+ int acpi_sysfs_init(void);
+@@ -88,7 +87,6 @@ void acpi_device_add_finalize(struct acpi_device *device);
+ void acpi_free_pnp_ids(struct acpi_device_pnp *pnp);
+ int acpi_bind_one(struct device *dev, acpi_handle handle);
+ int acpi_unbind_one(struct device *dev);
+-void acpi_device_hotplug(void *data, u32 ost_src);
+ bool acpi_device_is_present(struct acpi_device *adev);
+ 
+ /* --------------------------------------------------------------------------
+diff --git a/drivers/acpi/pci_root.c b/drivers/acpi/pci_root.c
+index b69a4a6..b78bd91 100644
+--- a/drivers/acpi/pci_root.c
++++ b/drivers/acpi/pci_root.c
+@@ -51,6 +51,12 @@ static int acpi_pci_root_add(struct acpi_device *device,
+         const struct acpi_device_id *not_used);
+ static void acpi_pci_root_remove(struct acpi_device *device);
+ 
++static int acpi_pci_root_scan_dependent(struct acpi_device *adev)
++{
++ acpiphp_check_host_bridge(adev->handle);
++ return 0;
++}
++
+ #define ACPI_PCIE_REQ_SUPPORT (OSC_PCI_EXT_CONFIG_SUPPORT \
+     | OSC_PCI_ASPM_SUPPORT \
+     | OSC_PCI_CLOCK_PM_SUPPORT \
+@@ -66,7 +72,8 @@ static struct acpi_scan_handler pci_root_handler = {
+  .attach = acpi_pci_root_add,
+  .detach = acpi_pci_root_remove,
+  .hotplug = {
+-  .ignore = true,
++  .enabled = true,
++  .scan_dependent = acpi_pci_root_scan_dependent,
+  },
+ };
+ 
+@@ -630,119 +637,9 @@ static void acpi_pci_root_remove(struct acpi_device *device)
+ void __init acpi_pci_root_init(void)
+ {
+  acpi_hest_init();
+-
+- if (!acpi_pci_disabled) {
+-  pci_acpi_crs_quirks();
+-  acpi_scan_add_handler(&pci_root_handler);
+- }
+-}
+-/* Support root bridge hotplug */
+-
+-static void handle_root_bridge_insertion(acpi_handle handle)
+-{
+- struct acpi_device *device = NULL;
+-
+- acpi_bus_get_device(handle, &device);
+- if (acpi_device_enumerated(device)) {
+-  dev_printk(KERN_DEBUG, &device->dev,
+-      "acpi device already exists; ignoring notify\n");
+-  return;
+- }
+-
+- if (acpi_bus_scan(handle))
+-  acpi_handle_err(handle, "cannot add bridge to acpi list\n");
+-}
+-
+-static void hotplug_event_root(void *data, u32 type)
+-{
+- acpi_handle handle = data;
+- struct acpi_pci_root *root;
+-
+- acpi_scan_lock_acquire();
+-
+- root = acpi_pci_find_root(handle);
+-
+- switch (type) {
+- case ACPI_NOTIFY_BUS_CHECK:
+-  /* bus enumerate */
+-  acpi_handle_printk(KERN_DEBUG, handle,
+-       "Bus check notify on %s\n", __func__);
+-  if (root)
+-   acpiphp_check_host_bridge(handle);
+-  else
+-   handle_root_bridge_insertion(handle);
+-
+-  break;
+-
+- case ACPI_NOTIFY_DEVICE_CHECK:
+-  /* device check */
+-  acpi_handle_printk(KERN_DEBUG, handle,
+-       "Device check notify on %s\n", __func__);
+-  if (!root)
+-   handle_root_bridge_insertion(handle);
+-  break;
+-
+- case ACPI_NOTIFY_EJECT_REQUEST:
+-  /* request device eject */
+-  acpi_handle_printk(KERN_DEBUG, handle,
+-       "Device eject notify on %s\n", __func__);
+-  if (!root)
+-   break;
+-
+-  acpi_evaluate_hotplug_ost(handle, ACPI_NOTIFY_EJECT_REQUEST,
+-       ACPI_OST_SC_EJECT_IN_PROGRESS, NULL);
+-  get_device(&root->device->dev);
+-
+-  acpi_scan_lock_release();
+-
+-  acpi_device_hotplug(root->device, ACPI_NOTIFY_EJECT_REQUEST);
++ if (acpi_pci_disabled)
+   return;
+- default:
+-  acpi_handle_warn(handle,
+-     "notify_handler: unknown event type 0x%x\n",
+-     type);
+-  break;
+- }
+-
+- acpi_scan_lock_release();
+-}
+-
+-static void handle_hotplug_event_root(acpi_handle handle, u32 type,
+-     void *context)
+-{
+- acpi_hotplug_execute(hotplug_event_root, handle, type);
+-}
+-
+-static acpi_status __init
+-find_root_bridges(acpi_handle handle, u32 lvl, void *context, void **rv)
+-{
+- acpi_status status;
+- int *count = (int *)context;
+-
+- if (!acpi_is_root_bridge(handle))
+-  return AE_OK;
+-
+- (*count)++;
+-
+- status = acpi_install_notify_handler(handle, ACPI_SYSTEM_NOTIFY,
+-     handle_hotplug_event_root, NULL);
+- if (ACPI_FAILURE(status))
+-  acpi_handle_printk(KERN_DEBUG, handle,
+-   "notify handler is not installed, exit status: %u\n",
+-    (unsigned int)status);
+- else
+-  acpi_handle_printk(KERN_DEBUG, handle,
+-       "notify handler is installed\n");
+-
+- return AE_OK;
+-}
+-
+-void __init acpi_pci_root_hp_init(void)
+-{
+- int num = 0;
+-
+- acpi_walk_namespace(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT,
+-  ACPI_UINT32_MAX, find_root_bridges, NULL, &num, NULL);
+ 
+- printk(KERN_DEBUG "Found %d acpi root devices\n", num);
++ pci_acpi_crs_quirks();
++ acpi_scan_add_handler_with_hotplug(&pci_root_handler, "pci_root");
+ }
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index f3ddfbf..de59f9d 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -283,17 +283,6 @@ static int acpi_scan_device_check(struct acpi_device *adev)
+ {
+  int error;
+ 
+- /*
+-  * This function is only called for device objects for which matching
+-  * scan handlers exist.  The only situation in which the scan handler is
+-  * not attached to this device object yet is when the device has just
+-  * appeared (either it wasn't present at all before or it was removed
+-  * and then added again).
+-  */
+- if (adev->handler) {
+-  dev_warn(&adev->dev, "Already enumerated\n");
+-  return -EBUSY;
+- }
+  error = acpi_bus_scan(adev->handle);
+  if (error) {
+   dev_warn(&adev->dev, "Namespace scan failure\n");
+@@ -309,10 +298,11 @@ static int acpi_scan_device_check(struct acpi_device *adev)
+  return 0;
+ }
+ 
+-void acpi_device_hotplug(void *data, u32 src)
++static void acpi_device_hotplug(void *data, u32 src)
+ {
+  u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
+  struct acpi_device *adev = data;
++ struct acpi_scan_handler *handler;
+  int error;
+ 
+  lock_device_hotplug();
+@@ -326,12 +316,32 @@ void acpi_device_hotplug(void *data, u32 src)
+  if (adev->handle == INVALID_ACPI_HANDLE)
+   goto out;
+ 
++ handler = adev->handler;
++
+  switch (src) {
+  case ACPI_NOTIFY_BUS_CHECK:
+-  error = acpi_bus_scan(adev->handle);
++  if (handler) {
++   error = handler->hotplug.scan_dependent ?
++     handler->hotplug.scan_dependent(adev) :
++     acpi_bus_scan(adev->handle);
++  } else {
++   error = acpi_scan_device_check(adev);
++  }
+   break;
+  case ACPI_NOTIFY_DEVICE_CHECK:
+-  error = acpi_scan_device_check(adev);
++  /*
++   * This code is only run for device objects for which matching
++   * scan handlers exist.  The only situation in which the scan
++   * handler is not attached to this device object yet is when the
++   * device has just appeared (either it wasn't present at all
++   * before or it was removed and then added again).
++   */
++  if (adev->handler) {
++   dev_warn(&adev->dev, "Already enumerated\n");
++   error = -EBUSY;
++  } else {
++   error = acpi_scan_device_check(adev);
++  }
+   break;
+  case ACPI_NOTIFY_EJECT_REQUEST:
+  case ACPI_OST_EC_OSPM_EJECT:
+@@ -1805,7 +1815,7 @@ static void acpi_scan_init_hotplug(acpi_handle handle, int type)
+   */
+  list_for_each_entry(hwid, &pnp.ids, list) {
+   handler = acpi_scan_match_handler(hwid->id, NULL);
+-  if (handler && !handler->hotplug.ignore) {
++  if (handler) {
+    acpi_install_notify_handler(handle, ACPI_SYSTEM_NOTIFY,
+      acpi_hotplug_notify_cb, handler);
+    break;
+@@ -2083,8 +2093,6 @@ int __init acpi_scan_init(void)
+ 
+  acpi_update_all_gpes();
+ 
+- acpi_pci_root_hp_init();
+-
+  out:
+  mutex_unlock(&acpi_scan_lock);
+  return result;
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index 730df36..fe169f9 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -100,8 +100,8 @@ enum acpi_hotplug_mode {
+ struct acpi_hotplug_profile {
+  struct kobject kobj;
+  bool enabled:1;
+- bool ignore:1;
+  enum acpi_hotplug_mode mode;
++ int (*scan_dependent)(struct acpi_device *adev);
+ };
+ 
+ static inline struct acpi_hotplug_profile *to_acpi_hotplug_profile(
+-- 
+1.7.1

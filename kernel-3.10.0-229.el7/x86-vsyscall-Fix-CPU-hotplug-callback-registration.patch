@@ -1,0 +1,84 @@
+From f796b1ab37aae0ba5f39c521a23cfea7e1dc63ff Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:07:45 -0400
+Subject: [x86] vsyscall: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-9-git-send-email-prarit@redhat.com>
+Patchwork-id: 85742
+O-Subject: [RHEL7.1 PATCH BZ 1119078 08/35] x86, vsyscall: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit 42112a0f5d34601e5d0a1bc7c769ba39adda0769
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:06:50 2014 +0530
+
+    x86, vsyscall: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the vsyscall code in x86 by using this latter form of callback
+    registration.
+
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/vsyscall_64.c b/arch/x86/kernel/vsyscall_64.c
+index 1f96f93..556eaf2 100644
+--- a/arch/x86/kernel/vsyscall_64.c
++++ b/arch/x86/kernel/vsyscall_64.c
+@@ -393,9 +393,13 @@ static int __init vsyscall_init(void)
+ {
+  BUG_ON(VSYSCALL_ADDR(0) != __fix_to_virt(VSYSCALL_FIRST_PAGE));
+ 
++ cpu_notifier_register_begin();
++
+  on_each_cpu(cpu_vsyscall_init, NULL, 1);
+  /* notifier priority > KVM */
+- hotcpu_notifier(cpu_vsyscall_notifier, 30);
++ __hotcpu_notifier(cpu_vsyscall_notifier, 30);
++
++ cpu_notifier_register_done();
+ 
+  return 0;
+ }
+-- 
+1.7.1

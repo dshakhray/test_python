@@ -1,0 +1,71 @@
+From 497a9272056f9f2318d8ea7d5b6f9a038b3ba83b Mon Sep 17 00:00:00 2001
+From: Tomas Henzl <thenzl@redhat.com>
+Date: Mon, 8 Sep 2014 14:30:53 -0400
+Subject: [scsi] hpsa: add 5 second delay after doorbell reset
+
+Message-id: <1410186734-19986-3-git-send-email-thenzl@redhat.com>
+Patchwork-id: 92045
+O-Subject: [RHEL6.6 e-stor PATCH 02/83] hpsa: add 5 second delay after doorbell reset
+Bugzilla: 1069185
+RH-Acked-by: Maurizio Lombardi <mlombard@redhat.com>
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Ewan Milne <emilne@redhat.com>
+
+The hardware guys tell us that after initiating a software
+reset via the doorbell register we need to wait 5 seconds before
+attempting to talk to the board *at all*.  This means that we
+cannot watch the board to verify it transitions from "ready" to
+to "not ready" then back "ready", since this transition will
+most likely happen during those 5 seconds (though we can still
+verify the reset happens by watching the "driver version" field
+get cleared.)
+
+Signed-off-by: Stephen M. Cameron <scameron@beardog.cce.hp.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit 85009239477a9b0b06d068d6ead9226d5c809a82)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/hpsa.c b/drivers/scsi/hpsa.c
+index 11c05c2..744d322 100644
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@ -3795,6 +3795,13 @@ static int hpsa_controller_hard_reset(struct pci_dev *pdev,
+    */
+   dev_info(&pdev->dev, "using doorbell to reset controller\n");
+   writel(use_doorbell, vaddr + SA5_DOORBELL);
++
++  /* PMC hardware guys tell us we need a 5 second delay after
++   * doorbell reset and before any attempt to talk to the board
++   * at all to ensure that this actually works and doesn't fall
++   * over in some weird corner cases.
++   */
++  msleep(5000);
+  } else { /* Try to do it the PCI power state way */
+ 
+   /* Quoting from the Open CISS Specification: "The Power
+@@ -3991,6 +3998,23 @@ static int hpsa_kdump_hard_reset_controller(struct pci_dev *pdev)
+     need a little pause here */
+  msleep(HPSA_POST_RESET_PAUSE_MSECS);
+ 
++ if (!use_doorbell) {
++  /* Wait for board to become not ready, then ready.
++   * (if we used the doorbell, then we already waited 5 secs
++   * so the "not ready" state is already gone by so we
++   * won't catch it.)
++   */
++  dev_info(&pdev->dev, "Waiting for board to reset.\n");
++  rc = hpsa_wait_for_board_state(pdev, vaddr, BOARD_NOT_READY);
++  if (rc) {
++   dev_warn(&pdev->dev,
++    "failed waiting for board to reset."
++    " Will try soft reset.\n");
++   /* Not expected, but try soft reset later */
++   rc = -ENOTSUPP;
++   goto unmap_cfgtable;
++  }
++ }
+  rc = hpsa_wait_for_board_state(pdev, vaddr, BOARD_READY);
+  if (rc) {
+   dev_warn(&pdev->dev,
+-- 
+1.7.1

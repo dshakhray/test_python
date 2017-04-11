@@ -1,0 +1,534 @@
+From d54181a75f4d8340afdc05c8ab4f72a08bfb1fda Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:08 -0400
+Subject: [powerpc] powernv: Read OPAL error log and export it through sysfs
+
+Message-id: <1410545655-205645-320-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94671
+O-Subject: [RHEL7 PATCH 319/626] powerpc/powernv: Read OPAL error log and export it through sysfs
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 774fea1a38c6a5a8ccc10969db84da24565f276f
+Author: Stewart Smith <stewart@linux.vnet.ibm.com>
+Date:   Fri Feb 28 11:58:32 2014 +1100
+
+    powerpc/powernv: Read OPAL error log and export it through sysfs
+
+    Based on a patch by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+
+    This patch adds support to read error logs from OPAL and export
+    them to userspace through a sysfs interface.
+
+    We export each log entry as a directory in /sys/firmware/opal/elog/
+
+    Currently, OPAL will buffer up to 128 error log records, we don't
+    need to have any knowledge of this limit on the Linux side as that
+    is actually largely transparent to us.
+
+    Each error log entry has the following files: id, type, acknowledge, raw.
+    Currently we just export the raw binary error log in the 'raw' attribute.
+    In a future patch, we may parse more of the error log to make it a bit
+    easier for userspace (e.g. to be able to display a brief summary in
+    petitboot without having to have a full parser).
+
+    If we have >128 logs from OPAL, we'll only be notified of 128 until
+    userspace starts acknowledging them. This limitation may be lifted in
+    the future and with this patch, that should "just work" from the linux side.
+
+    A userspace daemon should:
+    - wait for error log entries using normal mechanisms (we announce creation)
+    - read error log entry
+    - save error log entry safely to disk
+    - acknowledge the error log entry
+    - rinse, repeat.
+
+    On the Linux side, we read the error log when we're notified of it. This
+    possibly isn't ideal as it would be better to only read them on-demand.
+    However, this doesn't really work with current OPAL interface, so we
+    read the error log immediately when notified at the moment.
+
+    I've tested this pretty extensively and am rather confident that the
+    linux side of things works rather well. There is currently an issue with
+    the service processor side of things for >128 error logs though.
+
+    Signed-off-by: Stewart Smith <stewart@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+ create mode 100644 Documentation/ABI/stable/sysfs-firmware-opal-elog
+ create mode 100644 arch/powerpc/platforms/powernv/opal-elog.c
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/ABI/stable/sysfs-firmware-opal-elog b/Documentation/ABI/stable/sysfs-firmware-opal-elog
+new file mode 100644
+index 0000000..e1f3058
+--- /dev/null
++++ b/Documentation/ABI/stable/sysfs-firmware-opal-elog
+@@ -0,0 +1,60 @@
++What:  /sys/firmware/opal/elog
++Date:  Feb 2014
++Contact: Stewart Smith <stewart@linux.vnet.ibm.com>
++Description:
++  This directory exposes error log entries retrieved
++  through the OPAL firmware interface.
++
++  Each error log is identified by a unique ID and will
++  exist until explicitly acknowledged to firmware.
++
++  Each log entry has a directory in /sys/firmware/opal/elog.
++
++  Log entries may be purged by the service processor
++  before retrieved by firmware or retrieved/acknowledged by
++  Linux if there is no room for more log entries.
++
++  In the event that Linux has retrieved the log entries
++  but not explicitly acknowledged them to firmware and
++  the service processor needs more room for log entries,
++  the only remaining copy of a log message may be in
++  Linux.
++
++  Typically, a user space daemon will monitor for new
++  entries, read them out and acknowledge them.
++
++  The service processor may be able to store more log
++  entries than firmware can, so after you acknowledge
++  an event from Linux you may instantly get another one
++  from the queue that was generated some time in the past.
++
++  The raw log format is a binary format. We currently
++  do not parse this at all in kernel, leaving it up to
++  user space to solve the problem. In future, we may
++  do more parsing in kernel and add more files to make
++  it easier for simple user space processes to extract
++  more information.
++
++  For each log entry (directory), there are the following
++  files:
++
++  id:  An ASCII representation of the ID of the
++    error log, in hex - e.g. "0x01".
++
++  type:  An ASCII representation of the type id and
++    description of the type of error log.
++    Currently just "0x00 PEL" - platform error log.
++    In the future there may be additional types.
++
++  raw:  A read-only binary file that can be read
++    to get the raw log entry. These are
++    <16kb, often just hundreds of bytes and
++    "average" 2kb.
++
++  acknowledge: Writing 'ack' to this file will acknowledge
++    the error log to firmware (and in turn
++    the service processor, if applicable).
++    Shortly after acknowledging it, the log
++    entry will be removed from sysfs.
++    Reading this file will list the supported
++    operations (curently just acknowledge).
+\ No newline at end of file
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 84d83ad..5db92dd 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -151,6 +151,11 @@ extern int opal_enter_rtas(struct rtas_args *args,
+ #define OPAL_LPC_READ    67
+ #define OPAL_LPC_WRITE    68
+ #define OPAL_RETURN_CPU    69
++#define OPAL_ELOG_READ    71
++#define OPAL_ELOG_WRITE    72
++#define OPAL_ELOG_ACK    73
++#define OPAL_ELOG_RESEND   74
++#define OPAL_ELOG_SIZE    75
+ #define OPAL_FLASH_VALIDATE   76
+ #define OPAL_FLASH_MANAGE   77
+ #define OPAL_FLASH_UPDATE   78
+@@ -824,6 +829,13 @@ int64_t opal_lpc_write(uint32_t chip_id, enum OpalLPCAddressType addr_type,
+          uint32_t addr, uint32_t data, uint32_t sz);
+ int64_t opal_lpc_read(uint32_t chip_id, enum OpalLPCAddressType addr_type,
+         uint32_t addr, __be32 *data, uint32_t sz);
++
++int64_t opal_read_elog(uint64_t buffer, size_t size, uint64_t log_id);
++int64_t opal_get_elog_size(uint64_t *log_id, size_t *size, uint64_t *elog_type);
++int64_t opal_write_elog(uint64_t buffer, uint64_t size, uint64_t offset);
++int64_t opal_send_ack_elog(uint64_t log_id);
++void opal_resend_pending_logs(void);
++
+ int64_t opal_validate_flash(uint64_t buffer, uint32_t *size, uint32_t *result);
+ int64_t opal_manage_flash(uint8_t op);
+ int64_t opal_update_flash(uint64_t blk_list);
+@@ -864,6 +876,7 @@ extern void opal_get_rtc_time(struct rtc_time *tm);
+ extern unsigned long opal_get_boot_time(void);
+ extern void opal_nvram_init(void);
+ extern void opal_flash_init(void);
++extern int opal_elog_init(void);
+ 
+ extern int opal_machine_check(struct pt_regs *regs);
+ extern bool opal_mce_check_early_recovery(struct pt_regs *regs);
+diff --git a/arch/powerpc/platforms/powernv/Makefile b/arch/powerpc/platforms/powernv/Makefile
+index 8d767fd..189fd45 100644
+--- a/arch/powerpc/platforms/powernv/Makefile
++++ b/arch/powerpc/platforms/powernv/Makefile
+@@ -1,6 +1,6 @@
+ obj-y   += setup.o opal-takeover.o opal-wrappers.o opal.o
+ obj-y   += opal-rtc.o opal-nvram.o opal-lpc.o opal-flash.o
+-obj-y   += rng.o
++obj-y   += rng.o opal-elog.o
+ 
+ obj-$(CONFIG_SMP) += smp.o
+ obj-$(CONFIG_PCI) += pci.o pci-p5ioc2.o pci-ioda.o
+diff --git a/arch/powerpc/platforms/powernv/opal-elog.c b/arch/powerpc/platforms/powernv/opal-elog.c
+new file mode 100644
+index 0000000..1d7355b
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/opal-elog.c
+@@ -0,0 +1,313 @@
++/*
++ * Error log support on PowerNV.
++ *
++ * Copyright 2013,2014 IBM Corp.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/of.h>
++#include <linux/slab.h>
++#include <linux/sysfs.h>
++#include <linux/fs.h>
++#include <linux/vmalloc.h>
++#include <linux/fcntl.h>
++#include <linux/kobject.h>
++#include <asm/uaccess.h>
++#include <asm/opal.h>
++
++struct elog_obj {
++ struct kobject kobj;
++ struct bin_attribute raw_attr;
++ uint64_t id;
++ uint64_t type;
++ size_t size;
++ char *buffer;
++};
++#define to_elog_obj(x) container_of(x, struct elog_obj, kobj)
++
++struct elog_attribute {
++ struct attribute attr;
++ ssize_t (*show)(struct elog_obj *elog, struct elog_attribute *attr,
++   char *buf);
++ ssize_t (*store)(struct elog_obj *elog, struct elog_attribute *attr,
++    const char *buf, size_t count);
++};
++#define to_elog_attr(x) container_of(x, struct elog_attribute, attr)
++
++static ssize_t elog_id_show(struct elog_obj *elog_obj,
++       struct elog_attribute *attr,
++       char *buf)
++{
++ return sprintf(buf, "0x%llx\n", elog_obj->id);
++}
++
++static const char *elog_type_to_string(uint64_t type)
++{
++ switch (type) {
++ case 0: return "PEL";
++ default: return "unknown";
++ }
++}
++
++static ssize_t elog_type_show(struct elog_obj *elog_obj,
++         struct elog_attribute *attr,
++         char *buf)
++{
++ return sprintf(buf, "0x%llx %s\n",
++         elog_obj->type,
++         elog_type_to_string(elog_obj->type));
++}
++
++static ssize_t elog_ack_show(struct elog_obj *elog_obj,
++        struct elog_attribute *attr,
++        char *buf)
++{
++ return sprintf(buf, "ack - acknowledge log message\n");
++}
++
++static void delay_release_kobj(void *kobj)
++{
++ kobject_put((struct kobject *)kobj);
++}
++
++static ssize_t elog_ack_store(struct elog_obj *elog_obj,
++         struct elog_attribute *attr,
++         const char *buf,
++         size_t count)
++{
++ opal_send_ack_elog(elog_obj->id);
++ sysfs_schedule_callback(&elog_obj->kobj, delay_release_kobj,
++    &elog_obj->kobj, THIS_MODULE);
++ return count;
++}
++
++static struct elog_attribute id_attribute =
++ __ATTR(id, 0666, elog_id_show, NULL);
++static struct elog_attribute type_attribute =
++ __ATTR(type, 0666, elog_type_show, NULL);
++static struct elog_attribute ack_attribute =
++ __ATTR(acknowledge, 0660, elog_ack_show, elog_ack_store);
++
++static struct kset *elog_kset;
++
++static ssize_t elog_attr_show(struct kobject *kobj,
++         struct attribute *attr,
++         char *buf)
++{
++ struct elog_attribute *attribute;
++ struct elog_obj *elog;
++
++ attribute = to_elog_attr(attr);
++ elog = to_elog_obj(kobj);
++
++ if (!attribute->show)
++  return -EIO;
++
++ return attribute->show(elog, attribute, buf);
++}
++
++static ssize_t elog_attr_store(struct kobject *kobj,
++          struct attribute *attr,
++          const char *buf, size_t len)
++{
++ struct elog_attribute *attribute;
++ struct elog_obj *elog;
++
++ attribute = to_elog_attr(attr);
++ elog = to_elog_obj(kobj);
++
++ if (!attribute->store)
++  return -EIO;
++
++ return attribute->store(elog, attribute, buf, len);
++}
++
++static const struct sysfs_ops elog_sysfs_ops = {
++ .show = elog_attr_show,
++ .store = elog_attr_store,
++};
++
++static void elog_release(struct kobject *kobj)
++{
++ struct elog_obj *elog;
++
++ elog = to_elog_obj(kobj);
++ kfree(elog->buffer);
++ kfree(elog);
++}
++
++static struct attribute *elog_default_attrs[] = {
++ &id_attribute.attr,
++ &type_attribute.attr,
++ &ack_attribute.attr,
++ NULL,
++};
++
++static struct kobj_type elog_ktype = {
++ .sysfs_ops = &elog_sysfs_ops,
++ .release = &elog_release,
++ .default_attrs = elog_default_attrs,
++};
++
++/* Maximum size of a single log on FSP is 16KB */
++#define OPAL_MAX_ERRLOG_SIZE 16384
++
++static ssize_t raw_attr_read(struct file *filep, struct kobject *kobj,
++        struct bin_attribute *bin_attr,
++        char *buffer, loff_t pos, size_t count)
++{
++ int opal_rc;
++
++ struct elog_obj *elog = to_elog_obj(kobj);
++
++ /* We may have had an error reading before, so let's retry */
++ if (!elog->buffer) {
++  elog->buffer = kzalloc(elog->size, GFP_KERNEL);
++  if (!elog->buffer)
++   return -EIO;
++
++  opal_rc = opal_read_elog(__pa(elog->buffer),
++      elog->size, elog->id);
++  if (opal_rc != OPAL_SUCCESS) {
++   pr_err("ELOG: log read failed for log-id=%llx\n",
++          elog->id);
++   kfree(elog->buffer);
++   elog->buffer = NULL;
++   return -EIO;
++  }
++ }
++
++ memcpy(buffer, elog->buffer + pos, count);
++
++ return count;
++}
++
++static struct elog_obj *create_elog_obj(uint64_t id, size_t size, uint64_t type)
++{
++ struct elog_obj *elog;
++ int rc;
++
++ elog = kzalloc(sizeof(*elog), GFP_KERNEL);
++ if (!elog)
++  return NULL;
++
++ elog->kobj.kset = elog_kset;
++
++ kobject_init(&elog->kobj, &elog_ktype);
++
++ sysfs_bin_attr_init(&elog->raw_attr);
++
++ elog->raw_attr.attr.name = "raw";
++ elog->raw_attr.attr.mode = 0400;
++ elog->raw_attr.size = size;
++ elog->raw_attr.read = raw_attr_read;
++
++ elog->id = id;
++ elog->size = size;
++ elog->type = type;
++
++ elog->buffer = kzalloc(elog->size, GFP_KERNEL);
++
++ if (elog->buffer) {
++  rc = opal_read_elog(__pa(elog->buffer),
++      elog->size, elog->id);
++  if (rc != OPAL_SUCCESS) {
++   pr_err("ELOG: log read failed for log-id=%llx\n",
++          elog->id);
++   kfree(elog->buffer);
++   elog->buffer = NULL;
++  }
++ }
++
++ rc = kobject_add(&elog->kobj, NULL, "0x%llx", id);
++ if (rc) {
++  kobject_put(&elog->kobj);
++  return NULL;
++ }
++
++ rc = sysfs_create_bin_file(&elog->kobj, &elog->raw_attr);
++ if (rc) {
++  kobject_put(&elog->kobj);
++  return NULL;
++ }
++
++ kobject_uevent(&elog->kobj, KOBJ_ADD);
++
++ return elog;
++}
++
++static void elog_work_fn(struct work_struct *work)
++{
++ size_t elog_size;
++ uint64_t log_id;
++ uint64_t elog_type;
++ int rc;
++ char name[2+16+1];
++
++ rc = opal_get_elog_size(&log_id, &elog_size, &elog_type);
++ if (rc != OPAL_SUCCESS) {
++  pr_err("ELOG: Opal log read failed\n");
++  return;
++ }
++
++ BUG_ON(elog_size > OPAL_MAX_ERRLOG_SIZE);
++
++ if (elog_size >= OPAL_MAX_ERRLOG_SIZE)
++  elog_size  =  OPAL_MAX_ERRLOG_SIZE;
++
++ sprintf(name, "0x%llx", log_id);
++
++ /* we may get notified twice, let's handle
++  * that gracefully and not create two conflicting
++  * entries.
++  */
++ if (kset_find_obj(elog_kset, name))
++  return;
++
++ create_elog_obj(log_id, elog_size, elog_type);
++}
++
++static DECLARE_WORK(elog_work, elog_work_fn);
++
++static int elog_event(struct notifier_block *nb,
++    unsigned long events, void *change)
++{
++ /* check for error log event */
++ if (events & OPAL_EVENT_ERROR_LOG_AVAIL)
++  schedule_work(&elog_work);
++ return 0;
++}
++
++static struct notifier_block elog_nb = {
++ .notifier_call  = elog_event,
++ .next           = NULL,
++ .priority       = 0
++};
++
++int __init opal_elog_init(void)
++{
++ int rc = 0;
++
++ elog_kset = kset_create_and_add("elog", NULL, opal_kobj);
++ if (!elog_kset) {
++  pr_warn("%s: failed to create elog kset\n", __func__);
++  return -1;
++ }
++
++ rc = opal_notifier_register(&elog_nb);
++ if (rc) {
++  pr_err("%s: Can't register OPAL event notifier (%d)\n",
++  __func__, rc);
++  return rc;
++ }
++
++ /* We are now ready to pull error logs from opal. */
++ opal_resend_pending_logs();
++
++ return 0;
++}
+diff --git a/arch/powerpc/platforms/powernv/opal-wrappers.S b/arch/powerpc/platforms/powernv/opal-wrappers.S
+index aab54b6..b59b4b2 100644
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@ -123,6 +123,11 @@ OPAL_CALL(opal_xscom_write,   OPAL_XSCOM_WRITE);
+ OPAL_CALL(opal_lpc_read,   OPAL_LPC_READ);
+ OPAL_CALL(opal_lpc_write,   OPAL_LPC_WRITE);
+ OPAL_CALL(opal_return_cpu,   OPAL_RETURN_CPU);
++OPAL_CALL(opal_read_elog,   OPAL_ELOG_READ);
++OPAL_CALL(opal_send_ack_elog,   OPAL_ELOG_ACK);
++OPAL_CALL(opal_get_elog_size,   OPAL_ELOG_SIZE);
++OPAL_CALL(opal_resend_pending_logs,  OPAL_ELOG_RESEND);
++OPAL_CALL(opal_write_elog,   OPAL_ELOG_WRITE);
+ OPAL_CALL(opal_validate_flash,   OPAL_FLASH_VALIDATE);
+ OPAL_CALL(opal_manage_flash,   OPAL_FLASH_MANAGE);
+ OPAL_CALL(opal_update_flash,   OPAL_FLASH_UPDATE);
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index d5f11d6..0a44938 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -566,6 +566,8 @@ static int __init opal_init(void)
+  /* Create "opal" kobject under /sys/firmware */
+  rc = opal_sysfs_init();
+  if (rc == 0) {
++  /* Setup error log interface */
++  rc = opal_elog_init();
+   /* Setup code update interface */
+   opal_flash_init();
+  }
+-- 
+1.7.1

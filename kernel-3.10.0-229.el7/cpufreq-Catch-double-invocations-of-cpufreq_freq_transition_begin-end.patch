@@ -1,0 +1,153 @@
+From 1e2f8d857b4ba7a2069151915d70aa907df05691 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:23:58 -0400
+Subject: [cpufreq] Catch double invocations of cpufreq_freq_transition_begin/end
+
+Message-id: <1409235879-1283-145-git-send-email-prarit@redhat.com>
+Patchwork-id: 89486
+O-Subject: [RHEL7.1 PATCH BZ 1134639 144/185] cpufreq: Catch double invocations of cpufreq_freq_transition_begin/end
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit ca654dc3a93d3b47dddc0c24a98043060bbb256b
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Mon May 5 12:52:39 2014 +0530
+
+    cpufreq: Catch double invocations of cpufreq_freq_transition_begin/end
+
+    Some cpufreq drivers were redundantly invoking the _begin() and _end()
+    APIs around frequency transitions, and this double invocation (one from
+    the cpufreq core and the other from the cpufreq driver) used to result
+    in a self-deadlock, leading to system hangs during boot. (The _begin()
+    API makes contending callers wait until the previous invocation is
+    complete. Hence, the cpufreq driver would end up waiting on itself!).
+
+    Now all such drivers have been fixed, but debugging this issue was not
+    very straight-forward (even lockdep didn't catch this). So let us add a
+    debug infrastructure to the cpufreq core to catch such issues more easily
+    in the future.
+
+    We add a new field called 'transition_task' to the policy structure, to keep
+    track of the task which is performing the frequency transition. Using this
+    field, we make note of this task during _begin() and print a warning if we
+    find a case where the same task is calling _begin() again, before completing
+    the previous frequency transition using the corresponding _end().
+
+    We have left out ASYNC_NOTIFICATION drivers from this debug infrastructure
+    for 2 reasons:
+
+    1. At the moment, we have no way to avoid a particular scenario where this
+       debug infrastructure can emit false-positive warnings for such drivers.
+       The scenario is depicted below:
+
+             Task A      Task B
+
+        /* 1st freq transition */
+        Invoke _begin() {
+                ...
+                ...
+        }
+
+        Change the frequency
+
+        /* 2nd freq transition */
+        Invoke _begin() {
+         ... //waiting for B to
+                ... //finish _end() for
+         ... //the 1st transition
+         ...       |    Got interrupt for successful
+         ...       |    change of frequency (1st one).
+         ...       |
+         ...       |    /* 1st freq transition */
+         ...       |    Invoke _end() {
+         ...       |     ...
+         ...       V    }
+         ...
+         ...
+        }
+
+       This scenario is actually deadlock-free because, once Task A changes the
+       frequency, it is Task B's responsibility to invoke the corresponding
+       _end() for the 1st frequency transition. Hence it is perfectly legal for
+       Task A to go ahead and attempt another frequency transition in the meantime.
+       (Of course it won't be able to proceed until Task B finishes the 1st _end(),
+       but this doesn't cause a deadlock or a hang).
+
+       The debug infrastructure cannot handle this scenario and will treat it as
+       a deadlock and print a warning. To avoid this, we exclude such drivers
+       from the purview of this code.
+
+    2. Luckily, we don't _need_ this infrastructure for ASYNC_NOTIFICATION drivers
+       at all! The cpufreq core does not automatically invoke the _begin() and
+       _end() APIs during frequency transitions in such drivers. Thus, the driver
+       alone is responsible for invoking _begin()/_end() and hence there shouldn't
+       be any conflicts which lead to double invocations. So, we can skip these
+       drivers, since the probability that such drivers will hit this problem is
+       extremely low, as outlined above.
+
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index b5102fe..4d476e0 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -365,6 +365,18 @@ static void cpufreq_notify_post_transition(struct cpufreq_policy *policy,
+ void cpufreq_freq_transition_begin(struct cpufreq_policy *policy,
+   struct cpufreq_freqs *freqs)
+ {
++
++ /*
++  * Catch double invocations of _begin() which lead to self-deadlock.
++  * ASYNC_NOTIFICATION drivers are left out because the cpufreq core
++  * doesn't invoke _begin() on their behalf, and hence the chances of
++  * double invocations are very low. Moreover, there are scenarios
++  * where these checks can emit false-positive warnings in these
++  * drivers; so we avoid that by skipping them altogether.
++  */
++ WARN_ON(!(cpufreq_driver->flags & CPUFREQ_ASYNC_NOTIFICATION)
++    && current == policy->transition_task);
++
+ wait:
+  wait_event(policy->transition_wait, !policy->transition_ongoing);
+ 
+@@ -376,6 +388,7 @@ wait:
+  }
+ 
+  policy->transition_ongoing = true;
++ policy->transition_task = current;
+ 
+  spin_unlock(&policy->transition_lock);
+ 
+@@ -392,6 +405,7 @@ void cpufreq_freq_transition_end(struct cpufreq_policy *policy,
+  cpufreq_notify_post_transition(policy, freqs, transition_failed);
+ 
+  policy->transition_ongoing = false;
++ policy->transition_task = NULL;
+ 
+  wake_up(&policy->transition_wait);
+ }
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index 2c1b665..aa1bf73 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -140,6 +140,7 @@ struct cpufreq_policy {
+  bool   transition_ongoing; /* Tracks transition status */
+  spinlock_t  transition_lock;
+  wait_queue_head_t transition_wait;
++ struct task_struct *transition_task; /* Task which is doing the transition */
+ };
+ 
+ #define CPUFREQ_ADJUST   (0)
+-- 
+1.7.1

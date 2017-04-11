@@ -1,0 +1,2795 @@
+From b706cc909d69c71a23970d47f951facddc7cd03e Mon Sep 17 00:00:00 2001
+From: Nikolay Aleksandrov <nikolay@redhat.com>
+Date: Mon, 1 Sep 2014 13:32:55 -0400
+Subject: [crypto] qat: Intel(R) QAT driver framework
+
+Message-id: <1409578401-26943-4-git-send-email-nikolay@redhat.com>
+Patchwork-id: 90080
+O-Subject: [RHEL7.1 PATCH BZ 1091130 03/29] crypto: qat - Intel(R) QAT driver framework
+Bugzilla: 1091130
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Herbert Xu <herbert.xu@redhat.com>
+
+From: Tadeusz Struk <tadeusz.struk@intel.com>
+
+This patch adds a common infractructure that will be used by all Intel(R)
+QuickAssist Technology (QAT) devices.
+
+v2 - added ./drivers/crypto/qat/Kconfig and ./drivers/crypto/qat/Makefile
+v4 - splits common part into more, smaller patches
+
+Acked-by: John Griffin <john.griffin@intel.com>
+Reviewed-by: Bruce W. Allan <bruce.w.allan@intel.com>
+Signed-off-by: Tadeusz Struk <tadeusz.struk@intel.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit d8cba25d2c68992a6e7c1d329b690a9ebe01167d)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/crypto/qat/Kconfig b/drivers/crypto/qat/Kconfig
+new file mode 100644
+index 0000000..3bd3fd9
+--- /dev/null
++++ b/drivers/crypto/qat/Kconfig
+@@ -0,0 +1,22 @@
++config CRYPTO_DEV_QAT
++ tristate
++ select CRYPTO_AEAD
++ select CRYPTO_AUTHENC
++ select CRYPTO_ALGAPI
++ select CRYPTO_AES
++ select CRYPTO_CBC
++ select CRYPTO_SHA1
++ select CRYPTO_SHA256
++ select CRYPTO_SHA512
++
++config CRYPTO_DEV_QAT_DH895xCC
++ tristate "Support for Intel(R) DH895xCC"
++ depends on X86 && PCI
++ default n
++ select CRYPTO_DEV_QAT
++ help
++   Support for Intel(R) DH895xcc with Intel(R) QuickAssist Technology
++   for accelerating crypto and compression workloads.
++
++   To compile this as a module, choose M here: the module
++   will be called qat_dh895xcc.
+diff --git a/drivers/crypto/qat/Makefile b/drivers/crypto/qat/Makefile
+new file mode 100644
+index 0000000..d11481b
+--- /dev/null
++++ b/drivers/crypto/qat/Makefile
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_CRYPTO_DEV_QAT) += qat_common/
++obj-$(CONFIG_CRYPTO_DEV_QAT_DH895xCC) += qat_dh895xcc/
+diff --git a/drivers/crypto/qat/qat_common/Makefile b/drivers/crypto/qat/qat_common/Makefile
+new file mode 100644
+index 0000000..e0424dc
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/Makefile
+@@ -0,0 +1,14 @@
++obj-$(CONFIG_CRYPTO_DEV_QAT) += intel_qat.o
++intel_qat-objs := adf_cfg.o \
++ adf_ctl_drv.o \
++ adf_dev_mgr.o \
++ adf_init.o \
++ adf_accel_engine.o \
++ adf_aer.o \
++ adf_transport.o \
++ qat_crypto.o \
++ qat_algs.o \
++ qat_uclo.o \
++ qat_hal.o
++
++intel_qat-$(CONFIG_DEBUG_FS) += adf_transport_debug.o
+diff --git a/drivers/crypto/qat/qat_common/adf_accel_devices.h b/drivers/crypto/qat/qat_common/adf_accel_devices.h
+new file mode 100644
+index 0000000..f3206d9
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_accel_devices.h
+@@ -0,0 +1,204 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#ifndef ADF_ACCEL_DEVICES_H_
++#define ADF_ACCEL_DEVICES_H_
++#include <linux/module.h>
++#include <linux/atomic.h>
++#include <linux/list.h>
++#include <linux/proc_fs.h>
++#include "adf_cfg_common.h"
++
++#define PCI_VENDOR_ID_INTEL 0x8086
++#define ADF_DH895XCC_DEVICE_NAME "dh895xcc"
++#define ADF_DH895XCC_PCI_DEVICE_ID 0x435
++#define ADF_DH895XCC_PMISC_BAR 1
++#define ADF_DH895XCC_ETR_BAR 2
++#define ADF_PCI_MAX_BARS 3
++#define ADF_DEVICE_NAME_LENGTH 32
++#define ADF_ETR_MAX_RINGS_PER_BANK 16
++#define ADF_MAX_MSIX_VECTOR_NAME 16
++#define ADF_DEVICE_NAME_PREFIX "qat_"
++
++enum adf_accel_capabilities {
++ ADF_ACCEL_CAPABILITIES_NULL = 0,
++ ADF_ACCEL_CAPABILITIES_CRYPTO_SYMMETRIC = 1,
++ ADF_ACCEL_CAPABILITIES_CRYPTO_ASYMMETRIC = 2,
++ ADF_ACCEL_CAPABILITIES_CIPHER = 4,
++ ADF_ACCEL_CAPABILITIES_AUTHENTICATION = 8,
++ ADF_ACCEL_CAPABILITIES_COMPRESSION = 32,
++ ADF_ACCEL_CAPABILITIES_LZS_COMPRESSION = 64,
++ ADF_ACCEL_CAPABILITIES_RANDOM_NUMBER = 128
++};
++
++struct adf_bar {
++ resource_size_t base_addr;
++ void __iomem *virt_addr;
++ resource_size_t size;
++} __packed;
++
++struct adf_accel_msix {
++ struct msix_entry *entries;
++ char **names;
++} __packed;
++
++struct adf_accel_pci {
++ struct pci_dev *pci_dev;
++ struct adf_accel_msix msix_entries;
++ struct adf_bar pci_bars[ADF_PCI_MAX_BARS];
++ uint8_t revid;
++ uint8_t sku;
++} __packed;
++
++enum dev_state {
++ DEV_DOWN = 0,
++ DEV_UP
++};
++
++enum dev_sku_info {
++ DEV_SKU_1 = 0,
++ DEV_SKU_2,
++ DEV_SKU_3,
++ DEV_SKU_4,
++ DEV_SKU_UNKNOWN,
++};
++
++static inline const char *get_sku_info(enum dev_sku_info info)
++{
++ switch (info) {
++ case DEV_SKU_1:
++  return "SKU1";
++ case DEV_SKU_2:
++  return "SKU2";
++ case DEV_SKU_3:
++  return "SKU3";
++ case DEV_SKU_4:
++  return "SKU4";
++ case DEV_SKU_UNKNOWN:
++ default:
++  break;
++ }
++ return "Unknown SKU";
++}
++
++struct adf_hw_device_class {
++ const char *name;
++ const enum adf_device_type type;
++ uint32_t instances;
++} __packed;
++
++struct adf_cfg_device_data;
++struct adf_accel_dev;
++struct adf_etr_data;
++struct adf_etr_ring_data;
++
++struct adf_hw_device_data {
++ struct adf_hw_device_class *dev_class;
++ uint32_t (*get_accel_mask)(uint32_t fuse);
++ uint32_t (*get_ae_mask)(uint32_t fuse);
++ uint32_t (*get_misc_bar_id)(struct adf_hw_device_data *self);
++ uint32_t (*get_etr_bar_id)(struct adf_hw_device_data *self);
++ uint32_t (*get_num_aes)(struct adf_hw_device_data *self);
++ uint32_t (*get_num_accels)(struct adf_hw_device_data *self);
++ enum dev_sku_info (*get_sku)(struct adf_hw_device_data *self);
++ void (*hw_arb_ring_enable)(struct adf_etr_ring_data *ring);
++ void (*hw_arb_ring_disable)(struct adf_etr_ring_data *ring);
++ int (*alloc_irq)(struct adf_accel_dev *accel_dev);
++ void (*free_irq)(struct adf_accel_dev *accel_dev);
++ void (*enable_error_correction)(struct adf_accel_dev *accel_dev);
++ const char *fw_name;
++ uint32_t pci_dev_id;
++ uint32_t fuses;
++ uint32_t accel_capabilities_mask;
++ uint16_t accel_mask;
++ uint16_t ae_mask;
++ uint16_t tx_rings_mask;
++ uint8_t tx_rx_gap;
++ uint8_t instance_id;
++ uint8_t num_banks;
++ uint8_t num_accel;
++ uint8_t num_logical_accel;
++ uint8_t num_engines;
++} __packed;
++
++/* CSR write macro */
++#define ADF_CSR_WR(csr_base, csr_offset, val) \
++ __raw_writel(val, csr_base + csr_offset)
++
++/* CSR read macro */
++#define ADF_CSR_RD(csr_base, csr_offset) __raw_readl(csr_base + csr_offset)
++
++#define GET_DEV(accel_dev) ((accel_dev)->accel_pci_dev.pci_dev->dev)
++#define GET_BARS(accel_dev) ((accel_dev)->accel_pci_dev.pci_bars)
++#define GET_HW_DATA(accel_dev) (accel_dev->hw_device)
++#define GET_MAX_BANKS(accel_dev) (GET_HW_DATA(accel_dev)->num_banks)
++#define GET_MAX_ACCELENGINES(accel_dev) (GET_HW_DATA(accel_dev)->num_engines)
++#define accel_to_pci_dev(accel_ptr) accel_ptr->accel_pci_dev.pci_dev
++
++struct adf_admin_comms;
++struct icp_qat_fw_loader_handle;
++struct adf_fw_loader_data {
++ struct icp_qat_fw_loader_handle *fw_loader;
++ const struct firmware *uof_fw;
++};
++
++struct adf_accel_dev {
++ struct adf_etr_data *transport;
++ struct adf_hw_device_data *hw_device;
++ struct adf_cfg_device_data *cfg;
++ struct adf_fw_loader_data *fw_loader;
++ struct adf_admin_comms *admin;
++ struct list_head crypto_list;
++ unsigned long status;
++ atomic_t ref_count;
++ struct dentry *debugfs_dir;
++ struct list_head list;
++ struct module *owner;
++ uint8_t accel_id;
++ uint8_t numa_node;
++ struct adf_accel_pci accel_pci_dev;
++} __packed;
++#endif
+diff --git a/drivers/crypto/qat/qat_common/adf_accel_engine.c b/drivers/crypto/qat/qat_common/adf_accel_engine.c
+new file mode 100644
+index 0000000..25801fe
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_accel_engine.c
+@@ -0,0 +1,168 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#include <linux/firmware.h>
++#include <linux/pci.h>
++#include "adf_cfg.h"
++#include "adf_accel_devices.h"
++#include "adf_common_drv.h"
++#include "icp_qat_uclo.h"
++
++int adf_ae_fw_load(struct adf_accel_dev *accel_dev)
++{
++ struct adf_fw_loader_data *loader_data = accel_dev->fw_loader;
++ struct adf_hw_device_data *hw_device = accel_dev->hw_device;
++ void *uof_addr;
++ uint32_t uof_size;
++
++ if (request_firmware(&loader_data->uof_fw, hw_device->fw_name,
++        &accel_dev->accel_pci_dev.pci_dev->dev)) {
++  pr_err("QAT: Failed to load firmware %s\n", hw_device->fw_name);
++  return -EFAULT;
++ }
++
++ uof_size = loader_data->uof_fw->size;
++ uof_addr = (void *)loader_data->uof_fw->data;
++ if (qat_uclo_map_uof_obj(loader_data->fw_loader, uof_addr, uof_size)) {
++  pr_err("QAT: Failed to map uof\n");
++  goto out_err;
++ }
++ if (qat_uclo_wr_all_uimage(loader_data->fw_loader)) {
++  pr_err("QAT: Failed to map uof\n");
++  goto out_err;
++ }
++ return 0;
++
++out_err:
++ release_firmware(loader_data->uof_fw);
++ return -EFAULT;
++}
++
++int adf_ae_fw_release(struct adf_accel_dev *accel_dev)
++{
++ struct adf_fw_loader_data *loader_data = accel_dev->fw_loader;
++
++ release_firmware(loader_data->uof_fw);
++ qat_uclo_del_uof_obj(loader_data->fw_loader);
++ qat_hal_deinit(loader_data->fw_loader);
++ loader_data->fw_loader = NULL;
++ return 0;
++}
++
++int adf_ae_start(struct adf_accel_dev *accel_dev)
++{
++ struct adf_fw_loader_data *loader_data = accel_dev->fw_loader;
++ struct adf_hw_device_data *hw_data = accel_dev->hw_device;
++ uint32_t ae_ctr, ae, max_aes = GET_MAX_ACCELENGINES(accel_dev);
++
++ for (ae = 0, ae_ctr = 0; ae < max_aes; ae++) {
++  if (hw_data->ae_mask & (1 << ae)) {
++   qat_hal_start(loader_data->fw_loader, ae, 0xFF);
++   ae_ctr++;
++  }
++ }
++ pr_info("QAT: qat_dev%d started %d acceleration engines\n",
++  accel_dev->accel_id, ae_ctr);
++ return 0;
++}
++
++int adf_ae_stop(struct adf_accel_dev *accel_dev)
++{
++ struct adf_fw_loader_data *loader_data = accel_dev->fw_loader;
++ struct adf_hw_device_data *hw_data = accel_dev->hw_device;
++ uint32_t ae_ctr, ae, max_aes = GET_MAX_ACCELENGINES(accel_dev);
++
++ for (ae = 0, ae_ctr = 0; ae < max_aes; ae++) {
++  if (hw_data->ae_mask & (1 << ae)) {
++   qat_hal_stop(loader_data->fw_loader, ae, 0xFF);
++   ae_ctr++;
++  }
++ }
++ pr_info("QAT: qat_dev%d stopped %d acceleration engines\n",
++  accel_dev->accel_id, ae_ctr);
++ return 0;
++}
++
++static int adf_ae_reset(struct adf_accel_dev *accel_dev, int ae)
++{
++ struct adf_fw_loader_data *loader_data = accel_dev->fw_loader;
++
++ qat_hal_reset(loader_data->fw_loader);
++ if (qat_hal_clr_reset(loader_data->fw_loader))
++  return -EFAULT;
++
++ return 0;
++}
++
++int adf_ae_init(struct adf_accel_dev *accel_dev)
++{
++ struct adf_fw_loader_data *loader_data;
++
++ loader_data = kzalloc(sizeof(*loader_data), GFP_KERNEL);
++ if (!loader_data)
++  return -ENOMEM;
++
++ accel_dev->fw_loader = loader_data;
++ if (qat_hal_init(accel_dev)) {
++  pr_err("QAT: Failed to init the AEs\n");
++  kfree(loader_data);
++  return -EFAULT;
++ }
++ if (adf_ae_reset(accel_dev, 0)) {
++  pr_err("QAT: Failed to reset the AEs\n");
++  qat_hal_deinit(loader_data->fw_loader);
++  kfree(loader_data);
++  return -EFAULT;
++ }
++ return 0;
++}
++
++int adf_ae_shutdown(struct adf_accel_dev *accel_dev)
++{
++ kfree(accel_dev->fw_loader);
++ accel_dev->fw_loader = NULL;
++ return 0;
++}
+diff --git a/drivers/crypto/qat/qat_common/adf_aer.c b/drivers/crypto/qat/qat_common/adf_aer.c
+new file mode 100644
+index 0000000..0651678
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_aer.c
+@@ -0,0 +1,258 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/aer.h>
++#include <linux/completion.h>
++#include <linux/workqueue.h>
++#include <linux/delay.h>
++#include "adf_accel_devices.h"
++#include "adf_common_drv.h"
++
++static struct workqueue_struct *device_reset_wq;
++
++static pci_ers_result_t adf_error_detected(struct pci_dev *pdev,
++        pci_channel_state_t state)
++{
++ struct adf_accel_dev *accel_dev = adf_devmgr_pci_to_accel_dev(pdev);
++
++ pr_info("QAT: Acceleration driver hardware error detected.\n");
++ if (!accel_dev) {
++  pr_err("QAT: Can't find acceleration device\n");
++  return PCI_ERS_RESULT_DISCONNECT;
++ }
++
++ if (state == pci_channel_io_perm_failure) {
++  pr_err("QAT: Can't recover from device error\n");
++  return PCI_ERS_RESULT_DISCONNECT;
++ }
++
++ return PCI_ERS_RESULT_NEED_RESET;
++}
++
++/* reset dev data */
++struct adf_reset_dev_data {
++ int mode;
++ struct adf_accel_dev *accel_dev;
++ struct completion compl;
++ struct work_struct reset_work;
++};
++
++#define PPDSTAT_OFFSET 0x7E
++static void adf_dev_restore(struct adf_accel_dev *accel_dev)
++{
++ struct pci_dev *pdev = accel_to_pci_dev(accel_dev);
++ struct pci_dev *parent = pdev->bus->self;
++ uint16_t ppdstat = 0, bridge_ctl = 0;
++ int pending = 0;
++
++ pr_info("QAT: Reseting device qat_dev%d\n", accel_dev->accel_id);
++ pci_read_config_word(pdev, PPDSTAT_OFFSET, &ppdstat);
++ pending = ppdstat & PCI_EXP_DEVSTA_TRPND;
++ if (pending) {
++  int ctr = 0;
++  do {
++   msleep(100);
++   pci_read_config_word(pdev, PPDSTAT_OFFSET, &ppdstat);
++   pending = ppdstat & PCI_EXP_DEVSTA_TRPND;
++  } while (pending && ctr++ < 10);
++ }
++
++ if (pending)
++  pr_info("QAT: Transaction still in progress. Proceeding\n");
++
++ pci_read_config_word(parent, PCI_BRIDGE_CONTROL, &bridge_ctl);
++ bridge_ctl |= PCI_BRIDGE_CTL_BUS_RESET;
++ pci_write_config_word(parent, PCI_BRIDGE_CONTROL, bridge_ctl);
++ msleep(100);
++ bridge_ctl &= ~PCI_BRIDGE_CTL_BUS_RESET;
++ pci_write_config_word(parent, PCI_BRIDGE_CONTROL, bridge_ctl);
++ msleep(100);
++ pci_restore_state(pdev);
++ pci_save_state(pdev);
++}
++
++static void adf_device_reset_worker(struct work_struct *work)
++{
++ struct adf_reset_dev_data *reset_data =
++    container_of(work, struct adf_reset_dev_data, reset_work);
++ struct adf_accel_dev *accel_dev = reset_data->accel_dev;
++
++ adf_dev_restarting_notify(accel_dev);
++ adf_dev_stop(accel_dev);
++ adf_dev_restore(accel_dev);
++ if (adf_dev_start(accel_dev)) {
++  /* The device hanged and we can't restart it so stop here */
++  dev_err(&GET_DEV(accel_dev), "Restart device failed\n");
++  kfree(reset_data);
++  WARN(1, "QAT: device restart failed. Device is unusable\n");
++  return;
++ }
++ adf_dev_restarted_notify(accel_dev);
++ clear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);
++
++ /* The dev is back alive. Notify the caller if in sync mode */
++ if (reset_data->mode == ADF_DEV_RESET_SYNC)
++  complete(&reset_data->compl);
++ else
++  kfree(reset_data);
++}
++
++static int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,
++          enum adf_dev_reset_mode mode)
++{
++ struct adf_reset_dev_data *reset_data;
++
++ if (adf_dev_started(accel_dev) &&
++     !test_bit(ADF_STATUS_RESTARTING, &accel_dev->status))
++  return 0;
++
++ set_bit(ADF_STATUS_RESTARTING, &accel_dev->status);
++ reset_data = kzalloc(sizeof(*reset_data), GFP_ATOMIC);
++ if (!reset_data)
++  return -ENOMEM;
++ reset_data->accel_dev = accel_dev;
++ init_completion(&reset_data->compl);
++ reset_data->mode = mode;
++ INIT_WORK(&reset_data->reset_work, adf_device_reset_worker);
++ queue_work(device_reset_wq, &reset_data->reset_work);
++
++ /* If in sync mode wait for the result */
++ if (mode == ADF_DEV_RESET_SYNC) {
++  int ret = 0;
++  /* Maximum device reset time is 10 seconds */
++  unsigned long wait_jiffies = msecs_to_jiffies(10000);
++  unsigned long timeout = wait_for_completion_timeout(
++       &reset_data->compl, wait_jiffies);
++  if (!timeout) {
++   pr_err("QAT: Reset device timeout expired\n");
++   ret = -EFAULT;
++  }
++  kfree(reset_data);
++  return ret;
++ }
++ return 0;
++}
++
++static pci_ers_result_t adf_slot_reset(struct pci_dev *pdev)
++{
++ struct adf_accel_dev *accel_dev = adf_devmgr_pci_to_accel_dev(pdev);
++
++ if (!accel_dev) {
++  pr_err("QAT: Can't find acceleration device\n");
++  return PCI_ERS_RESULT_DISCONNECT;
++ }
++ pci_cleanup_aer_uncorrect_error_status(pdev);
++ if (adf_dev_aer_schedule_reset(accel_dev, ADF_DEV_RESET_SYNC))
++  return PCI_ERS_RESULT_DISCONNECT;
++
++ return PCI_ERS_RESULT_RECOVERED;
++}
++
++static void adf_resume(struct pci_dev *pdev)
++{
++ pr_info("QAT: Acceleration driver reset completed\n");
++ pr_info("QAT: Device is up and runnig\n");
++}
++
++static struct pci_error_handlers adf_err_handler = {
++ .error_detected = adf_error_detected,
++ .slot_reset = adf_slot_reset,
++ .resume = adf_resume,
++};
++
++/**
++ * adf_enable_aer() - Enable Advance Error Reporting for acceleration device
++ * @accel_dev:  Pointer to acceleration device.
++ * @adf:        PCI device driver owning the given acceleration device.
++ *
++ * Function enables PCI Advance Error Reporting for the
++ * QAT acceleration device accel_dev.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_enable_aer(struct adf_accel_dev *accel_dev, struct pci_driver *adf)
++{
++ struct pci_dev *pdev = accel_to_pci_dev(accel_dev);
++
++ adf->err_handler = &adf_err_handler;
++ pci_enable_pcie_error_reporting(pdev);
++ return 0;
++}
++EXPORT_SYMBOL_GPL(adf_enable_aer);
++
++/**
++ * adf_disable_aer() - Enable Advance Error Reporting for acceleration device
++ * @accel_dev:  Pointer to acceleration device.
++ *
++ * Function disables PCI Advance Error Reporting for the
++ * QAT acceleration device accel_dev.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: void
++ */
++void adf_disable_aer(struct adf_accel_dev *accel_dev)
++{
++ struct pci_dev *pdev = accel_to_pci_dev(accel_dev);
++
++ pci_disable_pcie_error_reporting(pdev);
++}
++EXPORT_SYMBOL_GPL(adf_disable_aer);
++
++int adf_init_aer(void)
++{
++ device_reset_wq = create_workqueue("qat_device_reset_wq");
++ return (device_reset_wq == NULL) ? -EFAULT : 0;
++}
++
++void adf_exit_aer(void)
++{
++ if (device_reset_wq)
++  destroy_workqueue(device_reset_wq);
++ device_reset_wq = NULL;
++}
+diff --git a/drivers/crypto/qat/qat_common/adf_cfg.c b/drivers/crypto/qat/qat_common/adf_cfg.c
+new file mode 100644
+index 0000000..389c0cf
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_cfg.c
+@@ -0,0 +1,359 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/list.h>
++#include <linux/seq_file.h>
++#include "adf_accel_devices.h"
++#include "adf_common_drv.h"
++#include "adf_cfg.h"
++
++static DEFINE_MUTEX(qat_cfg_read_lock);
++
++static void *qat_dev_cfg_start(struct seq_file *sfile, loff_t *pos)
++{
++ struct adf_cfg_device_data *dev_cfg = sfile->private;
++ mutex_lock(&qat_cfg_read_lock);
++ return seq_list_start(&dev_cfg->sec_list, *pos);
++}
++
++static int qat_dev_cfg_show(struct seq_file *sfile, void *v)
++{
++ struct list_head *list;
++ struct adf_cfg_section *sec =
++    list_entry(v, struct adf_cfg_section, list);
++
++ seq_printf(sfile, "[%s]\n", sec->name);
++ list_for_each(list, &sec->param_head) {
++  struct adf_cfg_key_val *ptr =
++   list_entry(list, struct adf_cfg_key_val, list);
++  seq_printf(sfile, "%s = %s\n", ptr->key, ptr->val);
++ }
++ return 0;
++}
++
++static void *qat_dev_cfg_next(struct seq_file *sfile, void *v, loff_t *pos)
++{
++ struct adf_cfg_device_data *dev_cfg = sfile->private;
++ return seq_list_next(v, &dev_cfg->sec_list, pos);
++}
++
++static void qat_dev_cfg_stop(struct seq_file *sfile, void *v)
++{
++ mutex_unlock(&qat_cfg_read_lock);
++}
++
++static const struct seq_operations qat_dev_cfg_sops = {
++ .start = qat_dev_cfg_start,
++ .next = qat_dev_cfg_next,
++ .stop = qat_dev_cfg_stop,
++ .show = qat_dev_cfg_show
++};
++
++static int qat_dev_cfg_open(struct inode *inode, struct file *file)
++{
++ int ret = seq_open(file, &qat_dev_cfg_sops);
++
++ if (!ret) {
++  struct seq_file *seq_f = file->private_data;
++  seq_f->private = inode->i_private;
++ }
++ return ret;
++}
++
++static const struct file_operations qat_dev_cfg_fops = {
++ .open = qat_dev_cfg_open,
++ .read = seq_read,
++ .llseek = seq_lseek,
++ .release = seq_release
++};
++
++/**
++ * adf_cfg_dev_add() - Create an acceleration device configuration table.
++ * @accel_dev:  Pointer to acceleration device.
++ *
++ * Function creates a configuration table for the given acceleration device.
++ * The table stores device specific config values.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_cfg_dev_add(struct adf_accel_dev *accel_dev)
++{
++ struct adf_cfg_device_data *dev_cfg_data;
++
++ dev_cfg_data = kzalloc(sizeof(*dev_cfg_data), GFP_KERNEL);
++ if (!dev_cfg_data)
++  return -ENOMEM;
++ INIT_LIST_HEAD(&dev_cfg_data->sec_list);
++ init_rwsem(&dev_cfg_data->lock);
++ accel_dev->cfg = dev_cfg_data;
++
++ /* accel_dev->debugfs_dir should always be non-NULL here */
++ dev_cfg_data->debug = debugfs_create_file("dev_cfg", S_IRUSR,
++        accel_dev->debugfs_dir,
++        dev_cfg_data,
++        &qat_dev_cfg_fops);
++ if (!dev_cfg_data->debug) {
++  pr_err("QAT: Failed to create qat cfg debugfs entry.\n");
++  kfree(dev_cfg_data);
++  accel_dev->cfg = NULL;
++  return -EFAULT;
++ }
++ return 0;
++}
++EXPORT_SYMBOL_GPL(adf_cfg_dev_add);
++
++static void adf_cfg_section_del_all(struct list_head *head);
++
++void adf_cfg_del_all(struct adf_accel_dev *accel_dev)
++{
++ struct adf_cfg_device_data *dev_cfg_data = accel_dev->cfg;
++
++ down_write(&dev_cfg_data->lock);
++ adf_cfg_section_del_all(&dev_cfg_data->sec_list);
++ up_write(&dev_cfg_data->lock);
++}
++
++/**
++ * adf_cfg_dev_remove() - Clears acceleration device configuration table.
++ * @accel_dev:  Pointer to acceleration device.
++ *
++ * Function removes configuration table from the given acceleration device
++ * and frees all allocated memory.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: void
++ */
++void adf_cfg_dev_remove(struct adf_accel_dev *accel_dev)
++{
++ struct adf_cfg_device_data *dev_cfg_data = accel_dev->cfg;
++
++ down_write(&dev_cfg_data->lock);
++ adf_cfg_section_del_all(&dev_cfg_data->sec_list);
++ up_write(&dev_cfg_data->lock);
++ debugfs_remove(dev_cfg_data->debug);
++ kfree(dev_cfg_data);
++ accel_dev->cfg = NULL;
++}
++EXPORT_SYMBOL_GPL(adf_cfg_dev_remove);
++
++static void adf_cfg_keyval_add(struct adf_cfg_key_val *new,
++          struct adf_cfg_section *sec)
++{
++ list_add_tail(&new->list, &sec->param_head);
++}
++
++static void adf_cfg_keyval_del_all(struct list_head *head)
++{
++ struct list_head *list_ptr, *tmp;
++
++ list_for_each_prev_safe(list_ptr, tmp, head) {
++  struct adf_cfg_key_val *ptr =
++   list_entry(list_ptr, struct adf_cfg_key_val, list);
++  list_del(list_ptr);
++  kfree(ptr);
++ }
++}
++
++static void adf_cfg_section_del_all(struct list_head *head)
++{
++ struct adf_cfg_section *ptr;
++ struct list_head *list, *tmp;
++
++ list_for_each_prev_safe(list, tmp, head) {
++  ptr = list_entry(list, struct adf_cfg_section, list);
++  adf_cfg_keyval_del_all(&ptr->param_head);
++  list_del(list);
++  kfree(ptr);
++ }
++}
++
++static struct adf_cfg_key_val *adf_cfg_key_value_find(struct adf_cfg_section *s,
++            const char *key)
++{
++ struct list_head *list;
++
++ list_for_each(list, &s->param_head) {
++  struct adf_cfg_key_val *ptr =
++   list_entry(list, struct adf_cfg_key_val, list);
++  if (!strcmp(ptr->key, key))
++   return ptr;
++ }
++ return NULL;
++}
++
++static struct adf_cfg_section *adf_cfg_sec_find(struct adf_accel_dev *accel_dev,
++      const char *sec_name)
++{
++ struct adf_cfg_device_data *cfg = accel_dev->cfg;
++ struct list_head *list;
++
++ list_for_each(list, &cfg->sec_list) {
++  struct adf_cfg_section *ptr =
++   list_entry(list, struct adf_cfg_section, list);
++  if (!strcmp(ptr->name, sec_name))
++   return ptr;
++ }
++ return NULL;
++}
++
++static int adf_cfg_key_val_get(struct adf_accel_dev *accel_dev,
++          const char *sec_name,
++          const char *key_name,
++          char *val)
++{
++ struct adf_cfg_section *sec = adf_cfg_sec_find(accel_dev, sec_name);
++ struct adf_cfg_key_val *keyval = NULL;
++
++ if (sec)
++  keyval = adf_cfg_key_value_find(sec, key_name);
++ if (keyval) {
++  memcpy(val, keyval->val, ADF_CFG_MAX_VAL_LEN_IN_BYTES);
++  return 0;
++ }
++ return -1;
++}
++
++/**
++ * adf_cfg_add_key_value_param() - Add key-value config entry to config table.
++ * @accel_dev:  Pointer to acceleration device.
++ * @section_name: Name of the section where the param will be added
++ * @key: The key string
++ * @val: Value pain for the given @key
++ * @type: Type - string, int or address
++ *
++ * Function adds configuration key - value entry in the appropriate section
++ * in the given acceleration device
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_cfg_add_key_value_param(struct adf_accel_dev *accel_dev,
++    const char *section_name,
++    const char *key, const void *val,
++    enum adf_cfg_val_type type)
++{
++ struct adf_cfg_device_data *cfg = accel_dev->cfg;
++ struct adf_cfg_key_val *key_val;
++ struct adf_cfg_section *section = adf_cfg_sec_find(accel_dev,
++          section_name);
++ if (!section)
++  return -EFAULT;
++
++ key_val = kzalloc(sizeof(*key_val), GFP_KERNEL);
++ if (!key_val)
++  return -ENOMEM;
++
++ INIT_LIST_HEAD(&key_val->list);
++ strlcpy(key_val->key, key, sizeof(key_val->key));
++
++ if (type == ADF_DEC) {
++  snprintf(key_val->val, ADF_CFG_MAX_VAL_LEN_IN_BYTES,
++    "%ld", (*((long *)val)));
++ } else if (type == ADF_STR) {
++  strlcpy(key_val->val, (char *)val, sizeof(key_val->val));
++ } else if (type == ADF_HEX) {
++  snprintf(key_val->val, ADF_CFG_MAX_VAL_LEN_IN_BYTES,
++    "0x%lx", (unsigned long)val);
++ } else {
++  pr_err("QAT: Unknown type given.\n");
++  kfree(key_val);
++  return -1;
++ }
++ key_val->type = type;
++ down_write(&cfg->lock);
++ adf_cfg_keyval_add(key_val, section);
++ up_write(&cfg->lock);
++ return 0;
++}
++EXPORT_SYMBOL_GPL(adf_cfg_add_key_value_param);
++
++/**
++ * adf_cfg_section_add() - Add config section entry to config table.
++ * @accel_dev:  Pointer to acceleration device.
++ * @name: Name of the section
++ *
++ * Function adds configuration section where key - value entries
++ * will be stored.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_cfg_section_add(struct adf_accel_dev *accel_dev, const char *name)
++{
++ struct adf_cfg_device_data *cfg = accel_dev->cfg;
++ struct adf_cfg_section *sec = adf_cfg_sec_find(accel_dev, name);
++
++ if (sec)
++  return 0;
++
++ sec = kzalloc(sizeof(*sec), GFP_KERNEL);
++ if (!sec)
++  return -ENOMEM;
++
++ strlcpy(sec->name, name, sizeof(sec->name));
++ INIT_LIST_HEAD(&sec->param_head);
++ down_write(&cfg->lock);
++ list_add_tail(&sec->list, &cfg->sec_list);
++ up_write(&cfg->lock);
++ return 0;
++}
++EXPORT_SYMBOL_GPL(adf_cfg_section_add);
++
++int adf_cfg_get_param_value(struct adf_accel_dev *accel_dev,
++       const char *section, const char *name,
++       char *value)
++{
++ struct adf_cfg_device_data *cfg = accel_dev->cfg;
++ int ret;
++
++ down_read(&cfg->lock);
++ ret = adf_cfg_key_val_get(accel_dev, section, name, value);
++ up_read(&cfg->lock);
++ return ret;
++}
+diff --git a/drivers/crypto/qat/qat_common/adf_cfg.h b/drivers/crypto/qat/qat_common/adf_cfg.h
+new file mode 100644
+index 0000000..6a9c6f6
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_cfg.h
+@@ -0,0 +1,87 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#ifndef ADF_CFG_H_
++#define ADF_CFG_H_
++
++#include <linux/list.h>
++#include <linux/rwsem.h>
++#include <linux/debugfs.h>
++#include "adf_accel_devices.h"
++#include "adf_cfg_common.h"
++#include "adf_cfg_strings.h"
++
++struct adf_cfg_key_val {
++ char key[ADF_CFG_MAX_KEY_LEN_IN_BYTES];
++ char val[ADF_CFG_MAX_VAL_LEN_IN_BYTES];
++ enum adf_cfg_val_type type;
++ struct list_head list;
++};
++
++struct adf_cfg_section {
++ char name[ADF_CFG_MAX_SECTION_LEN_IN_BYTES];
++ struct list_head list;
++ struct list_head param_head;
++};
++
++struct adf_cfg_device_data {
++ struct list_head sec_list;
++ struct dentry *debug;
++ struct rw_semaphore lock;
++};
++
++int adf_cfg_dev_add(struct adf_accel_dev *accel_dev);
++void adf_cfg_dev_remove(struct adf_accel_dev *accel_dev);
++int adf_cfg_section_add(struct adf_accel_dev *accel_dev, const char *name);
++void adf_cfg_del_all(struct adf_accel_dev *accel_dev);
++int adf_cfg_add_key_value_param(struct adf_accel_dev *accel_dev,
++    const char *section_name,
++    const char *key, const void *val,
++    enum adf_cfg_val_type type);
++int adf_cfg_get_param_value(struct adf_accel_dev *accel_dev,
++       const char *section, const char *name, char *value);
++
++#endif
+diff --git a/drivers/crypto/qat/qat_common/adf_cfg_common.h b/drivers/crypto/qat/qat_common/adf_cfg_common.h
+new file mode 100644
+index 0000000..88b8218
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_cfg_common.h
+@@ -0,0 +1,100 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#ifndef ADF_CFG_COMMON_H_
++#define ADF_CFG_COMMON_H_
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++#define ADF_CFG_MAX_STR_LEN 64
++#define ADF_CFG_MAX_KEY_LEN_IN_BYTES ADF_CFG_MAX_STR_LEN
++#define ADF_CFG_MAX_VAL_LEN_IN_BYTES ADF_CFG_MAX_STR_LEN
++#define ADF_CFG_MAX_SECTION_LEN_IN_BYTES ADF_CFG_MAX_STR_LEN
++#define ADF_CFG_BASE_DEC 10
++#define ADF_CFG_BASE_HEX 16
++#define ADF_CFG_ALL_DEVICES 0xFE
++#define ADF_CFG_NO_DEVICE 0xFF
++#define ADF_CFG_AFFINITY_WHATEVER 0xFF
++#define MAX_DEVICE_NAME_SIZE 32
++#define ADF_MAX_DEVICES 32
++
++enum adf_cfg_val_type {
++ ADF_DEC,
++ ADF_HEX,
++ ADF_STR
++};
++
++enum adf_device_type {
++ DEV_UNKNOWN = 0,
++ DEV_DH895XCC,
++};
++
++struct adf_dev_status_info {
++ enum adf_device_type type;
++ uint8_t accel_id;
++ uint8_t instance_id;
++ uint8_t num_ae;
++ uint8_t num_accel;
++ uint8_t num_logical_accel;
++ uint8_t banks_per_accel;
++ uint8_t state;
++ uint8_t bus;
++ uint8_t dev;
++ uint8_t fun;
++ char name[MAX_DEVICE_NAME_SIZE];
++};
++
++#define ADF_CTL_IOC_MAGIC 'a'
++#define IOCTL_CONFIG_SYS_RESOURCE_PARAMETERS _IOW(ADF_CTL_IOC_MAGIC, 0, \
++  struct adf_user_cfg_ctl_data)
++#define IOCTL_STOP_ACCEL_DEV _IOW(ADF_CTL_IOC_MAGIC, 1, \
++  struct adf_user_cfg_ctl_data)
++#define IOCTL_START_ACCEL_DEV _IOW(ADF_CTL_IOC_MAGIC, 2, \
++  struct adf_user_cfg_ctl_data)
++#define IOCTL_STATUS_ACCEL_DEV _IOW(ADF_CTL_IOC_MAGIC, 3, uint32_t)
++#define IOCTL_GET_NUM_DEVICES _IOW(ADF_CTL_IOC_MAGIC, 4, int32_t)
++#endif
+diff --git a/drivers/crypto/qat/qat_common/adf_cfg_strings.h b/drivers/crypto/qat/qat_common/adf_cfg_strings.h
+new file mode 100644
+index 0000000..c7ac758
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_cfg_strings.h
+@@ -0,0 +1,83 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#ifndef ADF_CFG_STRINGS_H_
++#define ADF_CFG_STRINGS_H_
++
++#define ADF_GENERAL_SEC "GENERAL"
++#define ADF_KERNEL_SEC "KERNEL"
++#define ADF_ACCEL_SEC "Accelerator"
++#define ADF_NUM_CY "NumberCyInstances"
++#define ADF_NUM_DC "NumberDcInstances"
++#define ADF_RING_SYM_SIZE "NumConcurrentSymRequests"
++#define ADF_RING_ASYM_SIZE "NumConcurrentAsymRequests"
++#define ADF_RING_DC_SIZE "NumConcurrentRequests"
++#define ADF_RING_ASYM_TX "RingAsymTx"
++#define ADF_RING_SYM_TX "RingSymTx"
++#define ADF_RING_RND_TX "RingNrbgTx"
++#define ADF_RING_ASYM_RX "RingAsymRx"
++#define ADF_RING_SYM_RX "RinSymRx"
++#define ADF_RING_RND_RX "RingNrbgRx"
++#define ADF_RING_DC_TX "RingTx"
++#define ADF_RING_DC_RX "RingRx"
++#define ADF_ETRMGR_BANK "Bank"
++#define ADF_RING_BANK_NUM "BankNumber"
++#define ADF_CY "Cy"
++#define ADF_DC "Dc"
++#define ADF_ETRMGR_COALESCING_ENABLED "InterruptCoalescingEnabled"
++#define ADF_ETRMGR_COALESCING_ENABLED_FORMAT \
++ ADF_ETRMGR_BANK"%d"ADF_ETRMGR_COALESCING_ENABLED
++#define ADF_ETRMGR_COALESCE_TIMER "InterruptCoalescingTimerNs"
++#define ADF_ETRMGR_COALESCE_TIMER_FORMAT \
++ ADF_ETRMGR_BANK"%d"ADF_ETRMGR_COALESCE_TIMER
++#define ADF_ETRMGR_COALESCING_MSG_ENABLED "InterruptCoalescingNumResponses"
++#define ADF_ETRMGR_COALESCING_MSG_ENABLED_FORMAT \
++ ADF_ETRMGR_BANK"%d"ADF_ETRMGR_COALESCING_MSG_ENABLED
++#define ADF_ETRMGR_CORE_AFFINITY "CoreAffinity"
++#define ADF_ETRMGR_CORE_AFFINITY_FORMAT \
++ ADF_ETRMGR_BANK"%d"ADF_ETRMGR_CORE_AFFINITY
++#define ADF_ACCEL_STR "Accelerator%d"
++#endif
+diff --git a/drivers/crypto/qat/qat_common/adf_cfg_user.h b/drivers/crypto/qat/qat_common/adf_cfg_user.h
+new file mode 100644
+index 0000000..0c38a15
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_cfg_user.h
+@@ -0,0 +1,94 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#ifndef ADF_CFG_USER_H_
++#define ADF_CFG_USER_H_
++
++#include "adf_cfg_common.h"
++#include "adf_cfg_strings.h"
++
++struct adf_user_cfg_key_val {
++ char key[ADF_CFG_MAX_KEY_LEN_IN_BYTES];
++ char val[ADF_CFG_MAX_VAL_LEN_IN_BYTES];
++ union {
++  char *user_val_ptr;
++  uint64_t padding1;
++ };
++ union {
++  struct adf_user_cfg_key_val *prev;
++  uint64_t padding2;
++ };
++ union {
++  struct adf_user_cfg_key_val *next;
++  uint64_t padding3;
++ };
++ enum adf_cfg_val_type type;
++};
++
++struct adf_user_cfg_section {
++ char name[ADF_CFG_MAX_SECTION_LEN_IN_BYTES];
++ union {
++  struct adf_user_cfg_key_val *params;
++  uint64_t padding1;
++ };
++ union {
++  struct adf_user_cfg_section *prev;
++  uint64_t padding2;
++ };
++ union {
++  struct adf_user_cfg_section *next;
++  uint64_t padding3;
++ };
++};
++
++struct adf_user_cfg_ctl_data {
++ union {
++  struct adf_user_cfg_section *config_section;
++  uint64_t padding;
++ };
++ uint8_t device_id;
++};
++#endif
+diff --git a/drivers/crypto/qat/qat_common/adf_common_drv.h b/drivers/crypto/qat/qat_common/adf_common_drv.h
+new file mode 100644
+index 0000000..3cea9fa
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_common_drv.h
+@@ -0,0 +1,192 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#ifndef ADF_DRV_H
++#define ADF_DRV_H
++
++#include <linux/list.h>
++#include <linux/pci.h>
++#include "adf_accel_devices.h"
++#include "icp_qat_fw_loader_handle.h"
++#include "icp_qat_hal.h"
++
++#define ADF_STATUS_RESTARTING 0
++#define ADF_STATUS_STARTING 1
++#define ADF_STATUS_CONFIGURED 2
++#define ADF_STATUS_STARTED 3
++#define ADF_STATUS_AE_INITIALISED 4
++#define ADF_STATUS_AE_UCODE_LOADED 5
++#define ADF_STATUS_AE_STARTED 6
++#define ADF_STATUS_ORPHAN_TH_RUNNING 7
++#define ADF_STATUS_IRQ_ALLOCATED 8
++
++enum adf_dev_reset_mode {
++ ADF_DEV_RESET_ASYNC = 0,
++ ADF_DEV_RESET_SYNC
++};
++
++enum adf_event {
++ ADF_EVENT_INIT = 0,
++ ADF_EVENT_START,
++ ADF_EVENT_STOP,
++ ADF_EVENT_SHUTDOWN,
++ ADF_EVENT_RESTARTING,
++ ADF_EVENT_RESTARTED,
++};
++
++struct service_hndl {
++ int (*event_hld)(struct adf_accel_dev *accel_dev,
++    enum adf_event event);
++ unsigned long init_status;
++ unsigned long start_status;
++ char *name;
++ struct list_head list;
++ int admin;
++};
++
++int adf_service_register(struct service_hndl *service);
++int adf_service_unregister(struct service_hndl *service);
++
++int adf_dev_init(struct adf_accel_dev *accel_dev);
++int adf_dev_start(struct adf_accel_dev *accel_dev);
++int adf_dev_stop(struct adf_accel_dev *accel_dev);
++int adf_dev_shutdown(struct adf_accel_dev *accel_dev);
++
++int adf_ctl_dev_register(void);
++void adf_ctl_dev_unregister(void);
++int adf_processes_dev_register(void);
++void adf_processes_dev_unregister(void);
++
++int adf_devmgr_add_dev(struct adf_accel_dev *accel_dev);
++void adf_devmgr_rm_dev(struct adf_accel_dev *accel_dev);
++struct list_head *adf_devmgr_get_head(void);
++struct adf_accel_dev *adf_devmgr_get_dev_by_id(uint32_t id);
++struct adf_accel_dev *adf_devmgr_get_first(void);
++struct adf_accel_dev *adf_devmgr_pci_to_accel_dev(struct pci_dev *pci_dev);
++int adf_devmgr_verify_id(uint32_t id);
++void adf_devmgr_get_num_dev(uint32_t *num);
++int adf_devmgr_in_reset(struct adf_accel_dev *accel_dev);
++int adf_dev_started(struct adf_accel_dev *accel_dev);
++int adf_dev_restarting_notify(struct adf_accel_dev *accel_dev);
++int adf_dev_restarted_notify(struct adf_accel_dev *accel_dev);
++int adf_ae_init(struct adf_accel_dev *accel_dev);
++int adf_ae_shutdown(struct adf_accel_dev *accel_dev);
++int adf_ae_fw_load(struct adf_accel_dev *accel_dev);
++int adf_ae_fw_release(struct adf_accel_dev *accel_dev);
++int adf_ae_start(struct adf_accel_dev *accel_dev);
++int adf_ae_stop(struct adf_accel_dev *accel_dev);
++
++int adf_enable_aer(struct adf_accel_dev *accel_dev, struct pci_driver *adf);
++void adf_disable_aer(struct adf_accel_dev *accel_dev);
++int adf_init_aer(void);
++void adf_exit_aer(void);
++
++int adf_dev_get(struct adf_accel_dev *accel_dev);
++void adf_dev_put(struct adf_accel_dev *accel_dev);
++int adf_dev_in_use(struct adf_accel_dev *accel_dev);
++int adf_init_etr_data(struct adf_accel_dev *accel_dev);
++void adf_cleanup_etr_data(struct adf_accel_dev *accel_dev);
++int qat_crypto_register(void);
++int qat_crypto_unregister(void);
++struct qat_crypto_instance *qat_crypto_get_instance_node(int node);
++void qat_crypto_put_instance(struct qat_crypto_instance *inst);
++void qat_alg_callback(void *resp);
++int qat_algs_init(void);
++void qat_algs_exit(void);
++int qat_algs_register(void);
++int qat_algs_unregister(void);
++
++int qat_hal_init(struct adf_accel_dev *accel_dev);
++void qat_hal_deinit(struct icp_qat_fw_loader_handle *handle);
++void qat_hal_start(struct icp_qat_fw_loader_handle *handle, unsigned char ae,
++     unsigned int ctx_mask);
++void qat_hal_stop(struct icp_qat_fw_loader_handle *handle, unsigned char ae,
++    unsigned int ctx_mask);
++void qat_hal_reset(struct icp_qat_fw_loader_handle *handle);
++int qat_hal_clr_reset(struct icp_qat_fw_loader_handle *handle);
++void qat_hal_set_live_ctx(struct icp_qat_fw_loader_handle *handle,
++     unsigned char ae, unsigned int ctx_mask);
++int qat_hal_set_ae_lm_mode(struct icp_qat_fw_loader_handle *handle,
++      unsigned char ae, enum icp_qat_uof_regtype lm_type,
++      unsigned char mode);
++int qat_hal_set_ae_ctx_mode(struct icp_qat_fw_loader_handle *handle,
++       unsigned char ae, unsigned char mode);
++int qat_hal_set_ae_nn_mode(struct icp_qat_fw_loader_handle *handle,
++      unsigned char ae, unsigned char mode);
++void qat_hal_set_pc(struct icp_qat_fw_loader_handle *handle,
++      unsigned char ae, unsigned int ctx_mask, unsigned int upc);
++void qat_hal_wr_uwords(struct icp_qat_fw_loader_handle *handle,
++         unsigned char ae, unsigned int uaddr,
++         unsigned int words_num, uint64_t *uword);
++void qat_hal_wr_umem(struct icp_qat_fw_loader_handle *handle, unsigned char ae,
++       unsigned int uword_addr, unsigned int words_num,
++       unsigned int *data);
++int qat_hal_get_ins_num(void);
++int qat_hal_batch_wr_lm(struct icp_qat_fw_loader_handle *handle,
++   unsigned char ae,
++   struct icp_qat_uof_batch_init *lm_init_header);
++int qat_hal_init_gpr(struct icp_qat_fw_loader_handle *handle,
++       unsigned char ae, unsigned char ctx_mask,
++       enum icp_qat_uof_regtype reg_type,
++       unsigned short reg_num, unsigned int regdata);
++int qat_hal_init_wr_xfer(struct icp_qat_fw_loader_handle *handle,
++    unsigned char ae, unsigned char ctx_mask,
++    enum icp_qat_uof_regtype reg_type,
++    unsigned short reg_num, unsigned int regdata);
++int qat_hal_init_rd_xfer(struct icp_qat_fw_loader_handle *handle,
++    unsigned char ae, unsigned char ctx_mask,
++    enum icp_qat_uof_regtype reg_type,
++    unsigned short reg_num, unsigned int regdata);
++int qat_hal_init_nn(struct icp_qat_fw_loader_handle *handle,
++      unsigned char ae, unsigned char ctx_mask,
++      unsigned short reg_num, unsigned int regdata);
++int qat_hal_wr_lm(struct icp_qat_fw_loader_handle *handle,
++    unsigned char ae, unsigned short lm_addr, unsigned int value);
++int qat_uclo_wr_all_uimage(struct icp_qat_fw_loader_handle *handle);
++int qat_uclo_del_uof_obj(struct icp_qat_fw_loader_handle *handle);
++int qat_uclo_map_uof_obj(struct icp_qat_fw_loader_handle *handle,
++    void *addr_ptr, int mem_size);
++#endif
+diff --git a/drivers/crypto/qat/qat_common/adf_ctl_drv.c b/drivers/crypto/qat/qat_common/adf_ctl_drv.c
+new file mode 100644
+index 0000000..d97069b
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_ctl_drv.c
+@@ -0,0 +1,490 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/bitops.h>
++#include <linux/pci.h>
++#include <linux/cdev.h>
++#include <linux/uaccess.h>
++
++#include "adf_accel_devices.h"
++#include "adf_common_drv.h"
++#include "adf_cfg.h"
++#include "adf_cfg_common.h"
++#include "adf_cfg_user.h"
++
++#define DEVICE_NAME "qat_adf_ctl"
++
++static DEFINE_MUTEX(adf_ctl_lock);
++static long adf_ctl_ioctl(struct file *fp, unsigned int cmd, unsigned long arg);
++
++static const struct file_operations adf_ctl_ops = {
++ .owner = THIS_MODULE,
++ .unlocked_ioctl = adf_ctl_ioctl,
++ .compat_ioctl = adf_ctl_ioctl,
++};
++
++struct adf_ctl_drv_info {
++ unsigned int major;
++ struct cdev drv_cdev;
++ struct class *drv_class;
++};
++
++static struct adf_ctl_drv_info adt_ctl_drv;
++
++static void adf_chr_drv_destroy(void)
++{
++ device_destroy(adt_ctl_drv.drv_class, MKDEV(adt_ctl_drv.major, 0));
++ cdev_del(&adt_ctl_drv.drv_cdev);
++ class_destroy(adt_ctl_drv.drv_class);
++ unregister_chrdev_region(MKDEV(adt_ctl_drv.major, 0), 1);
++}
++
++static int adf_chr_drv_create(void)
++{
++ dev_t dev_id;
++ struct device *drv_device;
++
++ if (alloc_chrdev_region(&dev_id, 0, 1, DEVICE_NAME)) {
++  pr_err("QAT: unable to allocate chrdev region\n");
++  return -EFAULT;
++ }
++
++ adt_ctl_drv.drv_class = class_create(THIS_MODULE, DEVICE_NAME);
++ if (IS_ERR(adt_ctl_drv.drv_class)) {
++  pr_err("QAT: class_create failed for adf_ctl\n");
++  goto err_chrdev_unreg;
++ }
++ adt_ctl_drv.major = MAJOR(dev_id);
++ cdev_init(&adt_ctl_drv.drv_cdev, &adf_ctl_ops);
++ if (cdev_add(&adt_ctl_drv.drv_cdev, dev_id, 1)) {
++  pr_err("QAT: cdev add failed\n");
++  goto err_class_destr;
++ }
++
++ drv_device = device_create(adt_ctl_drv.drv_class, NULL,
++       MKDEV(adt_ctl_drv.major, 0),
++       NULL, DEVICE_NAME);
++ if (!drv_device) {
++  pr_err("QAT: failed to create device\n");
++  goto err_cdev_del;
++ }
++ return 0;
++err_cdev_del:
++ cdev_del(&adt_ctl_drv.drv_cdev);
++err_class_destr:
++ class_destroy(adt_ctl_drv.drv_class);
++err_chrdev_unreg:
++ unregister_chrdev_region(dev_id, 1);
++ return -EFAULT;
++}
++
++static int adf_ctl_alloc_resources(struct adf_user_cfg_ctl_data **ctl_data,
++       unsigned long arg)
++{
++ struct adf_user_cfg_ctl_data *cfg_data;
++
++ cfg_data = kzalloc(sizeof(*cfg_data), GFP_KERNEL);
++ if (!cfg_data)
++  return -ENOMEM;
++
++ /* Initialize device id to NO DEVICE as 0 is a valid device id */
++ cfg_data->device_id = ADF_CFG_NO_DEVICE;
++
++ if (copy_from_user(cfg_data, (void __user *)arg, sizeof(*cfg_data))) {
++  pr_err("QAT: failed to copy from user cfg_data.\n");
++  kfree(cfg_data);
++  return -EIO;
++ }
++
++ *ctl_data = cfg_data;
++ return 0;
++}
++
++static int adf_add_key_value_data(struct adf_accel_dev *accel_dev,
++      const char *section,
++      const struct adf_user_cfg_key_val *key_val)
++{
++ if (key_val->type == ADF_HEX) {
++  long *ptr = (long *)key_val->val;
++  long val = *ptr;
++
++  if (adf_cfg_add_key_value_param(accel_dev, section,
++      key_val->key, (void *)val,
++      key_val->type)) {
++   pr_err("QAT: failed to add keyvalue.\n");
++   return -EFAULT;
++  }
++ } else {
++  if (adf_cfg_add_key_value_param(accel_dev, section,
++      key_val->key, key_val->val,
++      key_val->type)) {
++   pr_err("QAT: failed to add keyvalue.\n");
++   return -EFAULT;
++  }
++ }
++ return 0;
++}
++
++static int adf_copy_key_value_data(struct adf_accel_dev *accel_dev,
++       struct adf_user_cfg_ctl_data *ctl_data)
++{
++ struct adf_user_cfg_key_val key_val;
++ struct adf_user_cfg_key_val *params_head;
++ struct adf_user_cfg_section section, *section_head;
++
++ section_head = ctl_data->config_section;
++
++ while (section_head) {
++  if (copy_from_user(&section, (void __user *)section_head,
++       sizeof(*section_head))) {
++   pr_err("QAT: failed to copy section info\n");
++   goto out_err;
++  }
++
++  if (adf_cfg_section_add(accel_dev, section.name)) {
++   pr_err("QAT: failed to add section.\n");
++   goto out_err;
++  }
++
++  params_head = section_head->params;
++
++  while (params_head) {
++   if (copy_from_user(&key_val, (void __user *)params_head,
++        sizeof(key_val))) {
++    pr_err("QAT: Failed to copy keyvalue.\n");
++    goto out_err;
++   }
++   if (adf_add_key_value_data(accel_dev, section.name,
++         &key_val)) {
++    goto out_err;
++   }
++   params_head = key_val.next;
++  }
++  section_head = section.next;
++ }
++ return 0;
++out_err:
++ adf_cfg_del_all(accel_dev);
++ return -EFAULT;
++}
++
++static int adf_ctl_ioctl_dev_config(struct file *fp, unsigned int cmd,
++        unsigned long arg)
++{
++ int ret;
++ struct adf_user_cfg_ctl_data *ctl_data;
++ struct adf_accel_dev *accel_dev;
++
++ ret = adf_ctl_alloc_resources(&ctl_data, arg);
++ if (ret)
++  return ret;
++
++ accel_dev = adf_devmgr_get_dev_by_id(ctl_data->device_id);
++ if (!accel_dev) {
++  ret = -EFAULT;
++  goto out;
++ }
++
++ if (adf_dev_started(accel_dev)) {
++  ret = -EFAULT;
++  goto out;
++ }
++
++ if (adf_copy_key_value_data(accel_dev, ctl_data)) {
++  ret = -EFAULT;
++  goto out;
++ }
++ set_bit(ADF_STATUS_CONFIGURED, &accel_dev->status);
++out:
++ kfree(ctl_data);
++ return ret;
++}
++
++static int adf_ctl_is_device_in_use(int id)
++{
++ struct list_head *itr, *head = adf_devmgr_get_head();
++
++ list_for_each(itr, head) {
++  struct adf_accel_dev *dev =
++    list_entry(itr, struct adf_accel_dev, list);
++
++  if (id == dev->accel_id || id == ADF_CFG_ALL_DEVICES) {
++   if (adf_devmgr_in_reset(dev) || adf_dev_in_use(dev)) {
++    pr_info("QAT: device qat_dev%d is busy\n",
++     dev->accel_id);
++    return -EBUSY;
++   }
++  }
++ }
++ return 0;
++}
++
++static int adf_ctl_stop_devices(uint32_t id)
++{
++ struct list_head *itr, *head = adf_devmgr_get_head();
++ int ret = 0;
++
++ list_for_each(itr, head) {
++  struct adf_accel_dev *accel_dev =
++    list_entry(itr, struct adf_accel_dev, list);
++  if (id == accel_dev->accel_id || id == ADF_CFG_ALL_DEVICES) {
++   if (!adf_dev_started(accel_dev))
++    continue;
++
++   if (adf_dev_stop(accel_dev)) {
++    pr_err("QAT: Failed to stop qat_dev%d\n", id);
++    ret = -EFAULT;
++   }
++  }
++ }
++ return ret;
++}
++
++static int adf_ctl_ioctl_dev_stop(struct file *fp, unsigned int cmd,
++      unsigned long arg)
++{
++ int ret;
++ struct adf_user_cfg_ctl_data *ctl_data;
++
++ ret = adf_ctl_alloc_resources(&ctl_data, arg);
++ if (ret)
++  return ret;
++
++ if (adf_devmgr_verify_id(ctl_data->device_id)) {
++  pr_err("QAT: Device %d not found\n", ctl_data->device_id);
++  ret = -ENODEV;
++  goto out;
++ }
++
++ ret = adf_ctl_is_device_in_use(ctl_data->device_id);
++ if (ret)
++  goto out;
++
++ if (ctl_data->device_id == ADF_CFG_ALL_DEVICES)
++  pr_info("QAT: Stopping all acceleration devices.\n");
++ else
++  pr_info("QAT: Stopping acceleration device qat_dev%d.\n",
++   ctl_data->device_id);
++
++ ret = adf_ctl_stop_devices(ctl_data->device_id);
++ if (ret)
++  pr_err("QAT: failed to stop device.\n");
++out:
++ kfree(ctl_data);
++ return ret;
++}
++
++static int adf_ctl_ioctl_dev_start(struct file *fp, unsigned int cmd,
++       unsigned long arg)
++{
++ int ret;
++ struct adf_user_cfg_ctl_data *ctl_data;
++ struct adf_accel_dev *accel_dev;
++
++ ret = adf_ctl_alloc_resources(&ctl_data, arg);
++ if (ret)
++  return ret;
++
++ accel_dev = adf_devmgr_get_dev_by_id(ctl_data->device_id);
++ if (!accel_dev) {
++  pr_err("QAT: Device %d not found\n", ctl_data->device_id);
++  ret = -ENODEV;
++  goto out;
++ }
++
++ if (!adf_dev_started(accel_dev)) {
++  pr_info("QAT: Starting acceleration device qat_dev%d.\n",
++   ctl_data->device_id);
++  ret = adf_dev_start(accel_dev);
++ } else {
++  pr_info("QAT: Acceleration device qat_dev%d already started.\n",
++   ctl_data->device_id);
++ }
++ if (ret) {
++  pr_err("QAT: Failed to start qat_dev%d\n", ctl_data->device_id);
++  adf_dev_stop(accel_dev);
++ }
++out:
++ kfree(ctl_data);
++ return ret;
++}
++
++static int adf_ctl_ioctl_get_num_devices(struct file *fp, unsigned int cmd,
++      unsigned long arg)
++{
++ uint32_t num_devices = 0;
++
++ adf_devmgr_get_num_dev(&num_devices);
++ if (copy_to_user((void __user *)arg, &num_devices, sizeof(num_devices)))
++  return -EFAULT;
++
++ return 0;
++}
++
++static int adf_ctl_ioctl_get_status(struct file *fp, unsigned int cmd,
++        unsigned long arg)
++{
++ struct adf_hw_device_data *hw_data;
++ struct adf_dev_status_info dev_info;
++ struct adf_accel_dev *accel_dev;
++
++ if (copy_from_user(&dev_info, (void __user *)arg,
++      sizeof(struct adf_dev_status_info))) {
++  pr_err("QAT: failed to copy from user.\n");
++  return -EFAULT;
++ }
++
++ accel_dev = adf_devmgr_get_dev_by_id(dev_info.accel_id);
++ if (!accel_dev) {
++  pr_err("QAT: Device %d not found\n", dev_info.accel_id);
++  return -ENODEV;
++ }
++ hw_data = accel_dev->hw_device;
++ dev_info.state = adf_dev_started(accel_dev) ? DEV_UP : DEV_DOWN;
++ dev_info.num_ae = hw_data->get_num_aes(hw_data);
++ dev_info.num_accel = hw_data->get_num_accels(hw_data);
++ dev_info.num_logical_accel = hw_data->num_logical_accel;
++ dev_info.banks_per_accel = hw_data->num_banks
++     / hw_data->num_logical_accel;
++ strlcpy(dev_info.name, hw_data->dev_class->name, sizeof(dev_info.name));
++ dev_info.instance_id = hw_data->instance_id;
++ dev_info.type = hw_data->dev_class->type;
++ dev_info.bus = accel_to_pci_dev(accel_dev)->bus->number;
++ dev_info.dev = PCI_SLOT(accel_to_pci_dev(accel_dev)->devfn);
++ dev_info.fun = PCI_FUNC(accel_to_pci_dev(accel_dev)->devfn);
++
++ if (copy_to_user((void __user *)arg, &dev_info,
++    sizeof(struct adf_dev_status_info))) {
++  pr_err("QAT: failed to copy status.\n");
++  return -EFAULT;
++ }
++ return 0;
++}
++
++static long adf_ctl_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
++{
++ int ret;
++
++ if (mutex_lock_interruptible(&adf_ctl_lock))
++  return -EFAULT;
++
++ switch (cmd) {
++ case IOCTL_CONFIG_SYS_RESOURCE_PARAMETERS:
++  ret = adf_ctl_ioctl_dev_config(fp, cmd, arg);
++  break;
++
++ case IOCTL_STOP_ACCEL_DEV:
++  ret = adf_ctl_ioctl_dev_stop(fp, cmd, arg);
++  break;
++
++ case IOCTL_START_ACCEL_DEV:
++  ret = adf_ctl_ioctl_dev_start(fp, cmd, arg);
++  break;
++
++ case IOCTL_GET_NUM_DEVICES:
++  ret = adf_ctl_ioctl_get_num_devices(fp, cmd, arg);
++  break;
++
++ case IOCTL_STATUS_ACCEL_DEV:
++  ret = adf_ctl_ioctl_get_status(fp, cmd, arg);
++  break;
++ default:
++  pr_err("QAT: Invalid ioclt\n");
++  ret = -EFAULT;
++  break;
++ }
++ mutex_unlock(&adf_ctl_lock);
++ return ret;
++}
++
++static int __init adf_register_ctl_device_driver(void)
++{
++ mutex_init(&adf_ctl_lock);
++
++ if (qat_algs_init())
++  goto err_algs_init;
++
++ if (adf_chr_drv_create())
++  goto err_chr_dev;
++
++ if (adf_init_aer())
++  goto err_aer;
++
++ if (qat_crypto_register())
++  goto err_crypto_register;
++
++ return 0;
++
++err_crypto_register:
++ adf_exit_aer();
++err_aer:
++ adf_chr_drv_destroy();
++err_chr_dev:
++ qat_algs_exit();
++err_algs_init:
++ mutex_destroy(&adf_ctl_lock);
++ return -EFAULT;
++}
++
++static void __exit adf_unregister_ctl_device_driver(void)
++{
++ adf_chr_drv_destroy();
++ adf_exit_aer();
++ qat_crypto_unregister();
++ qat_algs_exit();
++ mutex_destroy(&adf_ctl_lock);
++}
++
++module_init(adf_register_ctl_device_driver);
++module_exit(adf_unregister_ctl_device_driver);
++MODULE_LICENSE("Dual BSD/GPL");
++MODULE_AUTHOR("Intel");
++MODULE_DESCRIPTION("Intel(R) QuickAssist Technology");
++MODULE_ALIAS("intel_qat");
+diff --git a/drivers/crypto/qat/qat_common/adf_dev_mgr.c b/drivers/crypto/qat/qat_common/adf_dev_mgr.c
+new file mode 100644
+index 0000000..ae71555
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_dev_mgr.c
+@@ -0,0 +1,215 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#include <linux/mutex.h>
++#include <linux/list.h>
++#include "adf_cfg.h"
++#include "adf_common_drv.h"
++
++static LIST_HEAD(accel_table);
++static DEFINE_MUTEX(table_lock);
++static uint32_t num_devices;
++
++/**
++ * adf_devmgr_add_dev() - Add accel_dev to the acceleration framework
++ * @accel_dev:  Pointer to acceleration device.
++ *
++ * Function adds acceleration device to the acceleration framework.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_devmgr_add_dev(struct adf_accel_dev *accel_dev)
++{
++ struct list_head *itr;
++
++ if (num_devices == ADF_MAX_DEVICES) {
++  pr_err("QAT: Only support up to %d devices\n", ADF_MAX_DEVICES);
++  return -EFAULT;
++ }
++
++ mutex_lock(&table_lock);
++ list_for_each(itr, &accel_table) {
++  struct adf_accel_dev *ptr =
++    list_entry(itr, struct adf_accel_dev, list);
++
++  if (ptr == accel_dev) {
++   mutex_unlock(&table_lock);
++   return -EEXIST;
++  }
++ }
++ atomic_set(&accel_dev->ref_count, 0);
++ list_add_tail(&accel_dev->list, &accel_table);
++ accel_dev->accel_id = num_devices++;
++ mutex_unlock(&table_lock);
++ return 0;
++}
++EXPORT_SYMBOL_GPL(adf_devmgr_add_dev);
++
++struct list_head *adf_devmgr_get_head(void)
++{
++ return &accel_table;
++}
++
++/**
++ * adf_devmgr_rm_dev() - Remove accel_dev from the acceleration framework.
++ * @accel_dev:  Pointer to acceleration device.
++ *
++ * Function removes acceleration device from the acceleration framework.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: void
++ */
++void adf_devmgr_rm_dev(struct adf_accel_dev *accel_dev)
++{
++ mutex_lock(&table_lock);
++ list_del(&accel_dev->list);
++ num_devices--;
++ mutex_unlock(&table_lock);
++}
++EXPORT_SYMBOL_GPL(adf_devmgr_rm_dev);
++
++struct adf_accel_dev *adf_devmgr_get_first(void)
++{
++ struct adf_accel_dev *dev = NULL;
++
++ if (!list_empty(&accel_table))
++  dev = list_first_entry(&accel_table, struct adf_accel_dev,
++           list);
++ return dev;
++}
++
++/**
++ * adf_devmgr_pci_to_accel_dev() - Get accel_dev associated with the pci_dev.
++ * @accel_dev:  Pointer to pci device.
++ *
++ * Function returns acceleration device associated with the given pci device.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: pinter to accel_dev or NULL if not found.
++ */
++struct adf_accel_dev *adf_devmgr_pci_to_accel_dev(struct pci_dev *pci_dev)
++{
++ struct list_head *itr;
++
++ list_for_each(itr, &accel_table) {
++  struct adf_accel_dev *ptr =
++    list_entry(itr, struct adf_accel_dev, list);
++
++  if (ptr->accel_pci_dev.pci_dev == pci_dev) {
++   mutex_unlock(&table_lock);
++   return ptr;
++  }
++ }
++ return NULL;
++}
++EXPORT_SYMBOL_GPL(adf_devmgr_pci_to_accel_dev);
++
++struct adf_accel_dev *adf_devmgr_get_dev_by_id(uint32_t id)
++{
++ struct list_head *itr;
++
++ list_for_each(itr, &accel_table) {
++  struct adf_accel_dev *ptr =
++    list_entry(itr, struct adf_accel_dev, list);
++
++  if (ptr->accel_id == id) {
++   mutex_unlock(&table_lock);
++   return ptr;
++  }
++ }
++ return NULL;
++}
++
++int adf_devmgr_verify_id(uint32_t id)
++{
++ if (id == ADF_CFG_ALL_DEVICES)
++  return 0;
++
++ if (adf_devmgr_get_dev_by_id(id))
++  return 0;
++
++ return -ENODEV;
++}
++
++void adf_devmgr_get_num_dev(uint32_t *num)
++{
++ struct list_head *itr;
++
++ *num = 0;
++ list_for_each(itr, &accel_table) {
++  (*num)++;
++ }
++}
++
++int adf_dev_in_use(struct adf_accel_dev *accel_dev)
++{
++ return atomic_read(&accel_dev->ref_count) != 0;
++}
++
++int adf_dev_get(struct adf_accel_dev *accel_dev)
++{
++ if (atomic_add_return(1, &accel_dev->ref_count) == 1)
++  if (!try_module_get(accel_dev->owner))
++   return -EFAULT;
++ return 0;
++}
++
++void adf_dev_put(struct adf_accel_dev *accel_dev)
++{
++ if (atomic_sub_return(1, &accel_dev->ref_count) == 0)
++  module_put(accel_dev->owner);
++}
++
++int adf_devmgr_in_reset(struct adf_accel_dev *accel_dev)
++{
++ return test_bit(ADF_STATUS_RESTARTING, &accel_dev->status);
++}
++
++int adf_dev_started(struct adf_accel_dev *accel_dev)
++{
++ return test_bit(ADF_STATUS_STARTED, &accel_dev->status);
++}
+diff --git a/drivers/crypto/qat/qat_common/adf_init.c b/drivers/crypto/qat/qat_common/adf_init.c
+new file mode 100644
+index 0000000..5c3d6f1
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_init.c
+@@ -0,0 +1,388 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#include <linux/mutex.h>
++#include <linux/list.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include "adf_accel_devices.h"
++#include "adf_cfg.h"
++#include "adf_common_drv.h"
++
++static LIST_HEAD(service_table);
++static DEFINE_MUTEX(service_lock);
++
++static void adf_service_add(struct service_hndl *service)
++{
++ mutex_lock(&service_lock);
++ list_add(&service->list, &service_table);
++ mutex_unlock(&service_lock);
++}
++
++/**
++ * adf_service_register() - Register acceleration service in the accel framework
++ * @service:    Pointer to the service
++ *
++ * Function adds the acceleration service to the acceleration framework.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_service_register(struct service_hndl *service)
++{
++ service->init_status = 0;
++ service->start_status = 0;
++ adf_service_add(service);
++ return 0;
++}
++EXPORT_SYMBOL_GPL(adf_service_register);
++
++static void adf_service_remove(struct service_hndl *service)
++{
++ mutex_lock(&service_lock);
++ list_del(&service->list);
++ mutex_unlock(&service_lock);
++}
++
++/**
++ * adf_service_unregister() - Unregister acceleration service from the framework
++ * @service:    Pointer to the service
++ *
++ * Function remove the acceleration service from the acceleration framework.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_service_unregister(struct service_hndl *service)
++{
++ if (service->init_status || service->start_status) {
++  pr_err("QAT: Could not remove active service\n");
++  return -EFAULT;
++ }
++ adf_service_remove(service);
++ return 0;
++}
++EXPORT_SYMBOL_GPL(adf_service_unregister);
++
++/**
++ * adf_dev_start() - Start acceleration service for the given accel device
++ * @accel_dev:    Pointer to acceleration device.
++ *
++ * Function notifies all the registered services that the acceleration device
++ * is ready to be used.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_dev_start(struct adf_accel_dev *accel_dev)
++{
++ struct service_hndl *service;
++ struct list_head *list_itr;
++ struct adf_hw_device_data *hw_data = accel_dev->hw_device;
++
++ if (!test_bit(ADF_STATUS_CONFIGURED, &accel_dev->status)) {
++  pr_info("QAT: Device not configured\n");
++  return -EFAULT;
++ }
++ set_bit(ADF_STATUS_STARTING, &accel_dev->status);
++
++ if (adf_ae_init(accel_dev)) {
++  pr_err("QAT: Failed to initialise Acceleration Engine\n");
++  return -EFAULT;
++ }
++ set_bit(ADF_STATUS_AE_INITIALISED, &accel_dev->status);
++
++ if (adf_ae_fw_load(accel_dev)) {
++  pr_err("Failed to load acceleration FW\n");
++  adf_ae_fw_release(accel_dev);
++  return -EFAULT;
++ }
++ set_bit(ADF_STATUS_AE_UCODE_LOADED, &accel_dev->status);
++
++ if (hw_data->alloc_irq(accel_dev)) {
++  pr_err("QAT: Failed to allocate interrupts\n");
++  return -EFAULT;
++ }
++ set_bit(ADF_STATUS_IRQ_ALLOCATED, &accel_dev->status);
++
++ /*
++  * Subservice initialisation is divided into two stages: init and start.
++  * This is to facilitate any ordering dependencies between services
++  * prior to starting any of the accelerators.
++  */
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (!service->admin)
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_INIT)) {
++   pr_err("QAT: Failed to initialise service %s\n",
++          service->name);
++   return -EFAULT;
++  }
++  set_bit(accel_dev->accel_id, &service->init_status);
++ }
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (service->admin)
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_INIT)) {
++   pr_err("QAT: Failed to initialise service %s\n",
++          service->name);
++   return -EFAULT;
++  }
++  set_bit(accel_dev->accel_id, &service->init_status);
++ }
++
++ hw_data->enable_error_correction(accel_dev);
++
++ if (adf_ae_start(accel_dev)) {
++  pr_err("QAT: AE Start Failed\n");
++  return -EFAULT;
++ }
++ set_bit(ADF_STATUS_AE_STARTED, &accel_dev->status);
++
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (!service->admin)
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_START)) {
++   pr_err("QAT: Failed to start service %s\n",
++          service->name);
++   return -EFAULT;
++  }
++  set_bit(accel_dev->accel_id, &service->start_status);
++ }
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (service->admin)
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_START)) {
++   pr_err("QAT: Failed to start service %s\n",
++          service->name);
++   return -EFAULT;
++  }
++  set_bit(accel_dev->accel_id, &service->start_status);
++ }
++
++ clear_bit(ADF_STATUS_STARTING, &accel_dev->status);
++ set_bit(ADF_STATUS_STARTED, &accel_dev->status);
++
++ if (qat_algs_register()) {
++  pr_err("QAT: Failed to register crypto algs\n");
++  set_bit(ADF_STATUS_STARTING, &accel_dev->status);
++  clear_bit(ADF_STATUS_STARTED, &accel_dev->status);
++  return -EFAULT;
++ }
++ return 0;
++}
++EXPORT_SYMBOL_GPL(adf_dev_start);
++
++/**
++ * adf_dev_stop() - Stop acceleration service for the given accel device
++ * @accel_dev:    Pointer to acceleration device.
++ *
++ * Function notifies all the registered services that the acceleration device
++ * is shuting down.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_dev_stop(struct adf_accel_dev *accel_dev)
++{
++ struct adf_hw_device_data *hw_data = accel_dev->hw_device;
++ struct service_hndl *service;
++ struct list_head *list_itr;
++ int ret, wait = 0;
++
++ if (!adf_dev_started(accel_dev) &&
++     !test_bit(ADF_STATUS_STARTING, &accel_dev->status)) {
++  return 0;
++ }
++ clear_bit(ADF_STATUS_CONFIGURED, &accel_dev->status);
++ clear_bit(ADF_STATUS_STARTING, &accel_dev->status);
++ clear_bit(ADF_STATUS_STARTED, &accel_dev->status);
++
++ if (qat_algs_unregister())
++  pr_err("QAT: Failed to unregister crypto algs\n");
++
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (service->admin)
++   continue;
++  if (!test_bit(accel_dev->accel_id, &service->start_status))
++   continue;
++  ret = service->event_hld(accel_dev, ADF_EVENT_STOP);
++  if (!ret) {
++   clear_bit(accel_dev->accel_id, &service->start_status);
++  } else if (ret == -EAGAIN) {
++   wait = 1;
++   clear_bit(accel_dev->accel_id, &service->start_status);
++  }
++ }
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (!service->admin)
++   continue;
++  if (!test_bit(accel_dev->accel_id, &service->start_status))
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_STOP))
++   pr_err("QAT: Failed to shutdown service %s\n",
++          service->name);
++  else
++   clear_bit(accel_dev->accel_id, &service->start_status);
++ }
++
++ if (wait)
++  msleep(100);
++
++ if (adf_dev_started(accel_dev)) {
++  if (adf_ae_stop(accel_dev))
++   pr_err("QAT: failed to stop AE\n");
++  else
++   clear_bit(ADF_STATUS_AE_STARTED, &accel_dev->status);
++ }
++
++ if (test_bit(ADF_STATUS_AE_UCODE_LOADED, &accel_dev->status)) {
++  if (adf_ae_fw_release(accel_dev))
++   pr_err("QAT: Failed to release the ucode\n");
++  else
++   clear_bit(ADF_STATUS_AE_UCODE_LOADED,
++      &accel_dev->status);
++ }
++
++ if (test_bit(ADF_STATUS_AE_INITIALISED, &accel_dev->status)) {
++  if (adf_ae_shutdown(accel_dev))
++   pr_err("QAT: Failed to shutdown Accel Engine\n");
++  else
++   clear_bit(ADF_STATUS_AE_INITIALISED,
++      &accel_dev->status);
++ }
++
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (service->admin)
++   continue;
++  if (!test_bit(accel_dev->accel_id, &service->init_status))
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_SHUTDOWN))
++   pr_err("QAT: Failed to shutdown service %s\n",
++          service->name);
++  else
++   clear_bit(accel_dev->accel_id, &service->init_status);
++ }
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (!service->admin)
++   continue;
++  if (!test_bit(accel_dev->accel_id, &service->init_status))
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_SHUTDOWN))
++   pr_err("QAT: Failed to shutdown service %s\n",
++          service->name);
++  else
++   clear_bit(accel_dev->accel_id, &service->init_status);
++ }
++
++ if (test_bit(ADF_STATUS_IRQ_ALLOCATED, &accel_dev->status)) {
++  hw_data->free_irq(accel_dev);
++  clear_bit(ADF_STATUS_IRQ_ALLOCATED, &accel_dev->status);
++ }
++
++ /* Delete configuration only if not restarting */
++ if (!test_bit(ADF_STATUS_RESTARTING, &accel_dev->status))
++  adf_cfg_del_all(accel_dev);
++
++ return 0;
++}
++EXPORT_SYMBOL_GPL(adf_dev_stop);
++
++int adf_dev_restarting_notify(struct adf_accel_dev *accel_dev)
++{
++ struct service_hndl *service;
++ struct list_head *list_itr;
++
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (service->admin)
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_RESTARTING))
++   pr_err("QAT: Failed to restart service %s.\n",
++          service->name);
++ }
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (!service->admin)
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_RESTARTING))
++   pr_err("QAT: Failed to restart service %s.\n",
++          service->name);
++ }
++ return 0;
++}
++
++int adf_dev_restarted_notify(struct adf_accel_dev *accel_dev)
++{
++ struct service_hndl *service;
++ struct list_head *list_itr;
++
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (service->admin)
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_RESTARTED))
++   pr_err("QAT: Failed to restart service %s.\n",
++          service->name);
++ }
++ list_for_each(list_itr, &service_table) {
++  service = list_entry(list_itr, struct service_hndl, list);
++  if (!service->admin)
++   continue;
++  if (service->event_hld(accel_dev, ADF_EVENT_RESTARTED))
++   pr_err("QAT: Failed to restart service %s.\n",
++          service->name);
++ }
++ return 0;
++}
+-- 
+1.7.1

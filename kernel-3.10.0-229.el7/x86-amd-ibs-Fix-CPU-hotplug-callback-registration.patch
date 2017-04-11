@@ -1,0 +1,92 @@
+From f373fe76018d531861105c92a9f33a1d8c77e8ba Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:07:51 -0400
+Subject: [x86] amd, ibs: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-15-git-send-email-prarit@redhat.com>
+Patchwork-id: 85748
+O-Subject: [RHEL7.1 PATCH BZ 1119078 14/35] x86, amd, ibs: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Jiri Olsa <jolsa@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit 047868ce2952bb6a86ccea3ecc6fd59faa9062a7
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:07:45 2014 +0530
+
+    x86, amd, ibs: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the amd-ibs code in x86 by using this latter form of callback
+    registration.
+
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Cc: Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Don Zickus <dzickus@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/cpu/perf_event_amd_ibs.c b/arch/x86/kernel/cpu/perf_event_amd_ibs.c
+index e09f0bf..254c5fc 100644
+--- a/arch/x86/kernel/cpu/perf_event_amd_ibs.c
++++ b/arch/x86/kernel/cpu/perf_event_amd_ibs.c
+@@ -889,13 +889,13 @@ static __init int amd_ibs_init(void)
+  if (!ibs_eilvt_valid())
+   goto out;
+ 
+- get_online_cpus();
++ cpu_notifier_register_begin();
+  ibs_caps = caps;
+  /* make ibs_caps visible to other cpus: */
+  smp_mb();
+- perf_cpu_notifier(perf_ibs_cpu_notifier);
+  smp_call_function(setup_APIC_ibs, NULL, 1);
+- put_online_cpus();
++ __perf_cpu_notifier(perf_ibs_cpu_notifier);
++ cpu_notifier_register_done();
+ 
+  ret = perf_event_ibs_init();
+ out:
+-- 
+1.7.1

@@ -1,0 +1,115 @@
+From 19194c5469d71f4e002a2fe9659e2609e53445c9 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:05:05 -0400
+Subject: [base] refactor add_memory_section() to add_memory_block()
+
+Message-id: <20140710010505.22146.52781.stgit@gir.stowe>
+Patchwork-id: 85605
+O-Subject: [RHEL7.1 PATCH 066/105] drivers: base: refactor add_memory_section() to add_memory_block()
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: cb5e39b8038be913030a7b01d4396cfa5f9ded7b
+
+commit cb5e39b8038be913030a7b01d4396cfa5f9ded7b
+Author: Seth Jennings <sjenning@linux.vnet.ibm.com>
+Date:   Tue Aug 20 12:13:03 2013 -0500
+
+    drivers: base: refactor add_memory_section() to add_memory_block()
+
+    Right now memory_dev_init() maintains the memory block pointer
+    between iterations of add_memory_section().  This is nasty.
+
+    This patch refactors add_memory_section() to become add_memory_block().
+    The refactoring pulls the section scanning out of memory_dev_init()
+    and simplifies the signature.
+
+    Signed-off-by: Seth Jennings <sjenning@linux.vnet.ibm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/base/memory.c b/drivers/base/memory.c
+index 3de685d..8cae776 100644
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@ -604,32 +604,31 @@ static int init_memory_block(struct memory_block **memory,
+  return ret;
+ }
+ 
+-static int add_memory_section(struct mem_section *section,
+-   struct memory_block **mem_p)
++static int add_memory_block(int base_section_nr)
+ {
+- struct memory_block *mem = NULL;
+- int scn_nr = __section_nr(section);
+- int ret = 0;
+-
+- if (mem_p && *mem_p) {
+-  if (scn_nr >= (*mem_p)->start_section_nr &&
+-      scn_nr <= (*mem_p)->end_section_nr) {
+-   mem = *mem_p;
+-  }
+- }
++ struct memory_block *mem;
++ int i, ret, section_count = 0, section_nr;
+ 
+- if (mem)
+-  mem->section_count++;
+- else {
+-  ret = init_memory_block(&mem, section, MEM_ONLINE);
+-  /* store memory_block pointer for next loop */
+-  if (!ret && mem_p)
+-   *mem_p = mem;
++ for (i = base_section_nr;
++      (i < base_section_nr + sections_per_block) && i < NR_MEM_SECTIONS;
++      i++) {
++  if (!present_section_nr(i))
++   continue;
++  if (section_count == 0)
++   section_nr = i;
++  section_count++;
+  }
+ 
+- return ret;
++ if (section_count == 0)
++  return 0;
++ ret = init_memory_block(&mem, __nr_to_section(section_nr), MEM_ONLINE);
++ if (ret)
++  return ret;
++ mem->section_count = section_count;
++ return 0;
+ }
+ 
++
+ /*
+  * need an interface for the VM to add new memory regions,
+  * but without onlining it.
+@@ -735,7 +734,6 @@ int __init memory_dev_init(void)
+  int ret;
+  int err;
+  unsigned long block_sz;
+- struct memory_block *mem = NULL;
+ 
+  ret = subsys_system_register(&memory_subsys, memory_root_attr_groups);
+  if (ret)
+@@ -749,12 +747,8 @@ int __init memory_dev_init(void)
+   * during boot and have been initialized
+   */
+  mutex_lock(&mem_sysfs_mutex);
+- for (i = 0; i < NR_MEM_SECTIONS; i++) {
+-  if (!present_section_nr(i))
+-   continue;
+-  /* don't need to reuse memory_block if only one per block */
+-  err = add_memory_section(__nr_to_section(i),
+-     (sections_per_block == 1) ? NULL : &mem);
++ for (i = 0; i < NR_MEM_SECTIONS; i += sections_per_block) {
++  err = add_memory_block(i);
+   if (!ret)
+    ret = err;
+  }
+-- 
+1.7.1

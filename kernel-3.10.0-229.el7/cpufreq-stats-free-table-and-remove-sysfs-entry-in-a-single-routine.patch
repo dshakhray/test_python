@@ -1,0 +1,123 @@
+From ba6a0442820b328d9ce5de94c9a881ac2172700a Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:23:07 -0400
+Subject: [cpufreq] stats: free table and remove sysfs entry in a single routine
+
+Message-id: <1409235879-1283-94-git-send-email-prarit@redhat.com>
+Patchwork-id: 89424
+O-Subject: [RHEL7.1 PATCH BZ 1134639 093/185] cpufreq: stats: free table and remove sysfs entry in a single routine
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit 2d13594dcb7eaa41fa180e8a3b27a8f10845381f
+Author: Viresh Kumar <viresh.kumar@linaro.org>
+Date:   Tue Jan 7 07:10:12 2014 +0530
+
+    cpufreq: stats: free table and remove sysfs entry in a single routine
+
+    We don't have code paths now where we need to do these two things
+    separately, so it is better do them in a single routine. Just as
+    they are allocated in a single routine.
+
+    Acked-by: Nicolas Pitre <nico@linaro.org>
+    Tested-by: Nicolas Pitre <nico@linaro.org>
+    Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq_stats.c b/drivers/cpufreq/cpufreq_stats.c
+index 655bea6..5efc585 100644
+--- a/drivers/cpufreq/cpufreq_stats.c
++++ b/drivers/cpufreq/cpufreq_stats.c
+@@ -152,40 +152,32 @@ static int freq_table_get_index(struct cpufreq_stats *stat, unsigned int freq)
+  return -1;
+ }
+ 
+-/* should be called late in the CPU removal sequence so that the stats
+- * memory is still available in case someone tries to use it.
+- */
+-static void cpufreq_stats_free_table(unsigned int cpu)
++static void __cpufreq_stats_free_table(struct cpufreq_policy *policy)
+ {
+- struct cpufreq_stats *stat = per_cpu(cpufreq_stats_table, cpu);
++ struct cpufreq_stats *stat = per_cpu(cpufreq_stats_table, policy->cpu);
+ 
+- if (stat) {
+-  pr_debug("%s: Free stat table\n", __func__);
+-  kfree(stat->time_in_state);
+-  kfree(stat);
+-  per_cpu(cpufreq_stats_table, cpu) = NULL;
+- }
++ if (!stat)
++  return;
++
++ pr_debug("%s: Free stat table\n", __func__);
++
++ sysfs_remove_group(&policy->kobj, &stats_attr_group);
++ kfree(stat->time_in_state);
++ kfree(stat);
++ per_cpu(cpufreq_stats_table, policy->cpu) = NULL;
+ }
+ 
+-/* must be called early in the CPU removal sequence (before
+- * cpufreq_remove_dev) so that policy is still valid.
+- */
+-static void cpufreq_stats_free_sysfs(unsigned int cpu)
++static void cpufreq_stats_free_table(unsigned int cpu)
+ {
+- struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
++ struct cpufreq_policy *policy;
+ 
++ policy = cpufreq_cpu_get(cpu);
+  if (!policy)
+   return;
+ 
+- if (!cpufreq_frequency_get_table(cpu))
+-  goto put_ref;
+-
+- if (!policy_is_shared(policy)) {
+-  pr_debug("%s: Free sysfs stat\n", __func__);
+-  sysfs_remove_group(&policy->kobj, &stats_attr_group);
+- }
++ if (cpufreq_frequency_get_table(policy->cpu))
++  __cpufreq_stats_free_table(policy);
+ 
+-put_ref:
+  cpufreq_cpu_put(policy);
+ }
+ 
+@@ -294,10 +286,8 @@ static int cpufreq_stat_notifier_policy(struct notifier_block *nb,
+ 
+  if (val == CPUFREQ_CREATE_POLICY)
+   ret = cpufreq_stats_create_table(policy, table);
+- else if (val == CPUFREQ_REMOVE_POLICY) {
+-  cpufreq_stats_free_sysfs(cpu);
+-  cpufreq_stats_free_table(cpu);
+- }
++ else if (val == CPUFREQ_REMOVE_POLICY)
++  __cpufreq_stats_free_table(policy);
+ 
+  return ret;
+ }
+@@ -377,10 +367,8 @@ static void __exit cpufreq_stats_exit(void)
+    CPUFREQ_POLICY_NOTIFIER);
+  cpufreq_unregister_notifier(&notifier_trans_block,
+    CPUFREQ_TRANSITION_NOTIFIER);
+- for_each_online_cpu(cpu) {
++ for_each_online_cpu(cpu)
+   cpufreq_stats_free_table(cpu);
+-  cpufreq_stats_free_sysfs(cpu);
+- }
+ }
+ 
+ MODULE_AUTHOR("Zou Nan hai <nanhai.zou@intel.com>");
+-- 
+1.7.1

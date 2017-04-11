@@ -1,0 +1,72 @@
+From d1229b1c401463f479491f4ab087723e67ad5482 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:27:31 -0400
+Subject: [tools] perf/ui/tui/progress: Don't force a refresh during progress update
+
+Message-id: <1408462094-14194-283-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88310
+O-Subject: [PATCH RHEL7.1 BZ1131394 282/325] perf ui tui progress: Don't force a refresh during progress update
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit d53e57d039c323fe3a43630e9f729df48134e2c9
+Author: Patrick Palka <patrick@parcs.ath.cx>
+Date: Fri Oct 25 20:25:49 2013 -0400
+
+description
+===========
+Each call to tui_progress__update() would forcibly refresh the entire
+screen.  This is somewhat inefficient and causes noticable flickering
+during the startup of perf-report, especially on large/slow terminals.
+
+It looks like the force-refresh in tui_progress__update() serves no
+purpose other than to clear the screen so that the progress bar of a
+previous operation does not subsume that of a subsequent operation.  But
+we can do just that in a much more efficient manner by clearing only the
+region that a previous progress bar may have occupied before repainting
+the new progress bar.  Then the force-refresh could be removed with no
+change in visuals.
+
+This patch disables the slow force-refresh in tui_progress__update() and
+instead calls SLsmg_fill_region() on the entire area that the progress
+bar may occupy before repainting it.  This change makes the startup of
+perf-report much faster and appear much "smoother".
+
+It turns out that this was a big bottleneck in the startup speed of
+perf-report -- with this patch, perf-report starts up ~2x faster (1.1s
+vs 0.55s) on my machines.  (These numbers were measured by running "time
+perf report" on an 8MB perf.data and pressing 'q' immediately.)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/ui/tui/progress.c b/tools/perf/ui/tui/progress.c
+index 3e2d936..c61d14b 100644
+--- a/tools/perf/ui/tui/progress.c
++++ b/tools/perf/ui/tui/progress.c
+@@ -18,13 +18,14 @@ static void tui_progress__update(struct ui_progress *p)
+  if (p->total == 0)
+   return;
+ 
+- ui__refresh_dimensions(true);
++ ui__refresh_dimensions(false);
+  pthread_mutex_lock(&ui__lock);
+  y = SLtt_Screen_Rows / 2 - 2;
+  SLsmg_set_color(0);
+  SLsmg_draw_box(y, 0, 3, SLtt_Screen_Cols);
+  SLsmg_gotorc(y++, 1);
+  SLsmg_write_string((char *)p->title);
++ SLsmg_fill_region(y, 1, 1, SLtt_Screen_Cols - 2, ' ');
+  SLsmg_set_color(HE_COLORSET_SELECTED);
+  bar = ((SLtt_Screen_Cols - 2) * p->curr) / p->total;
+  SLsmg_fill_region(y, 1, 1, bar, ' ');
+-- 
+1.7.1

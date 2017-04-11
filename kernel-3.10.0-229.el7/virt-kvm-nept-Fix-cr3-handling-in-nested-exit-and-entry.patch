@@ -1,0 +1,85 @@
+From 0790ebf4634f520bd8708bffccfb99088b9ad3f5 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:37:30 -0400
+Subject: [virt] kvm/nept: Fix cr3 handling in nested exit and entry
+
+Message-id: <1406040016-3289-56-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86134
+O-Subject: [RHEL7 PATCH v2 055/221] nEPT: Fix cr3 handling in nested exit and entry
+Bugzilla: 1048496 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Nadav Har'El <nyh@il.ibm.com>
+
+The existing code for handling cr3 and related VMCS fields during nested
+exit and entry wasn't correct in all cases:
+
+If L2 is allowed to control cr3 (and this is indeed the case in nested EPT),
+during nested exit we must copy the modified cr3 from vmcs02 to vmcs12, and
+we forgot to do so. This patch adds this copy.
+
+If L0 isn't controlling cr3 when running L2 (i.e., L0 is using EPT), and
+whoever does control cr3 (L1 or L2) is using PAE, the processor might have
+saved PDPTEs and we should also save them in vmcs12 (and restore later).
+
+Reviewed-by: Xiao Guangrong <xiaoguangrong@linux.vnet.ibm.com>
+Reviewed-by: Orit Wasserman <owasserm@redhat.com>
+Signed-off-by: Nadav Har'El <nyh@il.ibm.com>
+Signed-off-by: Jun Nakajima <jun.nakajima@intel.com>
+Signed-off-by: Xinhao Xu <xinhao.xu@intel.com>
+Signed-off-by: Yang Zhang <yang.z.zhang@Intel.com>
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3633cfc3e8656a660953e701c189444831f44075)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 9e91dc5..2c1e4e9 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -7605,6 +7605,16 @@ static void prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+  kvm_set_cr3(vcpu, vmcs12->guest_cr3);
+  kvm_mmu_reset_context(vcpu);
+ 
++ /*
++  * L1 may access the L2's PDPTR, so save them to construct vmcs12
++  */
++ if (enable_ept) {
++  vmcs_write64(GUEST_PDPTR0, vmcs12->guest_pdptr0);
++  vmcs_write64(GUEST_PDPTR1, vmcs12->guest_pdptr1);
++  vmcs_write64(GUEST_PDPTR2, vmcs12->guest_pdptr2);
++  vmcs_write64(GUEST_PDPTR3, vmcs12->guest_pdptr3);
++ }
++
+  kvm_register_write(vcpu, VCPU_REGS_RSP, vmcs12->guest_rsp);
+  kvm_register_write(vcpu, VCPU_REGS_RIP, vmcs12->guest_rip);
+ }
+@@ -7927,6 +7937,22 @@ static void prepare_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+  vmcs12->guest_pending_dbg_exceptions =
+   vmcs_readl(GUEST_PENDING_DBG_EXCEPTIONS);
+ 
++ /*
++  * In some cases (usually, nested EPT), L2 is allowed to change its
++  * own CR3 without exiting. If it has changed it, we must keep it.
++  * Of course, if L0 is using shadow page tables, GUEST_CR3 was defined
++  * by L0, not L1 or L2, so we mustn't unconditionally copy it to vmcs12.
++  *
++  * Additionally, restore L2's PDPTR to vmcs12.
++  */
++ if (enable_ept) {
++  vmcs12->guest_cr3 = vmcs_read64(GUEST_CR3);
++  vmcs12->guest_pdptr0 = vmcs_read64(GUEST_PDPTR0);
++  vmcs12->guest_pdptr1 = vmcs_read64(GUEST_PDPTR1);
++  vmcs12->guest_pdptr2 = vmcs_read64(GUEST_PDPTR2);
++  vmcs12->guest_pdptr3 = vmcs_read64(GUEST_PDPTR3);
++ }
++
+  vmcs12->vm_entry_controls =
+   (vmcs12->vm_entry_controls & ~VM_ENTRY_IA32E_MODE) |
+   (vmcs_read32(VM_ENTRY_CONTROLS) & VM_ENTRY_IA32E_MODE);
+-- 
+1.7.1

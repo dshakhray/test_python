@@ -1,0 +1,647 @@
+From ec5babce8dd303894456cb12ad04174670e87701 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:27 -0400
+Subject: [virt] kvm/ppc: book3s hv - Context-switch new POWER8 SPRs
+
+Message-id: <1410545655-205645-339-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94680
+O-Subject: [RHEL7 PATCH 338/626] KVM: PPC: Book3S HV: Context-switch new POWER8 SPRs
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit b005255e12a311d2c87ea70a7c7b192b2187c22c
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Wed Jan 8 21:25:21 2014 +1100
+
+    KVM: PPC: Book3S HV: Context-switch new POWER8 SPRs
+
+    This adds fields to the struct kvm_vcpu_arch to store the new
+    guest-accessible SPRs on POWER8, adds code to the get/set_one_reg
+    functions to allow userspace to access this state, and adds code to
+    the guest entry and exit to context-switch these SPRs between host
+    and guest.
+
+    Note that DPDES (Directed Privileged Doorbell Exception State) is
+    shared between threads on a core; hence we store it in struct
+    kvmppc_vcore and have the master thread save and restore it.
+
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 355fa14..69e0134 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -309,6 +309,7 @@ struct kvmppc_vcore {
+  ulong lpcr;
+  u32 arch_compat;
+  ulong pcr;
++ ulong dpdes;  /* doorbell state (POWER8) */
+ };
+ 
+ #define VCORE_ENTRY_COUNT(vc) ((vc)->entry_exit_count & 0xff)
+@@ -464,6 +465,7 @@ struct kvm_vcpu_arch {
+  ulong pc;
+  ulong ctr;
+  ulong lr;
++ ulong tar;
+ 
+  ulong xer;
+  u32 cr;
+@@ -473,13 +475,32 @@ struct kvm_vcpu_arch {
+  ulong guest_owned_ext;
+  ulong purr;
+  ulong spurr;
++ ulong ic;
++ ulong vtb;
+  ulong dscr;
+  ulong amr;
+  ulong uamor;
++ ulong iamr;
+  u32 ctrl;
+  ulong dabr;
++ ulong dawr;
++ ulong dawrx;
++ ulong ciabr;
+  ulong cfar;
+  ulong ppr;
++ ulong pspb;
++ ulong fscr;
++ ulong tfhar;
++ ulong tfiar;
++ ulong texasr;
++ ulong ebbhr;
++ ulong ebbrr;
++ ulong bescr;
++ ulong csigr;
++ ulong tacr;
++ ulong tcscr;
++ ulong acop;
++ ulong wort;
+  ulong shadow_srr1;
+ #endif
+  u32 vrsave; /* also USPRG0 */
+@@ -514,10 +535,12 @@ struct kvm_vcpu_arch {
+  u32 ccr1;
+  u32 dbsr;
+ 
+- u64 mmcr[3];
++ u64 mmcr[5];
+  u32 pmc[8];
++ u32 spmc[2];
+  u64 siar;
+  u64 sdar;
++ u64 sier;
+ 
+ #ifdef CONFIG_KVM_EXIT_TIMING
+  struct mutex exit_timing_lock;
+diff --git a/arch/powerpc/include/asm/reg.h b/arch/powerpc/include/asm/reg.h
+index e91f228..52f74a4 100644
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -224,6 +224,11 @@
+ #define   CTRL_TE 0x00c00000 /* thread enable */
+ #define   CTRL_RUNLATCH 0x1
+ #define SPRN_DAWR 0xB4
++#define SPRN_CIABR 0xBB
++#define   CIABR_PRIV  0x3
++#define   CIABR_PRIV_USER 1
++#define   CIABR_PRIV_SUPER 2
++#define   CIABR_PRIV_HYPER 3
+ #define SPRN_DAWRX 0xBC
+ #define   DAWRX_USER (1UL << 0)
+ #define   DAWRX_KERNEL (1UL << 1)
+@@ -261,6 +266,8 @@
+ #define SPRN_HRMOR 0x139 /* Real mode offset register */
+ #define SPRN_HSRR0 0x13A /* Hypervisor Save/Restore 0 */
+ #define SPRN_HSRR1 0x13B /* Hypervisor Save/Restore 1 */
++#define SPRN_IC  0x350 /* Virtual Instruction Count */
++#define SPRN_VTB 0x351 /* Virtual Time Base */
+ /* HFSCR and FSCR bit numbers are the same */
+ #define FSCR_TAR_LG 8 /* Enable Target Address Register */
+ #define FSCR_EBB_LG 7 /* Enable Event Based Branching */
+@@ -369,6 +376,8 @@
+ #define DER_EBRKE 0x00000002 /* External Breakpoint Interrupt */
+ #define DER_DPIE 0x00000001 /* Dev. Port Nonmaskable Request */
+ #define SPRN_DMISS 0x3D0  /* Data TLB Miss Register */
++#define SPRN_DHDES 0x0B1  /* Directed Hyp. Doorbell Exc. State */
++#define SPRN_DPDES 0x0B0  /* Directed Priv. Doorbell Exc. State */
+ #define SPRN_EAR 0x11A  /* External Address Register */
+ #define SPRN_HASH1 0x3D2  /* Primary Hash Address Register */
+ #define SPRN_HASH2 0x3D3  /* Secondary Hash Address Resgister */
+@@ -428,6 +437,7 @@
+ #define SPRN_IABR 0x3F2 /* Instruction Address Breakpoint Register */
+ #define SPRN_IABR2 0x3FA  /* 83xx */
+ #define SPRN_IBCR 0x135  /* 83xx Insn Breakpoint Control Reg */
++#define SPRN_IAMR 0x03D  /* Instr. Authority Mask Reg */
+ #define SPRN_HID4 0x3F4  /* 970 HID4 */
+ #define  HID4_LPES0  (1ul << (63-0)) /* LPAR env. sel. bit 0 */
+ #define  HID4_RMLS2_SH  (63 - 2) /* Real mode limit bottom 2 bits */
+@@ -542,6 +552,7 @@
+ #define SPRN_PIR 0x3FF /* Processor Identification Register */
+ #endif
+ #define SPRN_TIR 0x1BE /* Thread Identification Register */
++#define SPRN_PSPB 0x09F /* Problem State Priority Boost reg */
+ #define SPRN_PTEHI 0x3D5 /* 981 7450 PTE HI word (S/W TLB load) */
+ #define SPRN_PTELO 0x3D6 /* 982 7450 PTE LO word (S/W TLB load) */
+ #define SPRN_PURR 0x135 /* Processor Utilization of Resources Reg */
+@@ -686,6 +697,7 @@
+ #define SPRN_EBBRR 805 /* Event based branch return register */
+ #define SPRN_BESCR 806 /* Branch event status and control register */
+ #define   BESCR_GE 0x8000000000000000ULL /* Global Enable */
++#define SPRN_WORT 895 /* Workload optimization register - thread */
+ 
+ #define SPRN_PMC1 787
+ #define SPRN_PMC2 788
+@@ -702,6 +714,11 @@
+ #define   SIER_SIHV  0x1000000 /* Sampled MSR_HV */
+ #define   SIER_SIAR_VALID 0x0400000 /* SIAR contents valid */
+ #define   SIER_SDAR_VALID 0x0200000 /* SDAR contents valid */
++#define SPRN_TACR 888
++#define SPRN_TCSCR 889
++#define SPRN_CSIGR 890
++#define SPRN_SPMC1 892
++#define SPRN_SPMC2 893
+ 
+ /* When EBB is enabled, some of MMCR0/MMCR2/SIER are user accessible */
+ #define MMCR0_USER_MASK (MMCR0_FC | MMCR0_PMXE | MMCR0_PMAO)
+diff --git a/arch/powerpc/include/uapi/asm/kvm.h b/arch/powerpc/include/uapi/asm/kvm.h
+index e420d46..26d3fd6 100644
+--- a/arch/powerpc/include/uapi/asm/kvm.h
++++ b/arch/powerpc/include/uapi/asm/kvm.h
+@@ -531,6 +531,7 @@ struct kvm_get_htab_header {
+ #define KVM_REG_PPC_TCSCR (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb1)
+ #define KVM_REG_PPC_PID  (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb2)
+ #define KVM_REG_PPC_ACOP (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb3)
++#define KVM_REG_PPC_WORT (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb4)
+ 
+ #define KVM_REG_PPC_VRSAVE (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0xb4)
+ #define KVM_REG_PPC_LPCR (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0xb5)
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 37e117b..d6f215a 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -436,6 +436,7 @@ int main(void)
+  DEFINE(VCPU_XER, offsetof(struct kvm_vcpu, arch.xer));
+  DEFINE(VCPU_CTR, offsetof(struct kvm_vcpu, arch.ctr));
+  DEFINE(VCPU_LR, offsetof(struct kvm_vcpu, arch.lr));
++ DEFINE(VCPU_TAR, offsetof(struct kvm_vcpu, arch.tar));
+  DEFINE(VCPU_CR, offsetof(struct kvm_vcpu, arch.cr));
+  DEFINE(VCPU_PC, offsetof(struct kvm_vcpu, arch.pc));
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+@@ -488,11 +489,17 @@ int main(void)
+  DEFINE(VCPU_VCPUID, offsetof(struct kvm_vcpu, vcpu_id));
+  DEFINE(VCPU_PURR, offsetof(struct kvm_vcpu, arch.purr));
+  DEFINE(VCPU_SPURR, offsetof(struct kvm_vcpu, arch.spurr));
++ DEFINE(VCPU_IC, offsetof(struct kvm_vcpu, arch.ic));
++ DEFINE(VCPU_VTB, offsetof(struct kvm_vcpu, arch.vtb));
+  DEFINE(VCPU_DSCR, offsetof(struct kvm_vcpu, arch.dscr));
+  DEFINE(VCPU_AMR, offsetof(struct kvm_vcpu, arch.amr));
+  DEFINE(VCPU_UAMOR, offsetof(struct kvm_vcpu, arch.uamor));
++ DEFINE(VCPU_IAMR, offsetof(struct kvm_vcpu, arch.iamr));
+  DEFINE(VCPU_CTRL, offsetof(struct kvm_vcpu, arch.ctrl));
+  DEFINE(VCPU_DABR, offsetof(struct kvm_vcpu, arch.dabr));
++ DEFINE(VCPU_DAWR, offsetof(struct kvm_vcpu, arch.dawr));
++ DEFINE(VCPU_DAWRX, offsetof(struct kvm_vcpu, arch.dawrx));
++ DEFINE(VCPU_CIABR, offsetof(struct kvm_vcpu, arch.ciabr));
+  DEFINE(VCPU_HFLAGS, offsetof(struct kvm_vcpu, arch.hflags));
+  DEFINE(VCPU_DEC, offsetof(struct kvm_vcpu, arch.dec));
+  DEFINE(VCPU_DEC_EXPIRES, offsetof(struct kvm_vcpu, arch.dec_expires));
+@@ -501,8 +508,10 @@ int main(void)
+  DEFINE(VCPU_PRODDED, offsetof(struct kvm_vcpu, arch.prodded));
+  DEFINE(VCPU_MMCR, offsetof(struct kvm_vcpu, arch.mmcr));
+  DEFINE(VCPU_PMC, offsetof(struct kvm_vcpu, arch.pmc));
++ DEFINE(VCPU_SPMC, offsetof(struct kvm_vcpu, arch.spmc));
+  DEFINE(VCPU_SIAR, offsetof(struct kvm_vcpu, arch.siar));
+  DEFINE(VCPU_SDAR, offsetof(struct kvm_vcpu, arch.sdar));
++ DEFINE(VCPU_SIER, offsetof(struct kvm_vcpu, arch.sier));
+  DEFINE(VCPU_SLB, offsetof(struct kvm_vcpu, arch.slb));
+  DEFINE(VCPU_SLB_MAX, offsetof(struct kvm_vcpu, arch.slb_max));
+  DEFINE(VCPU_SLB_NR, offsetof(struct kvm_vcpu, arch.slb_nr));
+@@ -512,6 +521,19 @@ int main(void)
+  DEFINE(VCPU_TRAP, offsetof(struct kvm_vcpu, arch.trap));
+  DEFINE(VCPU_CFAR, offsetof(struct kvm_vcpu, arch.cfar));
+  DEFINE(VCPU_PPR, offsetof(struct kvm_vcpu, arch.ppr));
++ DEFINE(VCPU_FSCR, offsetof(struct kvm_vcpu, arch.fscr));
++ DEFINE(VCPU_PSPB, offsetof(struct kvm_vcpu, arch.pspb));
++ DEFINE(VCPU_TFHAR, offsetof(struct kvm_vcpu, arch.tfhar));
++ DEFINE(VCPU_TFIAR, offsetof(struct kvm_vcpu, arch.tfiar));
++ DEFINE(VCPU_TEXASR, offsetof(struct kvm_vcpu, arch.texasr));
++ DEFINE(VCPU_EBBHR, offsetof(struct kvm_vcpu, arch.ebbhr));
++ DEFINE(VCPU_EBBRR, offsetof(struct kvm_vcpu, arch.ebbrr));
++ DEFINE(VCPU_BESCR, offsetof(struct kvm_vcpu, arch.bescr));
++ DEFINE(VCPU_CSIGR, offsetof(struct kvm_vcpu, arch.csigr));
++ DEFINE(VCPU_TACR, offsetof(struct kvm_vcpu, arch.tacr));
++ DEFINE(VCPU_TCSCR, offsetof(struct kvm_vcpu, arch.tcscr));
++ DEFINE(VCPU_ACOP, offsetof(struct kvm_vcpu, arch.acop));
++ DEFINE(VCPU_WORT, offsetof(struct kvm_vcpu, arch.wort));
+  DEFINE(VCPU_SHADOW_SRR1, offsetof(struct kvm_vcpu, arch.shadow_srr1));
+  DEFINE(VCORE_ENTRY_EXIT, offsetof(struct kvmppc_vcore, entry_exit_count));
+  DEFINE(VCORE_NAP_COUNT, offsetof(struct kvmppc_vcore, nap_count));
+@@ -521,6 +543,7 @@ int main(void)
+  DEFINE(VCORE_TB_OFFSET, offsetof(struct kvmppc_vcore, tb_offset));
+  DEFINE(VCORE_LPCR, offsetof(struct kvmppc_vcore, lpcr));
+  DEFINE(VCORE_PCR, offsetof(struct kvmppc_vcore, pcr));
++ DEFINE(VCORE_DPDES, offsetof(struct kvmppc_vcore, dpdes));
+  DEFINE(VCPU_SLB_E, offsetof(struct kvmppc_slb, orige));
+  DEFINE(VCPU_SLB_V, offsetof(struct kvmppc_slb, origv));
+  DEFINE(VCPU_SLB_SIZE, sizeof(struct kvmppc_slb));
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 28a7717..8811056 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -800,7 +800,7 @@ static int kvmppc_get_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+  case KVM_REG_PPC_UAMOR:
+   *val = get_reg_val(id, vcpu->arch.uamor);
+   break;
+- case KVM_REG_PPC_MMCR0 ... KVM_REG_PPC_MMCRA:
++ case KVM_REG_PPC_MMCR0 ... KVM_REG_PPC_MMCRS:
+   i = id - KVM_REG_PPC_MMCR0;
+   *val = get_reg_val(id, vcpu->arch.mmcr[i]);
+   break;
+@@ -808,12 +808,85 @@ static int kvmppc_get_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+   i = id - KVM_REG_PPC_PMC1;
+   *val = get_reg_val(id, vcpu->arch.pmc[i]);
+   break;
++ case KVM_REG_PPC_SPMC1 ... KVM_REG_PPC_SPMC2:
++  i = id - KVM_REG_PPC_SPMC1;
++  *val = get_reg_val(id, vcpu->arch.spmc[i]);
++  break;
+  case KVM_REG_PPC_SIAR:
+   *val = get_reg_val(id, vcpu->arch.siar);
+   break;
+  case KVM_REG_PPC_SDAR:
+   *val = get_reg_val(id, vcpu->arch.sdar);
+   break;
++ case KVM_REG_PPC_SIER:
++  *val = get_reg_val(id, vcpu->arch.sier);
++  break;
++ case KVM_REG_PPC_IAMR:
++  *val = get_reg_val(id, vcpu->arch.iamr);
++  break;
++ case KVM_REG_PPC_TFHAR:
++  *val = get_reg_val(id, vcpu->arch.tfhar);
++  break;
++ case KVM_REG_PPC_TFIAR:
++  *val = get_reg_val(id, vcpu->arch.tfiar);
++  break;
++ case KVM_REG_PPC_TEXASR:
++  *val = get_reg_val(id, vcpu->arch.texasr);
++  break;
++ case KVM_REG_PPC_FSCR:
++  *val = get_reg_val(id, vcpu->arch.fscr);
++  break;
++ case KVM_REG_PPC_PSPB:
++  *val = get_reg_val(id, vcpu->arch.pspb);
++  break;
++ case KVM_REG_PPC_EBBHR:
++  *val = get_reg_val(id, vcpu->arch.ebbhr);
++  break;
++ case KVM_REG_PPC_EBBRR:
++  *val = get_reg_val(id, vcpu->arch.ebbrr);
++  break;
++ case KVM_REG_PPC_BESCR:
++  *val = get_reg_val(id, vcpu->arch.bescr);
++  break;
++ case KVM_REG_PPC_TAR:
++  *val = get_reg_val(id, vcpu->arch.tar);
++  break;
++ case KVM_REG_PPC_DPDES:
++  *val = get_reg_val(id, vcpu->arch.vcore->dpdes);
++  break;
++ case KVM_REG_PPC_DAWR:
++  *val = get_reg_val(id, vcpu->arch.dawr);
++  break;
++ case KVM_REG_PPC_DAWRX:
++  *val = get_reg_val(id, vcpu->arch.dawrx);
++  break;
++ case KVM_REG_PPC_CIABR:
++  *val = get_reg_val(id, vcpu->arch.ciabr);
++  break;
++ case KVM_REG_PPC_IC:
++  *val = get_reg_val(id, vcpu->arch.ic);
++  break;
++ case KVM_REG_PPC_VTB:
++  *val = get_reg_val(id, vcpu->arch.vtb);
++  break;
++ case KVM_REG_PPC_CSIGR:
++  *val = get_reg_val(id, vcpu->arch.csigr);
++  break;
++ case KVM_REG_PPC_TACR:
++  *val = get_reg_val(id, vcpu->arch.tacr);
++  break;
++ case KVM_REG_PPC_TCSCR:
++  *val = get_reg_val(id, vcpu->arch.tcscr);
++  break;
++ case KVM_REG_PPC_PID:
++  *val = get_reg_val(id, vcpu->arch.pid);
++  break;
++ case KVM_REG_PPC_ACOP:
++  *val = get_reg_val(id, vcpu->arch.acop);
++  break;
++ case KVM_REG_PPC_WORT:
++  *val = get_reg_val(id, vcpu->arch.wort);
++  break;
+  case KVM_REG_PPC_VPA_ADDR:
+   spin_lock(&vcpu->arch.vpa_update_lock);
+   *val = get_reg_val(id, vcpu->arch.vpa.next_gpa);
+@@ -882,7 +955,7 @@ static int kvmppc_set_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+  case KVM_REG_PPC_UAMOR:
+   vcpu->arch.uamor = set_reg_val(id, *val);
+   break;
+- case KVM_REG_PPC_MMCR0 ... KVM_REG_PPC_MMCRA:
++ case KVM_REG_PPC_MMCR0 ... KVM_REG_PPC_MMCRS:
+   i = id - KVM_REG_PPC_MMCR0;
+   vcpu->arch.mmcr[i] = set_reg_val(id, *val);
+   break;
+@@ -890,12 +963,88 @@ static int kvmppc_set_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+   i = id - KVM_REG_PPC_PMC1;
+   vcpu->arch.pmc[i] = set_reg_val(id, *val);
+   break;
++ case KVM_REG_PPC_SPMC1 ... KVM_REG_PPC_SPMC2:
++  i = id - KVM_REG_PPC_SPMC1;
++  vcpu->arch.spmc[i] = set_reg_val(id, *val);
++  break;
+  case KVM_REG_PPC_SIAR:
+   vcpu->arch.siar = set_reg_val(id, *val);
+   break;
+  case KVM_REG_PPC_SDAR:
+   vcpu->arch.sdar = set_reg_val(id, *val);
+   break;
++ case KVM_REG_PPC_SIER:
++  vcpu->arch.sier = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_IAMR:
++  vcpu->arch.iamr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_TFHAR:
++  vcpu->arch.tfhar = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_TFIAR:
++  vcpu->arch.tfiar = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_TEXASR:
++  vcpu->arch.texasr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_FSCR:
++  vcpu->arch.fscr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_PSPB:
++  vcpu->arch.pspb = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_EBBHR:
++  vcpu->arch.ebbhr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_EBBRR:
++  vcpu->arch.ebbrr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_BESCR:
++  vcpu->arch.bescr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_TAR:
++  vcpu->arch.tar = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_DPDES:
++  vcpu->arch.vcore->dpdes = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_DAWR:
++  vcpu->arch.dawr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_DAWRX:
++  vcpu->arch.dawrx = set_reg_val(id, *val) & ~DAWRX_HYP;
++  break;
++ case KVM_REG_PPC_CIABR:
++  vcpu->arch.ciabr = set_reg_val(id, *val);
++  /* Don't allow setting breakpoints in hypervisor code */
++  if ((vcpu->arch.ciabr & CIABR_PRIV) == CIABR_PRIV_HYPER)
++   vcpu->arch.ciabr &= ~CIABR_PRIV; /* disable */
++  break;
++ case KVM_REG_PPC_IC:
++  vcpu->arch.ic = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_VTB:
++  vcpu->arch.vtb = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_CSIGR:
++  vcpu->arch.csigr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_TACR:
++  vcpu->arch.tacr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_TCSCR:
++  vcpu->arch.tcscr = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_PID:
++  vcpu->arch.pid = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_ACOP:
++  vcpu->arch.acop = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_WORT:
++  vcpu->arch.wort = set_reg_val(id, *val);
++  break;
+  case KVM_REG_PPC_VPA_ADDR:
+   addr = set_reg_val(id, *val);
+   r = -EINVAL;
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 36b8990..804de0e 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -464,6 +464,13 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+  beq 38f
+  mtspr SPRN_PCR, r7
+ 38:
++
++BEGIN_FTR_SECTION
++ /* DPDES is shared between threads */
++ ld r8, VCORE_DPDES(r5)
++ mtspr SPRN_DPDES, r8
++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
++
+  li r0,1
+  stb r0,VCORE_IN_GUEST(r5) /* signal secondaries to continue */
+  b 10f
+@@ -663,6 +670,18 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+  mtspr SPRN_MMCRA, r6
+  mtspr SPRN_SIAR, r7
+  mtspr SPRN_SDAR, r8
++BEGIN_FTR_SECTION
++ ld r5, VCPU_MMCR + 24(r4)
++ ld r6, VCPU_SIER(r4)
++ lwz r7, VCPU_PMC + 24(r4)
++ lwz r8, VCPU_PMC + 28(r4)
++ ld r9, VCPU_MMCR + 32(r4)
++ mtspr SPRN_MMCR2, r5
++ mtspr SPRN_SIER, r6
++ mtspr SPRN_SPMC1, r7
++ mtspr SPRN_SPMC2, r8
++ mtspr SPRN_MMCRS, r9
++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+  mtspr SPRN_MMCR0, r3
+  isync
+ 
+@@ -694,6 +713,61 @@ BEGIN_FTR_SECTION
+  mtspr SPRN_DSCR, r5
+ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ 
++BEGIN_FTR_SECTION
++ /* Skip next section on POWER7 or PPC970 */
++ b 8f
++END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
++ /* Turn on TM so we can access TFHAR/TFIAR/TEXASR */
++ mfmsr r8
++ li r0, 1
++ rldimi r8, r0, MSR_TM_LG, 63-MSR_TM_LG
++ mtmsrd r8
++
++ /* Load up POWER8-specific registers */
++ ld r5, VCPU_IAMR(r4)
++ lwz r6, VCPU_PSPB(r4)
++ ld r7, VCPU_FSCR(r4)
++ mtspr SPRN_IAMR, r5
++ mtspr SPRN_PSPB, r6
++ mtspr SPRN_FSCR, r7
++ ld r5, VCPU_DAWR(r4)
++ ld r6, VCPU_DAWRX(r4)
++ ld r7, VCPU_CIABR(r4)
++ ld r8, VCPU_TAR(r4)
++ mtspr SPRN_DAWR, r5
++ mtspr SPRN_DAWRX, r6
++ mtspr SPRN_CIABR, r7
++ mtspr SPRN_TAR, r8
++ ld r5, VCPU_IC(r4)
++ ld r6, VCPU_VTB(r4)
++ mtspr SPRN_IC, r5
++ mtspr SPRN_VTB, r6
++ ld r5, VCPU_TFHAR(r4)
++ ld r6, VCPU_TFIAR(r4)
++ ld r7, VCPU_TEXASR(r4)
++ ld r8, VCPU_EBBHR(r4)
++ mtspr SPRN_TFHAR, r5
++ mtspr SPRN_TFIAR, r6
++ mtspr SPRN_TEXASR, r7
++ mtspr SPRN_EBBHR, r8
++ ld r5, VCPU_EBBRR(r4)
++ ld r6, VCPU_BESCR(r4)
++ ld r7, VCPU_CSIGR(r4)
++ ld r8, VCPU_TACR(r4)
++ mtspr SPRN_EBBRR, r5
++ mtspr SPRN_BESCR, r6
++ mtspr SPRN_CSIGR, r7
++ mtspr SPRN_TACR, r8
++ ld r5, VCPU_TCSCR(r4)
++ ld r6, VCPU_ACOP(r4)
++ lwz r7, VCPU_GUEST_PID(r4)
++ ld r8, VCPU_WORT(r4)
++ mtspr SPRN_TCSCR, r5
++ mtspr SPRN_ACOP, r6
++ mtspr SPRN_PID, r7
++ mtspr SPRN_WORT, r8
++8:
++
+  /*
+   * Set the decrementer to the guest decrementer.
+   */
+@@ -1084,6 +1158,54 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_201)
+  add r5,r5,r6
+  std r5,VCPU_DEC_EXPIRES(r9)
+ 
++BEGIN_FTR_SECTION
++ b 8f
++END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
++ /* Turn on TM so we can access TFHAR/TFIAR/TEXASR */
++ mfmsr r8
++ li r0, 1
++ rldimi r8, r0, MSR_TM_LG, 63-MSR_TM_LG
++ mtmsrd r8
++
++ /* Save POWER8-specific registers */
++ mfspr r5, SPRN_IAMR
++ mfspr r6, SPRN_PSPB
++ mfspr r7, SPRN_FSCR
++ std r5, VCPU_IAMR(r9)
++ stw r6, VCPU_PSPB(r9)
++ std r7, VCPU_FSCR(r9)
++ mfspr r5, SPRN_IC
++ mfspr r6, SPRN_VTB
++ mfspr r7, SPRN_TAR
++ std r5, VCPU_IC(r9)
++ std r6, VCPU_VTB(r9)
++ std r7, VCPU_TAR(r9)
++ mfspr r5, SPRN_TFHAR
++ mfspr r6, SPRN_TFIAR
++ mfspr r7, SPRN_TEXASR
++ mfspr r8, SPRN_EBBHR
++ std r5, VCPU_TFHAR(r9)
++ std r6, VCPU_TFIAR(r9)
++ std r7, VCPU_TEXASR(r9)
++ std r8, VCPU_EBBHR(r9)
++ mfspr r5, SPRN_EBBRR
++ mfspr r6, SPRN_BESCR
++ mfspr r7, SPRN_CSIGR
++ mfspr r8, SPRN_TACR
++ std r5, VCPU_EBBRR(r9)
++ std r6, VCPU_BESCR(r9)
++ std r7, VCPU_CSIGR(r9)
++ std r8, VCPU_TACR(r9)
++ mfspr r5, SPRN_TCSCR
++ mfspr r6, SPRN_ACOP
++ mfspr r7, SPRN_PID
++ mfspr r8, SPRN_WORT
++ std r5, VCPU_TCSCR(r9)
++ std r6, VCPU_ACOP(r9)
++ stw r7, VCPU_GUEST_PID(r9)
++ std r8, VCPU_WORT(r9)
++8:
++
+  /* Save and reset AMR and UAMOR before turning on the MMU */
+ BEGIN_FTR_SECTION
+  mfspr r5,SPRN_AMR
+@@ -1193,6 +1315,20 @@ BEGIN_FTR_SECTION
+  stw r10, VCPU_PMC + 24(r9)
+  stw r11, VCPU_PMC + 28(r9)
+ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
++BEGIN_FTR_SECTION
++ mfspr r4, SPRN_MMCR2
++ mfspr r5, SPRN_SIER
++ mfspr r6, SPRN_SPMC1
++ mfspr r7, SPRN_SPMC2
++ mfspr r8, SPRN_MMCRS
++ std r4, VCPU_MMCR + 24(r9)
++ std r5, VCPU_SIER(r9)
++ stw r6, VCPU_PMC + 24(r9)
++ stw r7, VCPU_PMC + 28(r9)
++ std r8, VCPU_MMCR + 32(r9)
++ lis r4, 0x8000
++ mtspr SPRN_MMCRS, r4
++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ 22:
+  /* Clear out SLB */
+  li r5,0
+@@ -1294,6 +1430,15 @@ secondary_too_late:
+  mtspr SPRN_LPID,r7
+  isync
+ 
++BEGIN_FTR_SECTION
++ /* DPDES is shared between threads */
++ mfspr r7, SPRN_DPDES
++ std r7, VCORE_DPDES(r5)
++ /* clear DPDES so we don't get guest doorbells in the host */
++ li r8, 0
++ mtspr SPRN_DPDES, r8
++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
++
+  /* Subtract timebase offset from timebase */
+  ld r8,VCORE_TB_OFFSET(r5)
+  cmpdi r8,0
+-- 
+1.7.1

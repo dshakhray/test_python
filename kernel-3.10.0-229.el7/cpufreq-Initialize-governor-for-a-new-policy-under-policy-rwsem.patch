@@ -1,0 +1,94 @@
+From 7b965e6251c3bc832e58df567471afe6cf6f4946 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:23:32 -0400
+Subject: [cpufreq] Initialize governor for a new policy under policy->rwsem
+
+Message-id: <1409235879-1283-119-git-send-email-prarit@redhat.com>
+Patchwork-id: 89509
+O-Subject: [RHEL7.1 PATCH BZ 1134639 118/185] cpufreq: Initialize governor for a new policy under policy->rwsem
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit 4e97b631f24c927b2302368f4f83efbba82076ee
+Author: Viresh Kumar <viresh.kumar@linaro.org>
+Date:   Tue Mar 4 11:44:01 2014 +0800
+
+    cpufreq: Initialize governor for a new policy under policy->rwsem
+
+    policy->rwsem is used to lock access to all parts of code modifying
+    struct cpufreq_policy, but it's not used on a new policy created by
+    __cpufreq_add_dev().
+
+    Because of that, if cpufreq_update_policy() is called in a tight loop
+    on one CPU in parallel with offline/online of another CPU, then the
+    following crash can be triggered:
+
+    Unable to handle kernel NULL pointer dereference at virtual address 00000020
+    pgd = c0003000
+    [00000020] *pgd=80000000004003, *pmd=00000000
+    Internal error: Oops: 206 [#1] PREEMPT SMP ARM
+
+    PC is at __cpufreq_governor+0x10/0x1ac
+    LR is at cpufreq_update_policy+0x114/0x150
+
+    ---[ end trace f23a8defea6cd706 ]---
+    Kernel panic - not syncing: Fatal exception
+    CPU0: stopping
+    CPU: 0 PID: 7136 Comm: mpdecision Tainted: G      D W    3.10.0-gd727407-00074-g979ede8 #396
+
+    [<c0afe180>] (notifier_call_chain+0x40/0x68) from [<c02a23ac>] (__blocking_notifier_call_chain+0x40/0x58)
+    [<c02a23ac>] (__blocking_notifier_call_chain+0x40/0x58) from [<c02a23d8>] (blocking_notifier_call_chain+0x14/0x1c)
+    [<c02a23d8>] (blocking_notifier_call_chain+0x14/0x1c) from [<c0803c68>] (cpufreq_set_policy+0xd4/0x2b8)
+    [<c0803c68>] (cpufreq_set_policy+0xd4/0x2b8) from [<c0803e7c>] (cpufreq_init_policy+0x30/0x98)
+    [<c0803e7c>] (cpufreq_init_policy+0x30/0x98) from [<c0805a18>] (__cpufreq_add_dev.isra.17+0x4dc/0x7a4)
+    [<c0805a18>] (__cpufreq_add_dev.isra.17+0x4dc/0x7a4) from [<c0805d38>] (cpufreq_cpu_callback+0x58/0x84)
+    [<c0805d38>] (cpufreq_cpu_callback+0x58/0x84) from [<c0afe180>] (notifier_call_chain+0x40/0x68)
+    [<c0afe180>] (notifier_call_chain+0x40/0x68) from [<c02812dc>] (__cpu_notify+0x28/0x44)
+    [<c02812dc>] (__cpu_notify+0x28/0x44) from [<c0aeed90>] (_cpu_up+0xf4/0x1dc)
+    [<c0aeed90>] (_cpu_up+0xf4/0x1dc) from [<c0aeeed4>] (cpu_up+0x5c/0x78)
+    [<c0aeeed4>] (cpu_up+0x5c/0x78) from [<c0aec808>] (store_online+0x44/0x74)
+    [<c0aec808>] (store_online+0x44/0x74) from [<c03a40f4>] (sysfs_write_file+0x108/0x14c)
+    [<c03a40f4>] (sysfs_write_file+0x108/0x14c) from [<c03517d4>] (vfs_write+0xd0/0x180)
+    [<c03517d4>] (vfs_write+0xd0/0x180) from [<c0351ca8>] (SyS_write+0x38/0x68)
+    [<c0351ca8>] (SyS_write+0x38/0x68) from [<c0205de0>] (ret_fast_syscall+0x0/0x30)
+
+    Fix that by taking locks at appropriate places in __cpufreq_add_dev()
+    as well.
+
+    Reported-by: Saravana Kannan <skannan@codeaurora.org>
+    Suggested-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+    [rjw: Changelog]
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index e690efe..ec90cc1 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1117,6 +1117,7 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
+   policy->user_policy.max = policy->max;
+  }
+ 
++ down_write(&policy->rwsem);
+  write_lock_irqsave(&cpufreq_driver_lock, flags);
+  for_each_cpu(j, policy->cpus)
+   per_cpu(cpufreq_cpu_data, j) = policy;
+@@ -1200,6 +1201,7 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
+   policy->user_policy.policy = policy->policy;
+   policy->user_policy.governor = policy->governor;
+  }
++ up_write(&policy->rwsem);
+ 
+  kobject_uevent(&policy->kobj, KOBJ_ADD);
+  up_read(&cpufreq_rwsem);
+-- 
+1.7.1

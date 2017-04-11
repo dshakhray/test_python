@@ -1,0 +1,81 @@
+From 0641738cb955c63a51459064180b99e99e2903f2 Mon Sep 17 00:00:00 2001
+From: Amit Shah <amit.shah@redhat.com>
+Date: Mon, 18 Aug 2014 10:00:24 -0400
+Subject: [hwrng] random: add_hwgenerator_randomness() for feeding entropy from devices
+
+Message-id: <b8db4ec6115dffabd0b41558e9eb4bab806dbe5a.1408347166.git.amit.shah@redhat.com>
+Patchwork-id: 87838
+O-Subject: [RHEL7.1 kernel PATCH 1/6] random: add_hwgenerator_randomness() for feeding entropy from devices
+Bugzilla: 1129195
+RH-Acked-by: Amos Kong <akong@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Herbert Xu <herbert.xu@redhat.com>
+
+From: Torsten Duwe <duwe@lst.de>
+
+This patch adds an interface to the random pool for feeding entropy
+in-kernel.
+
+Signed-off-by: Torsten Duwe <duwe@suse.de>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Acked-by: H. Peter Anvin <hpa@zytor.com>
+(cherry picked from commit c84dbf61a7b322188d2a7fddc0cc6317ac6713e2)
+
+RHEL7 modifications:
+ - mix_pool_bytes() signature changed upstream; added last NULL param
+ - ENTROPY_BITS() unavailable; used input_pool.entropy_count
+ - random_write_wakeup_bits unavailable; used random_write_wakeup_thresh
+
+Signed-off-by: Amit Shah <amit.shah@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/char/random.c b/drivers/char/random.c
+index 0672be7..af60efb 100644
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -250,6 +250,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/mm.h>
+ #include <linux/spinlock.h>
++#include <linux/kthread.h>
+ #include <linux/percpu.h>
+ #include <linux/cryptohash.h>
+ #include <linux/fips.h>
+@@ -1516,3 +1517,23 @@ randomize_range(unsigned long start, unsigned long end, unsigned long len)
+   return 0;
+  return PAGE_ALIGN(get_random_int() % range + start);
+ }
++
++/* Interface for in-kernel drivers of true hardware RNGs.
++ * Those devices may produce endless random bits and will be throttled
++ * when our pool is full.
++ */
++void add_hwgenerator_randomness(const char *buffer, size_t count,
++    size_t entropy)
++{
++ struct entropy_store *poolp = &input_pool;
++
++ /* Suspend writing if we're above the trickle threshold.
++  * We'll be woken up again once below random_write_wakeup_thresh,
++  * or when the calling thread is about to terminate.
++  */
++ wait_event_interruptible(random_write_wait, kthread_should_stop() ||
++   input_pool.entropy_count <= random_write_wakeup_thresh);
++ mix_pool_bytes(poolp, buffer, count, NULL);
++ credit_entropy_bits(poolp, entropy);
++}
++EXPORT_SYMBOL_GPL(add_hwgenerator_randomness);
+diff --git a/include/linux/hw_random.h b/include/linux/hw_random.h
+index b4b0eef..3f075ff 100644
+--- a/include/linux/hw_random.h
++++ b/include/linux/hw_random.h
+@@ -47,5 +47,7 @@ struct hwrng {
+ extern int hwrng_register(struct hwrng *rng);
+ /** Unregister a Hardware Random Number Generator driver. */
+ extern void hwrng_unregister(struct hwrng *rng);
++/** Feed random bits into the pool. */
++extern void add_hwgenerator_randomness(const char *buffer, size_t count, size_t entropy);
+ 
+ #endif /* LINUX_HWRANDOM_H_ */
+-- 
+1.7.1

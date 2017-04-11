@@ -1,0 +1,156 @@
+From fcf871dd724b46d6d7f862789c3e0260662a7d54 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:12 -0400
+Subject: [powerpc] powernv: Enable fetching of platform sensor data
+
+Message-id: <1410545655-205645-324-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94369
+O-Subject: [RHEL7 PATCH 323/626] powerpc/powernv: Enable fetching of platform sensor data
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 7224adbbb80329d1a3ec5aa98213b50365fcd246
+Author: Neelesh Gupta <neelegup@linux.vnet.ibm.com>
+Date:   Fri Mar 7 11:03:27 2014 +0530
+
+    powerpc/powernv: Enable fetching of platform sensor data
+
+    This patch enables fetching of various platform sensor data through
+    OPAL and expects a sensor handle from the driver to pass to OPAL.
+
+    Signed-off-by: Neelesh Gupta <neelegup@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+ create mode 100644 arch/powerpc/platforms/powernv/opal-sensor.c
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 8ee694c..fe2aa0b 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -169,6 +169,7 @@ extern int opal_enter_rtas(struct rtas_args *args,
+ #define OPAL_GET_MSG    85
+ #define OPAL_CHECK_ASYNC_COMPLETION  86
+ #define OPAL_SYNC_HOST_REBOOT   87
++#define OPAL_SENSOR_READ   88
+ #define OPAL_GET_PARAM    89
+ #define OPAL_SET_PARAM    90
+ #define OPAL_DUMP_RESEND   91
+@@ -873,6 +874,8 @@ int64_t opal_get_param(uint64_t token, uint32_t param_id, uint64_t buffer,
+   size_t length);
+ int64_t opal_set_param(uint64_t token, uint32_t param_id, uint64_t buffer,
+   size_t length);
++int64_t opal_sensor_read(uint32_t sensor_hndl, int token,
++  uint32_t *sensor_data);
+ 
+ /* Internal functions */
+ extern int early_init_dt_scan_opal(unsigned long node, const char *uname, int depth, void *data);
+@@ -903,6 +906,7 @@ extern int opal_async_get_token_interruptible(void);
+ extern int __opal_async_release_token(int token);
+ extern int opal_async_release_token(int token);
+ extern int opal_async_wait_response(uint64_t token, struct opal_msg *msg);
++extern int opal_get_sensor_data(u32 sensor_hndl, u32 *sensor_data);
+ 
+ extern void hvc_opal_init_early(void);
+ 
+diff --git a/arch/powerpc/platforms/powernv/Makefile b/arch/powerpc/platforms/powernv/Makefile
+index 760b499..f324ea0 100644
+--- a/arch/powerpc/platforms/powernv/Makefile
++++ b/arch/powerpc/platforms/powernv/Makefile
+@@ -1,6 +1,6 @@
+ obj-y   += setup.o opal-takeover.o opal-wrappers.o opal.o opal-async.o
+ obj-y   += opal-rtc.o opal-nvram.o opal-lpc.o opal-flash.o
+-obj-y   += rng.o opal-elog.o opal-dump.o opal-sysparam.o
++obj-y   += rng.o opal-elog.o opal-dump.o opal-sysparam.o opal-sensor.o
+ 
+ obj-$(CONFIG_SMP) += smp.o
+ obj-$(CONFIG_PCI) += pci.o pci-p5ioc2.o pci-ioda.o
+diff --git a/arch/powerpc/platforms/powernv/opal-sensor.c b/arch/powerpc/platforms/powernv/opal-sensor.c
+new file mode 100644
+index 0000000..663cc9c
+--- /dev/null
++++ b/arch/powerpc/platforms/powernv/opal-sensor.c
+@@ -0,0 +1,64 @@
++/*
++ * PowerNV sensor code
++ *
++ * Copyright (C) 2013 IBM
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/delay.h>
++#include <linux/mutex.h>
++#include <asm/opal.h>
++
++static DEFINE_MUTEX(opal_sensor_mutex);
++
++/*
++ * This will return sensor information to driver based on the requested sensor
++ * handle. A handle is an opaque id for the powernv, read by the driver from the
++ * device tree..
++ */
++int opal_get_sensor_data(u32 sensor_hndl, u32 *sensor_data)
++{
++ int ret, token;
++ struct opal_msg msg;
++
++ token = opal_async_get_token_interruptible();
++ if (token < 0) {
++  pr_err("%s: Couldn't get the token, returning\n", __func__);
++  ret = token;
++  goto out;
++ }
++
++ mutex_lock(&opal_sensor_mutex);
++ ret = opal_sensor_read(sensor_hndl, token, sensor_data);
++ if (ret != OPAL_ASYNC_COMPLETION)
++  goto out_token;
++
++ ret = opal_async_wait_response(token, &msg);
++ if (ret) {
++  pr_err("%s: Failed to wait for the async response, %d\n",
++    __func__, ret);
++  goto out_token;
++ }
++
++ ret = msg.params[1];
++
++out_token:
++ mutex_unlock(&opal_sensor_mutex);
++ opal_async_release_token(token);
++out:
++ return ret;
++}
++EXPORT_SYMBOL_GPL(opal_get_sensor_data);
+diff --git a/arch/powerpc/platforms/powernv/opal-wrappers.S b/arch/powerpc/platforms/powernv/opal-wrappers.S
+index e6c49b6..bb90f9a 100644
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@ -141,5 +141,6 @@ OPAL_CALL(opal_get_msg,    OPAL_GET_MSG);
+ OPAL_CALL(opal_check_completion,  OPAL_CHECK_ASYNC_COMPLETION);
+ OPAL_CALL(opal_dump_resend_notification, OPAL_DUMP_RESEND);
+ OPAL_CALL(opal_sync_host_reboot,  OPAL_SYNC_HOST_REBOOT);
++OPAL_CALL(opal_sensor_read,   OPAL_SENSOR_READ);
+ OPAL_CALL(opal_get_param,   OPAL_GET_PARAM);
+ OPAL_CALL(opal_set_param,   OPAL_SET_PARAM);
+-- 
+1.7.1

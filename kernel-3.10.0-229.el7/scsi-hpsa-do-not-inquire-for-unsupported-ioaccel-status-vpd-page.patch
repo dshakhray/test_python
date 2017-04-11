@@ -1,0 +1,98 @@
+From 2f2dda8fe727721a1a5da86f4f0d04f8564b249e Mon Sep 17 00:00:00 2001
+From: Tomas Henzl <thenzl@redhat.com>
+Date: Mon, 8 Sep 2014 14:31:24 -0400
+Subject: [scsi] hpsa: do not inquire for unsupported ioaccel status vpd page
+
+Message-id: <1410186734-19986-34-git-send-email-thenzl@redhat.com>
+Patchwork-id: 92054
+O-Subject: [RHEL6.6 e-stor PATCH 33/83] hpsa: do not inquire for unsupported ioaccel status vpd page
+Bugzilla: 1069185
+RH-Acked-by: Maurizio Lombardi <mlombard@redhat.com>
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Ewan Milne <emilne@redhat.com>
+
+Signed-off-by: Stephen M. Cameron <scameron@beardog.cce.hp.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit 1b70150af548f47edfe45a6b97392e4a80538274)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/hpsa.c b/drivers/scsi/hpsa.c
+index 53d5825..0496ca1 100644
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@ -2082,6 +2082,49 @@ static int hpsa_get_raid_map(struct ctlr_info *h,
+  return rc;
+ }
+ 
++static int hpsa_vpd_page_supported(struct ctlr_info *h,
++ unsigned char scsi3addr[], u8 page)
++{
++ int rc;
++ int i;
++ int pages;
++ unsigned char *buf, bufsize;
++
++ buf = kzalloc(256, GFP_KERNEL);
++ if (!buf)
++  return 0;
++
++ /* Get the size of the page list first */
++ rc = hpsa_scsi_do_inquiry(h, scsi3addr,
++    VPD_PAGE | HPSA_VPD_SUPPORTED_PAGES,
++    buf, HPSA_VPD_HEADER_SZ);
++ if (rc != 0)
++  goto exit_unsupported;
++ pages = buf[3];
++ if ((pages + HPSA_VPD_HEADER_SZ) <= 255)
++  bufsize = pages + HPSA_VPD_HEADER_SZ;
++ else
++  bufsize = 255;
++
++ /* Get the whole VPD page list */
++ rc = hpsa_scsi_do_inquiry(h, scsi3addr,
++    VPD_PAGE | HPSA_VPD_SUPPORTED_PAGES,
++    buf, bufsize);
++ if (rc != 0)
++  goto exit_unsupported;
++
++ pages = buf[3];
++ for (i = 1; i <= pages; i++)
++  if (buf[3 + i] == page)
++   goto exit_supported;
++exit_unsupported:
++ kfree(buf);
++ return 0;
++exit_supported:
++ kfree(buf);
++ return 1;
++}
++
+ static void hpsa_get_ioaccel_status(struct ctlr_info *h,
+  unsigned char *scsi3addr, struct hpsa_scsi_dev_t *this_device)
+ {
+@@ -2095,6 +2138,8 @@ static void hpsa_get_ioaccel_status(struct ctlr_info *h,
+  buf = kzalloc(64, GFP_KERNEL);
+  if (!buf)
+   return;
++ if (!hpsa_vpd_page_supported(h, scsi3addr, HPSA_VPD_LV_IOACCEL_STATUS))
++  goto out;
+  rc = hpsa_scsi_do_inquiry(h, scsi3addr,
+    VPD_PAGE | HPSA_VPD_LV_IOACCEL_STATUS, buf, 64);
+  if (rc != 0)
+diff --git a/drivers/scsi/hpsa_cmd.h b/drivers/scsi/hpsa_cmd.h
+index e048167..769fd2a 100644
+--- a/drivers/scsi/hpsa_cmd.h
++++ b/drivers/scsi/hpsa_cmd.h
+@@ -144,8 +144,10 @@
+ #define CFGTBL_BusType_Fibre2G  0x00000200l
+ 
+ /* VPD Inquiry types */
++#define HPSA_VPD_SUPPORTED_PAGES        0x00
+ #define HPSA_VPD_LV_DEVICE_GEOMETRY     0xC1
+ #define HPSA_VPD_LV_IOACCEL_STATUS      0xC2
++#define HPSA_VPD_HEADER_SZ              4
+ 
+ struct vals32 {
+  u32   lower;
+-- 
+1.7.1

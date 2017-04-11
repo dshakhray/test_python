@@ -1,0 +1,75 @@
+From 4efb260b59f6cdd160eb938fe432026ce57b7ab3 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:37:10 -0400
+Subject: [virt] kvm/async_pf: mm->mm_users can not pin apf->mm
+
+Message-id: <1406040016-3289-36-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86114
+O-Subject: [RHEL7 PATCH v2 035/221] KVM: async_pf: mm->mm_users can not pin apf->mm
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Oleg Nesterov <oleg@redhat.com>
+
+get_user_pages(mm) is simply wrong if mm->mm_users == 0 and exit_mmap/etc
+was already called (or is in progress), mm->mm_count can only pin mm->pgd
+and mm_struct itself.
+
+Change kvm_setup_async_pf/async_pf_execute to inc/dec mm->mm_users.
+
+kvm_create_vm/kvm_destroy_vm play with ->mm_count too but this case looks
+fine at first glance, it seems that this ->mm is only used to verify that
+current->mm == kvm->mm.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 41c22f626254b9dc0376928cae009e73d1b6a49a)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/virt/kvm/async_pf.c b/virt/kvm/async_pf.c
+index 8631d9c..f2c80d5 100644
+--- a/virt/kvm/async_pf.c
++++ b/virt/kvm/async_pf.c
+@@ -85,7 +85,7 @@ static void async_pf_execute(struct work_struct *work)
+  if (waitqueue_active(&vcpu->wq))
+   wake_up_interruptible(&vcpu->wq);
+ 
+- mmdrop(mm);
++ mmput(mm);
+  kvm_put_kvm(vcpu->kvm);
+ }
+ 
+@@ -98,7 +98,7 @@ void kvm_clear_async_pf_completion_queue(struct kvm_vcpu *vcpu)
+        typeof(*work), queue);
+   list_del(&work->queue);
+   if (cancel_work_sync(&work->work)) {
+-   mmdrop(work->mm);
++   mmput(work->mm);
+    kvm_put_kvm(vcpu->kvm); /* == work->vcpu->kvm */
+    kmem_cache_free(async_pf_cache, work);
+   }
+@@ -162,7 +162,7 @@ int kvm_setup_async_pf(struct kvm_vcpu *vcpu, gva_t gva, gfn_t gfn,
+  work->addr = gfn_to_hva(vcpu->kvm, gfn);
+  work->arch = *arch;
+  work->mm = current->mm;
+- atomic_inc(&work->mm->mm_count);
++ atomic_inc(&work->mm->mm_users);
+  kvm_get_kvm(work->vcpu->kvm);
+ 
+  /* this can't really happen otherwise gfn_to_pfn_async
+@@ -180,7 +180,7 @@ int kvm_setup_async_pf(struct kvm_vcpu *vcpu, gva_t gva, gfn_t gfn,
+  return 1;
+ retry_sync:
+  kvm_put_kvm(work->vcpu->kvm);
+- mmdrop(work->mm);
++ mmput(work->mm);
+  kmem_cache_free(async_pf_cache, work);
+  return 0;
+ }
+-- 
+1.7.1

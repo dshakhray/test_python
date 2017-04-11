@@ -1,0 +1,87 @@
+From 76e0110f245e8e7434373696699dae5c60183f38 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:01 -0400
+Subject: [powerpc] Skip emulating & leave interrupts off for kernel program checks
+
+Message-id: <1410545655-205645-73-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94114
+O-Subject: [RHEL7 PATCH 072/626] powerpc: Skip emulating & leave interrupts off for kernel program checks
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit b3f6a45925232d29519007f1ba6687e1e790fb5d
+Author: Michael Ellerman <michael@ellerman.id.au>
+Date:   Thu Aug 15 15:22:19 2013 +1000
+
+    powerpc: Skip emulating & leave interrupts off for kernel program checks
+
+    In the program check handler we handle some causes with interrupts off
+    and others with interrupts on.
+
+    We need to enable interrupts to handle the emulation cases, because they
+    access userspace memory and might sleep.
+
+    For faults in the kernel we don't want to do any emulation, and
+    emulate_instruction() enforces that. do_mathemu() doesn't but probably
+    should.
+
+    The other disadvantage of enabling interrupts for kernel faults is that
+    we may take another interrupt, and recurse. As seen below:
+
+      --- Exception: e40 at c000000000004ee0 performance_monitor_relon_pSeries_1
+      [link register   ] c00000000000f858 .arch_local_irq_restore+0x38/0x90
+      [c000000fb185dc10] 0000000000000000 (unreliable)
+      [c000000fb185dc80] c0000000007d8558 .program_check_exception+0x298/0x2d0
+      [c000000fb185dd00] c000000000002f40 emulation_assist_common+0x140/0x180
+      --- Exception: e40 at c000000000004ee0 performance_monitor_relon_pSeries_1
+      [link register   ] c00000000000f858 .arch_local_irq_restore+0x38/0x90
+      [c000000fb185dff0] 00000000008b9190 (unreliable)
+      [c000000fb185e060] c0000000007d8558 .program_check_exception+0x298/0x2d0
+
+    So avoid both problems by checking if the fault was in the kernel and
+    skipping the enable of interrupts and the emulation. Go straight to
+    delivering the SIGILL, which for kernel faults calls die() and so on,
+    dropping us in the debugger etc.
+
+    Signed-off-by: Michael Ellerman <michael@ellerman.id.au>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/traps.c b/arch/powerpc/kernel/traps.c
+index 64a1073..2bdaffa 100644
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@ -1116,6 +1116,16 @@ void __kprobes program_check_exception(struct pt_regs *regs)
+  }
+ #endif
+ 
++ /*
++  * If we took the program check in the kernel skip down to sending a
++  * SIGILL. The subsequent cases all relate to emulating instructions
++  * which we should only do for userspace. We also do not want to enable
++  * interrupts for kernel faults because that might lead to further
++  * faults, and loose the context of the original exception.
++  */
++ if (!user_mode(regs))
++  goto sigill;
++
+  /* We restore the interrupt state now */
+  if (!arch_irq_disabled_regs(regs))
+   local_irq_enable();
+@@ -1159,6 +1169,7 @@ void __kprobes program_check_exception(struct pt_regs *regs)
+   }
+  }
+ 
++sigill:
+  if (reason & REASON_PRIVILEGED)
+   _exception(SIGILL, regs, ILL_PRVOPC, regs->nip);
+  else
+-- 
+1.7.1

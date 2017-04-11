@@ -1,0 +1,138 @@
+From f9f6d36a86d79e24d144eff045af2bd4b26b4290 Mon Sep 17 00:00:00 2001
+From: David Milburn <dmilburn@redhat.com>
+Date: Mon, 18 Aug 2014 19:58:39 -0400
+Subject: [block] nvme: Flush with data support
+
+Message-id: <1408391935-24886-7-git-send-email-dmilburn@redhat.com>
+Patchwork-id: 87881
+O-Subject: [RHEL7.1 PATCH BZ 1111259 6/22] NVMe: Flush with data support
+Bugzilla: 1111259
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+commit 53562be74bd06bbe74d2acf3caca5398f8eeb160
+Author: Keith Busch <keith.busch@intel.com>
+Date:   Tue Apr 29 11:41:29 2014 -0600
+
+    NVMe: Flush with data support
+
+    It is possible a filesystem may send a flush flagged bio with write
+    data. There is no such composite NVMe command, so the driver sends flush
+    and write separately.
+
+    The device is allowed to execute these commands in any order, so it was
+    possible the driver ends the bio after the write completes, but while the
+    flush is still active. We don't want to let a filesystem believe flush
+    succeeded before it really has; this could cause data corruption on a
+    power loss between these events. To fix, this patch splits the flush
+    and write into chained bios.
+
+    Signed-off-by: Keith Busch <keith.busch@intel.com>
+    Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+
+RHEL: nvme_split_flush_data uses nvme_bio_split since RHEL7 doesn't
+include upstream 20d0189b1012a37d2533a87fb451f7852f2418d1 bio_split
+code.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/nvme-core.c b/drivers/block/nvme-core.c
+index 88d859d..8307982 100644
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@ -197,16 +197,13 @@ static int alloc_cmdid_killable(struct nvme_queue *nvmeq, void *ctx,
+ #define CMD_CTX_CANCELLED (0x30C + CMD_CTX_BASE)
+ #define CMD_CTX_COMPLETED (0x310 + CMD_CTX_BASE)
+ #define CMD_CTX_INVALID  (0x314 + CMD_CTX_BASE)
+-#define CMD_CTX_FLUSH  (0x318 + CMD_CTX_BASE)
+-#define CMD_CTX_ABORT  (0x31C + CMD_CTX_BASE)
++#define CMD_CTX_ABORT  (0x318 + CMD_CTX_BASE)
+ 
+ static void special_completion(struct nvme_queue *nvmeq, void *ctx,
+       struct nvme_completion *cqe)
+ {
+  if (ctx == CMD_CTX_CANCELLED)
+   return;
+- if (ctx == CMD_CTX_FLUSH)
+-  return;
+  if (ctx == CMD_CTX_ABORT) {
+   ++nvmeq->dev->abort_limit;
+   return;
+@@ -712,16 +709,6 @@ static int nvme_submit_flush(struct nvme_queue *nvmeq, struct nvme_ns *ns,
+  return 0;
+ }
+ 
+-int nvme_submit_flush_data(struct nvme_queue *nvmeq, struct nvme_ns *ns)
+-{
+- int cmdid = alloc_cmdid(nvmeq, (void *)CMD_CTX_FLUSH,
+-     special_completion, NVME_IO_TIMEOUT);
+- if (unlikely(cmdid < 0))
+-  return cmdid;
+-
+- return nvme_submit_flush(nvmeq, ns, cmdid);
+-}
+-
+ static int nvme_submit_iod(struct nvme_queue *nvmeq, struct nvme_iod *iod)
+ {
+  struct bio *bio = iod->private;
+@@ -737,7 +724,7 @@ static int nvme_submit_iod(struct nvme_queue *nvmeq, struct nvme_iod *iod)
+ 
+  if (bio->bi_rw & REQ_DISCARD)
+   return nvme_submit_discard(nvmeq, ns, bio, iod, cmdid);
+- if ((bio->bi_rw & REQ_FLUSH) && !iod->nents)
++ if (bio->bi_rw & REQ_FLUSH)
+   return nvme_submit_flush(nvmeq, ns, cmdid);
+ 
+  control = 0;
+@@ -772,6 +759,23 @@ static int nvme_submit_iod(struct nvme_queue *nvmeq, struct nvme_iod *iod)
+ 
+ }
+ 
++static int nvme_split_flush_data(struct nvme_queue *nvmeq, struct bio *bio)
++{
++ struct nvme_bio_pair *bp = nvme_bio_split(bio, 0, 0, 0);
++ if (!bp)
++  return -ENOMEM;
++
++ bp->b1.bi_rw &= ~REQ_FLUSH;
++
++ if (!waitqueue_active(&nvmeq->sq_full))
++  add_wait_queue(&nvmeq->sq_full, &nvmeq->sq_cong_wait);
++ bio_list_add(&nvmeq->sq_cong, &bp->b1);
++ bio_list_add(&nvmeq->sq_cong, &bp->b2);
++ wake_up(&nvmeq->sq_full);
++
++ return 0;
++}
++
+ /*
+  * Called with local interrupts disabled and the q_lock held.  May not sleep.
+  */
+@@ -782,11 +786,8 @@ static int nvme_submit_bio_queue(struct nvme_queue *nvmeq, struct nvme_ns *ns,
+  int psegs = bio_phys_segments(ns->queue, bio);
+  int result;
+ 
+- if ((bio->bi_rw & REQ_FLUSH) && psegs) {
+-  result = nvme_submit_flush_data(nvmeq, ns);
+-  if (result)
+-   return result;
+- }
++ if ((bio->bi_rw & REQ_FLUSH) && psegs)
++  return nvme_split_flush_data(nvmeq, bio);
+ 
+  iod = nvme_alloc_iod(psegs, bio->bi_size, GFP_ATOMIC);
+  if (!iod)
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index aa135f7..3ae4391 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -155,7 +155,6 @@ struct nvme_iod *nvme_map_user_pages(struct nvme_dev *dev, int write,
+ void nvme_unmap_user_pages(struct nvme_dev *dev, int write,
+    struct nvme_iod *iod);
+ int nvme_submit_io_cmd(struct nvme_dev *, struct nvme_command *, u32 *);
+-int nvme_submit_flush_data(struct nvme_queue *nvmeq, struct nvme_ns *ns);
+ int nvme_submit_admin_cmd(struct nvme_dev *, struct nvme_command *,
+        u32 *result);
+ int nvme_identify(struct nvme_dev *, unsigned nsid, unsigned cns,
+-- 
+1.7.1

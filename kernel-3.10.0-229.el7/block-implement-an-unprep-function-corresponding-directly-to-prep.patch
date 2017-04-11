@@ -1,0 +1,122 @@
+From 33caf2a0fee365b544f06e584ab87dbf7b984c09 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:37:00 -0400
+Subject: [block] implement an unprep function corresponding directly to prep
+
+Message-id: <1402670238-13916-133-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83844
+O-Subject: [RHEL7.1 PATCH 132/150] block: implement an unprep function corresponding directly to prep
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+
+BZ: 1105204
+
+XXX: RHEL7 already had blk_unprep_request
+
+Upstream commit 28018c242a4ec7017bbbf81d2d3952f820a27118
+Author: James Bottomley <James.Bottomley@suse.de>
+Date:   Thu Jul 1 19:49:17 2010 +0900
+
+    block: implement an unprep function corresponding directly to prep
+
+    Reviewed-by: FUJITA Tomonori <fujita.tomonori@lab.ntt.co.jp>
+
+    Signed-off-by: Jens Axboe <jaxboe@fusionio.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 1410958..453faf3 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -714,6 +714,7 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
+ 
+  q->request_fn  = rfn;
+  q->prep_rq_fn  = NULL;
++ q->unprep_rq_fn  = NULL;
+  q->queue_flags  |= QUEUE_FLAG_DEFAULT;
+ 
+  /* Override internal queue lock with supplied lock pointer */
+@@ -2540,12 +2541,18 @@ static bool blk_update_bidi_request(struct request *rq, int error,
+  * @req: the request
+  *
+  * This function makes a request ready for complete resubmission (or
+- * completion).  It happens only after all error handling is complete.
+- * The queue lock is held when calling this.
++ * completion).  It happens only after all error handling is complete,
++ * so represents the appropriate moment to deallocate any resources
++ * that were allocated to the request in the prep_rq_fn.  The queue
++ * lock is held when calling this.
+  */
+ void blk_unprep_request(struct request *req)
+ {
++ struct request_queue *q = req->q;
++
+  req->cmd_flags &= ~REQ_DONTPREP;
++ if (q->unprep_rq_fn)
++  q->unprep_rq_fn(q, req);
+ }
+ EXPORT_SYMBOL_GPL(blk_unprep_request);
+ 
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index 8f39914..b928e68 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -37,6 +37,23 @@ void blk_queue_prep_rq(struct request_queue *q, prep_rq_fn *pfn)
+ EXPORT_SYMBOL(blk_queue_prep_rq);
+ 
+ /**
++ * blk_queue_unprep_rq - set an unprepare_request function for queue
++ * @q:  queue
++ * @ufn: unprepare_request function
++ *
++ * It's possible for a queue to register an unprepare_request callback
++ * which is invoked before the request is finally completed. The goal
++ * of the function is to deallocate any data that was allocated in the
++ * prepare_request callback.
++ *
++ */
++void blk_queue_unprep_rq(struct request_queue *q, unprep_rq_fn *ufn)
++{
++ q->unprep_rq_fn = ufn;
++}
++EXPORT_SYMBOL(blk_queue_unprep_rq);
++
++/**
+  * blk_queue_merge_bvec - set a merge_bvec function for queue
+  * @q:  queue
+  * @mbfn: merge_bvec_fn
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 549fe54..49f4bf0 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -251,6 +251,7 @@ struct blk_queue_ctx;
+ typedef void (request_fn_proc) (struct request_queue *q);
+ typedef void (make_request_fn) (struct request_queue *q, struct bio *bio);
+ typedef int (prep_rq_fn) (struct request_queue *, struct request *);
++typedef void (unprep_rq_fn) (struct request_queue *, struct request *);
+ 
+ struct bio_vec;
+ struct bvec_merge_data {
+@@ -522,6 +523,8 @@ struct request_queue {
+  struct list_head all_q_node;
+ 
+ #ifndef __GENKSYMS__
++ unprep_rq_fn  *unprep_rq_fn;
++
+  struct blk_mq_tag_set *tag_set;
+  struct list_head tag_set_list;
+ 
+@@ -1078,6 +1081,7 @@ extern int blk_queue_dma_drain(struct request_queue *q,
+ extern void blk_queue_lld_busy(struct request_queue *q, lld_busy_fn *fn);
+ extern void blk_queue_segment_boundary(struct request_queue *, unsigned long);
+ extern void blk_queue_prep_rq(struct request_queue *, prep_rq_fn *pfn);
++extern void blk_queue_unprep_rq(struct request_queue *, unprep_rq_fn *ufn);
+ extern void blk_queue_merge_bvec(struct request_queue *, merge_bvec_fn *);
+ extern void blk_queue_dma_alignment(struct request_queue *, int);
+ extern void blk_queue_update_dma_alignment(struct request_queue *, int);
+-- 
+1.7.1

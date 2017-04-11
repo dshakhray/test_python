@@ -1,0 +1,323 @@
+From 766ffb829af1983254cda3505479db489648309b Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Mon, 16 Jun 2014 12:51:36 -0400
+Subject: [s390] sclp: add parameter to specify number of buffer pages
+
+Message-id: <1402923096-1618-1-git-send-email-brueckner@redhat.com>
+Patchwork-id: 84025
+O-Subject: [RHEL7.1 PATCH] [s390] s390/sclp: add parameter to specify number of buffer pages
+Bugzilla: 1103744
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Description
+-----------
+commit 25b41a7b67ee4f4d12cee8a4b8b5929e36c27e29
+Author: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Date:   Fri May 24 12:30:03 2013 +0200
+
+    s390/sclp: add parameter to specify number of buffer pages
+
+    Add a kernel parameter to be able to specify the number of pages to be
+    used as output buffer by the line-mode sclp driver and the vt220 sclp
+    driver. The current number of output pages is 6, if the service element
+    is unavailable the boot messages alone can fill up the output buffer.
+    If this happens the system blocks until the service element is working
+    again. For a large LPAR with many devices it is sensible to have the
+    ability to increase the output buffer size. To help to debug this
+    situation add a counter for the page-pool-empty situation and make it
+    available as a sclp driver attribute.
+    To avoid the system to stall until the service element works again
+    add another kernel parameter to allow to drop output buffers.
+
+    Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+Bugzilla
+--------
+BZ 1103744
+https://bugzilla.redhat.com/show_bug.cgi?id=1103744
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version v3.11-rc1
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=25b41a7b67ee4f4d12cee8a4b8b5929e36c27e29
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7572070
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/s390/char/sclp.c b/drivers/s390/char/sclp.c
+index 2df1aac..d5b6ef0 100644
+--- a/drivers/s390/char/sclp.c
++++ b/drivers/s390/char/sclp.c
+@@ -50,11 +50,42 @@ static char sclp_init_sccb[PAGE_SIZE] __attribute__((__aligned__(PAGE_SIZE)));
+ /* Suspend request */
+ static DECLARE_COMPLETION(sclp_request_queue_flushed);
+ 
++/* Number of console pages to allocate, used by sclp_con.c and sclp_vt220.c */
++int sclp_console_pages = SCLP_CONSOLE_PAGES;
++/* Flag to indicate if buffer pages are dropped on buffer full condition */
++int sclp_console_drop = 0;
++/* Number of times the console dropped buffer pages */
++unsigned long sclp_console_full;
++
+ static void sclp_suspend_req_cb(struct sclp_req *req, void *data)
+ {
+  complete(&sclp_request_queue_flushed);
+ }
+ 
++static int __init sclp_setup_console_pages(char *str)
++{
++ int pages, rc;
++
++ rc = kstrtoint(str, 0, &pages);
++ if (!rc && pages >= SCLP_CONSOLE_PAGES)
++  sclp_console_pages = pages;
++ return 1;
++}
++
++__setup("sclp_con_pages=", sclp_setup_console_pages);
++
++static int __init sclp_setup_console_drop(char *str)
++{
++ int drop, rc;
++
++ rc = kstrtoint(str, 0, &drop);
++ if (!rc && drop)
++  sclp_console_drop = 1;
++ return 1;
++}
++
++__setup("sclp_con_drop=", sclp_setup_console_drop);
++
+ static struct sclp_req sclp_suspend_req;
+ 
+ /* Timer for request retries. */
+@@ -1018,11 +1049,47 @@ static const struct dev_pm_ops sclp_pm_ops = {
+  .restore = sclp_restore,
+ };
+ 
++static ssize_t sclp_show_console_pages(struct device_driver *dev, char *buf)
++{
++ return sprintf(buf, "%i\n", sclp_console_pages);
++}
++
++static DRIVER_ATTR(con_pages, S_IRUSR, sclp_show_console_pages, NULL);
++
++static ssize_t sclp_show_con_drop(struct device_driver *dev, char *buf)
++{
++ return sprintf(buf, "%i\n", sclp_console_drop);
++}
++
++static DRIVER_ATTR(con_drop, S_IRUSR, sclp_show_con_drop, NULL);
++
++static ssize_t sclp_show_console_full(struct device_driver *dev, char *buf)
++{
++ return sprintf(buf, "%lu\n", sclp_console_full);
++}
++
++static DRIVER_ATTR(con_full, S_IRUSR, sclp_show_console_full, NULL);
++
++static struct attribute *sclp_drv_attrs[] = {
++ &driver_attr_con_pages.attr,
++ &driver_attr_con_drop.attr,
++ &driver_attr_con_full.attr,
++ NULL,
++};
++static struct attribute_group sclp_drv_attr_group = {
++ .attrs = sclp_drv_attrs,
++};
++static const struct attribute_group *sclp_drv_attr_groups[] = {
++ &sclp_drv_attr_group,
++ NULL,
++};
++
+ static struct platform_driver sclp_pdrv = {
+  .driver = {
+   .name = "sclp",
+   .owner = THIS_MODULE,
+   .pm = &sclp_pm_ops,
++  .groups = sclp_drv_attr_groups,
+  },
+ };
+ 
+@@ -1101,10 +1168,12 @@ static __init int sclp_initcall(void)
+  rc = platform_driver_register(&sclp_pdrv);
+  if (rc)
+   return rc;
++
+  sclp_pdev = platform_device_register_simple("sclp", -1, NULL, 0);
+  rc = IS_ERR(sclp_pdev) ? PTR_ERR(sclp_pdev) : 0;
+  if (rc)
+   goto fail_platform_driver_unregister;
++
+  rc = atomic_notifier_chain_register(&panic_notifier_list,
+          &sclp_on_panic_nb);
+  if (rc)
+diff --git a/drivers/s390/char/sclp.h b/drivers/s390/char/sclp.h
+index a071559..40d1406 100644
+--- a/drivers/s390/char/sclp.h
++++ b/drivers/s390/char/sclp.h
+@@ -15,7 +15,7 @@
+ 
+ /* maximum number of pages concerning our own memory management */
+ #define MAX_KMEM_PAGES (sizeof(unsigned long) << 3)
+-#define MAX_CONSOLE_PAGES 6
++#define SCLP_CONSOLE_PAGES 6
+ 
+ #define EVTYP_OPCMD  0x01
+ #define EVTYP_MSG  0x02
+@@ -176,6 +176,10 @@ int sclp_sync_request(sclp_cmdw_t command, void *sccb);
+ int sclp_sdias_init(void);
+ void sclp_sdias_exit(void);
+ 
++extern int sclp_console_pages;
++extern int sclp_console_drop;
++extern unsigned long sclp_console_full;
++
+ /* useful inlines */
+ 
+ /* VM uses EBCDIC 037, LPAR+native(SE+HMC) use EBCDIC 500 */
+diff --git a/drivers/s390/char/sclp_con.c b/drivers/s390/char/sclp_con.c
+index ecf45c5..5880def 100644
+--- a/drivers/s390/char/sclp_con.c
++++ b/drivers/s390/char/sclp_con.c
+@@ -130,6 +130,31 @@ sclp_console_timeout(unsigned long data)
+ }
+ 
+ /*
++ * Drop oldest console buffer if sclp_con_drop is set
++ */
++static int
++sclp_console_drop_buffer(void)
++{
++ struct list_head *list;
++ struct sclp_buffer *buffer;
++ void *page;
++
++ if (!sclp_console_drop)
++  return 0;
++ list = sclp_con_outqueue.next;
++ if (sclp_con_queue_running)
++  /* The first element is in I/O */
++  list = list->next;
++ if (list == &sclp_con_outqueue)
++  return 0;
++ list_del(list);
++ buffer = list_entry(list, struct sclp_buffer, list);
++ page = sclp_unmake_buffer(buffer);
++ list_add_tail((struct list_head *) page, &sclp_con_pages);
++ return 1;
++}
++
++/*
+  * Writes the given message to S390 system console
+  */
+ static void
+@@ -150,9 +175,13 @@ sclp_console_write(struct console *console, const char *message,
+  do {
+   /* make sure we have a console output buffer */
+   if (sclp_conbuf == NULL) {
++   if (list_empty(&sclp_con_pages))
++    sclp_console_full++;
+    while (list_empty(&sclp_con_pages)) {
+     if (sclp_con_suspended)
+      goto out;
++    if (sclp_console_drop_buffer())
++     break;
+     spin_unlock_irqrestore(&sclp_con_lock, flags);
+     sclp_sync_wait();
+     spin_lock_irqsave(&sclp_con_lock, flags);
+@@ -297,7 +326,7 @@ sclp_console_init(void)
+   return rc;
+  /* Allocate pages for output buffering */
+  INIT_LIST_HEAD(&sclp_con_pages);
+- for (i = 0; i < MAX_CONSOLE_PAGES; i++) {
++ for (i = 0; i < sclp_console_pages; i++) {
+   page = (void *) get_zeroed_page(GFP_KERNEL | GFP_DMA);
+   list_add_tail(page, &sclp_con_pages);
+  }
+diff --git a/drivers/s390/char/sclp_vt220.c b/drivers/s390/char/sclp_vt220.c
+index 5aaaa2e..4eed38c 100644
+--- a/drivers/s390/char/sclp_vt220.c
++++ b/drivers/s390/char/sclp_vt220.c
+@@ -362,6 +362,31 @@ sclp_vt220_timeout(unsigned long data)
+ 
+ #define BUFFER_MAX_DELAY HZ/20
+ 
++/*
++ * Drop oldest console buffer if sclp_con_drop is set
++ */
++static int
++sclp_vt220_drop_buffer(void)
++{
++ struct list_head *list;
++ struct sclp_vt220_request *request;
++ void *page;
++
++ if (!sclp_console_drop)
++  return 0;
++ list = sclp_vt220_outqueue.next;
++ if (sclp_vt220_queue_running)
++  /* The first element is in I/O */
++  list = list->next;
++ if (list == &sclp_vt220_outqueue)
++  return 0;
++ list_del(list);
++ request = list_entry(list, struct sclp_vt220_request, list);
++ page = request->sclp_req.sccb;
++ list_add_tail((struct list_head *) page, &sclp_vt220_empty);
++ return 1;
++}
++
+ /* 
+  * Internal implementation of the write function. Write COUNT bytes of data
+  * from memory at BUF
+@@ -390,12 +415,16 @@ __sclp_vt220_write(const unsigned char *buf, int count, int do_schedule,
+  do {
+   /* Create an sclp output buffer if none exists yet */
+   if (sclp_vt220_current_request == NULL) {
++   if (list_empty(&sclp_vt220_empty))
++    sclp_console_full++;
+    while (list_empty(&sclp_vt220_empty)) {
+-    spin_unlock_irqrestore(&sclp_vt220_lock, flags);
+     if (may_fail || sclp_vt220_suspended)
+      goto out;
+-    else
+-     sclp_sync_wait();
++    if (sclp_vt220_drop_buffer())
++     break;
++    spin_unlock_irqrestore(&sclp_vt220_lock, flags);
++
++    sclp_sync_wait();
+     spin_lock_irqsave(&sclp_vt220_lock, flags);
+    }
+    page = (void *) sclp_vt220_empty.next;
+@@ -428,8 +457,8 @@ __sclp_vt220_write(const unsigned char *buf, int count, int do_schedule,
+   sclp_vt220_timer.expires = jiffies + BUFFER_MAX_DELAY;
+   add_timer(&sclp_vt220_timer);
+  }
+- spin_unlock_irqrestore(&sclp_vt220_lock, flags);
+ out:
++ spin_unlock_irqrestore(&sclp_vt220_lock, flags);
+  return overall_written;
+ }
+ 
+@@ -803,7 +832,7 @@ sclp_vt220_con_init(void)
+ 
+  if (!CONSOLE_IS_SCLP)
+   return 0;
+- rc = __sclp_vt220_init(MAX_CONSOLE_PAGES);
++ rc = __sclp_vt220_init(sclp_console_pages);
+  if (rc)
+   return rc;
+  /* Attach linux console */
+-- 
+1.7.1

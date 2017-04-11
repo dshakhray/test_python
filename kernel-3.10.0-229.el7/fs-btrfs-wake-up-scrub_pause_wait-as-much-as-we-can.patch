@@ -1,0 +1,70 @@
+From ebe4ced8816abe6b37dab8af632a17b411a2c32a Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:01:37 -0400
+Subject: [fs] btrfs: wake up @scrub_pause_wait as much as we can
+
+Message-id: <1407179109-13714-211-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87137
+O-Subject: [RHEL7.1 PATCH 210/422] Btrfs: wake up @scrub_pause_wait as much as we can
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+
+commit 32a447896c7b4c5cf5502a3ca7f5ef57d498fb03
+Author: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+Date:   Wed Feb 19 19:24:19 2014 +0800
+
+    Btrfs: wake up @scrub_pause_wait as much as we can
+
+    check if @scrubs_running=@scrubs_paused condition inside wait_event()
+    is not an atomic operation which means we may inc/dec @scrub_running/
+    paused at any time. Let's wake up @scrub_pause_wait as much as we can
+    to let commit transaction blocked less.
+
+    An example below:
+
+    Thread1    Thread2
+    |->scrub_blocked_if_needed() |->scrub_pending_trans_workers_inc
+      |->increase @scrub_paused
+                                           |->increase @scrub_running
+      |->wake up scrub_pause_wait list
+                                           |->scrub blocked
+                                           |->increase @scrub_paused
+
+    Thread3 is commiting transaction which is blocked at btrfs_scrub_pause().
+    So after Thread2 increase @scrub_paused, we meet the condition
+    @scrub_paused=@scrub_running, but transaction will be still blocked until
+    another calling to wake up @scrub_pause_wait.
+
+    Signed-off-by: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+    Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+index f2f8803..682ec3f 100644
+--- a/fs/btrfs/scrub.c
++++ b/fs/btrfs/scrub.c
+@@ -315,6 +315,16 @@ static void scrub_pending_trans_workers_inc(struct scrub_ctx *sctx)
+  atomic_inc(&fs_info->scrubs_running);
+  atomic_inc(&fs_info->scrubs_paused);
+  mutex_unlock(&fs_info->scrub_lock);
++
++ /*
++  * check if @scrubs_running=@scrubs_paused condition
++  * inside wait_event() is not an atomic operation.
++  * which means we may inc/dec @scrub_running/paused
++  * at any time. Let's wake up @scrub_pause_wait as
++  * much as we can to let commit transaction blocked less.
++  */
++ wake_up(&fs_info->scrub_pause_wait);
++
+  atomic_inc(&sctx->workers_pending);
+ }
+ 
+-- 
+1.7.1

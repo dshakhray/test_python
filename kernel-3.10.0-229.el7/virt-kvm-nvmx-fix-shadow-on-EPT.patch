@@ -1,0 +1,98 @@
+From d83970379fffdc6a7a178974de9ee4b5a3cb8bce Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:37:55 -0400
+Subject: [virt] kvm/nvmx: fix shadow on EPT
+
+Message-id: <1406040016-3289-81-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86159
+O-Subject: [RHEL7 PATCH v2 080/221] KVM: nVMX: fix shadow on EPT
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Gleb Natapov <gleb@redhat.com>
+
+72f857950f6f19 broke shadow on EPT. This patch reverts it and fixes PAE
+on nEPT (which reverted commit fixed) in other way.
+
+Shadow on EPT is now broken because while L1 builds shadow page table
+for L2 (which is PAE while L2 is in real mode) it never loads L2's
+GUEST_PDPTR[0-3].  They do not need to be loaded because without nested
+virtualization HW does this during guest entry if EPT is disabled,
+but in our case L0 emulates L2's vmentry while EPT is enables, so we
+cannot rely on vmcs12->guest_pdptr[0-3] to contain up-to-date values
+and need to re-read PDPTEs from L2 memory. This is what kvm_set_cr3()
+is doing, but by clearing cache bits during L2 vmentry we drop values
+that kvm_set_cr3() read from memory.
+
+So why the same code does not work for PAE on nEPT? kvm_set_cr3()
+reads pdptes into vcpu->arch.walk_mmu->pdptrs[]. walk_mmu points to
+vcpu->arch.nested_mmu while nested guest is running, but ept_load_pdptrs()
+uses vcpu->arch.mmu which contain incorrect values. Fix that by using
+walk_mmu in ept_(load|save)_pdptrs.
+
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+Tested-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d0d538b9d1239ed6ed318a2304ba5a763f835089)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 708ecc3..2a1a9fc 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -3255,25 +3255,29 @@ static void vmx_decache_cr4_guest_bits(struct kvm_vcpu *vcpu)
+ 
+ static void ept_load_pdptrs(struct kvm_vcpu *vcpu)
+ {
++ struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
++
+  if (!test_bit(VCPU_EXREG_PDPTR,
+         (unsigned long *)&vcpu->arch.regs_dirty))
+   return;
+ 
+  if (is_paging(vcpu) && is_pae(vcpu) && !is_long_mode(vcpu)) {
+-  vmcs_write64(GUEST_PDPTR0, vcpu->arch.mmu.pdptrs[0]);
+-  vmcs_write64(GUEST_PDPTR1, vcpu->arch.mmu.pdptrs[1]);
+-  vmcs_write64(GUEST_PDPTR2, vcpu->arch.mmu.pdptrs[2]);
+-  vmcs_write64(GUEST_PDPTR3, vcpu->arch.mmu.pdptrs[3]);
++  vmcs_write64(GUEST_PDPTR0, mmu->pdptrs[0]);
++  vmcs_write64(GUEST_PDPTR1, mmu->pdptrs[1]);
++  vmcs_write64(GUEST_PDPTR2, mmu->pdptrs[2]);
++  vmcs_write64(GUEST_PDPTR3, mmu->pdptrs[3]);
+  }
+ }
+ 
+ static void ept_save_pdptrs(struct kvm_vcpu *vcpu)
+ {
++ struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
++
+  if (is_paging(vcpu) && is_pae(vcpu) && !is_long_mode(vcpu)) {
+-  vcpu->arch.mmu.pdptrs[0] = vmcs_read64(GUEST_PDPTR0);
+-  vcpu->arch.mmu.pdptrs[1] = vmcs_read64(GUEST_PDPTR1);
+-  vcpu->arch.mmu.pdptrs[2] = vmcs_read64(GUEST_PDPTR2);
+-  vcpu->arch.mmu.pdptrs[3] = vmcs_read64(GUEST_PDPTR3);
++  mmu->pdptrs[0] = vmcs_read64(GUEST_PDPTR0);
++  mmu->pdptrs[1] = vmcs_read64(GUEST_PDPTR1);
++  mmu->pdptrs[2] = vmcs_read64(GUEST_PDPTR2);
++  mmu->pdptrs[3] = vmcs_read64(GUEST_PDPTR3);
+  }
+ 
+  __set_bit(VCPU_EXREG_PDPTR,
+@@ -7776,10 +7780,6 @@ static void prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+   vmcs_write64(GUEST_PDPTR1, vmcs12->guest_pdptr1);
+   vmcs_write64(GUEST_PDPTR2, vmcs12->guest_pdptr2);
+   vmcs_write64(GUEST_PDPTR3, vmcs12->guest_pdptr3);
+-  __clear_bit(VCPU_EXREG_PDPTR,
+-    (unsigned long *)&vcpu->arch.regs_avail);
+-  __clear_bit(VCPU_EXREG_PDPTR,
+-    (unsigned long *)&vcpu->arch.regs_dirty);
+  }
+ 
+  kvm_register_write(vcpu, VCPU_REGS_RSP, vmcs12->guest_rsp);
+-- 
+1.7.1

@@ -1,0 +1,112 @@
+From 582072f33936fc0104d64540354db7572c931eb3 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:07:41 -0400
+Subject: [kernel] cpu_hotplug, perf: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-5-git-send-email-prarit@redhat.com>
+Patchwork-id: 85759
+O-Subject: [RHEL7.1 PATCH BZ 1119078 04/35] CPU hotplug, perf: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Jiri Olsa <jolsa@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit f0bdb5e0c72b7347c867da539367138ad95c6b24
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:04:39 2014 +0530
+
+    CPU hotplug, perf: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the perf subsystem's hotplug notifier by using this latter form of
+    callback registration.
+
+    Also provide a bare-bones version of perf_cpu_notifier() that doesn't
+    invoke the notifiers for the already online CPUs. This would be useful
+    for subsystems that need to perform a different set of initialization
+    for the already online CPUs, or don't need the initialization altogether.
+
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Cc: Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Don Zickus <dzickus@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Cc: Kyle McMartin <kmcmarti@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 945612c..144b455 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -827,6 +827,8 @@ do {         \
+   { .notifier_call = fn, .priority = CPU_PRI_PERF }; \
+  unsigned long cpu = smp_processor_id();    \
+  unsigned long flags;      \
++         \
++ cpu_notifier_register_begin();     \
+  fn(&fn##_nb, (unsigned long)CPU_UP_PREPARE,   \
+   (void *)(unsigned long)cpu);    \
+  local_irq_save(flags);      \
+@@ -835,9 +837,21 @@ do {         \
+  local_irq_restore(flags);     \
+  fn(&fn##_nb, (unsigned long)CPU_ONLINE,    \
+   (void *)(unsigned long)cpu);    \
+- register_cpu_notifier(&fn##_nb);    \
++ __register_cpu_notifier(&fn##_nb);    \
++ cpu_notifier_register_done();     \
+ } while (0)
+ 
++/*
++ * Bare-bones version of perf_cpu_notifier(), which doesn't invoke the
++ * callback for already online CPUs.
++ */
++#define __perf_cpu_notifier(fn)      \
++do {         \
++ static struct notifier_block fn##_nb =    \
++  { .notifier_call = fn, .priority = CPU_PRI_PERF }; \
++         \
++ __register_cpu_notifier(&fn##_nb);    \
++} while (0)
+ 
+ struct perf_pmu_events_attr {
+  struct device_attribute attr;
+-- 
+1.7.1

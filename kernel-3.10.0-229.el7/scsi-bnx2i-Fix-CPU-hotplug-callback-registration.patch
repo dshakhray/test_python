@@ -1,0 +1,108 @@
+From 7baaf2cb496bc1c623ff24ed8e7bb59c3b5c69c5 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:08:00 -0400
+Subject: [scsi] bnx2i: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-24-git-send-email-prarit@redhat.com>
+Patchwork-id: 85775
+O-Subject: [RHEL7.1 PATCH BZ 1119078 23/35] scsi, bnx2i: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit bc0003c93f0e68b5383fb36579f7efa267b7dc16
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:09:39 2014 +0530
+
+    scsi, bnx2i: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the bnx2i code in scsi by using this latter form of callback registration.
+
+    Cc: Eddie Wai <eddie.wai@broadcom.com>
+    Cc: "James E.J. Bottomley" <JBottomley@parallels.com>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Maurizio Lombardi <mlombard@redhat.com>
+Cc: David Milburn <dmilburn@redhat.com>
+Cc: Doug Ledford <dledford@redhat.com>
+Cc: Michal Schmidt <mschmidt@redhat.com>
+Cc: Tomas Henzl <thenzl@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/bnx2i/bnx2i_init.c b/drivers/scsi/bnx2i/bnx2i_init.c
+index 34c294b..80c03b4 100644
+--- a/drivers/scsi/bnx2i/bnx2i_init.c
++++ b/drivers/scsi/bnx2i/bnx2i_init.c
+@@ -537,11 +537,15 @@ static int __init bnx2i_mod_init(void)
+   p->iothread = NULL;
+  }
+ 
++ cpu_notifier_register_begin();
++
+  for_each_online_cpu(cpu)
+   bnx2i_percpu_thread_create(cpu);
+ 
+  /* Initialize per CPU interrupt thread */
+- register_hotcpu_notifier(&bnx2i_cpu_notifier);
++ __register_hotcpu_notifier(&bnx2i_cpu_notifier);
++
++ cpu_notifier_register_done();
+ 
+  return 0;
+ 
+@@ -581,11 +585,15 @@ static void __exit bnx2i_mod_exit(void)
+  }
+  mutex_unlock(&bnx2i_dev_lock);
+ 
+- unregister_hotcpu_notifier(&bnx2i_cpu_notifier);
++ cpu_notifier_register_begin();
+ 
+  for_each_online_cpu(cpu)
+   bnx2i_percpu_thread_destroy(cpu);
+ 
++ __unregister_hotcpu_notifier(&bnx2i_cpu_notifier);
++
++ cpu_notifier_register_done();
++
+  iscsi_unregister_transport(&bnx2i_iscsi_transport);
+  cnic_unregister_driver(CNIC_ULP_ISCSI);
+ }
+-- 
+1.7.1

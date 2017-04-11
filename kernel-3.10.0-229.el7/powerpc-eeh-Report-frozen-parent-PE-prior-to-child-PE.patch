@@ -1,0 +1,144 @@
+From 29437446bcd98b7a4cb06d5c9e7a7acff54ddebd Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:13:16 -0400
+Subject: [powerpc] eeh: Report frozen parent PE prior to child PE
+
+Message-id: <1410545655-205645-568-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94447
+O-Subject: [RHEL7 PATCH 567/626] powerpc/eeh: Report frozen parent PE prior to child PE
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 1ad7a72c5e57bc6a7a3190c580df14dc3642febf
+Author: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Date:   Mon May 5 09:29:03 2014 +1000
+
+    powerpc/eeh: Report frozen parent PE prior to child PE
+
+    When we have the corner case of frozen parent and child PE at the
+    same time, we have to handle the frozen parent PE prior to the
+    child. Without clearning the frozen state on parent PE, the child
+    PE can't be recovered successfully.
+
+    The patch searches the EEH PE hierarchy tree and returns the toppest
+    frozen PE to be handled. It ensures the frozen parent PE will be
+    handled prior to child PE.
+
+    Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index 3764fb7..a42c3f8 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -357,10 +357,11 @@ out:
+ int eeh_dev_check_failure(struct eeh_dev *edev)
+ {
+  int ret;
++ int active_flags = (EEH_STATE_MMIO_ACTIVE | EEH_STATE_DMA_ACTIVE);
+  unsigned long flags;
+  struct device_node *dn;
+  struct pci_dev *dev;
+- struct eeh_pe *pe;
++ struct eeh_pe *pe, *parent_pe;
+  int rc = 0;
+  const char *location;
+ 
+@@ -438,14 +439,34 @@ int eeh_dev_check_failure(struct eeh_dev *edev)
+   */
+  if ((ret < 0) ||
+      (ret == EEH_STATE_NOT_SUPPORT) ||
+-     (ret & (EEH_STATE_MMIO_ACTIVE | EEH_STATE_DMA_ACTIVE)) ==
+-     (EEH_STATE_MMIO_ACTIVE | EEH_STATE_DMA_ACTIVE)) {
++     ((ret & active_flags) == active_flags)) {
+   eeh_stats.false_positives++;
+   pe->false_positives++;
+   rc = 0;
+   goto dn_unlock;
+  }
+ 
++ /*
++  * It should be corner case that the parent PE has been
++  * put into frozen state as well. We should take care
++  * that at first.
++  */
++ parent_pe = pe->parent;
++ while (parent_pe) {
++  /* Hit the ceiling ? */
++  if (parent_pe->type & EEH_PE_PHB)
++   break;
++
++  /* Frozen parent PE ? */
++  ret = eeh_ops->get_state(parent_pe, NULL);
++  if (ret > 0 &&
++      (ret & active_flags) != active_flags)
++   pe = parent_pe;
++
++  /* Next parent level */
++  parent_pe = parent_pe->parent;
++ }
++
+  eeh_stats.slot_resets++;
+ 
+  /* Avoid repeated reports of this failure, including problems
+diff --git a/arch/powerpc/platforms/powernv/eeh-ioda.c b/arch/powerpc/platforms/powernv/eeh-ioda.c
+index e0d6a3a..68167cd 100644
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@ -705,11 +705,12 @@ static int ioda_eeh_next_error(struct eeh_pe **pe)
+ {
+  struct pci_controller *hose;
+  struct pnv_phb *phb;
+- struct eeh_pe *phb_pe;
++ struct eeh_pe *phb_pe, *parent_pe;
+  __be64 frozen_pe_no;
+  __be16 err_type, severity;
++ int active_flags = (EEH_STATE_MMIO_ACTIVE | EEH_STATE_DMA_ACTIVE);
+  long rc;
+- int ret = EEH_NEXT_ERR_NONE;
++ int state, ret = EEH_NEXT_ERR_NONE;
+ 
+  /*
+   * While running here, it's safe to purge the event queue.
+@@ -839,6 +840,31 @@ static int ioda_eeh_next_error(struct eeh_pe **pe)
+   }
+ 
+   /*
++   * We probably have the frozen parent PE out there and
++   * we need have to handle frozen parent PE firstly.
++   */
++  if (ret == EEH_NEXT_ERR_FROZEN_PE) {
++   parent_pe = (*pe)->parent;
++   while (parent_pe) {
++    /* Hit the ceiling ? */
++    if (parent_pe->type & EEH_PE_PHB)
++     break;
++
++    /* Frozen parent PE ? */
++    state = ioda_eeh_get_state(parent_pe);
++    if (state > 0 &&
++        (state & active_flags) != active_flags)
++     *pe = parent_pe;
++
++    /* Next parent level */
++    parent_pe = parent_pe->parent;
++   }
++
++   /* We possibly migrate to another PE */
++   eeh_pe_state_mark(*pe, EEH_PE_ISOLATED);
++  }
++
++  /*
+    * If we have no errors on the specific PHB or only
+    * informative error there, we continue poking it.
+    * Otherwise, we need actions to be taken by upper
+-- 
+1.7.1

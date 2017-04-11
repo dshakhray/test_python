@@ -1,0 +1,89 @@
+From 1771ca8e52c09c8a94181570964dd945cff31df5 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Mon, 23 Jun 2014 21:51:42 -0400
+Subject: [fs] nfsd: fix laundromat next-run-time calculation
+
+Message-id: <1403560314-32525-161-git-send-email-bfields@redhat.com>
+Patchwork-id: 84598
+O-Subject: [Patch RHEL7 160/172] nfsd: fix laundromat next-run-time calculation
+Bugzilla: 1111719
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jlayton@primarydata.com>
+
+The laundromat uses two variables to calculate when it should next run,
+but one is completely ignored at the end of the run. Merge the two and
+rename the variable to be more descriptive of what it does.
+
+Signed-off-by: Jeff Layton <jlayton@primarydata.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: a832e7ae8b4f71fc522089d83fd445693aa7dbc5
+Bugzilla: 1111719
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index d0a016a..01a0e43 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -3397,8 +3397,7 @@ nfs4_laundromat(struct nfsd_net *nn)
+  struct nfs4_delegation *dp;
+  struct list_head *pos, *next, reaplist;
+  time_t cutoff = get_seconds() - nn->nfsd4_lease;
+- time_t t, clientid_val = nn->nfsd4_lease;
+- time_t u, test_val = nn->nfsd4_lease;
++ time_t t, new_timeo = nn->nfsd4_lease;
+ 
+  nfs4_lock_state();
+ 
+@@ -3410,8 +3409,7 @@ nfs4_laundromat(struct nfsd_net *nn)
+   clp = list_entry(pos, struct nfs4_client, cl_lru);
+   if (time_after((unsigned long)clp->cl_time, (unsigned long)cutoff)) {
+    t = clp->cl_time - cutoff;
+-   if (clientid_val > t)
+-    clientid_val = t;
++   new_timeo = min(new_timeo, t);
+    break;
+   }
+   if (mark_client_expired_locked(clp)) {
+@@ -3434,9 +3432,8 @@ nfs4_laundromat(struct nfsd_net *nn)
+   if (net_generic(dp->dl_stid.sc_client->net, nfsd_net_id) != nn)
+    continue;
+   if (time_after((unsigned long)dp->dl_time, (unsigned long)cutoff)) {
+-   u = dp->dl_time - cutoff;
+-   if (test_val > u)
+-    test_val = u;
++   t = dp->dl_time - cutoff;
++   new_timeo = min(new_timeo, t);
+    break;
+   }
+   list_move(&dp->dl_recall_lru, &reaplist);
+@@ -3446,21 +3443,18 @@ nfs4_laundromat(struct nfsd_net *nn)
+   dp = list_entry (pos, struct nfs4_delegation, dl_recall_lru);
+   revoke_delegation(dp);
+  }
+- test_val = nn->nfsd4_lease;
+  list_for_each_safe(pos, next, &nn->close_lru) {
+   oo = container_of(pos, struct nfs4_openowner, oo_close_lru);
+   if (time_after((unsigned long)oo->oo_time, (unsigned long)cutoff)) {
+-   u = oo->oo_time - cutoff;
+-   if (test_val > u)
+-    test_val = u;
++   t = oo->oo_time - cutoff;
++   new_timeo = min(new_timeo, t);
+    break;
+   }
+   release_openowner(oo);
+  }
+- if (clientid_val < NFSD_LAUNDROMAT_MINTIMEOUT)
+-  clientid_val = NFSD_LAUNDROMAT_MINTIMEOUT;
++ new_timeo = max_t(time_t, new_timeo, NFSD_LAUNDROMAT_MINTIMEOUT);
+  nfs4_unlock_state();
+- return clientid_val;
++ return new_timeo;
+ }
+ 
+ static struct workqueue_struct *laundry_wq;
+-- 
+1.7.1

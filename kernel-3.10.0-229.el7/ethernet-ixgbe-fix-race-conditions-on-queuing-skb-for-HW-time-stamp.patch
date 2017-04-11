@@ -1,0 +1,86 @@
+From c6ffb2347b73039abae41b124b0bafa058aed561 Mon Sep 17 00:00:00 2001
+From: John Greene <jogreene@redhat.com>
+Date: Wed, 10 Sep 2014 18:29:03 -0400
+Subject: [ethernet] ixgbe: fix race conditions on queuing skb for HW time stamp
+
+Message-id: <1410373750-11341-44-git-send-email-jogreene@redhat.com>
+Patchwork-id: 93521
+O-Subject: [RHEL7.1 PATCH 43/50] ixgbe: fix race conditions on queuing skb for HW time stamp
+Bugzilla: 1091123
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+
+BZ: 1091123
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7919168
+Tested: In beaker. See BZ for details
+
+ixgbe has a single set of TX time stamping resources per NIC.
+Use a simple bit lock to avoid race conditions and leaking skbs
+when multiple TX rings try to claim time stamping.
+
+Signed-off-by: Jakub Kicinski <kubakici@wp.pl>
+Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 151b260c624d47b2c78b2f887e4f791c09c73c17)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+index a35601a..bd59d32 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -792,6 +792,7 @@ enum ixgbe_state_t {
+  __IXGBE_SERVICE_SCHED,
+  __IXGBE_IN_SFP_INIT,
+  __IXGBE_PTP_RUNNING,
++ __IXGBE_PTP_TX_IN_PROGRESS,
+ };
+ 
+ struct ixgbe_cb {
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index d67ff24..ef39325 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -6778,7 +6778,9 @@ netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
+   tx_flags |= IXGBE_TX_FLAGS_SW_VLAN;
+  }
+ 
+- if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)) {
++ if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP &&
++       !test_and_set_bit_lock(__IXGBE_PTP_TX_IN_PROGRESS,
++         &adapter->state))) {
+   skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+   tx_flags |= IXGBE_TX_FLAGS_TSTAMP;
+ 
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
+index 8b527d7..63515a6 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
+@@ -493,6 +493,7 @@ static void ixgbe_ptp_tx_hwtstamp(struct ixgbe_adapter *adapter)
+ 
+  dev_kfree_skb_any(adapter->ptp_tx_skb);
+  adapter->ptp_tx_skb = NULL;
++ clear_bit_unlock(__IXGBE_PTP_TX_IN_PROGRESS, &adapter->state);
+ }
+ 
+ /**
+@@ -515,6 +516,7 @@ static void ixgbe_ptp_tx_hwtstamp_work(struct work_struct *work)
+  if (timeout) {
+   dev_kfree_skb_any(adapter->ptp_tx_skb);
+   adapter->ptp_tx_skb = NULL;
++  clear_bit_unlock(__IXGBE_PTP_TX_IN_PROGRESS, &adapter->state);
+   e_warn(drv, "clearing Tx Timestamp hang");
+   return;
+  }
+@@ -925,6 +927,7 @@ void ixgbe_ptp_stop(struct ixgbe_adapter *adapter)
+  if (adapter->ptp_tx_skb) {
+   dev_kfree_skb_any(adapter->ptp_tx_skb);
+   adapter->ptp_tx_skb = NULL;
++  clear_bit_unlock(__IXGBE_PTP_TX_IN_PROGRESS, &adapter->state);
+  }
+ 
+  if (adapter->ptp_clock) {
+-- 
+1.7.1

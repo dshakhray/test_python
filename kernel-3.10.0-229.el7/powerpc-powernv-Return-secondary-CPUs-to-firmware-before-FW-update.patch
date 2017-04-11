@@ -1,0 +1,170 @@
+From e2a17537b53e12e269ffffde126f08c6f7f21618 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:12:21 -0400
+Subject: [powerpc] powernv: Return secondary CPUs to firmware before FW update
+
+Message-id: <1410545655-205645-513-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94434
+O-Subject: [RHEL7 PATCH 512/626] powerpc/powernv: Return secondary CPUs to firmware before FW update
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 2196c6f1ed66eef23df3b478cfe71661ae83726e
+Author: Vasant Hegde <hegdevasant@linux.vnet.ibm.com>
+Date:   Wed Apr 9 22:48:55 2014 +0530
+
+    powerpc/powernv: Return secondary CPUs to firmware before FW update
+
+    Firmware update on PowerNV platform takes several minutes. During
+    this time one CPU is stuck in FW and the kernel complains about "soft
+    lockups".
+
+    This patch returns all secondary CPUs to firmware before starting
+    firmware update process.
+
+    [ Reworked a bit and cleaned up -- BenH ]
+
+    Signed-off-by: Vasant Hegde <hegdevasant@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 66ad7a7..81720ff 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -916,6 +916,7 @@ extern void opal_get_rtc_time(struct rtc_time *tm);
+ extern unsigned long opal_get_boot_time(void);
+ extern void opal_nvram_init(void);
+ extern void opal_flash_init(void);
++extern void opal_flash_term_callback(void);
+ extern int opal_elog_init(void);
+ extern void opal_platform_dump_init(void);
+ extern void opal_sys_param_init(void);
+diff --git a/arch/powerpc/platforms/powernv/opal-flash.c b/arch/powerpc/platforms/powernv/opal-flash.c
+index 75b2264..1a98617 100644
+--- a/arch/powerpc/platforms/powernv/opal-flash.c
++++ b/arch/powerpc/platforms/powernv/opal-flash.c
+@@ -20,6 +20,7 @@
+ #include <linux/mm.h>
+ #include <linux/vmalloc.h>
+ #include <linux/pagemap.h>
++#include <linux/delay.h>
+ 
+ #include <asm/opal.h>
+ 
+@@ -290,11 +291,6 @@ static int opal_flash_update(int op)
+  /* First entry address */
+  addr = __pa(list);
+ 
+- pr_alert("FLASH: Image is %u bytes\n", image_data.size);
+- pr_alert("FLASH: Image update requested\n");
+- pr_alert("FLASH: Image will be updated during system reboot\n");
+- pr_alert("FLASH: This will take several minutes. Do not power off!\n");
+-
+ flash:
+  rc = opal_update_flash(addr);
+ 
+@@ -302,6 +298,47 @@ invalid_img:
+  return rc;
+ }
+ 
++/* Return CPUs to OPAL before starting FW update */
++static void flash_return_cpu(void *info)
++{
++ int cpu = smp_processor_id();
++
++ if (!cpu_online(cpu))
++  return;
++
++ /* Disable IRQ */
++ hard_irq_disable();
++
++ /* Return the CPU to OPAL */
++ opal_return_cpu();
++}
++
++/* This gets called just before system reboots */
++void opal_flash_term_callback(void)
++{
++ struct cpumask mask;
++
++ if (update_flash_data.status != FLASH_IMG_READY)
++  return;
++
++ pr_alert("FLASH: Flashing new firmware\n");
++ pr_alert("FLASH: Image is %u bytes\n", image_data.size);
++ pr_alert("FLASH: Performing flash and reboot/shutdown\n");
++ pr_alert("FLASH: This will take several minutes. Do not power off!\n");
++
++ /* Small delay to help getting the above message out */
++ msleep(500);
++
++ /* Return secondary CPUs to firmware */
++ cpumask_copy(&mask, cpu_online_mask);
++ cpumask_clear_cpu(smp_processor_id(), &mask);
++ if (!cpumask_empty(&mask))
++  smp_call_function_many(&mask,
++           flash_return_cpu, NULL, false);
++ /* Hard disable interrupts */
++ hard_irq_disable();
++}
++
+ /*
+  * Show candidate image status
+  */
+diff --git a/arch/powerpc/platforms/powernv/setup.c b/arch/powerpc/platforms/powernv/setup.c
+index f8c4b03..b6ed4ad 100644
+--- a/arch/powerpc/platforms/powernv/setup.c
++++ b/arch/powerpc/platforms/powernv/setup.c
+@@ -99,11 +99,32 @@ static void pnv_show_cpuinfo(struct seq_file *m)
+  of_node_put(root);
+ }
+ 
++static void pnv_prepare_going_down(void)
++{
++ /*
++  * Disable all notifiers from OPAL, we can't
++  * service interrupts anymore anyway
++  */
++ opal_notifier_disable();
++
++ /* Soft disable interrupts */
++ local_irq_disable();
++
++ /*
++  * Return secondary CPUs to firwmare if a flash update
++  * is pending otherwise we will get all sort of error
++  * messages about CPU being stuck etc.. This will also
++  * have the side effect of hard disabling interrupts so
++  * past this point, the kernel is effectively dead.
++  */
++ opal_flash_term_callback();
++}
++
+ static void  __noreturn pnv_restart(char *cmd)
+ {
+  long rc = OPAL_BUSY;
+ 
+- opal_notifier_disable();
++ pnv_prepare_going_down();
+ 
+  while (rc == OPAL_BUSY || rc == OPAL_BUSY_EVENT) {
+   rc = opal_cec_reboot();
+@@ -120,7 +141,7 @@ static void __noreturn pnv_power_off(void)
+ {
+  long rc = OPAL_BUSY;
+ 
+- opal_notifier_disable();
++ pnv_prepare_going_down();
+ 
+  while (rc == OPAL_BUSY || rc == OPAL_BUSY_EVENT) {
+   rc = opal_cec_power_down(0);
+-- 
+1.7.1

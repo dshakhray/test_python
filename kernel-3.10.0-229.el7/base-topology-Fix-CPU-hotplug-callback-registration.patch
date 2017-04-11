@@ -1,0 +1,92 @@
+From 3823ea397ea92ab430383f2d54d422b650a96544 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:08:03 -0400
+Subject: [base] topology: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-27-git-send-email-prarit@redhat.com>
+Patchwork-id: 85752
+O-Subject: [RHEL7.1 PATCH BZ 1119078 26/35] drivers/base/topology.c: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit e12b711196a158a475350ee67876a1e9e2601661
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:10:12 2014 +0530
+
+    drivers/base/topology.c: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the topology code by using this latter form of callback registration.
+
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/base/topology.c b/drivers/base/topology.c
+index 2f5919e..6209484 100644
+--- a/drivers/base/topology.c
++++ b/drivers/base/topology.c
+@@ -181,16 +181,20 @@ static int topology_cpu_callback(struct notifier_block *nfb,
+ static int topology_sysfs_init(void)
+ {
+  int cpu;
+- int rc;
++ int rc = 0;
++
++ cpu_notifier_register_begin();
+ 
+  for_each_online_cpu(cpu) {
+   rc = topology_add_dev(cpu);
+   if (rc)
+-   return rc;
++   goto out;
+  }
+- hotcpu_notifier(topology_cpu_callback, 0);
++ __hotcpu_notifier(topology_cpu_callback, 0);
+ 
+- return 0;
++out:
++ cpu_notifier_register_done();
++ return rc;
+ }
+ 
+ device_initcall(topology_sysfs_init);
+-- 
+1.7.1

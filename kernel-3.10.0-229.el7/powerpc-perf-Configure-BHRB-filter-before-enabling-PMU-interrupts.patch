@@ -1,0 +1,91 @@
+From 554073c9f6e6de320caf5a5323090f613dd64495 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:08:36 -0400
+Subject: [powerpc] perf: Configure BHRB filter before enabling PMU interrupts
+
+Message-id: <1410545655-205645-288-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94328
+O-Subject: [RHEL7 PATCH 287/626] powerpc/perf: Configure BHRB filter before enabling PMU interrupts
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit b4d6c06c8de81517320a9964b0c26e096aeadd7b
+Author: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Date:   Wed Dec 18 13:14:53 2013 +1100
+
+    powerpc/perf: Configure BHRB filter before enabling PMU interrupts
+
+    Right now the config_bhrb() PMU specific call happens after
+    write_mmcr0(), which actually enables the PMU for event counting and
+    interrupts. So there is a small window of time where the PMU and BHRB
+    runs without the required HW branch filter (if any) enabled in BHRB.
+
+    This can cause some of the branch samples to be collected through BHRB
+    without any filter applied and hence affects the correctness of
+    the results. This patch moves the BHRB config function call before
+    enabling interrupts.
+
+    Here are some data points captured via trace prints which depicts how we
+    could get PMU interrupts with BHRB filter NOT enabled with a standard
+    perf record command line (asking for branch record information as well).
+
+        $ perf record -j any_call ls
+
+    Before the patch:-
+
+        ls-1962  [003] d...  2065.299590: .perf_event_interrupt: MMCRA: 40000000000
+        ls-1962  [003] d...  2065.299603: .perf_event_interrupt: MMCRA: 40000000000
+        ...
+
+        All the PMU interrupts before this point did not have the requested
+        HW branch filter enabled in the MMCRA.
+
+        ls-1962  [003] d...  2065.299647: .perf_event_interrupt: MMCRA: 40040000000
+        ls-1962  [003] d...  2065.299662: .perf_event_interrupt: MMCRA: 40040000000
+
+    After the patch:-
+
+        ls-1850  [008] d...   190.311828: .perf_event_interrupt: MMCRA: 40040000000
+        ls-1850  [008] d...   190.311848: .perf_event_interrupt: MMCRA: 40040000000
+
+        All the PMU interrupts have the requested HW BHRB branch filter
+        enabled in MMCRA.
+
+    Signed-off-by: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+    [mpe: Fixed up whitespace and cleaned up changelog]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/perf/core-book3s.c b/arch/powerpc/perf/core-book3s.c
+index 39af8d8..e478f1b 100644
+--- a/arch/powerpc/perf/core-book3s.c
++++ b/arch/powerpc/perf/core-book3s.c
+@@ -1248,6 +1248,9 @@ static void power_pmu_enable(struct pmu *pmu)
+  mmcr0 = ebb_switch_in(ebb, cpuhw->mmcr[0]);
+ 
+  mb();
++ if (cpuhw->bhrb_users)
++  ppmu->config_bhrb(cpuhw->bhrb_filter);
++
+  write_mmcr0(cpuhw, mmcr0);
+ 
+  /*
+@@ -1259,8 +1262,6 @@ static void power_pmu_enable(struct pmu *pmu)
+  }
+ 
+  out:
+- if (cpuhw->bhrb_users)
+-  ppmu->config_bhrb(cpuhw->bhrb_filter);
+ 
+  local_irq_restore(flags);
+ }
+-- 
+1.7.1

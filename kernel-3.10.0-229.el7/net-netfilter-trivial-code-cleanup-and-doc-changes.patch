@@ -1,0 +1,160 @@
+From 9595b5a5b9822cae81fe401dc58dacbbd74266ad Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Thu, 4 Sep 2014 11:21:48 -0400
+Subject: [net] netfilter: trivial code cleanup and doc changes
+
+Message-id: <1409829716-13720-2-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 91216
+O-Subject: [PATCH 1/9 RHEL7.1 net] netfilter: trivial code cleanup and doc changes
+Bugzilla: 1043012
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Jesper Brouer <jbrouer@redhat.com>
+
+BZ: 1043012
+
+commit b476b72a0f8514a5a4c561bab731ddd506a284e7
+Author: Jesper Dangaard Brouer <brouer@redhat.com>
+Date:   Mon Mar 3 14:44:54 2014 +0100
+
+    netfilter: trivial code cleanup and doc changes
+
+    Changes while reading through the netfilter code.
+
+    Added hint about how conntrack nf_conn refcnt is accessed.
+    And renamed repl_hash to reply_hash for readability
+
+    Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Reviewed-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
+index a68a061..4d1915d 100644
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -73,7 +73,13 @@ struct nf_conn_help {
+ 
+ struct nf_conn {
+  /* Usage count in here is 1 for hash table/destruct timer, 1 per skb,
+-           plus 1 for any connection(s) we are `master' for */
++  * plus 1 for any connection(s) we are `master' for
++  *
++  * Hint, SKB address this struct and refcnt via skb->nfct and
++  * helpers nf_conntrack_get() and nf_conntrack_put().
++  * Helper nf_ct_put() equals nf_conntrack_put() by dec refcnt,
++  * beware nf_ct_get() is different and don't inc refcnt.
++  */
+  struct nf_conntrack ct_general;
+ 
+  spinlock_t lock;
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index 6b78bb8..a767387 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -423,21 +423,21 @@ EXPORT_SYMBOL_GPL(nf_conntrack_find_get);
+ 
+ static void __nf_conntrack_hash_insert(struct nf_conn *ct,
+            unsigned int hash,
+-           unsigned int repl_hash)
++           unsigned int reply_hash)
+ {
+  struct net *net = nf_ct_net(ct);
+ 
+  hlist_nulls_add_head_rcu(&ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode,
+       &net->ct.hash[hash]);
+  hlist_nulls_add_head_rcu(&ct->tuplehash[IP_CT_DIR_REPLY].hnnode,
+-      &net->ct.hash[repl_hash]);
++      &net->ct.hash[reply_hash]);
+ }
+ 
+ int
+ nf_conntrack_hash_check_insert(struct nf_conn *ct)
+ {
+  struct net *net = nf_ct_net(ct);
+- unsigned int hash, repl_hash;
++ unsigned int hash, reply_hash;
+  struct nf_conntrack_tuple_hash *h;
+  struct hlist_nulls_node *n;
+  u16 zone;
+@@ -445,7 +445,7 @@ nf_conntrack_hash_check_insert(struct nf_conn *ct)
+  zone = nf_ct_zone(ct);
+  hash = hash_conntrack(net, zone,
+          &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
+- repl_hash = hash_conntrack(net, zone,
++ reply_hash = hash_conntrack(net, zone,
+        &ct->tuplehash[IP_CT_DIR_REPLY].tuple);
+ 
+  spin_lock_bh(&nf_conntrack_lock);
+@@ -456,7 +456,7 @@ nf_conntrack_hash_check_insert(struct nf_conn *ct)
+           &h->tuple) &&
+       zone == nf_ct_zone(nf_ct_tuplehash_to_ctrack(h)))
+    goto out;
+- hlist_nulls_for_each_entry(h, n, &net->ct.hash[repl_hash], hnnode)
++ hlist_nulls_for_each_entry(h, n, &net->ct.hash[reply_hash], hnnode)
+   if (nf_ct_tuple_equal(&ct->tuplehash[IP_CT_DIR_REPLY].tuple,
+           &h->tuple) &&
+       zone == nf_ct_zone(nf_ct_tuplehash_to_ctrack(h)))
+@@ -466,7 +466,7 @@ nf_conntrack_hash_check_insert(struct nf_conn *ct)
+  smp_wmb();
+  /* The caller holds a reference to this object */
+  atomic_set(&ct->ct_general.use, 2);
+- __nf_conntrack_hash_insert(ct, hash, repl_hash);
++ __nf_conntrack_hash_insert(ct, hash, reply_hash);
+  NF_CT_STAT_INC(net, insert);
+  spin_unlock_bh(&nf_conntrack_lock);
+ 
+@@ -498,7 +498,7 @@ EXPORT_SYMBOL_GPL(nf_conntrack_tmpl_insert);
+ int
+ __nf_conntrack_confirm(struct sk_buff *skb)
+ {
+- unsigned int hash, repl_hash;
++ unsigned int hash, reply_hash;
+  struct nf_conntrack_tuple_hash *h;
+  struct nf_conn *ct;
+  struct nf_conn_help *help;
+@@ -522,7 +522,7 @@ __nf_conntrack_confirm(struct sk_buff *skb)
+  /* reuse the hash saved before */
+  hash = *(unsigned long *)&ct->tuplehash[IP_CT_DIR_REPLY].hnnode.pprev;
+  hash = hash_bucket(hash, net);
+- repl_hash = hash_conntrack(net, zone,
++ reply_hash = hash_conntrack(net, zone,
+        &ct->tuplehash[IP_CT_DIR_REPLY].tuple);
+ 
+  /* We're not in hash table, and we refuse to set up related
+@@ -555,7 +555,7 @@ __nf_conntrack_confirm(struct sk_buff *skb)
+           &h->tuple) &&
+       zone == nf_ct_zone(nf_ct_tuplehash_to_ctrack(h)))
+    goto out;
+- hlist_nulls_for_each_entry(h, n, &net->ct.hash[repl_hash], hnnode)
++ hlist_nulls_for_each_entry(h, n, &net->ct.hash[reply_hash], hnnode)
+   if (nf_ct_tuple_equal(&ct->tuplehash[IP_CT_DIR_REPLY].tuple,
+           &h->tuple) &&
+       zone == nf_ct_zone(nf_ct_tuplehash_to_ctrack(h)))
+@@ -585,7 +585,7 @@ __nf_conntrack_confirm(struct sk_buff *skb)
+   * guarantee that no other CPU can find the conntrack before the above
+   * stores are visible.
+   */
+- __nf_conntrack_hash_insert(ct, hash, repl_hash);
++ __nf_conntrack_hash_insert(ct, hash, reply_hash);
+  NF_CT_STAT_INC(net, insert);
+  spin_unlock_bh(&nf_conntrack_lock);
+ 
+diff --git a/net/netfilter/nf_conntrack_expect.c b/net/netfilter/nf_conntrack_expect.c
+index 4fd1ca9..da2f84f 100644
+--- a/net/netfilter/nf_conntrack_expect.c
++++ b/net/netfilter/nf_conntrack_expect.c
+@@ -417,7 +417,7 @@ out:
+  return ret;
+ }
+ 
+-int nf_ct_expect_related_report(struct nf_conntrack_expect *expect, 
++int nf_ct_expect_related_report(struct nf_conntrack_expect *expect,
+     u32 portid, int report)
+ {
+  int ret;
+-- 
+1.7.1

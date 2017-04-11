@@ -1,0 +1,68 @@
+From eb1dff266f314bba8f1db2223dedcb3d6e70f559 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:38:01 -0400
+Subject: [virt] kvm/nvmx: Do not put exception that caused vmexit to IDT_VECTORING_INFO
+
+Message-id: <1406040016-3289-87-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86165
+O-Subject: [RHEL7 PATCH v2 086/221] KVM: nVMX: Do not put exception that caused vmexit to IDT_VECTORING_INFO
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Gleb Natapov <gleb@redhat.com>
+
+If an exception causes vmexit directly it should not be reported in
+IDT_VECTORING_INFO during the exit. For that we need to be able to
+distinguish between exception that is injected into nested VM and one that
+is reinjected because its delivery failed. Fortunately we already have
+mechanism to do so for nested SVM, so here we just use correct function
+to requeue exceptions and make sure that reinjected exception is not
+moved to IDT_VECTORING_INFO during vmexit emulation and not re-checked
+for interception during delivery.
+
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 851eb6677cb14f7fada8735041b12f5add0c247e)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 11fb251..b85755e 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -1921,7 +1921,7 @@ static void vmx_queue_exception(struct kvm_vcpu *vcpu, unsigned nr,
+  struct vcpu_vmx *vmx = to_vmx(vcpu);
+  u32 intr_info = nr | INTR_INFO_VALID_MASK;
+ 
+- if (nr == PF_VECTOR && is_guest_mode(vcpu) &&
++ if (!reinject && nr == PF_VECTOR && is_guest_mode(vcpu) &&
+      !vmx->nested.nested_run_pending && nested_pf_handled(vcpu))
+   return;
+ 
+@@ -7059,9 +7059,9 @@ static void __vmx_complete_interrupts(struct kvm_vcpu *vcpu,
+  case INTR_TYPE_HARD_EXCEPTION:
+   if (idt_vectoring_info & VECTORING_INFO_DELIVER_CODE_MASK) {
+    u32 err = vmcs_read32(error_code_field);
+-   kvm_queue_exception_e(vcpu, vector, err);
++   kvm_requeue_exception_e(vcpu, vector, err);
+   } else
+-   kvm_queue_exception(vcpu, vector);
++   kvm_requeue_exception(vcpu, vector);
+   break;
+  case INTR_TYPE_SOFT_INTR:
+   vcpu->arch.event_exit_inst_len = vmcs_read32(instr_len_field);
+@@ -8014,7 +8014,7 @@ static void vmcs12_save_pending_event(struct kvm_vcpu *vcpu,
+  u32 idt_vectoring;
+  unsigned int nr;
+ 
+- if (vcpu->arch.exception.pending) {
++ if (vcpu->arch.exception.pending && vcpu->arch.exception.reinject) {
+   nr = vcpu->arch.exception.nr;
+   idt_vectoring = nr | VECTORING_INFO_VALID_MASK;
+ 
+-- 
+1.7.1

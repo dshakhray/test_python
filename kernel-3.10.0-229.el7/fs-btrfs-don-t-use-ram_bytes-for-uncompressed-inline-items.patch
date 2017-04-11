@@ -1,0 +1,244 @@
+From 22c6431a2ab7f658fda0579e5b7fe5e363dfa078 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:00:31 -0400
+Subject: [fs] btrfs: don't use ram_bytes for uncompressed inline items
+
+Message-id: <1407179109-13714-145-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87189
+O-Subject: [RHEL7.1 PATCH 144/422] Btrfs: don't use ram_bytes for uncompressed inline items
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Chris Mason <clm@fb.com>
+
+commit 514ac8ad8793a097c0c9d89202c642479d6dfa34
+Author: Chris Mason <clm@fb.com>
+Date:   Fri Jan 3 21:07:00 2014 -0800
+
+    Btrfs: don't use ram_bytes for uncompressed inline items
+
+    If we truncate an uncompressed inline item, ram_bytes isn't updated to reflect
+    the new size.  The fixe uses the size directly from the item header when
+    reading uncompressed inlines, and also fixes truncate to update the
+    size as it goes.
+
+    Reported-by: Jens Axboe <axboe@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+    CC: stable@vger.kernel.org
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 84d4c05..fceddbd 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -2990,15 +2990,6 @@ BTRFS_SETGET_FUNCS(file_extent_encryption, struct btrfs_file_extent_item,
+ BTRFS_SETGET_FUNCS(file_extent_other_encoding, struct btrfs_file_extent_item,
+      other_encoding, 16);
+ 
+-/* this returns the number of file bytes represented by the inline item.
+- * If an item is compressed, this is the uncompressed size
+- */
+-static inline u32 btrfs_file_extent_inline_len(struct extent_buffer *eb,
+-            struct btrfs_file_extent_item *e)
+-{
+- return btrfs_file_extent_ram_bytes(eb, e);
+-}
+-
+ /*
+  * this returns the number of bytes used by the item on disk, minus the
+  * size of any extent headers.  If a file is compressed on disk, this is
+@@ -3012,6 +3003,32 @@ static inline u32 btrfs_file_extent_inline_item_len(struct extent_buffer *eb,
+  return btrfs_item_size(eb, e) - offset;
+ }
+ 
++/* this returns the number of file bytes represented by the inline item.
++ * If an item is compressed, this is the uncompressed size
++ */
++static inline u32 btrfs_file_extent_inline_len(struct extent_buffer *eb,
++            int slot,
++            struct btrfs_file_extent_item *fi)
++{
++ struct btrfs_map_token token;
++
++ btrfs_init_map_token(&token);
++ /*
++  * return the space used on disk if this item isn't
++  * compressed or encoded
++  */
++ if (btrfs_token_file_extent_compression(eb, fi, &token) == 0 &&
++     btrfs_token_file_extent_encryption(eb, fi, &token) == 0 &&
++     btrfs_token_file_extent_other_encoding(eb, fi, &token) == 0) {
++  return btrfs_file_extent_inline_item_len(eb,
++        btrfs_item_nr(slot));
++ }
++
++ /* otherwise use the ram bytes field */
++ return btrfs_token_file_extent_ram_bytes(eb, fi, &token);
++}
++
++
+ /* btrfs_dev_stats_item */
+ static inline u64 btrfs_dev_stats_value(struct extent_buffer *eb,
+      struct btrfs_dev_stats_item *ptr,
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 304a2ef..80f9b94 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -772,7 +772,8 @@ next_slot:
+     btrfs_file_extent_num_bytes(leaf, fi);
+   } else if (extent_type == BTRFS_FILE_EXTENT_INLINE) {
+    extent_end = key.offset +
+-    btrfs_file_extent_inline_len(leaf, fi);
++    btrfs_file_extent_inline_len(leaf,
++           path->slots[0], fi);
+   } else {
+    WARN_ON(1);
+    extent_end = search_start;
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 2bad0b8..ed9356d 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -1281,7 +1281,8 @@ next_slot:
+    nocow = 1;
+   } else if (extent_type == BTRFS_FILE_EXTENT_INLINE) {
+    extent_end = found_key.offset +
+-    btrfs_file_extent_inline_len(leaf, fi);
++    btrfs_file_extent_inline_len(leaf,
++           path->slots[0], fi);
+    extent_end = ALIGN(extent_end, root->sectorsize);
+   } else {
+    BUG_ON(1);
+@@ -4023,7 +4024,7 @@ search_again:
+         btrfs_file_extent_num_bytes(leaf, fi);
+    } else if (extent_type == BTRFS_FILE_EXTENT_INLINE) {
+     item_end += btrfs_file_extent_inline_len(leaf,
+-          fi);
++        path->slots[0], fi);
+    }
+    item_end--;
+   }
+@@ -4093,6 +4094,12 @@ search_again:
+      inode_sub_bytes(inode, item_end + 1 -
+        new_size);
+     }
++
++    /*
++     * update the ram bytes to properly reflect
++     * the new size of our item
++     */
++    btrfs_set_file_extent_ram_bytes(leaf, fi, size);
+     size =
+         btrfs_file_extent_calc_inline_size(size);
+     btrfs_truncate_item(root, path, size, 1);
+@@ -6178,7 +6185,7 @@ again:
+          btrfs_file_extent_num_bytes(leaf, item);
+  } else if (found_type == BTRFS_FILE_EXTENT_INLINE) {
+   size_t size;
+-  size = btrfs_file_extent_inline_len(leaf, item);
++  size = btrfs_file_extent_inline_len(leaf, path->slots[0], item);
+   extent_end = ALIGN(extent_start + size, root->sectorsize);
+  }
+ next:
+@@ -6247,7 +6254,7 @@ next:
+    goto out;
+   }
+ 
+-  size = btrfs_file_extent_inline_len(leaf, item);
++  size = btrfs_file_extent_inline_len(leaf, path->slots[0], item);
+   extent_offset = page_offset(page) + pg_offset - extent_start;
+   copy_size = min_t(u64, PAGE_CACHE_SIZE - pg_offset,
+     size - extent_offset);
+diff --git a/fs/btrfs/print-tree.c b/fs/btrfs/print-tree.c
+index 4eed002..6efd70d 100644
+--- a/fs/btrfs/print-tree.c
++++ b/fs/btrfs/print-tree.c
+@@ -249,7 +249,7 @@ void btrfs_print_leaf(struct btrfs_root *root, struct extent_buffer *l)
+        BTRFS_FILE_EXTENT_INLINE) {
+     printk(KERN_INFO "\t\tinline extent data "
+            "size %u\n",
+-           btrfs_file_extent_inline_len(l, fi));
++           btrfs_file_extent_inline_len(l, i, fi));
+     break;
+    }
+    printk(KERN_INFO "\t\textent data disk bytenr %llu "
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index 85259cb..730dce3 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -1377,7 +1377,7 @@ static int read_symlink(struct btrfs_root *root,
+  BUG_ON(compression);
+ 
+  off = btrfs_file_extent_inline_start(ei);
+- len = btrfs_file_extent_inline_len(path->nodes[0], ei);
++ len = btrfs_file_extent_inline_len(path->nodes[0], path->slots[0], ei);
+ 
+  ret = fs_path_add_from_extent_buffer(dest, path->nodes[0], off, len);
+ 
+@@ -4207,7 +4207,8 @@ static int send_write_or_clone(struct send_ctx *sctx,
+    struct btrfs_file_extent_item);
+  type = btrfs_file_extent_type(path->nodes[0], ei);
+  if (type == BTRFS_FILE_EXTENT_INLINE) {
+-  len = btrfs_file_extent_inline_len(path->nodes[0], ei);
++  len = btrfs_file_extent_inline_len(path->nodes[0],
++         path->slots[0], ei);
+   /*
+    * it is possible the inline item won't cover the whole page,
+    * but there may be items after this page.  Make
+@@ -4448,7 +4449,8 @@ static int get_last_extent(struct send_ctx *sctx, u64 offset)
+        struct btrfs_file_extent_item);
+  type = btrfs_file_extent_type(path->nodes[0], fi);
+  if (type == BTRFS_FILE_EXTENT_INLINE) {
+-  u64 size = btrfs_file_extent_inline_len(path->nodes[0], fi);
++  u64 size = btrfs_file_extent_inline_len(path->nodes[0],
++       path->slots[0], fi);
+   extent_end = ALIGN(key.offset + size,
+        sctx->send_root->sectorsize);
+  } else {
+@@ -4482,7 +4484,8 @@ static int maybe_send_hole(struct send_ctx *sctx, struct btrfs_path *path,
+        struct btrfs_file_extent_item);
+  type = btrfs_file_extent_type(path->nodes[0], fi);
+  if (type == BTRFS_FILE_EXTENT_INLINE) {
+-  u64 size = btrfs_file_extent_inline_len(path->nodes[0], fi);
++  u64 size = btrfs_file_extent_inline_len(path->nodes[0],
++       path->slots[0], fi);
+   extent_end = ALIGN(key->offset + size,
+        sctx->send_root->sectorsize);
+  } else {
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index b142b6d..39d83da 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -570,7 +570,7 @@ static noinline int replay_one_extent(struct btrfs_trans_handle *trans,
+   if (btrfs_file_extent_disk_bytenr(eb, item) == 0)
+    nbytes = 0;
+  } else if (found_type == BTRFS_FILE_EXTENT_INLINE) {
+-  size = btrfs_file_extent_inline_len(eb, item);
++  size = btrfs_file_extent_inline_len(eb, slot, item);
+   nbytes = btrfs_file_extent_ram_bytes(eb, item);
+   extent_end = ALIGN(start + size, root->sectorsize);
+  } else {
+@@ -3367,7 +3367,9 @@ static noinline int copy_items(struct btrfs_trans_handle *trans,
+      struct btrfs_file_extent_item);
+   if (btrfs_file_extent_type(src, extent) ==
+       BTRFS_FILE_EXTENT_INLINE) {
+-   len = btrfs_file_extent_inline_len(src, extent);
++   len = btrfs_file_extent_inline_len(src,
++          src_path->slots[0],
++          extent);
+    *last_extent = ALIGN(key.offset + len,
+           log->sectorsize);
+   } else {
+@@ -3431,7 +3433,7 @@ fill_holes:
+   extent = btrfs_item_ptr(src, i, struct btrfs_file_extent_item);
+   if (btrfs_file_extent_type(src, extent) ==
+       BTRFS_FILE_EXTENT_INLINE) {
+-   len = btrfs_file_extent_inline_len(src, extent);
++   len = btrfs_file_extent_inline_len(src, i, extent);
+    extent_end = ALIGN(key.offset + len, log->sectorsize);
+   } else {
+    len = btrfs_file_extent_num_bytes(src, extent);
+-- 
+1.7.1

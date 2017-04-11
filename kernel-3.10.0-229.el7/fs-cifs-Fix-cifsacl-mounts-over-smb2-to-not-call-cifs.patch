@@ -1,0 +1,220 @@
+From a65d7556c0a4802e299f9db928c5ea95213570cf Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:39 -0400
+Subject: [fs] cifs: Fix cifsacl mounts over smb2 to not call cifs
+
+Message-id: <1406549822-10376-47-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86772
+O-Subject: [RHEL7.1 PATCH 46/69] [bz1082049][CIFS] Fix cifsacl mounts over smb2 to not call cifs
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Steve French <smfrench@gmail.com>
+
+When mounting with smb2/smb3 (e.g. vers=2.1) and cifsacl mount option,
+it was trying to get the mode by querying the acl over the cifs
+rather than smb2 protocol.  This patch makes that protocol
+independent and makes cifsacl smb2 mounts return a more intuitive
+operation not supported error (until we add a worker function
+for smb2_get_acl).
+
+Note that a previous patch fixed getxattr/setxattr for the CIFSACL xattr
+which would unconditionally call cifs_get_acl and cifs_set_acl (even when
+mounted smb2). I made those protocol independent last week (new protocol
+version operations "get_acl" and "set_acl" but did not add an
+smb2_get_acl and smb2_set_acl yet so those now simply return EOPNOTSUPP
+which at least is better than sending cifs requests on smb2 mount)
+
+The previous patches did not fix the one remaining case though ie
+mounting with "cifsacl" when getting mode from acl would unconditionally
+end up calling "cifs_get_acl_from_fid" even for smb2 - so made that protocol
+independent but to make that protocol independent had to make sure that the callers
+were passing the protocol independent handle structure (cifs_fid) instead
+of cifs specific _u16 network file handle (ie cifs_fid instead of cifs_fid->fid)
+
+Now mount with smb2 and cifsacl mount options will return EOPNOTSUP (instead
+of timing out) and a future patch will add smb2 operations (e.g. get_smb2_acl)
+to enable this.
+
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 42eacf9e57b65ffa768af72cb7fc86cc6f6af042)
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/cifsacl.c b/fs/cifs/cifsacl.c
+index c819b0b..7ff866d 100644
+--- a/fs/cifs/cifsacl.c
++++ b/fs/cifs/cifsacl.c
+@@ -865,8 +865,8 @@ static int build_sec_desc(struct cifs_ntsd *pntsd, struct cifs_ntsd *pnntsd,
+  return rc;
+ }
+ 
+-static struct cifs_ntsd *get_cifs_acl_by_fid(struct cifs_sb_info *cifs_sb,
+-  __u16 fid, u32 *pacllen)
++struct cifs_ntsd *get_cifs_acl_by_fid(struct cifs_sb_info *cifs_sb,
++  const struct cifs_fid *cifsfid, u32 *pacllen)
+ {
+  struct cifs_ntsd *pntsd = NULL;
+  unsigned int xid;
+@@ -877,7 +877,8 @@ static struct cifs_ntsd *get_cifs_acl_by_fid(struct cifs_sb_info *cifs_sb,
+   return ERR_CAST(tlink);
+ 
+  xid = get_xid();
+- rc = CIFSSMBGetCIFSACL(xid, tlink_tcon(tlink), fid, &pntsd, pacllen);
++ rc = CIFSSMBGetCIFSACL(xid, tlink_tcon(tlink), cifsfid->netfid, &pntsd,
++    pacllen);
+  free_xid(xid);
+ 
+  cifs_put_tlink(tlink);
+@@ -946,7 +947,7 @@ struct cifs_ntsd *get_cifs_acl(struct cifs_sb_info *cifs_sb,
+  if (!open_file)
+   return get_cifs_acl_by_path(cifs_sb, path, pacllen);
+ 
+- pntsd = get_cifs_acl_by_fid(cifs_sb, open_file->fid.netfid, pacllen);
++ pntsd = get_cifs_acl_by_fid(cifs_sb, &open_file->fid, pacllen);
+  cifsFileInfo_put(open_file);
+  return pntsd;
+ }
+@@ -1006,19 +1007,31 @@ out:
+ /* Translate the CIFS ACL (simlar to NTFS ACL) for a file into mode bits */
+ int
+ cifs_acl_to_fattr(struct cifs_sb_info *cifs_sb, struct cifs_fattr *fattr,
+-    struct inode *inode, const char *path, const __u16 *pfid)
++    struct inode *inode, const char *path,
++    const struct cifs_fid *pfid)
+ {
+  struct cifs_ntsd *pntsd = NULL;
+  u32 acllen = 0;
+  int rc = 0;
++ struct tcon_link *tlink = cifs_sb_tlink(cifs_sb);
++ struct cifs_tcon *tcon;
+ 
+  cifs_dbg(NOISY, "converting ACL to mode for %s\n", path);
+ 
+- if (pfid)
+-  pntsd = get_cifs_acl_by_fid(cifs_sb, *pfid, &acllen);
+- else
+-  pntsd = get_cifs_acl(cifs_sb, inode, path, &acllen);
++ if (IS_ERR(tlink))
++  return PTR_ERR(tlink);
++ tcon = tlink_tcon(tlink);
+ 
++ if (pfid && (tcon->ses->server->ops->get_acl_by_fid))
++  pntsd = tcon->ses->server->ops->get_acl_by_fid(cifs_sb, pfid,
++         &acllen);
++ else if (tcon->ses->server->ops->get_acl)
++  pntsd = tcon->ses->server->ops->get_acl(cifs_sb, inode, path,
++       &acllen);
++ else {
++  cifs_put_tlink(tlink);
++  return -EOPNOTSUPP;
++ }
+  /* if we can retrieve the ACL, now parse Access Control Entries, ACEs */
+  if (IS_ERR(pntsd)) {
+   rc = PTR_ERR(pntsd);
+@@ -1030,6 +1043,8 @@ cifs_acl_to_fattr(struct cifs_sb_info *cifs_sb, struct cifs_fattr *fattr,
+    cifs_dbg(VFS, "parse sec desc failed rc = %d\n", rc);
+  }
+ 
++ cifs_put_tlink(tlink);
++
+  return rc;
+ }
+ 
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 35cdf12..30f6e92 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -400,6 +400,8 @@ struct smb_version_operations {
+    const struct nls_table *, int);
+  struct cifs_ntsd * (*get_acl)(struct cifs_sb_info *, struct inode *,
+    const char *, u32 *);
++ struct cifs_ntsd * (*get_acl_by_fid)(struct cifs_sb_info *,
++   const struct cifs_fid *, u32 *);
+  int (*set_acl)(struct cifs_ntsd *, __u32, struct inode *, const char *,
+    int);
+ };
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index ad4efc2..ca7980a 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -154,7 +154,7 @@ extern struct inode *cifs_iget(struct super_block *sb,
+ 
+ extern int cifs_get_inode_info(struct inode **inode, const char *full_path,
+           FILE_ALL_INFO *data, struct super_block *sb,
+-          int xid, const __u16 *fid);
++          int xid, const struct cifs_fid *fid);
+ extern int cifs_get_inode_info_unix(struct inode **pinode,
+    const unsigned char *search_path,
+    struct super_block *sb, unsigned int xid);
+@@ -165,11 +165,13 @@ extern int cifs_rename_pending_delete(const char *full_path,
+           const unsigned int xid);
+ extern int cifs_acl_to_fattr(struct cifs_sb_info *cifs_sb,
+          struct cifs_fattr *fattr, struct inode *inode,
+-         const char *path, const __u16 *pfid);
++         const char *path, const struct cifs_fid *pfid);
+ extern int id_mode_to_cifs_acl(struct inode *inode, const char *path, __u64,
+      kuid_t, kgid_t);
+ extern struct cifs_ntsd *get_cifs_acl(struct cifs_sb_info *, struct inode *,
+      const char *, u32 *);
++extern struct cifs_ntsd *get_cifs_acl_by_fid(struct cifs_sb_info *,
++      const struct cifs_fid *, u32 *);
+ extern int set_cifs_acl(struct cifs_ntsd *, __u32, struct inode *,
+     const char *, int);
+ 
+diff --git a/fs/cifs/dir.c b/fs/cifs/dir.c
+index d3a6796..3db0c5f 100644
+--- a/fs/cifs/dir.c
++++ b/fs/cifs/dir.c
+@@ -378,7 +378,7 @@ cifs_create_get_file_info:
+            xid);
+  else {
+   rc = cifs_get_inode_info(&newinode, full_path, buf, inode->i_sb,
+-      xid, &fid->netfid);
++      xid, fid);
+   if (newinode) {
+    if (server->ops->set_lease_key)
+     server->ops->set_lease_key(newinode, fid);
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index 56b127e..8389f91 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -244,7 +244,7 @@ cifs_nt_open(char *full_path, struct inode *inode, struct cifs_sb_info *cifs_sb,
+            xid);
+  else
+   rc = cifs_get_inode_info(&inode, full_path, buf, inode->i_sb,
+-      xid, &fid->netfid);
++      xid, fid);
+ 
+ out:
+  kfree(buf);
+diff --git a/fs/cifs/inode.c b/fs/cifs/inode.c
+index 2aa8f53..3e6104a 100644
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -677,7 +677,7 @@ cgfi_exit:
+ int
+ cifs_get_inode_info(struct inode **inode, const char *full_path,
+       FILE_ALL_INFO *data, struct super_block *sb, int xid,
+-      const __u16 *fid)
++      const struct cifs_fid *fid)
+ {
+  bool validinum = false;
+  __u16 srchflgs;
+diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
+index 10bf8a6..d1fdfa8 100644
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@ -1084,6 +1084,7 @@ struct smb_version_operations smb1_operations = {
+ #endif /* CIFS_XATTR */
+ #ifdef CONFIG_CIFS_ACL
+  .get_acl = get_cifs_acl,
++ .get_acl_by_fid = get_cifs_acl_by_fid,
+  .set_acl = set_cifs_acl,
+ #endif /* CIFS_ACL */
+ };
+-- 
+1.7.1

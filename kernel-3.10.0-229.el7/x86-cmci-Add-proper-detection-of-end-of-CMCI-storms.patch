@@ -1,0 +1,165 @@
+From ae8ede877f4234b6ef16ca45dfcabca31c517962 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:41:39 -0400
+Subject: [x86] cmci: Add proper detection of end of CMCI storms
+
+Message-id: <1405345303-24468-10-git-send-email-prarit@redhat.com>
+Patchwork-id: 85788
+O-Subject: [RHEL7.1 PATCH BZ 1119306 09/13] x86, CMCI: Add proper detection of end of CMCI storms
+Bugzilla: 1119306
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119306
+
+commit 27f6c573e0f77f7d1cc907c1494c99a61e48b7d8
+Author: Chen, Gong <gong.chen@linux.intel.com>
+Date:   Thu Mar 27 21:24:36 2014 -0400
+
+    x86, CMCI: Add proper detection of end of CMCI storms
+
+    When CMCI storm persists for a long time(at least beyond predefined
+    threshold. It's 30 seconds for now), we can watch CMCI storm is
+    detected immediately after it subsides.
+
+    ...
+    Dec 10 22:04:29 kernel: CMCI storm detected: switching to poll mode
+    Dec 10 22:04:59 kernel: CMCI storm subsided: switching to interrupt mode
+    Dec 10 22:04:59 kernel: CMCI storm detected: switching to poll mode
+    Dec 10 22:05:29 kernel: CMCI storm subsided: switching to interrupt mode
+    ...
+
+    The problem is that our logic that determines that the storm has
+    ended is incorrect. We announce the end, re-enable interrupts and
+    realize that the storm is still going on, so we switch back to
+    polling mode. Rinse, repeat.
+
+    When a storm happens we disable signaling of errors via CMCI and begin
+    polling machine check banks instead. If we find any logged errors,
+    then we need to set a per-cpu flag so that our per-cpu tests that
+    check whether the storm is ongoing will see that errors are still
+    being logged independently of whether mce_notify_irq() says that the
+    error has been fully processed.
+
+    cmci_clear() is not the right tool to disable a bank. It disables the
+    interrupt for the bank as desired, but it also clears the bit for
+    this bank in "mce_banks_owned" so we will skip the bank when polling
+    (so we fail to see that the storm continues because we stop looking).
+    New cmci_storm_disable_banks() just disables the interrupt while
+    allowing polling to continue.
+
+    Reported-by: William Dauchy <wdauchy@gmail.com>
+    Signed-off-by: Chen, Gong <gong.chen@linux.intel.com>
+    Signed-off-by: Tony Luck <tony.luck@intel.com>
+
+Cc: Tony Camuso <tcamuso@redhat.com>
+Cc: Dean Nelson <dnelson@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index 9b7734b..eeee23f 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -89,6 +89,9 @@ static DECLARE_WAIT_QUEUE_HEAD(mce_chrdev_wait);
+ static DEFINE_PER_CPU(struct mce, mces_seen);
+ static int   cpu_missing;
+ 
++/* CMCI storm detection filter */
++static DEFINE_PER_CPU(unsigned long, mce_polled_error);
++
+ /*
+  * MCA banks polled by the period polling timer for corrected events.
+  * With Intel CMCI, this only has MCA banks which do not support CMCI (if any).
+@@ -595,6 +598,7 @@ void machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
+ {
+  struct mce m;
+  int i;
++ unsigned long *v;
+ 
+  this_cpu_inc(mce_poll_count);
+ 
+@@ -614,6 +618,8 @@ void machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
+   if (!(m.status & MCI_STATUS_VAL))
+    continue;
+ 
++  v = &get_cpu_var(mce_polled_error);
++  set_bit(0, v);
+   /*
+    * Uncorrected or signalled events are handled by the exception
+    * handler when it is enabled, so don't process those here.
+@@ -1278,10 +1284,18 @@ static unsigned long mce_adjust_timer_default(unsigned long interval)
+ static unsigned long (*mce_adjust_timer)(unsigned long interval) =
+  mce_adjust_timer_default;
+ 
++static int cmc_error_seen(void)
++{
++ unsigned long *v = &__get_cpu_var(mce_polled_error);
++
++ return test_and_clear_bit(0, v);
++}
++
+ static void mce_timer_fn(unsigned long data)
+ {
+  struct timer_list *t = &__get_cpu_var(mce_timer);
+  unsigned long iv;
++ int notify;
+ 
+  WARN_ON(smp_processor_id() != data);
+ 
+@@ -1296,7 +1310,9 @@ static void mce_timer_fn(unsigned long data)
+   * polling interval, otherwise increase the polling interval.
+   */
+  iv = __this_cpu_read(mce_next_interval);
+- if (mce_notify_irq()) {
++ notify = mce_notify_irq();
++ notify |= cmc_error_seen();
++ if (notify) {
+   iv = max(iv / 2, (unsigned long) HZ/100);
+  } else {
+   iv = min(iv * 2, round_jiffies_relative(check_interval * HZ));
+diff --git a/arch/x86/kernel/cpu/mcheck/mce_intel.c b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+index 4cfe045..177cd48 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce_intel.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+@@ -10,6 +10,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/percpu.h>
+ #include <linux/sched.h>
++#include <linux/cpumask.h>
+ #include <asm/apic.h>
+ #include <asm/processor.h>
+ #include <asm/msr.h>
+@@ -138,6 +139,22 @@ unsigned long mce_intel_adjust_timer(unsigned long interval)
+  }
+ }
+ 
++static void cmci_storm_disable_banks(void)
++{
++ unsigned long flags, *owned;
++ int bank;
++ u64 val;
++
++ raw_spin_lock_irqsave(&cmci_discover_lock, flags);
++ owned = __get_cpu_var(mce_banks_owned);
++ for_each_set_bit(bank, owned, MAX_NR_BANKS) {
++  rdmsrl(MSR_IA32_MCx_CTL2(bank), val);
++  val &= ~MCI_CTL2_CMCI_EN;
++  wrmsrl(MSR_IA32_MCx_CTL2(bank), val);
++ }
++ raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
++}
++
+ static bool cmci_storm_detect(void)
+ {
+  unsigned int cnt = __this_cpu_read(cmci_storm_cnt);
+@@ -159,7 +176,7 @@ static bool cmci_storm_detect(void)
+  if (cnt <= CMCI_STORM_THRESHOLD)
+   return false;
+ 
+- cmci_clear();
++ cmci_storm_disable_banks();
+  __this_cpu_write(cmci_storm_state, CMCI_STORM_ACTIVE);
+  r = atomic_add_return(1, &cmci_storm_on_cpus);
+  mce_timer_kick(CMCI_POLL_INTERVAL);
+-- 
+1.7.1

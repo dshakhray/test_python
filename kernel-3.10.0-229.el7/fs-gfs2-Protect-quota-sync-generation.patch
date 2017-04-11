@@ -1,0 +1,78 @@
+From 323dd767137e8798e25deac0f50cb2ac926eff85 Mon Sep 17 00:00:00 2001
+From: Abhijith Das <adas@redhat.com>
+Date: Fri, 15 Aug 2014 19:56:31 -0400
+Subject: [fs] gfs2: Protect quota sync generation
+
+Message-id: <1408132603-52384-6-git-send-email-adas@redhat.com>
+Patchwork-id: 87817
+O-Subject: [RHEL7.1 PATCH 05/17] GFS2: Protect quota sync generation
+Bugzilla: 1026406
+RH-Acked-by: Robert S Peterson <rpeterso@redhat.com>
+RH-Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+
+Now that gfs2_quota_sync can be potentially called from multiple
+threads, we should protect this bit of code, and the sync generation
+number in particular in order to ensure that there are no races
+when syncing quotas.
+
+Resolves: rhbz#1026406
+Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+Cc: Abhijith Das <adas@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 05fecff..e5aa1d4 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -721,6 +721,7 @@ struct gfs2_sbd {
+  struct list_head sd_quota_list;
+  atomic_t sd_quota_count;
+  struct mutex sd_quota_mutex;
++ struct mutex sd_quota_sync_mutex;
+  wait_queue_head_t sd_quota_wait;
+  struct list_head sd_trunc_list;
+  spinlock_t sd_trunc_lock;
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 67d8168..08ac6d8 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -94,6 +94,7 @@ static struct gfs2_sbd *init_sbd(struct super_block *sb)
+ 
+  INIT_LIST_HEAD(&sdp->sd_quota_list);
+  mutex_init(&sdp->sd_quota_mutex);
++ mutex_init(&sdp->sd_quota_sync_mutex);
+  init_waitqueue_head(&sdp->sd_quota_wait);
+  INIT_LIST_HEAD(&sdp->sd_trunc_list);
+  spin_lock_init(&sdp->sd_trunc_lock);
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index 05e5b38..5de5459 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -1129,12 +1129,13 @@ int gfs2_quota_sync(struct super_block *sb, int type)
+  unsigned int x;
+  int error = 0;
+ 
+- sdp->sd_quota_sync_gen++;
+-
+  qda = kcalloc(max_qd, sizeof(struct gfs2_quota_data *), GFP_KERNEL);
+  if (!qda)
+   return -ENOMEM;
+ 
++ mutex_lock(&sdp->sd_quota_sync_mutex);
++ sdp->sd_quota_sync_gen++;
++
+  do {
+   num_qd = 0;
+ 
+@@ -1159,6 +1160,7 @@ int gfs2_quota_sync(struct super_block *sb, int type)
+   }
+  } while (!error && num_qd == max_qd);
+ 
++ mutex_unlock(&sdp->sd_quota_sync_mutex);
+  kfree(qda);
+ 
+  return error;
+-- 
+1.7.1

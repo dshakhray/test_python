@@ -1,0 +1,109 @@
+From 95180d2d52f36055124338baff1bb8c4813f1029 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:02:21 -0400
+Subject: [fs] btrfs: fix possible empty list access when flushing the delalloc inodes
+
+Message-id: <1407179109-13714-255-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87194
+O-Subject: [RHEL7.1 PATCH 254/422] Btrfs: fix possible empty list access when flushing the delalloc inodes
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Miao Xie <miaox@cn.fujitsu.com>
+
+commit 573bfb72f7608eb7097d2dd036a714a6ab20cffe
+Author: Miao Xie <miaox@cn.fujitsu.com>
+Date:   Thu Mar 6 13:55:03 2014 +0800
+
+    Btrfs: fix possible empty list access when flushing the delalloc inodes
+
+    We didn't have a lock to protect the access to the delalloc inodes list, that is
+    we might access a empty delalloc inodes list if someone start flushing delalloc
+    inodes because the delalloc inodes were moved into a other list temporarily.
+    Fix it by wrapping the access with a lock.
+
+    Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 5f49215..2a9d32e 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1490,6 +1490,7 @@ struct btrfs_fs_info {
+   */
+  struct list_head ordered_roots;
+ 
++ struct mutex delalloc_root_mutex;
+  spinlock_t delalloc_root_lock;
+  /* all fs/file tree roots that have delalloc inodes. */
+  struct list_head delalloc_roots;
+@@ -1805,6 +1806,7 @@ struct btrfs_root {
+  spinlock_t root_item_lock;
+  atomic_t refs;
+ 
++ struct mutex delalloc_mutex;
+  spinlock_t delalloc_lock;
+  /*
+   * all of the inodes that have delalloc bytes.  It is possible for
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 7039962..5cc6633 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -1220,6 +1220,7 @@ static void __setup_root(u32 nodesize, u32 leafsize, u32 sectorsize,
+  mutex_init(&root->objectid_mutex);
+  mutex_init(&root->log_mutex);
+  mutex_init(&root->ordered_extent_mutex);
++ mutex_init(&root->delalloc_mutex);
+  init_waitqueue_head(&root->log_writer_wait);
+  init_waitqueue_head(&root->log_commit_wait[0]);
+  init_waitqueue_head(&root->log_commit_wait[1]);
+@@ -2208,6 +2209,7 @@ int open_ctree(struct super_block *sb,
+  spin_lock_init(&fs_info->buffer_lock);
+  rwlock_init(&fs_info->tree_mod_log_lock);
+  mutex_init(&fs_info->reloc_mutex);
++ mutex_init(&fs_info->delalloc_root_mutex);
+  seqlock_init(&fs_info->profiles_lock);
+ 
+  init_completion(&fs_info->kobj_unregister);
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index d542c9b..5853955 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -8465,6 +8465,7 @@ static int __start_delalloc_inodes(struct btrfs_root *root, int delay_iput,
+  INIT_LIST_HEAD(&works);
+  INIT_LIST_HEAD(&splice);
+ 
++ mutex_lock(&root->delalloc_mutex);
+  spin_lock(&root->delalloc_lock);
+  list_splice_init(&root->delalloc_inodes, &splice);
+  while (!list_empty(&splice)) {
+@@ -8510,6 +8511,7 @@ static int __start_delalloc_inodes(struct btrfs_root *root, int delay_iput,
+   list_splice_tail(&splice, &root->delalloc_inodes);
+   spin_unlock(&root->delalloc_lock);
+  }
++ mutex_unlock(&root->delalloc_mutex);
+  return ret;
+ }
+ 
+@@ -8551,6 +8553,7 @@ int btrfs_start_delalloc_roots(struct btrfs_fs_info *fs_info, int delay_iput,
+ 
+  INIT_LIST_HEAD(&splice);
+ 
++ mutex_lock(&fs_info->delalloc_root_mutex);
+  spin_lock(&fs_info->delalloc_root_lock);
+  list_splice_init(&fs_info->delalloc_roots, &splice);
+  while (!list_empty(&splice) && nr) {
+@@ -8590,6 +8593,7 @@ out:
+   list_splice_tail(&splice, &fs_info->delalloc_roots);
+   spin_unlock(&fs_info->delalloc_root_lock);
+  }
++ mutex_unlock(&fs_info->delalloc_root_mutex);
+  return ret;
+ }
+ 
+-- 
+1.7.1

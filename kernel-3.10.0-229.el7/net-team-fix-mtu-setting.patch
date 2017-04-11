@@ -1,0 +1,90 @@
+From b70830d6f4c11a44f74b0476aa44f9cf63ec7550 Mon Sep 17 00:00:00 2001
+From: Jiri Pirko <jpirko@redhat.com>
+Date: Tue, 3 Jun 2014 11:52:11 -0400
+Subject: [net] team: fix mtu setting
+
+Message-id: <1401796331-18742-1-git-send-email-jpirko@redhat.com>
+Patchwork-id: 82379
+O-Subject: [patch rhel7 net] team: fix mtu setting
+Bugzilla: 1103083
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: Jesper Brouer <jbrouer@redhat.com>
+RH-Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+BZ1103083
+https://brewweb.devel.redhat.com/taskinfo?taskID=7529508
+tested on my testing machine
+
+upstream (net) commit 9d0d68faea6962d62dd501cd6e71ce5cc8ed262b
+Author: Jiri Pirko <jiri@resnulli.us>
+Date:   Thu May 29 20:46:17 2014 +0200
+
+    team: fix mtu setting
+
+    Now it is not possible to set mtu to team device which has a port
+    enslaved to it. The reason is that when team_change_mtu() calls
+    dev_set_mtu() for port device, notificator for NETDEV_PRECHANGEMTU
+    event is called and team_device_event() returns NOTIFY_BAD forbidding
+    the change. So fix this by returning NOTIFY_DONE here in case team is
+    changing mtu in team_change_mtu().
+
+Signed-off-by: Jiri Pirko <jpirko@redhat.com>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 6545b7b..dbdae73 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -1734,6 +1734,7 @@ static int team_change_mtu(struct net_device *dev, int new_mtu)
+   * to traverse list in reverse under rcu_read_lock
+   */
+  mutex_lock(&team->lock);
++ team->port_mtu_change_allowed = true;
+  list_for_each_entry(port, &team->port_list, list) {
+   err = dev_set_mtu(port->dev, new_mtu);
+   if (err) {
+@@ -1742,6 +1743,7 @@ static int team_change_mtu(struct net_device *dev, int new_mtu)
+    goto unwind;
+   }
+  }
++ team->port_mtu_change_allowed = false;
+  mutex_unlock(&team->lock);
+ 
+  dev->mtu = new_mtu;
+@@ -1751,6 +1753,7 @@ static int team_change_mtu(struct net_device *dev, int new_mtu)
+ unwind:
+  list_for_each_entry_continue_reverse(port, &team->port_list, list)
+   dev_set_mtu(port->dev, dev->mtu);
++ team->port_mtu_change_allowed = false;
+  mutex_unlock(&team->lock);
+ 
+  return err;
+@@ -2876,7 +2879,9 @@ static int team_device_event(struct notifier_block *unused,
+   break;
+  case NETDEV_CHANGEMTU:
+   /* Forbid to change mtu of underlaying device */
+-  return NOTIFY_BAD;
++  if (!port->team->port_mtu_change_allowed)
++   return NOTIFY_BAD;
++  break;
+  case NETDEV_PRE_TYPE_CHANGE:
+   /* Forbid to change type of underlaying device */
+   return NOTIFY_BAD;
+diff --git a/include/linux/if_team.h b/include/linux/if_team.h
+index a899dc2..a6aa970 100644
+--- a/include/linux/if_team.h
++++ b/include/linux/if_team.h
+@@ -194,6 +194,7 @@ struct team {
+  bool user_carrier_enabled;
+  bool queue_override_enabled;
+  struct list_head *qom_lists; /* array of queue override mapping lists */
++ bool port_mtu_change_allowed;
+  struct {
+   unsigned int count;
+   unsigned int interval; /* in ms */
+-- 
+1.7.1

@@ -1,0 +1,169 @@
+From b6bb62f03fadf00f231f334ab64c1b2a2699d7b9 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:53:41 -0400
+Subject: [fs] nfs: Create a common multiple_pgios() function
+
+Message-id: <1403798077-28799-23-git-send-email-steved@redhat.com>
+Patchwork-id: 84937
+O-Subject: [RHEL7.1 PATCH 22/78] NFS: Create a common multiple_pgios() function
+Bugzilla: 1113248
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Anna Schumaker <Anna.Schumaker@netapp.com>
+
+Once again, these two functions look identical in the read and write
+case.  Time to combine them together!
+
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: c3766276f26090f4459329839cdcc8506dfbced5
+Bugzilla: 1113248
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index b1c5c84..eb6e6ff 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -243,6 +243,7 @@ void nfs_pgio_data_release(struct nfs_pgio_data *);
+ int nfs_generic_pgio(struct nfs_pageio_descriptor *, struct nfs_pgio_header *);
+ int nfs_initiate_pgio(struct rpc_clnt *, struct nfs_pgio_data *,
+         const struct rpc_call_ops *, int, int);
++int nfs_do_multiple_pgios(struct list_head *, const struct rpc_call_ops *, int);
+ 
+ static inline void nfs_iocounter_init(struct nfs_io_counter *c)
+ {
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index ab5b185..2471e02 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -493,6 +493,27 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(nfs_initiate_pgio);
+ 
++int nfs_do_multiple_pgios(struct list_head *head,
++     const struct rpc_call_ops *call_ops,
++     int how)
++{
++ struct nfs_pgio_data *data;
++ int ret = 0;
++
++ while (!list_empty(head)) {
++  int ret2;
++
++  data = list_first_entry(head, struct nfs_pgio_data, list);
++  list_del_init(&data->list);
++
++  ret2 = nfs_initiate_pgio(NFS_CLIENT(data->header->inode),
++      data, call_ops, how, 0);
++  if (ret == 0)
++    ret = ret2;
++ }
++ return ret;
++}
++
+ /**
+  * nfs_pgio_error - Clean up from a pageio error
+  * @desc: IO descriptor
+diff --git a/fs/nfs/read.c b/fs/nfs/read.c
+index 0359b0d..b834d45 100644
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@ -161,34 +161,6 @@ static void nfs_initiate_read(struct nfs_pgio_data *data, struct rpc_message *ms
+  NFS_PROTO(inode)->read_setup(data, msg);
+ }
+ 
+-static int nfs_do_read(struct nfs_pgio_data *data,
+-  const struct rpc_call_ops *call_ops)
+-{
+- struct inode *inode = data->header->inode;
+-
+- return nfs_initiate_pgio(NFS_CLIENT(inode), data, call_ops, 0, 0);
+-}
+-
+-static int
+-nfs_do_multiple_reads(struct list_head *head,
+-  const struct rpc_call_ops *call_ops)
+-{
+- struct nfs_pgio_data *data;
+- int ret = 0;
+-
+- while (!list_empty(head)) {
+-  int ret2;
+-
+-  data = list_first_entry(head, struct nfs_pgio_data, list);
+-  list_del_init(&data->list);
+-
+-  ret2 = nfs_do_read(data, call_ops);
+-  if (ret == 0)
+-   ret = ret2;
+- }
+- return ret;
+-}
+-
+ static void
+ nfs_async_read_error(struct list_head *head)
+ {
+@@ -222,8 +194,8 @@ static int nfs_generic_pg_readpages(struct nfs_pageio_descriptor *desc)
+  atomic_inc(&hdr->refcnt);
+  ret = nfs_generic_pgio(desc, hdr);
+  if (ret == 0)
+-  ret = nfs_do_multiple_reads(&hdr->rpc_list,
+-         desc->pg_rpc_callops);
++  ret = nfs_do_multiple_pgios(&hdr->rpc_list,
++         desc->pg_rpc_callops, 0);
+  if (atomic_dec_and_test(&hdr->refcnt))
+   hdr->completion_ops->completion(hdr);
+  return ret;
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index fc52723..575bbfc 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -947,35 +947,6 @@ static void nfs_initiate_write(struct nfs_pgio_data *data, struct rpc_message *m
+      &task_setup_data->rpc_client, msg, data);
+ }
+ 
+-static int nfs_do_write(struct nfs_pgio_data *data,
+-  const struct rpc_call_ops *call_ops,
+-  int how)
+-{
+- struct inode *inode = data->header->inode;
+-
+- return nfs_initiate_pgio(NFS_CLIENT(inode), data, call_ops, how, 0);
+-}
+-
+-static int nfs_do_multiple_writes(struct list_head *head,
+-  const struct rpc_call_ops *call_ops,
+-  int how)
+-{
+- struct nfs_pgio_data *data;
+- int ret = 0;
+-
+- while (!list_empty(head)) {
+-  int ret2;
+-
+-  data = list_first_entry(head, struct nfs_pgio_data, list);
+-  list_del_init(&data->list);
+-  
+-  ret2 = nfs_do_write(data, call_ops, how);
+-   if (ret == 0)
+-    ret = ret2;
+- }
+- return ret;
+-}
+-
+ /* If a nfs_flush_* function fails, it should remove reqs from @head and
+  * call this on each, which will prepare them to be retried on next
+  * writeback using standard nfs.
+@@ -1020,7 +991,7 @@ static int nfs_generic_pg_writepages(struct nfs_pageio_descriptor *desc)
+  atomic_inc(&hdr->refcnt);
+  ret = nfs_generic_pgio(desc, hdr);
+  if (ret == 0)
+-  ret = nfs_do_multiple_writes(&hdr->rpc_list,
++  ret = nfs_do_multiple_pgios(&hdr->rpc_list,
+           desc->pg_rpc_callops,
+           desc->pg_ioflags);
+  if (atomic_dec_and_test(&hdr->refcnt))
+-- 
+1.7.1

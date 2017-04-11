@@ -1,0 +1,108 @@
+From 56dda39660d0b3aa564f01fd99ecd99649fb6fff Mon Sep 17 00:00:00 2001
+From: Tomas Henzl <thenzl@redhat.com>
+Date: Thu, 18 Sep 2014 14:14:18 -0400
+Subject: [scsi] megaraid_sas: Do not scan non syspd drives
+
+Message-id: <1411049668-28841-19-git-send-email-thenzl@redhat.com>
+Patchwork-id: 96173
+O-Subject: [RHEL7.1 e-stor PATCH 18/28] megaraid_sas : Do not scan non syspd drives
+Bugzilla: 1088523
+RH-Acked-by: Ewan Milne <emilne@redhat.com>
+RH-Acked-by: Rob Evers <revers@redhat.com>
+
+Current driver allow device scan for all the devices on channel 0 and 1.
+E.a If we have two single drive raid volumes, we may see prints like below.
+First two prints are for physical device which are used to form VD.
+Prints like this creates confusion as it is really not required to scan any
+hidden physical devices.
+
+scsi1 : LSI SAS based MegaRAID driver
+scsi 1:0:0:0: Direct-Access     LSI      MR9361-8i        4.21 PQ: 0 ANSI: 5
+scsi 1:0:1:0: Direct-Access     LSI      MR9361-8i        4.21 PQ: 0 ANSI: 5
+scsi 1:2:0:0: Direct-Access     LSI      MR9361-8i        4.21 PQ: 0 ANSI: 5
+scsi 1:2:1:0: Direct-Access     LSI      MR9361-8i        4.21 PQ: 0 ANSI: 5
+
+When slave_alloc called, sdev-type will not be set, so current code will always
+return "0" in slave_alloc callback.
+This patch make sure that driver return "-ENXIO" for non-syspd devices.
+
+After this patch, we will see prints in syslog only for devices which are exposed.
+For current example, below print will be available in syslog.
+
+scsi1 : LSI SAS based MegaRAID driver
+scsi 1:2:0:0: Direct-Access     LSI      MR9361-8i        4.21 PQ: 0 ANSI: 5
+scsi 1:2:1:0: Direct-Access     LSI      MR9361-8i        4.21 PQ: 0 ANSI: 5
+
+scsi-queue/drivers-for-3.18 commit 07e38d94ef3646ccee4f222ae1f3033bb37f7fa0
+
+Signed-off-by: Sumit Saxena <sumit.saxena@avagotech.com>
+Signed-off-by: Kashyap Desai <kashyap.desai@avagotech.com>
+Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/megaraid/megaraid_sas_base.c b/drivers/scsi/megaraid/megaraid_sas_base.c
+index 3098c80..3aa40e7 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@ -1628,36 +1628,12 @@ static struct megasas_instance *megasas_lookup_instance(u16 host_no)
+ 
+ static int megasas_slave_configure(struct scsi_device *sdev)
+ {
+- u16             pd_index = 0;
+- struct  megasas_instance *instance ;
+-
+- instance = megasas_lookup_instance(sdev->host->host_no);
+-
+- /*
+- * Don't export physical disk devices to the disk driver.
+- *
+- * FIXME: Currently we don't export them to the midlayer at all.
+- *        That will be fixed once LSI engineers have audited the
+- *        firmware for possible issues.
+- */
+- if (sdev->channel < MEGASAS_MAX_PD_CHANNELS &&
+-    sdev->type == TYPE_DISK) {
+-  pd_index = (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) +
+-        sdev->id;
+-  if (instance->pd_list[pd_index].driveState ==
+-      MR_PD_STATE_SYSTEM) {
+-   blk_queue_rq_timeout(sdev->request_queue,
+-    MEGASAS_DEFAULT_CMD_TIMEOUT * HZ);
+-   return 0;
+-  }
+-  return -ENXIO;
+- }
+-
+  /*
+  * The RAID firmware may require extended timeouts.
+  */
+  blk_queue_rq_timeout(sdev->request_queue,
+   MEGASAS_DEFAULT_CMD_TIMEOUT * HZ);
++
+  return 0;
+ }
+ 
+@@ -1666,18 +1642,15 @@ static int megasas_slave_alloc(struct scsi_device *sdev)
+  u16             pd_index = 0;
+  struct megasas_instance *instance ;
+  instance = megasas_lookup_instance(sdev->host->host_no);
+- if ((sdev->channel < MEGASAS_MAX_PD_CHANNELS) &&
+-    (sdev->type == TYPE_DISK)) {
++ if (sdev->channel < MEGASAS_MAX_PD_CHANNELS) {
+   /*
+    * Open the OS scan to the SYSTEM PD
+    */
+   pd_index =
+    (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) +
+    sdev->id;
+-  if ((instance->pd_list[pd_index].driveState ==
+-     MR_PD_STATE_SYSTEM) &&
+-   (instance->pd_list[pd_index].driveType ==
+-      TYPE_DISK)) {
++  if (instance->pd_list[pd_index].driveState ==
++     MR_PD_STATE_SYSTEM) {
+    return 0;
+   }
+   return -ENXIO;
+-- 
+1.7.1

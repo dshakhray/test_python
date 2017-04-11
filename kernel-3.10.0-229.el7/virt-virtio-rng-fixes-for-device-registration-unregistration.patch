@@ -1,0 +1,143 @@
+From e38b9bb249c83be0ec1fbaf8be188df36b82f5bc Mon Sep 17 00:00:00 2001
+From: Amos Kong <akong@redhat.com>
+Date: Wed, 6 Aug 2014 05:16:22 -0400
+Subject: [virt] virtio-rng: fixes for device registration/unregistration
+
+Message-id: <1407302182-1492-5-git-send-email-akong@redhat.com>
+Patchwork-id: 87482
+O-Subject: [RHEL-7.1 kernel PATCH 4/4] virtio-rng: fixes for device registration/unregistration
+Bugzilla: 915335
+RH-Acked-by: Jason Wang <jasowang@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Amit Shah <amit.shah@redhat.com>
+
+From: Sasha Levin <sasha.levin@oracle.com>
+
+There are several fixes in this patch (mostly because it's hard
+splitting them up):
+
+ - Revert the name field in struct hwrng back to 'const'. Also, don't
+do an extra kmalloc for the name - just wasteful.
+ - Deal with allocation failures properly.
+ - Use IDA to allocate device number instead of brute forcing one.
+
+Signed-off-by: Sasha Levin <sasha.levin@oracle.com>
+Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+(cherry picked from commit a17597d3b418ca5a394d14724ccfc295cb3186c8)
+
+Fixed compiling error by adding head file <linux/idr.h>
+
+Signed-off-by: Amos Kong <akong@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/char/hw_random/virtio-rng.c b/drivers/char/hw_random/virtio-rng.c
+index 7b7d93a..d6a11ca 100644
+--- a/drivers/char/hw_random/virtio-rng.c
++++ b/drivers/char/hw_random/virtio-rng.c
+@@ -24,7 +24,9 @@
+ #include <linux/virtio.h>
+ #include <linux/virtio_rng.h>
+ #include <linux/module.h>
++#include <linux/idr.h>
+ 
++static DEFINE_IDA(rng_index_ida);
+ 
+ struct virtrng_info {
+  struct virtio_device *vdev;
+@@ -33,6 +35,8 @@ struct virtrng_info {
+  unsigned int data_avail;
+  struct completion have_data;
+  bool busy;
++ char name[25];
++ int index;
+ };
+ 
+ static void random_recv_done(struct virtqueue *vq)
+@@ -92,41 +96,45 @@ static void virtio_cleanup(struct hwrng *rng)
+ 
+ static int probe_common(struct virtio_device *vdev)
+ {
+- int err, i;
++ int err, index;
+  struct virtrng_info *vi = NULL;
+ 
+  vi = kzalloc(sizeof(struct virtrng_info), GFP_KERNEL);
+- vi->hwrng.name = kmalloc(40, GFP_KERNEL);
++ if (!vi)
++  return -ENOMEM;
++
++ vi->index = index = ida_simple_get(&rng_index_ida, 0, 0, GFP_KERNEL);
++ if (index < 0) {
++  kfree(vi);
++  return index;
++ }
++ sprintf(vi->name, "virtio_rng.%d", index);
+  init_completion(&vi->have_data);
+ 
+- vi->hwrng.read = virtio_read;
+- vi->hwrng.cleanup = virtio_cleanup;
+- vi->hwrng.priv = (unsigned long)vi;
++ vi->hwrng = (struct hwrng) {
++  .read = virtio_read,
++  .cleanup = virtio_cleanup,
++  .priv = (unsigned long)vi,
++  .name = vi->name,
++ };
+  vdev->priv = vi;
+ 
+  /* We expect a single virtqueue. */
+  vi->vq = virtio_find_single_vq(vdev, random_recv_done, "input");
+  if (IS_ERR(vi->vq)) {
+   err = PTR_ERR(vi->vq);
+-  kfree(vi->hwrng.name);
+   vi->vq = NULL;
+   kfree(vi);
+-  vi = NULL;
++  ida_simple_remove(&rng_index_ida, index);
+   return err;
+  }
+ 
+- i = 0;
+- do {
+-  sprintf(vi->hwrng.name, "virtio_rng.%d", i++);
+-  err = hwrng_register(&vi->hwrng);
+- } while (err == -EEXIST);
+-
++ err = hwrng_register(&vi->hwrng);
+  if (err) {
+   vdev->config->del_vqs(vdev);
+-  kfree(vi->hwrng.name);
+   vi->vq = NULL;
+   kfree(vi);
+-  vi = NULL;
++  ida_simple_remove(&rng_index_ida, index);
+   return err;
+  }
+ 
+@@ -140,10 +148,8 @@ static void remove_common(struct virtio_device *vdev)
+  vi->busy = false;
+  hwrng_unregister(&vi->hwrng);
+  vdev->config->del_vqs(vdev);
+- kfree(vi->hwrng.name);
+- vi->vq = NULL;
++ ida_simple_remove(&rng_index_ida, vi->index);
+  kfree(vi);
+- vi = NULL;
+ }
+ 
+ static int virtrng_probe(struct virtio_device *vdev)
+diff --git a/include/linux/hw_random.h b/include/linux/hw_random.h
+index 02d9c87..b4b0eef 100644
+--- a/include/linux/hw_random.h
++++ b/include/linux/hw_random.h
+@@ -31,7 +31,7 @@
+  * @priv:  Private data, for use by the RNG driver.
+  */
+ struct hwrng {
+- char *name;
++ const char *name;
+  int (*init)(struct hwrng *rng);
+  void (*cleanup)(struct hwrng *rng);
+  int (*data_present)(struct hwrng *rng, int wait);
+-- 
+1.7.1

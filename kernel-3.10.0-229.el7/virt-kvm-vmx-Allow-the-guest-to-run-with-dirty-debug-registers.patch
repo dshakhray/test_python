@@ -1,0 +1,110 @@
+From af324333335f38eab5b41b3045a9a88bcd7e75d6 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:39:17 -0400
+Subject: [virt] kvm/vmx: Allow the guest to run with dirty debug registers
+
+Message-id: <1406040016-3289-163-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86241
+O-Subject: [RHEL7 PATCH v2 162/221] KVM: vmx: Allow the guest to run with dirty debug registers
+Bugzilla: 1068627 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+When not running in guest-debug mode (i.e. the guest controls the debug
+registers, having to take an exit for each DR access is a waste of time.
+If the guest gets into a state where each context switch causes DR to be
+saved and restored, this can take away as much as 40% of the execution
+time from the guest.
+
+If the guest is running with vcpu->arch.db == vcpu->arch.eff_db, we
+can let it write freely to the debug registers and reload them on the
+next exit.  We still need to exit on the first access, so that the
+KVM_DEBUGREG_WONT_EXIT flag is set in switch_db_regs; after that, further
+accesses to the debug registers will not cause a vmexit.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 81908bf44340eb5ebc9969f67e6c8be0c92f2857)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index b2a913b..a9940ec 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -43,6 +43,7 @@
+ #include <asm/i387.h>
+ #include <asm/xcr.h>
+ #include <asm/perf_event.h>
++#include <asm/debugreg.h>
+ #include <asm/kexec.h>
+ 
+ #include "trace.h"
+@@ -2850,7 +2851,7 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf)
+         vmx_capability.ept, vmx_capability.vpid);
+  }
+ 
+- min = 0;
++ min = VM_EXIT_SAVE_DEBUG_CONTROLS;
+ #ifdef CONFIG_X86_64
+  min |= VM_EXIT_HOST_ADDR_SPACE_SIZE;
+ #endif
+@@ -5084,6 +5085,22 @@ static int handle_dr(struct kvm_vcpu *vcpu)
+   }
+  }
+ 
++ if (vcpu->guest_debug == 0) {
++  u32 cpu_based_vm_exec_control;
++
++  cpu_based_vm_exec_control = vmcs_read32(CPU_BASED_VM_EXEC_CONTROL);
++  cpu_based_vm_exec_control &= ~CPU_BASED_MOV_DR_EXITING;
++  vmcs_write32(CPU_BASED_VM_EXEC_CONTROL, cpu_based_vm_exec_control);
++
++  /*
++   * No more DR vmexits; force a reload of the debug registers
++   * and reenter on this instruction.  The next vmexit will
++   * retrieve the full state of the debug registers.
++   */
++  vcpu->arch.switch_db_regs |= KVM_DEBUGREG_WONT_EXIT;
++  return 1;
++ }
++
+  exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
+  dr = exit_qualification & DEBUG_REG_ACCESS_NUM;
+  reg = DEBUG_REG_ACCESS_REG(exit_qualification);
+@@ -5110,6 +5127,24 @@ static void vmx_set_dr6(struct kvm_vcpu *vcpu, unsigned long val)
+ {
+ }
+ 
++static void vmx_sync_dirty_debug_regs(struct kvm_vcpu *vcpu)
++{
++ u32 cpu_based_vm_exec_control;
++
++ get_debugreg(vcpu->arch.db[0], 0);
++ get_debugreg(vcpu->arch.db[1], 1);
++ get_debugreg(vcpu->arch.db[2], 2);
++ get_debugreg(vcpu->arch.db[3], 3);
++ get_debugreg(vcpu->arch.dr6, 6);
++ vcpu->arch.dr7 = vmcs_readl(GUEST_DR7);
++
++ vcpu->arch.switch_db_regs &= ~KVM_DEBUGREG_WONT_EXIT;
++
++ cpu_based_vm_exec_control = vmcs_read32(CPU_BASED_VM_EXEC_CONTROL);
++ cpu_based_vm_exec_control |= CPU_BASED_MOV_DR_EXITING;
++ vmcs_write32(CPU_BASED_VM_EXEC_CONTROL, cpu_based_vm_exec_control);
++}
++
+ static void vmx_set_dr7(struct kvm_vcpu *vcpu, unsigned long val)
+ {
+  vmcs_writel(GUEST_DR7, val);
+@@ -8628,6 +8663,7 @@ static struct kvm_x86_ops vmx_x86_ops = {
+  .get_dr6 = vmx_get_dr6,
+  .set_dr6 = vmx_set_dr6,
+  .set_dr7 = vmx_set_dr7,
++ .sync_dirty_debug_regs = vmx_sync_dirty_debug_regs,
+  .cache_reg = vmx_cache_reg,
+  .get_rflags = vmx_get_rflags,
+  .set_rflags = vmx_set_rflags,
+-- 
+1.7.1

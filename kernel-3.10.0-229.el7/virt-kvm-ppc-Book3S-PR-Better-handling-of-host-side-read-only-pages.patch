@@ -1,0 +1,490 @@
+From 156ccc86aabdeaca547632a3e3e7ed5afad092dc Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:06:07 -0400
+Subject: [virt] kvm/ppc: Book3S PR - Better handling of host-side read-only pages
+
+Message-id: <1410545655-205645-139-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94674
+O-Subject: [RHEL7 PATCH 138/626] KVM: PPC: Book3S PR: Better handling of host-side read-only pages
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 93b159b466bdc9753bba5c3c51b40d7ddbbcc07c
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:51 2013 +1000
+
+    KVM: PPC: Book3S PR: Better handling of host-side read-only pages
+
+    Currently we request write access to all pages that get mapped into the
+    guest, even if the guest is only loading from the page.  This reduces
+    the effectiveness of KSM because it means that we unshare every page we
+    access.  Also, we always set the changed (C) bit in the guest HPTE if
+    it allows writing, even for a guest load.
+
+    This fixes both these problems.  We pass an 'iswrite' flag to the
+    mmu.xlate() functions and to kvmppc_mmu_map_page() to indicate whether
+    the access is a load or a store.  The mmu.xlate() functions now only
+    set C for stores.  kvmppc_gfn_to_pfn() now calls gfn_to_pfn_prot()
+    instead of gfn_to_pfn() so that it can indicate whether we need write
+    access to the page, and get back a 'writable' flag to indicate whether
+    the page is writable or not.  If that 'writable' flag is clear, we then
+    make the host HPTE read-only even if the guest HPTE allowed writing.
+
+    This means that we can get a protection fault when the guest writes to a
+    page that it has mapped read-write but which is read-only on the host
+    side (perhaps due to KSM having merged the page).  Thus we now call
+    kvmppc_handle_pagefault() for protection faults as well as HPTE not found
+    faults.  In kvmppc_handle_pagefault(), if the access was allowed by the
+    guest HPTE and we thus need to install a new host HPTE, we then need to
+    remove the old host HPTE if there is one.  This is done with a new
+    function, kvmppc_mmu_unmap_page(), which uses kvmppc_mmu_pte_vflush() to
+    find and remove the old host HPTE.
+
+    Since the memslot-related functions require the KVM SRCU read lock to
+    be held, this adds srcu_read_lock/unlock pairs around the calls to
+    kvmppc_handle_pagefault().
+
+    Finally, this changes kvmppc_mmu_book3s_32_xlate_pte() to not ignore
+    guest HPTEs that don't permit access, and to return -EPERM for accesses
+    that are not permitted by the page protections.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 603fba4..a07bd7e 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -128,7 +128,9 @@ extern void kvmppc_set_pvr(struct kvm_vcpu *vcpu, u32 pvr);
+ extern void kvmppc_mmu_book3s_64_init(struct kvm_vcpu *vcpu);
+ extern void kvmppc_mmu_book3s_32_init(struct kvm_vcpu *vcpu);
+ extern void kvmppc_mmu_book3s_hv_init(struct kvm_vcpu *vcpu);
+-extern int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *pte);
++extern int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *pte,
++          bool iswrite);
++extern void kvmppc_mmu_unmap_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *pte);
+ extern int kvmppc_mmu_map_segment(struct kvm_vcpu *vcpu, ulong eaddr);
+ extern void kvmppc_mmu_flush_segment(struct kvm_vcpu *vcpu, ulong eaddr, ulong seg_size);
+ extern void kvmppc_mmu_flush_segments(struct kvm_vcpu *vcpu);
+@@ -157,7 +159,8 @@ extern void kvmppc_set_bat(struct kvm_vcpu *vcpu, struct kvmppc_bat *bat,
+       bool upper, u32 val);
+ extern void kvmppc_giveup_ext(struct kvm_vcpu *vcpu, ulong msr);
+ extern int kvmppc_emulate_paired_single(struct kvm_run *run, struct kvm_vcpu *vcpu);
+-extern pfn_t kvmppc_gfn_to_pfn(struct kvm_vcpu *vcpu, gfn_t gfn);
++extern pfn_t kvmppc_gfn_to_pfn(struct kvm_vcpu *vcpu, gfn_t gfn, bool writing,
++   bool *writable);
+ extern void kvmppc_add_revmap_chain(struct kvm *kvm, struct revmap_entry *rev,
+    unsigned long *rmap, long pte_index, int realmode);
+ extern void kvmppc_invalidate_hpte(struct kvm *kvm, unsigned long *hptep,
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index f482594..802984e 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -353,7 +353,8 @@ struct kvmppc_mmu {
+  /* book3s */
+  void (*mtsrin)(struct kvm_vcpu *vcpu, u32 srnum, ulong value);
+  u32  (*mfsrin)(struct kvm_vcpu *vcpu, u32 srnum);
+- int  (*xlate)(struct kvm_vcpu *vcpu, gva_t eaddr, struct kvmppc_pte *pte, bool data);
++ int  (*xlate)(struct kvm_vcpu *vcpu, gva_t eaddr,
++        struct kvmppc_pte *pte, bool data, bool iswrite);
+  void (*reset_msr)(struct kvm_vcpu *vcpu);
+  void (*tlbie)(struct kvm_vcpu *vcpu, ulong addr, bool large);
+  int  (*esid_to_vsid)(struct kvm_vcpu *vcpu, ulong esid, u64 *vsid);
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index f97369d..807103a 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -286,7 +286,8 @@ int kvmppc_core_prepare_to_enter(struct kvm_vcpu *vcpu)
+  return 0;
+ }
+ 
+-pfn_t kvmppc_gfn_to_pfn(struct kvm_vcpu *vcpu, gfn_t gfn)
++pfn_t kvmppc_gfn_to_pfn(struct kvm_vcpu *vcpu, gfn_t gfn, bool writing,
++   bool *writable)
+ {
+  ulong mp_pa = vcpu->arch.magic_page_pa;
+ 
+@@ -302,20 +303,22 @@ pfn_t kvmppc_gfn_to_pfn(struct kvm_vcpu *vcpu, gfn_t gfn)
+ 
+   pfn = (pfn_t)virt_to_phys((void*)shared_page) >> PAGE_SHIFT;
+   get_page(pfn_to_page(pfn));
++  if (writable)
++   *writable = true;
+   return pfn;
+  }
+ 
+- return gfn_to_pfn(vcpu->kvm, gfn);
++ return gfn_to_pfn_prot(vcpu->kvm, gfn, writing, writable);
+ }
+ 
+ static int kvmppc_xlate(struct kvm_vcpu *vcpu, ulong eaddr, bool data,
+-    struct kvmppc_pte *pte)
++   bool iswrite, struct kvmppc_pte *pte)
+ {
+  int relocated = (vcpu->arch.shared->msr & (data ? MSR_DR : MSR_IR));
+  int r;
+ 
+  if (relocated) {
+-  r = vcpu->arch.mmu.xlate(vcpu, eaddr, pte, data);
++  r = vcpu->arch.mmu.xlate(vcpu, eaddr, pte, data, iswrite);
+  } else {
+   pte->eaddr = eaddr;
+   pte->raddr = eaddr & KVM_PAM;
+@@ -361,7 +364,7 @@ int kvmppc_st(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+ 
+  vcpu->stat.st++;
+ 
+- if (kvmppc_xlate(vcpu, *eaddr, data, &pte))
++ if (kvmppc_xlate(vcpu, *eaddr, data, true, &pte))
+   return -ENOENT;
+ 
+  *eaddr = pte.raddr;
+@@ -383,7 +386,7 @@ int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+ 
+  vcpu->stat.ld++;
+ 
+- if (kvmppc_xlate(vcpu, *eaddr, data, &pte))
++ if (kvmppc_xlate(vcpu, *eaddr, data, false, &pte))
+   goto nopte;
+ 
+  *eaddr = pte.raddr;
+diff --git a/arch/powerpc/kvm/book3s_32_mmu.c b/arch/powerpc/kvm/book3s_32_mmu.c
+index b14af6d..76a64ce 100644
+--- a/arch/powerpc/kvm/book3s_32_mmu.c
++++ b/arch/powerpc/kvm/book3s_32_mmu.c
+@@ -84,7 +84,8 @@ static inline bool sr_nx(u32 sr_raw)
+ }
+ 
+ static int kvmppc_mmu_book3s_32_xlate_bat(struct kvm_vcpu *vcpu, gva_t eaddr,
+-       struct kvmppc_pte *pte, bool data);
++       struct kvmppc_pte *pte, bool data,
++       bool iswrite);
+ static int kvmppc_mmu_book3s_32_esid_to_vsid(struct kvm_vcpu *vcpu, ulong esid,
+           u64 *vsid);
+ 
+@@ -99,7 +100,7 @@ static u64 kvmppc_mmu_book3s_32_ea_to_vp(struct kvm_vcpu *vcpu, gva_t eaddr,
+  u64 vsid;
+  struct kvmppc_pte pte;
+ 
+- if (!kvmppc_mmu_book3s_32_xlate_bat(vcpu, eaddr, &pte, data))
++ if (!kvmppc_mmu_book3s_32_xlate_bat(vcpu, eaddr, &pte, data, false))
+   return pte.vpage;
+ 
+  kvmppc_mmu_book3s_32_esid_to_vsid(vcpu, eaddr >> SID_SHIFT, &vsid);
+@@ -146,7 +147,8 @@ static u32 kvmppc_mmu_book3s_32_get_ptem(u32 sre, gva_t eaddr, bool primary)
+ }
+ 
+ static int kvmppc_mmu_book3s_32_xlate_bat(struct kvm_vcpu *vcpu, gva_t eaddr,
+-       struct kvmppc_pte *pte, bool data)
++       struct kvmppc_pte *pte, bool data,
++       bool iswrite)
+ {
+  struct kvmppc_vcpu_book3s *vcpu_book3s = to_book3s(vcpu);
+  struct kvmppc_bat *bat;
+@@ -187,8 +189,7 @@ static int kvmppc_mmu_book3s_32_xlate_bat(struct kvm_vcpu *vcpu, gva_t eaddr,
+     printk(KERN_INFO "BAT is not readable!\n");
+     continue;
+    }
+-   if (!pte->may_write) {
+-    /* let's treat r/o BATs as not-readable for now */
++   if (iswrite && !pte->may_write) {
+     dprintk_pte("BAT is read-only!\n");
+     continue;
+    }
+@@ -202,7 +203,7 @@ static int kvmppc_mmu_book3s_32_xlate_bat(struct kvm_vcpu *vcpu, gva_t eaddr,
+ 
+ static int kvmppc_mmu_book3s_32_xlate_pte(struct kvm_vcpu *vcpu, gva_t eaddr,
+          struct kvmppc_pte *pte, bool data,
+-         bool primary)
++         bool iswrite, bool primary)
+ {
+  u32 sre;
+  hva_t ptegp;
+@@ -258,9 +259,6 @@ static int kvmppc_mmu_book3s_32_xlate_pte(struct kvm_vcpu *vcpu, gva_t eaddr,
+      break;
+    }
+ 
+-   if ( !pte->may_read )
+-    continue;
+-
+    dprintk_pte("MMU: Found PTE -> %x %x - %x\n",
+         pteg[i], pteg[i+1], pp);
+    found = 1;
+@@ -282,11 +280,12 @@ static int kvmppc_mmu_book3s_32_xlate_pte(struct kvm_vcpu *vcpu, gva_t eaddr,
+    pte_r |= PTEG_FLAG_ACCESSED;
+    put_user(pte_r >> 8, addr + 2);
+   }
+-  if (pte->may_write && !(pte_r & PTEG_FLAG_DIRTY)) {
+-   /* XXX should only set this for stores */
++  if (iswrite && pte->may_write && !(pte_r & PTEG_FLAG_DIRTY)) {
+    pte_r |= PTEG_FLAG_DIRTY;
+    put_user(pte_r, addr + 3);
+   }
++  if (!pte->may_read || (iswrite && !pte->may_write))
++   return -EPERM;
+   return 0;
+  }
+ 
+@@ -305,7 +304,8 @@ no_page_found:
+ }
+ 
+ static int kvmppc_mmu_book3s_32_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+-          struct kvmppc_pte *pte, bool data)
++          struct kvmppc_pte *pte, bool data,
++          bool iswrite)
+ {
+  int r;
+  ulong mp_ea = vcpu->arch.magic_page_ea;
+@@ -327,11 +327,13 @@ static int kvmppc_mmu_book3s_32_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+   return 0;
+  }
+ 
+- r = kvmppc_mmu_book3s_32_xlate_bat(vcpu, eaddr, pte, data);
++ r = kvmppc_mmu_book3s_32_xlate_bat(vcpu, eaddr, pte, data, iswrite);
+  if (r < 0)
+-        r = kvmppc_mmu_book3s_32_xlate_pte(vcpu, eaddr, pte, data, true);
++  r = kvmppc_mmu_book3s_32_xlate_pte(vcpu, eaddr, pte,
++         data, iswrite, true);
+  if (r < 0)
+-        r = kvmppc_mmu_book3s_32_xlate_pte(vcpu, eaddr, pte, data, false);
++  r = kvmppc_mmu_book3s_32_xlate_pte(vcpu, eaddr, pte,
++         data, iswrite, false);
+ 
+  return r;
+ }
+diff --git a/arch/powerpc/kvm/book3s_32_mmu_host.c b/arch/powerpc/kvm/book3s_32_mmu_host.c
+index 00e619b..6733223 100644
+--- a/arch/powerpc/kvm/book3s_32_mmu_host.c
++++ b/arch/powerpc/kvm/book3s_32_mmu_host.c
+@@ -138,7 +138,8 @@ static u32 *kvmppc_mmu_get_pteg(struct kvm_vcpu *vcpu, u32 vsid, u32 eaddr,
+ 
+ extern char etext[];
+ 
+-int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte)
++int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte,
++   bool iswrite)
+ {
+  pfn_t hpaddr;
+  u64 vpn;
+@@ -152,9 +153,11 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte)
+  bool evict = false;
+  struct hpte_cache *pte;
+  int r = 0;
++ bool writable;
+ 
+  /* Get host physical address for gpa */
+- hpaddr = kvmppc_gfn_to_pfn(vcpu, orig_pte->raddr >> PAGE_SHIFT);
++ hpaddr = kvmppc_gfn_to_pfn(vcpu, orig_pte->raddr >> PAGE_SHIFT,
++       iswrite, &writable);
+  if (is_error_noslot_pfn(hpaddr)) {
+   printk(KERN_INFO "Couldn't get guest page for gfn %lx!\n",
+      orig_pte->eaddr);
+@@ -204,7 +207,7 @@ next_pteg:
+   (primary ? 0 : PTE_SEC);
+  pteg1 = hpaddr | PTE_M | PTE_R | PTE_C;
+ 
+- if (orig_pte->may_write) {
++ if (orig_pte->may_write && writable) {
+   pteg1 |= PP_RWRW;
+   mark_page_dirty(vcpu->kvm, orig_pte->raddr >> PAGE_SHIFT);
+  } else {
+@@ -259,6 +262,11 @@ out:
+  return r;
+ }
+ 
++void kvmppc_mmu_unmap_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *pte)
++{
++ kvmppc_mmu_pte_vflush(vcpu, pte->vpage, 0xfffffffffULL);
++}
++
+ static struct kvmppc_sid_map *create_sid_map(struct kvm_vcpu *vcpu, u64 gvsid)
+ {
+  struct kvmppc_sid_map *map;
+diff --git a/arch/powerpc/kvm/book3s_64_mmu.c b/arch/powerpc/kvm/book3s_64_mmu.c
+index c110145..83da1f8 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu.c
++++ b/arch/powerpc/kvm/book3s_64_mmu.c
+@@ -206,7 +206,8 @@ static int decode_pagesize(struct kvmppc_slb *slbe, u64 r)
+ }
+ 
+ static int kvmppc_mmu_book3s_64_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+-    struct kvmppc_pte *gpte, bool data)
++          struct kvmppc_pte *gpte, bool data,
++          bool iswrite)
+ {
+  struct kvmppc_slb *slbe;
+  hva_t ptegp;
+@@ -345,8 +346,8 @@ do_second:
+   r |= HPTE_R_R;
+   put_user(r >> 8, addr + 6);
+  }
+- if (data && gpte->may_write && !(r & HPTE_R_C)) {
+-  /* Set the dirty flag -- XXX even if not writing */
++ if (iswrite && gpte->may_write && !(r & HPTE_R_C)) {
++  /* Set the dirty flag */
+   /* Use a single byte write */
+   char __user *addr = (char __user *) &pteg[i+1];
+   r |= HPTE_R_C;
+@@ -355,7 +356,7 @@ do_second:
+ 
+  mutex_unlock(&vcpu->kvm->arch.hpt_mutex);
+ 
+- if (!gpte->may_read)
++ if (!gpte->may_read || (iswrite && !gpte->may_write))
+   return -EPERM;
+  return 0;
+ 
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_host.c b/arch/powerpc/kvm/book3s_64_mmu_host.c
+index 6bda504..cc9fb89 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_host.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_host.c
+@@ -78,7 +78,8 @@ static struct kvmppc_sid_map *find_sid_vsid(struct kvm_vcpu *vcpu, u64 gvsid)
+  return NULL;
+ }
+ 
+-int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte)
++int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte,
++   bool iswrite)
+ {
+  unsigned long vpn;
+  pfn_t hpaddr;
+@@ -91,9 +92,11 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte)
+  struct kvmppc_sid_map *map;
+  int r = 0;
+  int hpsize = MMU_PAGE_4K;
++ bool writable;
+ 
+  /* Get host physical address for gpa */
+- hpaddr = kvmppc_gfn_to_pfn(vcpu, orig_pte->raddr >> PAGE_SHIFT);
++ hpaddr = kvmppc_gfn_to_pfn(vcpu, orig_pte->raddr >> PAGE_SHIFT,
++       iswrite, &writable);
+  if (is_error_noslot_pfn(hpaddr)) {
+   printk(KERN_INFO "Couldn't get guest page for gfn %lx!\n", orig_pte->eaddr);
+   r = -EINVAL;
+@@ -119,7 +122,7 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte)
+ 
+  vpn = hpt_vpn(orig_pte->eaddr, map->host_vsid, MMU_SEGSIZE_256M);
+ 
+- if (!orig_pte->may_write)
++ if (!orig_pte->may_write || !writable)
+   rflags |= HPTE_R_PP;
+  else
+   mark_page_dirty(vcpu->kvm, orig_pte->raddr >> PAGE_SHIFT);
+@@ -186,6 +189,17 @@ out:
+  return r;
+ }
+ 
++void kvmppc_mmu_unmap_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *pte)
++{
++ u64 mask = 0xfffffffffULL;
++ u64 vsid;
++
++ vcpu->arch.mmu.esid_to_vsid(vcpu, pte->eaddr >> SID_SHIFT, &vsid);
++ if (vsid & VSID_64K)
++  mask = 0xffffffff0ULL;
++ kvmppc_mmu_pte_vflush(vcpu, pte->vpage, mask);
++}
++
+ static struct kvmppc_sid_map *create_sid_map(struct kvm_vcpu *vcpu, u64 gvsid)
+ {
+  struct kvmppc_sid_map *map;
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index ccb89a0..394fef8 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -451,7 +451,7 @@ static unsigned long kvmppc_mmu_get_real_addr(unsigned long v, unsigned long r,
+ }
+ 
+ static int kvmppc_mmu_book3s_64_hv_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+-   struct kvmppc_pte *gpte, bool data)
++   struct kvmppc_pte *gpte, bool data, bool iswrite)
+ {
+  struct kvm *kvm = vcpu->kvm;
+  struct kvmppc_slb *slbe;
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index e329dd7..85b96a2 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -401,6 +401,7 @@ int kvmppc_handle_pagefault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+        ulong eaddr, int vec)
+ {
+  bool data = (vec == BOOK3S_INTERRUPT_DATA_STORAGE);
++ bool iswrite = false;
+  int r = RESUME_GUEST;
+  int relocated;
+  int page_found = 0;
+@@ -411,10 +412,12 @@ int kvmppc_handle_pagefault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+  u64 vsid;
+ 
+  relocated = data ? dr : ir;
++ if (data && (vcpu->arch.fault_dsisr & DSISR_ISSTORE))
++  iswrite = true;
+ 
+  /* Resolve real address if translation turned on */
+  if (relocated) {
+-  page_found = vcpu->arch.mmu.xlate(vcpu, eaddr, &pte, data);
++  page_found = vcpu->arch.mmu.xlate(vcpu, eaddr, &pte, data, iswrite);
+  } else {
+   pte.may_execute = true;
+   pte.may_read = true;
+@@ -475,12 +478,20 @@ int kvmppc_handle_pagefault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+   kvmppc_book3s_queue_irqprio(vcpu, vec + 0x80);
+  } else if (!is_mmio &&
+      kvmppc_visible_gfn(vcpu, pte.raddr >> PAGE_SHIFT)) {
++  if (data && !(vcpu->arch.fault_dsisr & DSISR_NOHPTE)) {
++   /*
++    * There is already a host HPTE there, presumably
++    * a read-only one for a page the guest thinks
++    * is writable, so get rid of it first.
++    */
++   kvmppc_mmu_unmap_page(vcpu, &pte);
++  }
+   /* The guest's PTE is not mapped yet. Map on the host */
+-  kvmppc_mmu_map_page(vcpu, &pte);
++  kvmppc_mmu_map_page(vcpu, &pte, iswrite);
+   if (data)
+    vcpu->stat.sp_storage++;
+   else if (vcpu->arch.mmu.is_dcbz32(vcpu) &&
+-   (!(vcpu->arch.hflags & BOOK3S_HFLAG_DCBZ32)))
++    (!(vcpu->arch.hflags & BOOK3S_HFLAG_DCBZ32)))
+    kvmppc_patch_dcbz(vcpu, &pte);
+  } else {
+   /* MMIO */
+@@ -730,7 +741,9 @@ int kvmppc_handle_exit(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 
+   /* only care about PTEG not found errors, but leave NX alone */
+   if (shadow_srr1 & 0x40000000) {
++   int idx = srcu_read_lock(&vcpu->kvm->srcu);
+    r = kvmppc_handle_pagefault(run, vcpu, kvmppc_get_pc(vcpu), exit_nr);
++   srcu_read_unlock(&vcpu->kvm->srcu, idx);
+    vcpu->stat.sp_instruc++;
+   } else if (vcpu->arch.mmu.is_dcbz32(vcpu) &&
+      (!(vcpu->arch.hflags & BOOK3S_HFLAG_DCBZ32))) {
+@@ -772,9 +785,15 @@ int kvmppc_handle_exit(struct kvm_run *run, struct kvm_vcpu *vcpu,
+   }
+ #endif
+ 
+-  /* The only case we need to handle is missing shadow PTEs */
+-  if (fault_dsisr & DSISR_NOHPTE) {
++  /*
++   * We need to handle missing shadow PTEs, and
++   * protection faults due to us mapping a page read-only
++   * when the guest thinks it is writable.
++   */
++  if (fault_dsisr & (DSISR_NOHPTE | DSISR_PROTFAULT)) {
++   int idx = srcu_read_lock(&vcpu->kvm->srcu);
+    r = kvmppc_handle_pagefault(run, vcpu, dar, exit_nr);
++   srcu_read_unlock(&vcpu->kvm->srcu, idx);
+   } else {
+    vcpu->arch.shared->dar = dar;
+    vcpu->arch.shared->dsisr = fault_dsisr;
+-- 
+1.7.1

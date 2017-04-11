@@ -1,0 +1,91 @@
+From 2bbcd8a69194cbae2272b82961be5dd074ce2002 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:39:16 -0400
+Subject: [virt] kvm/x86: Allow the guest to run with dirty debug registers
+
+Message-id: <1406040016-3289-162-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86240
+O-Subject: [RHEL7 PATCH v2 161/221] KVM: x86: Allow the guest to run with dirty debug registers
+Bugzilla: 1068627 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+When not running in guest-debug mode, the guest controls the debug
+registers and having to take an exit for each DR access is a waste
+of time.  If the guest gets into a state where each context switch
+causes DR to be saved and restored, this can take away as much as 40%
+of the execution time from the guest.
+
+After this patch, VMX- and SVM-specific code can set a flag in
+switch_db_regs, telling vcpu_enter_guest that on the next exit the debug
+registers might be dirty and need to be reloaded (syncing will be taken
+care of by a new callback in kvm_x86_ops).  This flag can be set on the
+first access to a debug registers, so that multiple accesses to the
+debug registers only cause one vmexit.
+
+Note that since the guest will be able to read debug registers and
+enable breakpoints in DR7, we need to ensure that they are synchronized
+on entry to the guest---including DR6 that was not synced before.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c77fb5fe6f031bee9403397ae7b94ea22ea19aa7)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 35f538b..fcaf9c9 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -339,6 +339,7 @@ struct kvm_pmu {
+ 
+ enum {
+  KVM_DEBUGREG_BP_ENABLED = 1,
++ KVM_DEBUGREG_WONT_EXIT = 2,
+ };
+ 
+ struct kvm_vcpu_arch {
+@@ -707,6 +708,7 @@ struct kvm_x86_ops {
+  void (*set_gdt)(struct kvm_vcpu *vcpu, struct desc_ptr *dt);
+  u64 (*get_dr6)(struct kvm_vcpu *vcpu);
+  void (*set_dr6)(struct kvm_vcpu *vcpu, unsigned long value);
++ void (*sync_dirty_debug_regs)(struct kvm_vcpu *vcpu);
+  void (*set_dr7)(struct kvm_vcpu *vcpu, unsigned long value);
+  void (*cache_reg)(struct kvm_vcpu *vcpu, enum kvm_reg reg);
+  unsigned long (*get_rflags)(struct kvm_vcpu *vcpu);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 1f5fcca..0f222b7 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6046,12 +6046,28 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+   set_debugreg(vcpu->arch.eff_db[1], 1);
+   set_debugreg(vcpu->arch.eff_db[2], 2);
+   set_debugreg(vcpu->arch.eff_db[3], 3);
++  set_debugreg(vcpu->arch.dr6, 6);
+  }
+ 
+  trace_kvm_entry(vcpu->vcpu_id);
+  kvm_x86_ops->run(vcpu);
+ 
+  /*
++  * Do this here before restoring debug registers on the host.  And
++  * since we do this before handling the vmexit, a DR access vmexit
++  * can (a) read the correct value of the debug registers, (b) set
++  * KVM_DEBUGREG_WONT_EXIT again.
++  */
++ if (unlikely(vcpu->arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT)) {
++  int i;
++
++  WARN_ON(vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP);
++  kvm_x86_ops->sync_dirty_debug_regs(vcpu);
++  for (i = 0; i < KVM_NR_DB_REGS; i++)
++   vcpu->arch.eff_db[i] = vcpu->arch.db[i];
++ }
++
++ /*
+   * If the guest has used debug registers, at least dr7
+   * will be disabled while returning to the host.
+   * If we don't have active breakpoints in the host, we don't
+-- 
+1.7.1

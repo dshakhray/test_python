@@ -1,0 +1,172 @@
+From be8b5735b5b70d5f0670da8c80111b22f0a9cd45 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:38 -0400
+Subject: [virt] kvm/ppc: book3s hv - Basic little-endian guest support
+
+Message-id: <1410545655-205645-350-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94242
+O-Subject: [RHEL7 PATCH 349/626] KVM: PPC: Book3S HV: Basic little-endian guest support
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit d682916a381ac7c8eb965c10ab64bc7cc2f18647
+Author: Anton Blanchard <anton@samba.org>
+Date:   Wed Jan 8 21:25:30 2014 +1100
+
+    KVM: PPC: Book3S HV: Basic little-endian guest support
+
+    We create a guest MSR from scratch when delivering exceptions in
+    a few places.  Instead of extracting LPCR[ILE] and inserting it
+    into MSR_LE each time, we simply create a new variable intr_msr which
+    contains the entire MSR to use.  For a little-endian guest, userspace
+    needs to set the ILE (interrupt little-endian) bit in the LPCR for
+    each vcpu (or at least one vcpu in each virtual core).
+
+    [paulus@samba.org - removed H_SET_MODE implementation from original
+    version of the patch, and made kvmppc_set_lpcr update vcpu->arch.intr_msr.]
+
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 8ca6611..c383ee5 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -666,6 +666,7 @@ struct kvm_vcpu_arch {
+  spinlock_t tbacct_lock;
+  u64 busy_stolen;
+  u64 busy_preempt;
++ unsigned long intr_msr;
+ #endif
+ };
+ 
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 09f57df..2d23ad9 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -484,6 +484,7 @@ int main(void)
+  DEFINE(VCPU_DAR, offsetof(struct kvm_vcpu, arch.shregs.dar));
+  DEFINE(VCPU_VPA, offsetof(struct kvm_vcpu, arch.vpa.pinned_addr));
+  DEFINE(VCPU_VPA_DIRTY, offsetof(struct kvm_vcpu, arch.vpa.dirty));
++ DEFINE(VCPU_INTR_MSR, offsetof(struct kvm_vcpu, arch.intr_msr));
+ #endif
+ #ifdef CONFIG_PPC_BOOK3S
+  DEFINE(VCPU_VCPUID, offsetof(struct kvm_vcpu, vcpu_id));
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 1936b16..e130be7 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -262,7 +262,7 @@ int kvmppc_mmu_hv_init(void)
+ 
+ static void kvmppc_mmu_book3s_64_hv_reset_msr(struct kvm_vcpu *vcpu)
+ {
+- kvmppc_set_msr(vcpu, MSR_SF | MSR_ME);
++ kvmppc_set_msr(vcpu, vcpu->arch.intr_msr);
+ }
+ 
+ /*
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index be0c7f4..c5443ad 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -788,6 +788,27 @@ static void kvmppc_set_lpcr(struct kvm_vcpu *vcpu, u64 new_lpcr)
+ 
+  spin_lock(&vc->lock);
+  /*
++  * If ILE (interrupt little-endian) has changed, update the
++  * MSR_LE bit in the intr_msr for each vcpu in this vcore.
++  */
++ if ((new_lpcr & LPCR_ILE) != (vc->lpcr & LPCR_ILE)) {
++  struct kvm *kvm = vcpu->kvm;
++  struct kvm_vcpu *vcpu;
++  int i;
++
++  mutex_lock(&kvm->lock);
++  kvm_for_each_vcpu(i, vcpu, kvm) {
++   if (vcpu->arch.vcore != vc)
++    continue;
++   if (new_lpcr & LPCR_ILE)
++    vcpu->arch.intr_msr |= MSR_LE;
++   else
++    vcpu->arch.intr_msr &= ~MSR_LE;
++  }
++  mutex_unlock(&kvm->lock);
++ }
++
++ /*
+   * Userspace can only modify DPFD (default prefetch depth),
+   * ILE (interrupt little-endian) and TC (translation control).
+   * On POWER8 userspace can also modify AIL (alt. interrupt loc.)
+@@ -1153,6 +1174,7 @@ static struct kvm_vcpu *kvmppc_core_vcpu_create_hv(struct kvm *kvm,
+  spin_lock_init(&vcpu->arch.vpa_update_lock);
+  spin_lock_init(&vcpu->arch.tbacct_lock);
+  vcpu->arch.busy_preempt = TB_NIL;
++ vcpu->arch.intr_msr = MSR_SF | MSR_ME;
+ 
+  kvmppc_mmu_book3s_hv_init(vcpu);
+ 
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 7660051..1152d4f 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -818,8 +818,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+ 12: mtspr SPRN_SRR0, r10
+  mr r10,r0
+  mtspr SPRN_SRR1, r11
+- li r11,(MSR_ME << 1) | 1 /* synthesize MSR_SF | MSR_ME */
+- rotldi r11,r11,63
++ ld r11, VCPU_INTR_MSR(r4)
+ 5:
+ 
+ /*
+@@ -1626,8 +1625,7 @@ kvmppc_hdsi:
+  mtspr SPRN_SRR0, r10
+  mtspr SPRN_SRR1, r11
+  li r10, BOOK3S_INTERRUPT_DATA_STORAGE
+- li r11, (MSR_ME << 1) | 1 /* synthesize MSR_SF | MSR_ME */
+- rotldi r11, r11, 63
++ ld r11, VCPU_INTR_MSR(r9)
+ fast_interrupt_c_return:
+ 6: ld r7, VCPU_CTR(r9)
+  lwz r8, VCPU_XER(r9)
+@@ -1696,8 +1694,7 @@ kvmppc_hisi:
+ 1: mtspr SPRN_SRR0, r10
+  mtspr SPRN_SRR1, r11
+  li r10, BOOK3S_INTERRUPT_INST_STORAGE
+- li r11, (MSR_ME << 1) | 1 /* synthesize MSR_SF | MSR_ME */
+- rotldi r11, r11, 63
++ ld r11, VCPU_INTR_MSR(r9)
+  b fast_interrupt_c_return
+ 
+ 3: ld r6, VCPU_KVM(r9) /* not relocated, use VRMA */
+@@ -1740,8 +1737,7 @@ sc_1_fast_return:
+  mtspr SPRN_SRR0,r10
+  mtspr SPRN_SRR1,r11
+  li r10, BOOK3S_INTERRUPT_SYSCALL
+- li r11, (MSR_ME << 1) | 1  /* synthesize MSR_SF | MSR_ME */
+- rotldi r11, r11, 63
++ ld r11, VCPU_INTR_MSR(r9)
+  mr r4,r9
+  b fast_guest_return
+ 
+@@ -2041,8 +2037,7 @@ machine_check_realmode:
+  beq mc_cont
+  /* If not, deliver a machine check.  SRR0/1 are already set */
+  li r10, BOOK3S_INTERRUPT_MACHINE_CHECK
+- li r11, (MSR_ME << 1) | 1 /* synthesize MSR_SF | MSR_ME */
+- rotldi r11, r11, 63
++ ld r11, VCPU_INTR_MSR(r9)
+  b fast_interrupt_c_return
+ 
+ /*
+-- 
+1.7.1

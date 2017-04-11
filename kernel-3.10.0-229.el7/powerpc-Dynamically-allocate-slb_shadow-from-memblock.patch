@@ -1,0 +1,111 @@
+From 8cbd9d8d0827e698d4f2398edb268a4fa76fc48d Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:07:36 -0400
+Subject: [powerpc] Dynamically allocate slb_shadow from memblock
+
+Message-id: <1410545655-205645-228-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94205
+O-Subject: [RHEL7 PATCH 227/626] powerpc: Dynamically allocate slb_shadow from memblock
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 6f4441ef7009b9ec063678d906eb762318689494
+Author: Jeremy Kerr <jk@ozlabs.org>
+Date:   Thu Dec 5 11:42:40 2013 +0800
+
+    powerpc: Dynamically allocate slb_shadow from memblock
+
+    Currently, the slb_shadow buffer is our largest symbol:
+
+      [jk@pablo linux]$ nm --size-sort -r -S obj/vmlinux | head -1
+      c000000000da0000 0000000000040000 d slb_shadow
+
+    - we allocate 128 bytes per cpu; so 256k with NR_CPUS=2048. As we have
+    constant initialisers, it's allocated in .text, causing a larger vmlinux
+    image. We may also allocate unecessary slb_shadow buffers (> no. pacas),
+    since we use the build-time NR_CPUS rather than the run-time nr_cpu_ids.
+
+    We could move this to the bss, but then we still have the NR_CPUS vs
+    nr_cpu_ids potential for overallocation.
+
+    This change dynamically allocates the slb_shadow array, during
+    initialise_pacas(). At a cost of 104 bytes of text, we save 256k of
+    data:
+
+      [jk@pablo linux]$ size obj/vmlinux{.orig,}
+         text     data      bss       dec     hex filename
+      9202795  5244676  1169576  15617047  ee4c17 obj/vmlinux.orig
+      9202899  4982532  1169576  15355007  ea4c7f obj/vmlinux
+
+    Tested on pseries.
+
+    Signed-off-by: Jeremy Kerr <jk@ozlabs.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/paca.c b/arch/powerpc/kernel/paca.c
+index 9095a6f..623c356 100644
+--- a/arch/powerpc/kernel/paca.c
++++ b/arch/powerpc/kernel/paca.c
+@@ -99,12 +99,28 @@ static inline void free_lppacas(void) { }
+  * 3 persistent SLBs are registered here.  The buffer will be zero
+  * initially, hence will all be invaild until we actually write them.
+  */
+-static struct slb_shadow slb_shadow[] __cacheline_aligned = {
+- [0 ... (NR_CPUS-1)] = {
+-  .persistent = cpu_to_be32(SLB_NUM_BOLTED),
+-  .buffer_length = cpu_to_be32(sizeof(struct slb_shadow)),
+- },
+-};
++static struct slb_shadow *slb_shadow;
++
++static void __init allocate_slb_shadows(int nr_cpus, int limit)
++{
++ int size = PAGE_ALIGN(sizeof(struct slb_shadow) * nr_cpus);
++ slb_shadow = __va(memblock_alloc_base(size, PAGE_SIZE, limit));
++ memset(slb_shadow, 0, size);
++}
++
++static struct slb_shadow * __init init_slb_shadow(int cpu)
++{
++ struct slb_shadow *s = &slb_shadow[cpu];
++
++ s->persistent = cpu_to_be32(SLB_NUM_BOLTED);
++ s->buffer_length = cpu_to_be32(sizeof(*s));
++
++ return s;
++}
++
++#else /* CONFIG_PPC_STD_MMU_64 */
++
++static void __init allocate_slb_shadows(int nr_cpus, int limit) { }
+ 
+ #endif /* CONFIG_PPC_STD_MMU_64 */
+ 
+@@ -142,7 +158,7 @@ void __init initialise_paca(struct paca_struct *new_paca, int cpu)
+  new_paca->__current = &init_task;
+  new_paca->data_offset = 0xfeeeeeeeeeeeeeeeULL;
+ #ifdef CONFIG_PPC_STD_MMU_64
+- new_paca->slb_shadow_ptr = &slb_shadow[cpu];
++ new_paca->slb_shadow_ptr = init_slb_shadow(cpu);
+ #endif /* CONFIG_PPC_STD_MMU_64 */
+ }
+ 
+@@ -190,6 +206,8 @@ void __init allocate_pacas(void)
+ 
+  allocate_lppacas(nr_cpu_ids, limit);
+ 
++ allocate_slb_shadows(nr_cpu_ids, limit);
++
+  /* Can't use for_each_*_cpu, as they aren't functional yet */
+  for (cpu = 0; cpu < nr_cpu_ids; cpu++)
+   initialise_paca(&paca[cpu], cpu);
+-- 
+1.7.1

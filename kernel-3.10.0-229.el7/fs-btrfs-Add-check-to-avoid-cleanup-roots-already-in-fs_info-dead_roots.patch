@@ -1,0 +1,98 @@
+From 33c4f1bcc9274e7a9889cef694fd44aaa21e2b43 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:03:31 -0400
+Subject: [fs] btrfs: Add check to avoid cleanup roots already in fs_info->dead_roots
+
+Message-id: <1407179109-13714-325-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87284
+O-Subject: [RHEL7.1 PATCH 324/422] btrfs: Add check to avoid cleanup roots already in fs_info->dead_roots.
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Qu Wenruo <quwenruo@cn.fujitsu.com>
+
+commit 65d33fd7a6e4aaf9cd6577555d0b3c18fbefe415
+Author: Qu Wenruo <quwenruo@cn.fujitsu.com>
+Date:   Tue Apr 22 17:13:51 2014 +0800
+
+    btrfs: Add check to avoid cleanup roots already in fs_info->dead_roots.
+
+    Current btrfs_orphan_cleanup will also cleanup roots which is already in
+    fs_info->dead_roots without protection.
+    This will have conditional race with fs_info->cleaner_kthread.
+
+    This patch will use refs in root->root_item to detect roots in
+    dead_roots and avoid conflicts.
+
+    Signed-off-by: Qu Wenruo <quwenruo@cn.fujitsu.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 6384cd4..961da99 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -3536,28 +3536,51 @@ int btrfs_cleanup_fs_roots(struct btrfs_fs_info *fs_info)
+ {
+  u64 root_objectid = 0;
+  struct btrfs_root *gang[8];
+- int i;
+- int ret;
++ int i = 0;
++ int err = 0;
++ unsigned int ret = 0;
++ int index;
+ 
+  while (1) {
++  index = srcu_read_lock(&fs_info->subvol_srcu);
+   ret = radix_tree_gang_lookup(&fs_info->fs_roots_radix,
+           (void **)gang, root_objectid,
+           ARRAY_SIZE(gang));
+-  if (!ret)
++  if (!ret) {
++   srcu_read_unlock(&fs_info->subvol_srcu, index);
+    break;
+-
++  }
+   root_objectid = gang[ret - 1]->root_key.objectid + 1;
++
+   for (i = 0; i < ret; i++) {
+-   int err;
++   /* Avoid to grab roots in dead_roots */
++   if (btrfs_root_refs(&gang[i]->root_item) == 0) {
++    gang[i] = NULL;
++    continue;
++   }
++   /* grab all the search result for later use */
++   gang[i] = btrfs_grab_fs_root(gang[i]);
++  }
++  srcu_read_unlock(&fs_info->subvol_srcu, index);
+ 
++  for (i = 0; i < ret; i++) {
++   if (!gang[i])
++    continue;
+    root_objectid = gang[i]->root_key.objectid;
+    err = btrfs_orphan_cleanup(gang[i]);
+    if (err)
+-    return err;
++    break;
++   btrfs_put_fs_root(gang[i]);
+   }
+   root_objectid++;
+  }
+- return 0;
++
++ /* release the uncleaned roots due to error */
++ for (; i < ret; i++) {
++  if (gang[i])
++   btrfs_put_fs_root(gang[i]);
++ }
++ return err;
+ }
+ 
+ int btrfs_commit_super(struct btrfs_root *root)
+-- 
+1.7.1

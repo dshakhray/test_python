@@ -1,0 +1,124 @@
+From 0a158b361bddea5886240e2266fdcd362d558e29 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:51 -0400
+Subject: [virt] kvm/ppc: book3s hv - Fix dirty map for hugepages
+
+Message-id: <1410545655-205645-363-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94289
+O-Subject: [RHEL7 PATCH 362/626] KVM: PPC: Book3S HV: Fix dirty map for hugepages
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 687414bebe30d59c766b682cf86b1c5fa92d7af9
+Author: Alexey Kardashevskiy <aik@ozlabs.ru>
+Date:   Mon May 26 19:48:38 2014 +1000
+
+    KVM: PPC: Book3S HV: Fix dirty map for hugepages
+
+    The dirty map that we construct for the KVM_GET_DIRTY_LOG ioctl has
+    one bit per system page (4K/64K).  Currently, we only set one bit in
+    the map for each HPT entry with the Change bit set, even if the HPT is
+    for a large page (e.g., 16MB).  Userspace then considers only the
+    first system page dirty, though in fact the guest may have modified
+    anywhere in the large page.
+
+    To fix this, we make kvm_test_clear_dirty() return the actual number
+    of pages that are dirty (and rename it to kvm_test_clear_dirty_npages()
+    to emphasize that that's what it returns).  In kvmppc_hv_get_dirty_log()
+    we then set that many bits in the dirty map.
+
+    Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index e130be7..42f746d 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -1047,22 +1047,27 @@ void kvm_set_spte_hva_hv(struct kvm *kvm, unsigned long hva, pte_t pte)
+  kvm_handle_hva(kvm, hva, kvm_unmap_rmapp);
+ }
+ 
+-static int kvm_test_clear_dirty(struct kvm *kvm, unsigned long *rmapp)
++/*
++ * Returns the number of system pages that are dirty.
++ * This can be more than 1 if we find a huge-page HPTE.
++ */
++static int kvm_test_clear_dirty_npages(struct kvm *kvm, unsigned long *rmapp)
+ {
+  struct revmap_entry *rev = kvm->arch.revmap;
+  unsigned long head, i, j;
++ unsigned long n;
+  unsigned long *hptep;
+- int ret = 0;
++ int npages_dirty = 0;
+ 
+  retry:
+  lock_rmap(rmapp);
+  if (*rmapp & KVMPPC_RMAP_CHANGED) {
+   *rmapp &= ~KVMPPC_RMAP_CHANGED;
+-  ret = 1;
++  npages_dirty = 1;
+  }
+  if (!(*rmapp & KVMPPC_RMAP_PRESENT)) {
+   unlock_rmap(rmapp);
+-  return ret;
++  return npages_dirty;
+  }
+ 
+  i = head = *rmapp & KVMPPC_RMAP_INDEX;
+@@ -1093,13 +1098,16 @@ static int kvm_test_clear_dirty(struct kvm *kvm, unsigned long *rmapp)
+     rev[i].guest_rpte |= HPTE_R_C;
+     note_hpte_modification(kvm, &rev[i]);
+    }
+-   ret = 1;
++   n = hpte_page_size(hptep[0], hptep[1]);
++   n = (n + PAGE_SIZE - 1) >> PAGE_SHIFT;
++   if (n > npages_dirty)
++    npages_dirty = n;
+   }
+   hptep[0] &= ~HPTE_V_HVLOCK;
+  } while ((i = j) != head);
+ 
+  unlock_rmap(rmapp);
+- return ret;
++ return npages_dirty;
+ }
+ 
+ static void harvest_vpa_dirty(struct kvmppc_vpa *vpa,
+@@ -1123,15 +1131,22 @@ static void harvest_vpa_dirty(struct kvmppc_vpa *vpa,
+ long kvmppc_hv_get_dirty_log(struct kvm *kvm, struct kvm_memory_slot *memslot,
+         unsigned long *map)
+ {
+- unsigned long i;
++ unsigned long i, j;
+  unsigned long *rmapp;
+  struct kvm_vcpu *vcpu;
+ 
+  preempt_disable();
+  rmapp = memslot->arch.rmap;
+  for (i = 0; i < memslot->npages; ++i) {
+-  if (kvm_test_clear_dirty(kvm, rmapp) && map)
+-   __set_bit_le(i, map);
++  int npages = kvm_test_clear_dirty_npages(kvm, rmapp);
++  /*
++   * Note that if npages > 0 then i must be a multiple of npages,
++   * since we always put huge-page HPTEs in the rmap chain
++   * corresponding to their page base address.
++   */
++  if (npages && map)
++   for (j = i; npages; ++j, --npages)
++    __set_bit_le(j, map);
+   ++rmapp;
+  }
+ 
+-- 
+1.7.1

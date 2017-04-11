@@ -1,0 +1,105 @@
+From b3730dae54180b7dd8d3d06057127aa828cccef1 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:52:51 -0400
+Subject: [tools] perf: Do proper comm override error handling
+
+Message-id: <1408953210-26343-284-git-send-email-jolsa@redhat.com>
+Patchwork-id: 89003
+O-Subject: [PATCH RHEL7.1 BZ1133083 283/322] perf tools: Do proper comm override error handling
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 3178f58b989430fd0721df97bf21cf1c0e8cc419
+Author: Frederic Weisbecker <fweisbec@gmail.com>
+Date: Tue Jan 14 16:37:14 2014 +0100
+
+description
+===========
+The comm overriding API ignores memory allocation failures by silently
+keeping the previous and out of date comm.
+
+As a result, the user may get buggy events without ever being notified
+about the problem and its source.
+
+Lets start to fix this by propagating the error from the API. Not all
+callers may be doing proper error handling on comm set yet but this is
+the first step toward it.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/comm.c b/tools/perf/util/comm.c
+index 67d1e40..f9e7776 100644
+--- a/tools/perf/util/comm.c
++++ b/tools/perf/util/comm.c
+@@ -94,19 +94,20 @@ struct comm *comm__new(const char *str, u64 timestamp)
+  return comm;
+ }
+ 
+-void comm__override(struct comm *comm, const char *str, u64 timestamp)
++int comm__override(struct comm *comm, const char *str, u64 timestamp)
+ {
+- struct comm_str *old = comm->comm_str;
++ struct comm_str *new, *old = comm->comm_str;
+ 
+- comm->comm_str = comm_str__findnew(str, &comm_str_root);
+- if (!comm->comm_str) {
+-  comm->comm_str = old;
+-  return;
+- }
++ new = comm_str__findnew(str, &comm_str_root);
++ if (!new)
++  return -ENOMEM;
+ 
+- comm->start = timestamp;
+- comm_str__get(comm->comm_str);
++ comm_str__get(new);
+  comm_str__put(old);
++ comm->comm_str = new;
++ comm->start = timestamp;
++
++ return 0;
+ }
+ 
+ void comm__free(struct comm *comm)
+diff --git a/tools/perf/util/comm.h b/tools/perf/util/comm.h
+index 7a86e56..fac5bd5 100644
+--- a/tools/perf/util/comm.h
++++ b/tools/perf/util/comm.h
+@@ -16,6 +16,6 @@ struct comm {
+ void comm__free(struct comm *comm);
+ struct comm *comm__new(const char *str, u64 timestamp);
+ const char *comm__str(const struct comm *comm);
+-void comm__override(struct comm *comm, const char *str, u64 timestamp);
++int comm__override(struct comm *comm, const char *str, u64 timestamp);
+ 
+ #endif  /* __PERF_COMM_H */
+diff --git a/tools/perf/util/thread.c b/tools/perf/util/thread.c
+index e394861..0358882 100644
+--- a/tools/perf/util/thread.c
++++ b/tools/perf/util/thread.c
+@@ -66,10 +66,13 @@ struct comm *thread__comm(const struct thread *thread)
+ int thread__set_comm(struct thread *thread, const char *str, u64 timestamp)
+ {
+  struct comm *new, *curr = thread__comm(thread);
++ int err;
+ 
+  /* Override latest entry if it had no specific time coverage */
+  if (!curr->start) {
+-  comm__override(curr, str, timestamp);
++  err = comm__override(curr, str, timestamp);
++  if (err)
++   return err;
+  } else {
+   new = comm__new(str, timestamp);
+   if (!new)
+-- 
+1.7.1

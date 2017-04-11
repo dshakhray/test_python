@@ -1,0 +1,119 @@
+From 04ec9a7c069b298f0963765ed150f439b7fd59b2 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:08:05 -0400
+Subject: [oprofile] nmi-timer: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-29-git-send-email-prarit@redhat.com>
+Patchwork-id: 85751
+O-Subject: [RHEL7.1 PATCH BZ 1119078 28/35] oprofile, nmi-timer: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit 180d86463257812dc17e5df912f3bddcc96abb00
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:10:36 2014 +0530
+
+    oprofile, nmi-timer: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the nmi-timer code in oprofile by using this latter form of callback
+    registration.
+
+    Cc: Robert Richter <rric@kernel.org>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/oprofile/nmi_timer_int.c b/drivers/oprofile/nmi_timer_int.c
+index 76f1c93..9559829 100644
+--- a/drivers/oprofile/nmi_timer_int.c
++++ b/drivers/oprofile/nmi_timer_int.c
+@@ -108,8 +108,8 @@ static void nmi_timer_shutdown(void)
+  struct perf_event *event;
+  int cpu;
+ 
+- get_online_cpus();
+- unregister_cpu_notifier(&nmi_timer_cpu_nb);
++ cpu_notifier_register_begin();
++ __unregister_cpu_notifier(&nmi_timer_cpu_nb);
+  for_each_possible_cpu(cpu) {
+   event = per_cpu(nmi_timer_events, cpu);
+   if (!event)
+@@ -119,7 +119,7 @@ static void nmi_timer_shutdown(void)
+   perf_event_release_kernel(event);
+  }
+ 
+- put_online_cpus();
++ cpu_notifier_register_done();
+ }
+ 
+ static int nmi_timer_setup(void)
+@@ -132,20 +132,23 @@ static int nmi_timer_setup(void)
+  do_div(period, HZ);
+  nmi_timer_attr.sample_period = period;
+ 
+- get_online_cpus();
+- err = register_cpu_notifier(&nmi_timer_cpu_nb);
++ cpu_notifier_register_begin();
++ err = __register_cpu_notifier(&nmi_timer_cpu_nb);
+  if (err)
+   goto out;
++
+  /* can't attach events to offline cpus: */
+  for_each_online_cpu(cpu) {
+   err = nmi_timer_start_cpu(cpu);
+-  if (err)
+-   break;
++  if (err) {
++   cpu_notifier_register_done();
++   nmi_timer_shutdown();
++   return err;
++  }
+  }
+- if (err)
+-  nmi_timer_shutdown();
++
+ out:
+- put_online_cpus();
++ cpu_notifier_register_done();
+  return err;
+ }
+ 
+-- 
+1.7.1

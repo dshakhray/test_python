@@ -1,0 +1,169 @@
+From 9fa6dd6563b132098d5adcc35b09376f098f475a Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Mon, 18 Aug 2014 19:56:55 -0400
+Subject: [scsi] qla2xxx: Do logins from a chip reset in DPC thread instead of the error handler thread
+
+Message-id: <1408391817-6389-68-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 87957
+O-Subject: [PATCH RHEL 7.1 e-stor 67/69] qla2xxx: Do logins from a chip reset in DPC thread instead of the error handler thread.
+Bugzilla: 1089346
+RH-Acked-by: Rob Evers <revers@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Chad Dupuis <chad.dupuis@qlogic.com>
+
+scsi commit id 7108b76e87e9a31099f5d4ac0aed6c3b77dce728
+
+Attempting to do any logins from the SCSI reset handler can lead to a deadlock
+scenario if a rport times out and the FC transport layer.  Move doing any port
+logins to the DPC thread so as not to impede the progress of the SCSI error
+handler thread and avoid deadlock situations.
+
+Signed-off-by: Chad Dupuis <chad.dupuis@qlogic.com>
+Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/qla2xxx/qla_dbg.c b/drivers/scsi/qla2xxx/qla_dbg.c
+index 70ee526..fc82219 100644
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@ -35,19 +35,19 @@
+  * |                              |                    | 0x503d,0x5044  |
+  * |                              |                    | 0x507b  |
+  * | Timer Routines               |       0x6012       |                |
+- * | User Space Interactions      |       0x70e1       | 0x7018,0x702e, |
+- * |                              |                    | 0x7020,0x7024, |
+- * |                              |                    | 0x7039,0x7045, |
+- * |                              |                    | 0x7073-0x7075, |
+- * |                              |                    | 0x707b,0x708c, |
+- * |                              |                    | 0x70a5,0x70a6, |
+- * |                              |                    | 0x70a8,0x70ab, |
+- * |                              |                    | 0x70ad-0x70ae, |
+- * |                              |                    | 0x70d1-0x70db, |
+- * |                              |                    | 0x7047,0x703b |
+- * |                              |                    | 0x70de-0x70df, |
+- * | Task Management              |       0x803d       | 0x8025-0x8026  |
+- * |                              |                    | 0x800b,0x8039  |
++ * | User Space Interactions      |       0x70e2       | 0x7018,0x702e  |
++ * |      |         | 0x7020,0x7024  |
++ * |                              |                    | 0x7039,0x7045  |
++ * |                              |                    | 0x7073-0x7075  |
++ * |                              |                    | 0x70a5-0x70a6  |
++ * |                              |                    | 0x70a8,0x70ab  |
++ * |                              |                    | 0x70ad-0x70ae  |
++ * |                              |                    | 0x70d7-0x70db  |
++ * |                              |                    | 0x70de-0x70df  |
++ * | Task Management              |       0x803d       | 0x8000,0x800b  |
++ * |                              |                    | 0x8025,0x8026  |
++ * |                              |                    | 0x8031,0x8032  |
++ * |                              |                    | 0x8039,0x803c  |
+  * | AER/EEH                      |       0x9011       |  |
+  * | Virtual Port                 |       0xa007       |  |
+  * | ISP82XX Specific             |       0xb157       | 0xb002,0xb024  |
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index d96e202..151194d 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -4694,7 +4694,6 @@ static int
+ qla2x00_restart_isp(scsi_qla_host_t *vha)
+ {
+  int status = 0;
+- uint32_t wait_time;
+  struct qla_hw_data *ha = vha->hw;
+  struct req_que *req = ha->req_q_map[0];
+  struct rsp_que *rsp = ha->rsp_q_map[0];
+@@ -4711,14 +4710,12 @@ qla2x00_restart_isp(scsi_qla_host_t *vha)
+  if (!status && !(status = qla2x00_init_rings(vha))) {
+   clear_bit(RESET_MARKER_NEEDED, &vha->dpc_flags);
+   ha->flags.chip_reset_done = 1;
++
+   /* Initialize the queues in use */
+   qla25xx_init_queues(ha);
+ 
+   status = qla2x00_fw_ready(vha);
+   if (!status) {
+-   ql_dbg(ql_dbg_taskm, vha, 0x8031,
+-       "Start configure loop status = %d.\n", status);
+-
+    /* Issue a marker after FW becomes ready. */
+    qla2x00_marker(vha, req, rsp, 0, 0, MK_SYNC_ALL);
+ 
+@@ -4733,24 +4730,12 @@ qla2x00_restart_isp(scsi_qla_host_t *vha)
+     qlt_24xx_process_atio_queue(vha);
+    spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ 
+-   /* Wait at most MAX_TARGET RSCNs for a stable link. */
+-   wait_time = 256;
+-   do {
+-    clear_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+-    qla2x00_configure_loop(vha);
+-    wait_time--;
+-   } while (!atomic_read(&vha->loop_down_timer) &&
+-    !(test_bit(ISP_ABORT_NEEDED, &vha->dpc_flags))
+-    && wait_time && (test_bit(LOOP_RESYNC_NEEDED,
+-    &vha->dpc_flags)));
++   set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+   }
+ 
+   /* if no cable then assume it's good */
+   if ((vha->device_flags & DFLG_NO_CABLE))
+    status = 0;
+-
+-  ql_dbg(ql_dbg_taskm, vha, 0x8032,
+-      "Configure loop done, status = 0x%x.\n", status);
+  }
+  return (status);
+ }
+@@ -5913,7 +5898,6 @@ int
+ qla82xx_restart_isp(scsi_qla_host_t *vha)
+ {
+  int status, rval;
+- uint32_t wait_time;
+  struct qla_hw_data *ha = vha->hw;
+  struct req_que *req = ha->req_q_map[0];
+  struct rsp_que *rsp = ha->rsp_q_map[0];
+@@ -5927,31 +5911,15 @@ qla82xx_restart_isp(scsi_qla_host_t *vha)
+ 
+   status = qla2x00_fw_ready(vha);
+   if (!status) {
+-   ql_log(ql_log_info, vha, 0x803c,
+-       "Start configure loop, status =%d.\n", status);
+-
+    /* Issue a marker after FW becomes ready. */
+    qla2x00_marker(vha, req, rsp, 0, 0, MK_SYNC_ALL);
+-
+    vha->flags.online = 1;
+-   /* Wait at most MAX_TARGET RSCNs for a stable link. */
+-   wait_time = 256;
+-   do {
+-    clear_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+-    qla2x00_configure_loop(vha);
+-    wait_time--;
+-   } while (!atomic_read(&vha->loop_down_timer) &&
+-       !(test_bit(ISP_ABORT_NEEDED, &vha->dpc_flags)) &&
+-       wait_time &&
+-       (test_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags)));
++   set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+   }
+ 
+   /* if no cable then assume it's good */
+   if ((vha->device_flags & DFLG_NO_CABLE))
+    status = 0;
+-
+-  ql_log(ql_log_info, vha, 0x8000,
+-      "Configure loop done, status = 0x%x.\n", status);
+  }
+ 
+  if (!status) {
+@@ -5965,8 +5933,6 @@ qla82xx_restart_isp(scsi_qla_host_t *vha)
+    vha->marker_needed = 1;
+   }
+ 
+-  vha->flags.online = 1;
+-
+   ha->isp_ops->enable_intrs(ha);
+ 
+   ha->isp_abort_cnt = 0;
+-- 
+1.7.1

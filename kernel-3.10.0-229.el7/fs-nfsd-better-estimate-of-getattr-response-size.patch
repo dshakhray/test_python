@@ -1,0 +1,88 @@
+From 5c8ea2aae3737c1cf9290da5b3bbb036324a83d1 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Mon, 23 Jun 2014 21:51:15 -0400
+Subject: [fs] nfsd: better estimate of getattr response size
+
+Message-id: <1403560314-32525-134-git-send-email-bfields@redhat.com>
+Patchwork-id: 84523
+O-Subject: [Patch RHEL7 133/172] nfsd4: better estimate of getattr response size
+Bugzilla: 1111719
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+We plan to use this estimate to decide whether or not to allow zero-copy
+reads.  Currently we're assuming all getattr's are a page, which can be
+both too small (ACLs e.g. may be arbitrarily long) and too large (after
+an upcoming read patch this will unnecessarily prevent zero copy reads
+in any read compound also containing a getattr).
+
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: b86cef60dafcbdf5a19adfa990c2c1672222e677
+Bugzilla: 1111719
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c
+index c6f005d..7fb0dc5 100644
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@ -1464,6 +1464,49 @@ static inline u32 nfsd4_create_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op
+   + nfs4_fattr_bitmap_maxsz) * sizeof(__be32);
+ }
+ 
++/*
++ * Note since this is an idempotent operation we won't insist on failing
++ * the op prematurely if the estimate is too large.  We may turn off splice
++ * reads unnecessarily.
++ */
++static inline u32 nfsd4_getattr_rsize(struct svc_rqst *rqstp,
++          struct nfsd4_op *op)
++{
++ u32 *bmap = op->u.getattr.ga_bmval;
++ u32 bmap0 = bmap[0], bmap1 = bmap[1], bmap2 = bmap[2];
++ u32 ret = 0;
++
++ if (bmap0 & FATTR4_WORD0_ACL)
++  return svc_max_payload(rqstp);
++ if (bmap0 & FATTR4_WORD0_FS_LOCATIONS)
++  return svc_max_payload(rqstp);
++
++ if (bmap1 & FATTR4_WORD1_OWNER) {
++  ret += IDMAP_NAMESZ + 4;
++  bmap1 &= ~FATTR4_WORD1_OWNER;
++ }
++ if (bmap1 & FATTR4_WORD1_OWNER_GROUP) {
++  ret += IDMAP_NAMESZ + 4;
++  bmap1 &= ~FATTR4_WORD1_OWNER_GROUP;
++ }
++ if (bmap0 & FATTR4_WORD0_FILEHANDLE) {
++  ret += NFS4_FHSIZE + 4;
++  bmap0 &= ~FATTR4_WORD0_FILEHANDLE;
++ }
++ if (bmap2 & FATTR4_WORD2_SECURITY_LABEL) {
++  ret += NFSD4_MAX_SEC_LABEL_LEN + 12;
++  bmap2 &= ~FATTR4_WORD2_SECURITY_LABEL;
++ }
++ /*
++  * Largest of remaining attributes are 16 bytes (e.g.,
++  * supported_attributes)
++  */
++ ret += 16 * (hweight32(bmap0) + hweight32(bmap1) + hweight32(bmap2));
++ /* bitmask, length */
++ ret += 20;
++ return ret;
++}
++
+ static inline u32 nfsd4_link_rsize(struct svc_rqst *rqstp, struct nfsd4_op *op)
+ {
+  return (op_encode_hdr_size + op_encode_change_info_maxsz)
+@@ -1602,6 +1645,7 @@ static struct nfsd4_operation nfsd4_ops[] = {
+  [OP_GETATTR] = {
+   .op_func = (nfsd4op_func)nfsd4_getattr,
+   .op_flags = ALLOWED_ON_ABSENT_FS,
++  .op_rsize_bop = nfsd4_getattr_rsize,
+   .op_name = "OP_GETATTR",
+  },
+  [OP_GETFH] = {
+-- 
+1.7.1

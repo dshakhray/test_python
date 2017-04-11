@@ -1,0 +1,131 @@
+From d67acfe74d3fad6d0cce2472d09c28799a7ff99b Mon Sep 17 00:00:00 2001
+From: Rob Evers <revers@redhat.com>
+Date: Wed, 20 Aug 2014 18:08:55 -0400
+Subject: [scsi] be2iscsi: Fix processing CQE before connection resources are freed
+
+Message-id: <1408558136-21958-4-git-send-email-revers@redhat.com>
+Patchwork-id: 88413
+O-Subject: [RHEL7.1 e-stor PATCH 4/5] scsi: be2iscsi: Fix processing CQE before connection resources are freed
+Bugzilla: 1130072
+RH-Acked-by: Ewan Milne <emilne@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: John Soni Jose <sony.john-n@emulex.com>
+
+http://marc.info/?l=linux-scsi&m=140747402305707&w=2
+
+Tested at Emulex
+
+ Driver should process the completion queue entries before a connection
+ resources are freed. While running mixed traffic due to latency driver
+ processes the CQE after the connection resources are freed. This fix
+ processes all the completion queue before the connection resources are
+ freed.
+
+Signed-off-by: John Soni Jose <sony.john-n@emulex.com>
+Signed-off-by: Jayamohan Kallickal <jayamohan.kallickal@emulex.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/be2iscsi/be_iscsi.c b/drivers/scsi/be2iscsi/be_iscsi.c
+index 9c2ff9f..627d6e0 100644
+--- a/drivers/scsi/be2iscsi/be_iscsi.c
++++ b/drivers/scsi/be2iscsi/be_iscsi.c
+@@ -1276,6 +1276,31 @@ int beiscsi_ep_poll(struct iscsi_endpoint *ep, int timeout_ms)
+ }
+ 
+ /**
++ * beiscsi_flush_cq()- Flush the CQ created.
++ * @phba: ptr device priv structure.
++ *
++ * Before the connection resource are freed flush
++ * all the CQ enteries
++ **/
++static void beiscsi_flush_cq(struct beiscsi_hba *phba)
++{
++ uint16_t i;
++ struct be_eq_obj *pbe_eq;
++ struct hwi_controller *phwi_ctrlr;
++ struct hwi_context_memory *phwi_context;
++
++ phwi_ctrlr = phba->phwi_ctrlr;
++ phwi_context = phwi_ctrlr->phwi_ctxt;
++
++ for (i = 0; i < phba->num_cpus; i++) {
++  pbe_eq = &phwi_context->be_eq[i];
++  blk_iopoll_disable(&pbe_eq->iopoll);
++  beiscsi_process_cq(pbe_eq);
++  blk_iopoll_enable(&pbe_eq->iopoll);
++ }
++}
++
++/**
+  * beiscsi_close_conn - Upload the  connection
+  * @ep: The iscsi endpoint
+  * @flag: The type of connection closure
+@@ -1296,6 +1321,10 @@ static int beiscsi_close_conn(struct  beiscsi_endpoint *beiscsi_ep, int flag)
+  }
+ 
+  ret = beiscsi_mccq_compl(phba, tag, NULL, NULL);
++
++ /* Flush the CQ entries */
++ beiscsi_flush_cq(phba);
++
+  return ret;
+ }
+ 
+diff --git a/drivers/scsi/be2iscsi/be_main.c b/drivers/scsi/be2iscsi/be_main.c
+index 8253fcf..6b079d6 100644
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@ -2118,7 +2118,7 @@ static void  beiscsi_process_mcc_isr(struct beiscsi_hba *phba)
+  * return
+  *     Number of Completion Entries processed.
+  **/
+-static unsigned int beiscsi_process_cq(struct be_eq_obj *pbe_eq)
++unsigned int beiscsi_process_cq(struct be_eq_obj *pbe_eq)
+ {
+  struct be_queue_info *cq;
+  struct sol_cqe *sol;
+@@ -2160,6 +2160,18 @@ static unsigned int beiscsi_process_cq(struct be_eq_obj *pbe_eq)
+ 
+   cri_index = BE_GET_CRI_FROM_CID(cid);
+   ep = phba->ep_array[cri_index];
++
++  if (ep == NULL) {
++   /* connection has already been freed
++    * just move on to next one
++    */
++   beiscsi_log(phba, KERN_WARNING,
++        BEISCSI_LOG_INIT,
++        "BM_%d : proc cqe of disconn ep: cid %d\n",
++        cid);
++   goto proc_next_cqe;
++  }
++
+   beiscsi_ep = ep->dd_data;
+   beiscsi_conn = beiscsi_ep->conn;
+ 
+@@ -2269,6 +2281,7 @@ static unsigned int beiscsi_process_cq(struct be_eq_obj *pbe_eq)
+    break;
+   }
+ 
++proc_next_cqe:
+   AMAP_SET_BITS(struct amap_sol_cqe, valid, sol, 0);
+   queue_tail_inc(cq);
+   sol = queue_tail_node(cq);
+diff --git a/drivers/scsi/be2iscsi/be_main.h b/drivers/scsi/be2iscsi/be_main.h
+index 29beb32..c7e7afb 100644
+--- a/drivers/scsi/be2iscsi/be_main.h
++++ b/drivers/scsi/be2iscsi/be_main.h
+@@ -840,6 +840,9 @@ void beiscsi_free_mgmt_task_handles(struct beiscsi_conn *beiscsi_conn,
+ void hwi_ring_cq_db(struct beiscsi_hba *phba,
+        unsigned int id, unsigned int num_processed,
+        unsigned char rearm, unsigned char event);
++
++unsigned int beiscsi_process_cq(struct be_eq_obj *pbe_eq);
++
+ static inline bool beiscsi_error(struct beiscsi_hba *phba)
+ {
+  return phba->ue_detected || phba->fw_timeout;
+-- 
+1.7.1

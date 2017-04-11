@@ -1,0 +1,188 @@
+From 23b30535dc44228433023744e9e44fe4853c5dd1 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Fri, 5 Sep 2014 01:50:19 -0400
+Subject: [iommu] vt-d: Make iommu_should_identity_map() take struct device
+
+Message-id: <20140905015018.31297.58440.stgit@gir.stowe>
+Patchwork-id: 91338
+O-Subject: [RHEL7.1 PATCH 45/65] iommu/vt-d: Make iommu_should_identity_map() take struct device
+Bugzilla: 1129880 1087643
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Alex Williamson <alex.williamson@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1087643
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1129880
+Upstream Status: 3bdb259116059a6b805cfe9be66f4054f92598a3
+
+commit 3bdb259116059a6b805cfe9be66f4054f92598a3
+Author: David Woodhouse <David.Woodhouse@intel.com>
+Date:   Sun Mar 9 16:03:08 2014 -0700
+
+    iommu/vt-d: Make iommu_should_identity_map() take struct device
+
+    Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+index 7b2b9f3..ccfce88 100644
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -2518,58 +2518,65 @@ static bool device_has_rmrr(struct device *dev)
+  return false;
+ }
+ 
+-static int iommu_should_identity_map(struct pci_dev *pdev, int startup)
++static int iommu_should_identity_map(struct device *dev, int startup)
+ {
+ 
+- /*
+-  * We want to prevent any device associated with an RMRR from
+-  * getting placed into the SI Domain. This is done because
+-  * problems exist when devices are moved in and out of domains
+-  * and their respective RMRR info is lost. We exempt USB devices
+-  * from this process due to their usage of RMRRs that are known
+-  * to not be needed after BIOS hand-off to OS.
+-  */
+- if (device_has_rmrr(&pdev->dev) &&
+-     (pdev->class >> 8) != PCI_CLASS_SERIAL_USB)
+-  return 0;
++ if (dev_is_pci(dev)) {
++  struct pci_dev *pdev = to_pci_dev(dev);
+ 
+- if ((iommu_identity_mapping & IDENTMAP_AZALIA) && IS_AZALIA(pdev))
+-  return 1;
++  /*
++   * We want to prevent any device associated with an RMRR from
++   * getting placed into the SI Domain. This is done because
++   * problems exist when devices are moved in and out of domains
++   * and their respective RMRR info is lost. We exempt USB devices
++   * from this process due to their usage of RMRRs that are known
++   * to not be needed after BIOS hand-off to OS.
++   */
++  if (device_has_rmrr(dev) &&
++      (pdev->class >> 8) != PCI_CLASS_SERIAL_USB)
++   return 0;
+ 
+- if ((iommu_identity_mapping & IDENTMAP_GFX) && IS_GFX_DEVICE(pdev))
+-  return 1;
++  if ((iommu_identity_mapping & IDENTMAP_AZALIA) && IS_AZALIA(pdev))
++   return 1;
+ 
+- if (!(iommu_identity_mapping & IDENTMAP_ALL))
+-  return 0;
++  if ((iommu_identity_mapping & IDENTMAP_GFX) && IS_GFX_DEVICE(pdev))
++   return 1;
+ 
+- /*
+-  * We want to start off with all devices in the 1:1 domain, and
+-  * take them out later if we find they can't access all of memory.
+-  *
+-  * However, we can't do this for PCI devices behind bridges,
+-  * because all PCI devices behind the same bridge will end up
+-  * with the same source-id on their transactions.
+-  *
+-  * Practically speaking, we can't change things around for these
+-  * devices at run-time, because we can't be sure there'll be no
+-  * DMA transactions in flight for any of their siblings.
+-  * 
+-  * So PCI devices (unless they're on the root bus) as well as
+-  * their parent PCI-PCI or PCIe-PCI bridges must be left _out_ of
+-  * the 1:1 domain, just in _case_ one of their siblings turns out
+-  * not to be able to map all of memory.
+-  */
+- if (!pci_is_pcie(pdev)) {
+-  if (!pci_is_root_bus(pdev->bus))
++  if (!(iommu_identity_mapping & IDENTMAP_ALL))
+    return 0;
+-  if (pdev->class >> 8 == PCI_CLASS_BRIDGE_PCI)
++
++  /*
++   * We want to start off with all devices in the 1:1 domain, and
++   * take them out later if we find they can't access all of memory.
++   *
++   * However, we can't do this for PCI devices behind bridges,
++   * because all PCI devices behind the same bridge will end up
++   * with the same source-id on their transactions.
++   *
++   * Practically speaking, we can't change things around for these
++   * devices at run-time, because we can't be sure there'll be no
++   * DMA transactions in flight for any of their siblings.
++   *
++   * So PCI devices (unless they're on the root bus) as well as
++   * their parent PCI-PCI or PCIe-PCI bridges must be left _out_ of
++   * the 1:1 domain, just in _case_ one of their siblings turns out
++   * not to be able to map all of memory.
++   */
++  if (!pci_is_pcie(pdev)) {
++   if (!pci_is_root_bus(pdev->bus))
++    return 0;
++   if (pdev->class >> 8 == PCI_CLASS_BRIDGE_PCI)
++    return 0;
++  } else if (pci_pcie_type(pdev) == PCI_EXP_TYPE_PCI_BRIDGE)
+    return 0;
+- } else if (pci_pcie_type(pdev) == PCI_EXP_TYPE_PCI_BRIDGE)
+-  return 0;
++ } else {
++  if (device_has_rmrr(dev))
++   return 0;
++ }
+ 
+- /* 
++ /*
+   * At boot time, we don't yet know if devices will be 64-bit capable.
+-  * Assume that they will -- if they turn out not to be, then we can 
++  * Assume that they will Ã¢ÂÂ if they turn out not to be, then we can
+   * take them out of the 1:1 domain later.
+   */
+  if (!startup) {
+@@ -2577,13 +2584,13 @@ static int iommu_should_identity_map(struct pci_dev *pdev, int startup)
+    * If the device's dma_mask is less than the system's memory
+    * size then this is not a candidate for identity mapping.
+    */
+-  u64 dma_mask = pdev->dma_mask;
++  u64 dma_mask = *dev->dma_mask;
+ 
+-  if (pdev->dev.coherent_dma_mask &&
+-      pdev->dev.coherent_dma_mask < dma_mask)
+-   dma_mask = pdev->dev.coherent_dma_mask;
++  if (dev->coherent_dma_mask &&
++      dev->coherent_dma_mask < dma_mask)
++   dma_mask = dev->coherent_dma_mask;
+ 
+-  return dma_mask >= dma_get_required_mask(&pdev->dev);
++  return dma_mask >= dma_get_required_mask(dev);
+  }
+ 
+  return 1;
+@@ -2599,7 +2606,7 @@ static int __init iommu_prepare_static_identity_mapping(int hw)
+   return -EFAULT;
+ 
+  for_each_pci_dev(pdev) {
+-  if (iommu_should_identity_map(pdev, 1)) {
++  if (iommu_should_identity_map(&pdev->dev, 1)) {
+    ret = domain_add_dev_info(si_domain, pdev,
+           hw ? CONTEXT_TT_PASS_THROUGH :
+         CONTEXT_TT_MULTI_LEVEL);
+@@ -2917,7 +2924,7 @@ static int iommu_no_mapping(struct device *dev)
+  pdev = to_pci_dev(dev);
+  found = identity_mapping(dev);
+  if (found) {
+-  if (iommu_should_identity_map(pdev, 0))
++  if (iommu_should_identity_map(&pdev->dev, 0))
+    return 1;
+   else {
+    /*
+@@ -2934,7 +2941,7 @@ static int iommu_no_mapping(struct device *dev)
+    * In case of a detached 64 bit DMA device from vm, the device
+    * is put into si_domain for identity mapping.
+    */
+-  if (iommu_should_identity_map(pdev, 0)) {
++  if (iommu_should_identity_map(&pdev->dev, 0)) {
+    int ret;
+    ret = domain_add_dev_info(si_domain, pdev,
+         hw_pass_through ?
+-- 
+1.7.1

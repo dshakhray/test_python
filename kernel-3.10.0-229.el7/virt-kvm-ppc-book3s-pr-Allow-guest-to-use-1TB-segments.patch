@@ -1,0 +1,274 @@
+From 267a9f91401598a1f3569eee4789826d3bf521b8 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:36 -0400
+Subject: [virt] kvm/ppc: book3s pr - Allow guest to use 1TB segments
+
+Message-id: <1410545655-205645-108-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94129
+O-Subject: [RHEL7 PATCH 107/626] KVM: PPC: Book3S PR: Allow guest to use 1TB segments
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 0f296829b5a59d5a157699cbb23672ccfdd8df4c
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Sat Jun 22 17:16:32 2013 +1000
+
+    KVM: PPC: Book3S PR: Allow guest to use 1TB segments
+
+    With this, the guest can use 1TB segments as well as 256MB segments.
+    Since we now have the situation where a single emulated guest segment
+    could correspond to multiple shadow segments (as the shadow segments
+    are still 256MB segments), this adds a new kvmppc_mmu_flush_segment()
+    to scan for all shadow segments that need to be removed.
+
+    This restructures the guest HPT (hashed page table) lookup code to
+    use the correct hashing and matching functions for HPTEs within a
+    1TB segment.  We use the standard hpt_hash() function instead of
+    open-coding the hash calculation, and we use HPTE_V_COMPARE() with
+    an AVPN value that has the B (segment size) field included.  The
+    calculation of avpn is done a little earlier since it doesn't change
+    in the loop starting at the do_second label.
+
+    The computation in kvmppc_mmu_book3s_64_esid_to_vsid() changes so that
+    it returns a 256MB VSID even if the guest SLB entry is a 1TB entry.
+    This is because the users of this function are creating 256MB SLB
+    entries.  We set a new VSID_1T flag so that entries created from 1T
+    segments don't collide with entries from 256MB segments.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 349ed85..08891d0 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -107,8 +107,9 @@ struct kvmppc_vcpu_book3s {
+ #define CONTEXT_GUEST  1
+ #define CONTEXT_GUEST_END 2
+ 
+-#define VSID_REAL 0x1fffffffffc00000ULL
+-#define VSID_BAT 0x1fffffffffb00000ULL
++#define VSID_REAL 0x0fffffffffc00000ULL
++#define VSID_BAT 0x0fffffffffb00000ULL
++#define VSID_1T  0x1000000000000000ULL
+ #define VSID_REAL_DR 0x2000000000000000ULL
+ #define VSID_REAL_IR 0x4000000000000000ULL
+ #define VSID_PR  0x8000000000000000ULL
+@@ -123,6 +124,7 @@ extern void kvmppc_mmu_book3s_32_init(struct kvm_vcpu *vcpu);
+ extern void kvmppc_mmu_book3s_hv_init(struct kvm_vcpu *vcpu);
+ extern int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *pte);
+ extern int kvmppc_mmu_map_segment(struct kvm_vcpu *vcpu, ulong eaddr);
++extern void kvmppc_mmu_flush_segment(struct kvm_vcpu *vcpu, ulong eaddr, ulong seg_size);
+ extern void kvmppc_mmu_flush_segments(struct kvm_vcpu *vcpu);
+ extern int kvmppc_book3s_hv_page_fault(struct kvm_run *run,
+    struct kvm_vcpu *vcpu, unsigned long addr,
+diff --git a/arch/powerpc/kvm/book3s_64_mmu.c b/arch/powerpc/kvm/book3s_64_mmu.c
+index 2e93bb5..ee435ba 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu.c
++++ b/arch/powerpc/kvm/book3s_64_mmu.c
+@@ -26,6 +26,7 @@
+ #include <asm/tlbflush.h>
+ #include <asm/kvm_ppc.h>
+ #include <asm/kvm_book3s.h>
++#include <asm/mmu-hash64.h>
+ 
+ /* #define DEBUG_MMU */
+ 
+@@ -76,6 +77,24 @@ static struct kvmppc_slb *kvmppc_mmu_book3s_64_find_slbe(
+  return NULL;
+ }
+ 
++static int kvmppc_slb_sid_shift(struct kvmppc_slb *slbe)
++{
++ return slbe->tb ? SID_SHIFT_1T : SID_SHIFT;
++}
++
++static u64 kvmppc_slb_offset_mask(struct kvmppc_slb *slbe)
++{
++ return (1ul << kvmppc_slb_sid_shift(slbe)) - 1;
++}
++
++static u64 kvmppc_slb_calc_vpn(struct kvmppc_slb *slb, gva_t eaddr)
++{
++ eaddr &= kvmppc_slb_offset_mask(slb);
++
++ return (eaddr >> VPN_SHIFT) |
++  ((slb->vsid) << (kvmppc_slb_sid_shift(slb) - VPN_SHIFT));
++}
++
+ static u64 kvmppc_mmu_book3s_64_ea_to_vp(struct kvm_vcpu *vcpu, gva_t eaddr,
+       bool data)
+ {
+@@ -85,11 +104,7 @@ static u64 kvmppc_mmu_book3s_64_ea_to_vp(struct kvm_vcpu *vcpu, gva_t eaddr,
+  if (!slb)
+   return 0;
+ 
+- if (slb->tb)
+-  return (((u64)eaddr >> 12) & 0xfffffff) |
+-         (((u64)slb->vsid) << 28);
+-
+- return (((u64)eaddr >> 12) & 0xffff) | (((u64)slb->vsid) << 16);
++ return kvmppc_slb_calc_vpn(slb, eaddr);
+ }
+ 
+ static int kvmppc_mmu_book3s_64_get_pagesize(struct kvmppc_slb *slbe)
+@@ -100,7 +115,8 @@ static int kvmppc_mmu_book3s_64_get_pagesize(struct kvmppc_slb *slbe)
+ static u32 kvmppc_mmu_book3s_64_get_page(struct kvmppc_slb *slbe, gva_t eaddr)
+ {
+  int p = kvmppc_mmu_book3s_64_get_pagesize(slbe);
+- return ((eaddr & 0xfffffff) >> p);
++
++ return ((eaddr & kvmppc_slb_offset_mask(slbe)) >> p);
+ }
+ 
+ static hva_t kvmppc_mmu_book3s_64_get_pteg(
+@@ -109,13 +125,15 @@ static hva_t kvmppc_mmu_book3s_64_get_pteg(
+     bool second)
+ {
+  u64 hash, pteg, htabsize;
+- u32 page;
++ u32 ssize;
+  hva_t r;
++ u64 vpn;
+ 
+- page = kvmppc_mmu_book3s_64_get_page(slbe, eaddr);
+  htabsize = ((1 << ((vcpu_book3s->sdr1 & 0x1f) + 11)) - 1);
+ 
+- hash = slbe->vsid ^ page;
++ vpn = kvmppc_slb_calc_vpn(slbe, eaddr);
++ ssize = slbe->tb ? MMU_SEGSIZE_1T : MMU_SEGSIZE_256M;
++ hash = hpt_hash(vpn, kvmppc_mmu_book3s_64_get_pagesize(slbe), ssize);
+  if (second)
+   hash = ~hash;
+  hash &= ((1ULL << 39ULL) - 1ULL);
+@@ -146,7 +164,7 @@ static u64 kvmppc_mmu_book3s_64_get_avpn(struct kvmppc_slb *slbe, gva_t eaddr)
+  u64 avpn;
+ 
+  avpn = kvmppc_mmu_book3s_64_get_page(slbe, eaddr);
+- avpn |= slbe->vsid << (28 - p);
++ avpn |= slbe->vsid << (kvmppc_slb_sid_shift(slbe) - p);
+ 
+  if (p < 24)
+   avpn >>= ((80 - p) - 56) - 8;
+@@ -189,13 +207,15 @@ static int kvmppc_mmu_book3s_64_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+  if (!slbe)
+   goto no_seg_found;
+ 
++ avpn = kvmppc_mmu_book3s_64_get_avpn(slbe, eaddr);
++ if (slbe->tb)
++  avpn |= SLB_VSID_B_1T;
++
+ do_second:
+  ptegp = kvmppc_mmu_book3s_64_get_pteg(vcpu_book3s, slbe, eaddr, second);
+  if (kvm_is_error_hva(ptegp))
+   goto no_page_found;
+ 
+- avpn = kvmppc_mmu_book3s_64_get_avpn(slbe, eaddr);
+-
+  if(copy_from_user(pteg, (void __user *)ptegp, sizeof(pteg))) {
+   printk(KERN_ERR "KVM can't copy data from 0x%lx!\n", ptegp);
+   goto no_page_found;
+@@ -218,7 +238,7 @@ do_second:
+    continue;
+ 
+   /* AVPN compare */
+-  if (HPTE_V_AVPN_VAL(avpn) == HPTE_V_AVPN_VAL(v)) {
++  if (HPTE_V_COMPARE(avpn, v)) {
+    u8 pp = (r & HPTE_R_PP) | key;
+    int eaddr_mask = 0xFFF;
+ 
+@@ -324,7 +344,7 @@ static void kvmppc_mmu_book3s_64_slbmte(struct kvm_vcpu *vcpu, u64 rs, u64 rb)
+  slbe->large = (rs & SLB_VSID_L) ? 1 : 0;
+  slbe->tb    = (rs & SLB_VSID_B_1T) ? 1 : 0;
+  slbe->esid  = slbe->tb ? esid_1t : esid;
+- slbe->vsid  = rs >> 12;
++ slbe->vsid  = (rs & ~SLB_VSID_B) >> (kvmppc_slb_sid_shift(slbe) - 16);
+  slbe->valid = (rb & SLB_ESID_V) ? 1 : 0;
+  slbe->Ks    = (rs & SLB_VSID_KS) ? 1 : 0;
+  slbe->Kp    = (rs & SLB_VSID_KP) ? 1 : 0;
+@@ -365,6 +385,7 @@ static u64 kvmppc_mmu_book3s_64_slbmfev(struct kvm_vcpu *vcpu, u64 slb_nr)
+ static void kvmppc_mmu_book3s_64_slbie(struct kvm_vcpu *vcpu, u64 ea)
+ {
+  struct kvmppc_slb *slbe;
++ u64 seg_size;
+ 
+  dprintk("KVM MMU: slbie(0x%llx)\n", ea);
+ 
+@@ -377,7 +398,8 @@ static void kvmppc_mmu_book3s_64_slbie(struct kvm_vcpu *vcpu, u64 ea)
+ 
+  slbe->valid = false;
+ 
+- kvmppc_mmu_map_segment(vcpu, ea);
++ seg_size = 1ull << kvmppc_slb_sid_shift(slbe);
++ kvmppc_mmu_flush_segment(vcpu, ea & ~(seg_size - 1), seg_size);
+ }
+ 
+ static void kvmppc_mmu_book3s_64_slbia(struct kvm_vcpu *vcpu)
+@@ -457,8 +479,14 @@ static int kvmppc_mmu_book3s_64_esid_to_vsid(struct kvm_vcpu *vcpu, ulong esid,
+ 
+  if (vcpu->arch.shared->msr & (MSR_DR|MSR_IR)) {
+   slb = kvmppc_mmu_book3s_64_find_slbe(vcpu, ea);
+-  if (slb)
++  if (slb) {
+    gvsid = slb->vsid;
++   if (slb->tb) {
++    gvsid <<= SID_SHIFT_1T - SID_SHIFT;
++    gvsid |= esid & ((1ul << (SID_SHIFT_1T - SID_SHIFT)) - 1);
++    gvsid |= VSID_1T;
++   }
++  }
+  }
+ 
+  switch (vcpu->arch.shared->msr & (MSR_DR|MSR_IR)) {
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_host.c b/arch/powerpc/kvm/book3s_64_mmu_host.c
+index 8757a25..e524052 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_host.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_host.c
+@@ -301,6 +301,23 @@ out:
+  return r;
+ }
+ 
++void kvmppc_mmu_flush_segment(struct kvm_vcpu *vcpu, ulong ea, ulong seg_size)
++{
++ struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
++ ulong seg_mask = -seg_size;
++ int i;
++
++ for (i = 1; i < svcpu->slb_max; i++) {
++  if ((svcpu->slb[i].esid & SLB_ESID_V) &&
++      (svcpu->slb[i].esid & seg_mask) == ea) {
++   /* Invalidate this entry */
++   svcpu->slb[i].esid = 0;
++  }
++ }
++
++ svcpu_put(svcpu);
++}
++
+ void kvmppc_mmu_flush_segments(struct kvm_vcpu *vcpu)
+ {
+  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 8032511..dfbe8dc 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -1255,8 +1255,7 @@ out:
+ #ifdef CONFIG_PPC64
+ int kvm_vm_ioctl_get_smmu_info(struct kvm *kvm, struct kvm_ppc_smmu_info *info)
+ {
+- /* No flags */
+- info->flags = 0;
++ info->flags = KVM_PPC_1T_SEGMENTS;
+ 
+  /* SLB is always 64 entries */
+  info->slb_size = 64;
+-- 
+1.7.1

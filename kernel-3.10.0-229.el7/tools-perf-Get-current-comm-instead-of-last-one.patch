@@ -1,0 +1,197 @@
+From 2a52e03855ff9b393adc10a5d51416a296757015 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:26:50 -0400
+Subject: [tools] perf: Get current comm instead of last one
+
+Message-id: <1408462094-14194-242-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88277
+O-Subject: [PATCH RHEL7.1 BZ1131394 241/325] perf tools: Get current comm instead of last one
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 4dfced359fbc719a35527416f1b4b3999647f68b
+Author: Namhyung Kim <namhyung.kim@lge.com>
+Date: Fri Sep 13 16:28:57 2013 +0900
+
+description
+===========
+At insert time, a hist entry should reference comm at the time otherwise
+it'll get the last comm anyway.
+
+[ Fixed up const pointer issues ]
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/comm.c b/tools/perf/util/comm.c
+index 8b3ac9f..ee0df0e 100644
+--- a/tools/perf/util/comm.c
++++ b/tools/perf/util/comm.c
+@@ -94,6 +94,21 @@ struct comm *comm__new(const char *str, u64 timestamp)
+  return comm;
+ }
+ 
++void comm__override(struct comm *comm, const char *str, u64 timestamp)
++{
++ struct comm_str *old = comm->comm_str;
++
++ comm->comm_str = comm_str__findnew(str, &comm_str_root);
++ if (!comm->comm_str) {
++  comm->comm_str = old;
++  return;
++ }
++
++ comm->start = timestamp;
++ comm_str__get(comm->comm_str);
++ comm_str__put(old);
++}
++
+ void comm__free(struct comm *comm)
+ {
+  comm_str__put(comm->comm_str);
+diff --git a/tools/perf/util/comm.h b/tools/perf/util/comm.h
+index f62d215..7a86e56 100644
+--- a/tools/perf/util/comm.h
++++ b/tools/perf/util/comm.h
+@@ -16,5 +16,6 @@ struct comm {
+ void comm__free(struct comm *comm);
+ struct comm *comm__new(const char *str, u64 timestamp);
+ const char *comm__str(const struct comm *comm);
++void comm__override(struct comm *comm, const char *str, u64 timestamp);
+ 
+ #endif  /* __PERF_COMM_H */
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index 7e80253..30793f9 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -416,6 +416,7 @@ struct hist_entry *__hists__add_mem_entry(struct hists *hists,
+ {
+  struct hist_entry entry = {
+   .thread = al->thread,
++  .comm = thread__comm(al->thread),
+   .ms = {
+    .map = al->map,
+    .sym = al->sym,
+@@ -446,6 +447,7 @@ struct hist_entry *__hists__add_branch_entry(struct hists *hists,
+ {
+  struct hist_entry entry = {
+   .thread = al->thread,
++  .comm = thread__comm(al->thread),
+   .ms = {
+    .map = bi->to.map,
+    .sym = bi->to.sym,
+@@ -475,6 +477,7 @@ struct hist_entry *__hists__add_entry(struct hists *hists,
+ {
+  struct hist_entry entry = {
+   .thread = al->thread,
++  .comm = thread__comm(al->thread),
+   .ms = {
+    .map = al->map,
+    .sym = al->sym,
+diff --git a/tools/perf/util/sort.c b/tools/perf/util/sort.c
+index bf91d0e..3c1b75c 100644
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@ -1,5 +1,6 @@
+ #include "sort.h"
+ #include "hist.h"
++#include "comm.h"
+ #include "symbol.h"
+ 
+ regex_t  parent_regex;
+@@ -81,25 +82,20 @@ static int64_t
+ sort__comm_cmp(struct hist_entry *left, struct hist_entry *right)
+ {
+  /* Compare the addr that should be unique among comm */
+- return thread__comm_str(right->thread) - thread__comm_str(left->thread);
++ return comm__str(right->comm) - comm__str(left->comm);
+ }
+ 
+ static int64_t
+ sort__comm_collapse(struct hist_entry *left, struct hist_entry *right)
+ {
+- const char *comm_l = thread__comm_str(left->thread);
+- const char *comm_r = thread__comm_str(right->thread);
+-
+- if (!comm_l || !comm_r)
+-  return cmp_null(comm_l, comm_r);
+-
+- return strcmp(comm_l, comm_r);
++ /* Compare the addr that should be unique among comm */
++ return comm__str(right->comm) - comm__str(left->comm);
+ }
+ 
+ static int hist_entry__comm_snprintf(struct hist_entry *he, char *bf,
+          size_t size, unsigned int width)
+ {
+- return repsep_snprintf(bf, size, "%*s", width, thread__comm_str(he->thread));
++ return repsep_snprintf(bf, size, "%*s", width, comm__str(he->comm));
+ }
+ 
+ struct sort_entry sort_comm = {
+diff --git a/tools/perf/util/sort.h b/tools/perf/util/sort.h
+index bf43336..f4e16f3 100644
+--- a/tools/perf/util/sort.h
++++ b/tools/perf/util/sort.h
+@@ -84,6 +84,7 @@ struct hist_entry {
+  struct he_stat  stat;
+  struct map_symbol ms;
+  struct thread  *thread;
++ struct comm  *comm;
+  u64   ip;
+  u64   transaction;
+  s32   cpu;
+diff --git a/tools/perf/util/thread.c b/tools/perf/util/thread.c
+index 15c53c2..cd8e2f5 100644
+--- a/tools/perf/util/thread.c
++++ b/tools/perf/util/thread.c
+@@ -54,7 +54,7 @@ void thread__delete(struct thread *thread)
+  free(thread);
+ }
+ 
+-static struct comm *thread__comm(const struct thread *thread)
++struct comm *thread__comm(const struct thread *thread)
+ {
+  if (list_empty(&thread->comm_list))
+   return NULL;
+@@ -69,8 +69,8 @@ int thread__set_comm(struct thread *thread, const char *str, u64 timestamp)
+ 
+  /* Override latest entry if it had no specific time coverage */
+  if (!curr->start) {
+-  list_del(&curr->list);
+-  comm__free(curr);
++  comm__override(curr, str, timestamp);
++  return 0;
+  }
+ 
+  new = comm__new(str, timestamp);
+diff --git a/tools/perf/util/thread.h b/tools/perf/util/thread.h
+index 8702c6b..373c055 100644
+--- a/tools/perf/util/thread.h
++++ b/tools/perf/util/thread.h
+@@ -26,6 +26,7 @@ struct thread {
+ };
+ 
+ struct machine;
++struct comm;
+ 
+ struct thread *thread__new(pid_t pid, pid_t tid);
+ void thread__delete(struct thread *self);
+@@ -36,6 +37,7 @@ static inline void thread__exited(struct thread *thread)
+ 
+ int thread__set_comm(struct thread *thread, const char *comm, u64 timestamp);
+ int thread__comm_len(struct thread *self);
++struct comm *thread__comm(const struct thread *thread);
+ const char *thread__comm_str(const struct thread *thread);
+ void thread__insert_map(struct thread *self, struct map *map);
+ int thread__fork(struct thread *thread, struct thread *parent, u64 timestamp);
+-- 
+1.7.1

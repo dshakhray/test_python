@@ -1,0 +1,142 @@
+From 9393aeb7488ac6bb548cec00e3b5ae2dc6a76a2b Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:36:36 -0400
+Subject: [block] add notion of a chunk size for request merging
+
+Message-id: <1402670238-13916-109-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83899
+O-Subject: [RHEL7.1 PATCH 108/150] block: add notion of a chunk size for request merging
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Breaks kABI (queue_limits struct) but it will be fixed at the end of
+this patch series.
+
+Upstream commit 762380ad9322951cea4ce9d24864265f9c66a916
+Author: Jens Axboe <axboe@fb.com>
+Date:   Thu Jun 5 13:38:39 2014 -0600
+
+    block: add notion of a chunk size for request merging
+
+    Some drivers have different limits on what size a request should
+    optimally be, depending on the offset of the request. Similar to
+    dividing a device into chunks. Add a setting that allows the driver
+    to inform the block layer of such a chunk size. The block layer will
+    then prevent merging across the chunks.
+
+    This is needed to optimally support NVMe with a non-zero stripe size.
+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index c38274e..1e81d1e 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -96,6 +96,7 @@ void blk_set_default_limits(struct queue_limits *lim)
+  lim->seg_boundary_mask = BLK_SEG_BOUNDARY_MASK;
+  lim->max_segment_size = BLK_MAX_SEGMENT_SIZE;
+  lim->max_sectors = lim->max_hw_sectors = BLK_SAFE_MAX_SECTORS;
++ lim->chunk_sectors = 0;
+  lim->max_write_same_sectors = 0;
+  lim->max_discard_sectors = 0;
+  lim->discard_granularity = 0;
+@@ -259,6 +260,23 @@ void blk_queue_max_hw_sectors(struct request_queue *q, unsigned int max_hw_secto
+ EXPORT_SYMBOL(blk_queue_max_hw_sectors);
+ 
+ /**
++ * blk_queue_chunk_sectors - set size of the chunk for this queue
++ * @q:  the request queue for the device
++ * @chunk_sectors:  chunk sectors in the usual 512b unit
++ *
++ * Description:
++ *    If a driver doesn't want IOs to cross a given chunk size, it can set
++ *    this limit and prevent merging across chunks. Note that the chunk size
++ *    must currently be a power-of-2 in sectors.
++ **/
++void blk_queue_chunk_sectors(struct request_queue *q, unsigned int chunk_sectors)
++{
++ BUG_ON(!is_power_of_2(chunk_sectors));
++ q->limits.chunk_sectors = chunk_sectors;
++}
++EXPORT_SYMBOL(blk_queue_chunk_sectors);
++
++/**
+  * blk_queue_max_discard_sectors - set max sectors for a single discard
+  * @q:  the request queue for the device
+  * @max_discard_sectors: maximum number of sectors to discard
+diff --git a/fs/bio.c b/fs/bio.c
+index f272171..2cddeb8 100644
+--- a/fs/bio.c
++++ b/fs/bio.c
+@@ -750,7 +750,8 @@ int bio_add_page(struct bio *bio, struct page *page, unsigned int len,
+    unsigned int offset)
+ {
+  struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+- return __bio_add_page(q, bio, page, len, offset, queue_max_sectors(q));
++
++ return __bio_add_page(q, bio, page, len, offset, blk_max_size_offset(q, bio->bi_sector));
+ }
+ EXPORT_SYMBOL(bio_add_page);
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index d92da6e..d692be5 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -287,6 +287,7 @@ struct queue_limits {
+  unsigned long  seg_boundary_mask;
+ 
+  unsigned int  max_hw_sectors;
++ unsigned int  chunk_sectors;
+  unsigned int  max_sectors;
+  unsigned int  max_segment_size;
+  unsigned int  physical_block_size;
+@@ -919,6 +920,20 @@ static inline unsigned int blk_queue_get_max_sectors(struct request_queue *q,
+  return q->limits.max_sectors;
+ }
+ 
++/*
++ * Return maximum size of a request at given offset. Only valid for
++ * file system requests.
++ */
++static inline unsigned int blk_max_size_offset(struct request_queue *q,
++            sector_t offset)
++{
++ if (!q->limits.chunk_sectors)
++  return q->limits.max_hw_sectors;
++
++ return q->limits.chunk_sectors -
++   (offset & (q->limits.chunk_sectors - 1));
++}
++
+ static inline unsigned int blk_rq_get_max_sectors(struct request *rq)
+ {
+  struct request_queue *q = rq->q;
+@@ -926,7 +941,11 @@ static inline unsigned int blk_rq_get_max_sectors(struct request *rq)
+  if (unlikely(rq->cmd_type == REQ_TYPE_BLOCK_PC))
+   return q->limits.max_hw_sectors;
+ 
+- return blk_queue_get_max_sectors(q, rq->cmd_flags);
++ if (!q->limits.chunk_sectors)
++  return blk_queue_get_max_sectors(q, rq->cmd_flags);
++
++ return min(blk_max_size_offset(q, blk_rq_pos(rq)),
++   blk_queue_get_max_sectors(q, rq->cmd_flags));
+ }
+ 
+ static inline unsigned int blk_rq_count_bios(struct request *rq)
+@@ -992,6 +1011,7 @@ extern void blk_queue_make_request(struct request_queue *, make_request_fn *);
+ extern void blk_queue_bounce_limit(struct request_queue *, u64);
+ extern void blk_limits_max_hw_sectors(struct queue_limits *, unsigned int);
+ extern void blk_queue_max_hw_sectors(struct request_queue *, unsigned int);
++extern void blk_queue_chunk_sectors(struct request_queue *, unsigned int);
+ extern void blk_queue_max_segments(struct request_queue *, unsigned short);
+ extern void blk_queue_max_segment_size(struct request_queue *, unsigned int);
+ extern void blk_queue_max_discard_sectors(struct request_queue *q,
+-- 
+1.7.1

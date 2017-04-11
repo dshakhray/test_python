@@ -1,0 +1,87 @@
+From 12fc6fff95242b05ad73fa6ea53106d8fb845dd9 Mon Sep 17 00:00:00 2001
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Thu, 29 May 2014 16:49:32 -0400
+Subject: [virt] xen/spinlock: Fix locking path engaging too soon under PVHVM
+
+Message-id: <1401382177-12769-2-git-send-email-vkuznets@redhat.com>
+Patchwork-id: 81159
+O-Subject: [RHEL7.1 PATCH 1/6] xen/spinlock: Fix locking path engaging too soon under PVHVM.
+Bugzilla: 1006977
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Andrew Jones <drjones@redhat.com>
+RH-Acked-by: Laszlo Ersek <lersek@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1006977
+Brew build: https://brewweb.devel.redhat.com/taskinfo?taskID=7482680
+Upstream commit: 1fb3a8b2cfb278f139d9ff7ca5fe06a65de64494
+
+Author: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date:   Tue Aug 13 11:47:21 2013 -0400
+
+The xen_lock_spinning has a check for the kicker interrupts
+and if it is not initialized it will spin normally (not enter
+the slowpath).
+
+But for PVHVM case we would initialize the kicker interrupt
+before the CPU came online. This meant that if the booting
+CPU used a spinlock and went in the slowpath - it would
+enter the slowpath and block forever. The forever part because
+during bootup: the spinlock would be taken _before_ the CPU
+sets itself to be online (more on this further), and we enter
+to poll on the event channel forever.
+
+The bootup CPU (see commit fc78d343fa74514f6fd117b5ef4cd27e4ac30236
+"xen/smp: initialize IPI vectors before marking CPU online"
+for details) and the CPU that started the bootup consult
+the cpu_online_mask to determine whether the booting CPU should
+get an IPI. The booting CPU has to set itself in this mask via:
+
+  set_cpu_online(smp_processor_id(), true);
+
+However, if the spinlock is taken before this (and it is) and
+it polls on an event channel - it will never be woken up as
+the kernel will never send an IPI to an offline CPU.
+
+Note that the PVHVM logic in sending IPIs is using the HVM
+path which has numerous checks using the cpu_online_mask
+and cpu_active_mask. See above mention git commit for details.
+
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Reviewed-by: David Vrabel <david.vrabel@citrix.com>
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/xen/enlighten.c b/arch/x86/xen/enlighten.c
+index a9d8079..003dbc7 100644
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@ -1690,7 +1690,6 @@ static int xen_hvm_cpu_notify(struct notifier_block *self, unsigned long action,
+  case CPU_UP_PREPARE:
+   xen_vcpu_setup(cpu);
+   if (xen_have_vector_callback) {
+-   xen_init_lock_cpu(cpu);
+    if (xen_feature(XENFEAT_hvm_safe_pvclock))
+     xen_setup_timer(cpu);
+   }
+diff --git a/arch/x86/xen/smp.c b/arch/x86/xen/smp.c
+index 597655b..4db779d 100644
+--- a/arch/x86/xen/smp.c
++++ b/arch/x86/xen/smp.c
+@@ -703,6 +703,15 @@ static int xen_hvm_cpu_up(unsigned int cpu, struct task_struct *tidle)
+  WARN_ON(rc);
+  if (!rc)
+   rc =  native_cpu_up(cpu, tidle);
++
++ /*
++  * We must initialize the slowpath CPU kicker _after_ the native
++  * path has executed. If we initialized it before none of the
++  * unlocker IPI kicks would reach the booting CPU as the booting
++  * CPU had not set itself 'online' in cpu_online_mask. That mask
++  * is checked when IPIs are sent (on HVM at least).
++  */
++ xen_init_lock_cpu(cpu);
+  return rc;
+ }
+ 
+-- 
+1.7.1

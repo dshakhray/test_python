@@ -1,0 +1,116 @@
+From 6acce07645e757eeb67f1773697c5148caa29b10 Mon Sep 17 00:00:00 2001
+From: J. Bruce Fields <bfields@redhat.com>
+Date: Mon, 23 Jun 2014 21:50:47 -0400
+Subject: [fs] nfsd: fix encoding of out-of-space replies
+
+Message-id: <1403560314-32525-106-git-send-email-bfields@redhat.com>
+Patchwork-id: 84521
+O-Subject: [Patch RHEL7 105/172] nfsd4: fix encoding of out-of-space replies
+Bugzilla: 1111719
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+If nfsd4_check_resp_size() returns an error then we should really be
+truncating the reply here, otherwise we may leave extra garbage at the
+end of the rpc reply.
+
+Also add a warning to catch any cases where our reply-size estimates may
+be wrong in the case of a non-idempotent operation.
+
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Upstream: 07d1f8020738ba3180ea9992c4fa7dbc0685396a
+Bugzilla: 1111719
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c
+index 259e5f5..2063764 100644
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@ -1170,9 +1170,7 @@ struct nfsd4_operation {
+ 
+ static struct nfsd4_operation nfsd4_ops[];
+ 
+-#ifdef NFSD_DEBUG
+ static const char *nfsd4_op_name(unsigned opnum);
+-#endif
+ 
+ /*
+  * Enforce NFSv4.1 COMPOUND ordering rules:
+@@ -1858,14 +1856,21 @@ static struct nfsd4_operation nfsd4_ops[] = {
+  },
+ };
+ 
+-#ifdef NFSD_DEBUG
++void warn_on_nonidempotent_op(struct nfsd4_op *op)
++{
++ if (OPDESC(op)->op_flags & OP_MODIFIES_SOMETHING) {
++  pr_err("unable to encode reply to nonidempotent op %d (%s)\n",
++   op->opnum, nfsd4_op_name(op->opnum));
++  WARN_ON_ONCE(1);
++ }
++}
++
+ static const char *nfsd4_op_name(unsigned opnum)
+ {
+  if (opnum < ARRAY_SIZE(nfsd4_ops))
+   return nfsd4_ops[opnum].op_name;
+  return "unknown_operation";
+ }
+-#endif
+ 
+ #define nfsd4_voidres   nfsd4_voidargs
+ struct nfsd4_voidargs { int dummy; };
+diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c
+index 1879250..24ba652 100644
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@ -3637,6 +3637,7 @@ nfsd4_encode_operation(struct nfsd4_compoundres *resp, struct nfsd4_op *op)
+ {
+  struct nfs4_stateowner *so = resp->cstate.replay_owner;
+  __be32 *statp;
++ nfsd4_enc encoder;
+  __be32 *p;
+ 
+  RESERVE_SPACE(8);
+@@ -3648,10 +3649,24 @@ nfsd4_encode_operation(struct nfsd4_compoundres *resp, struct nfsd4_op *op)
+   goto status;
+  BUG_ON(op->opnum < 0 || op->opnum >= ARRAY_SIZE(nfsd4_enc_ops) ||
+         !nfsd4_enc_ops[op->opnum]);
+- op->status = nfsd4_enc_ops[op->opnum](resp, op->status, &op->u);
++ encoder = nfsd4_enc_ops[op->opnum];
++ op->status = encoder(resp, op->status, &op->u);
+  /* nfsd4_check_resp_size guarantees enough room for error status */
+  if (!op->status)
+   op->status = nfsd4_check_resp_size(resp, 0);
++ if (op->status == nfserr_resource ||
++     op->status == nfserr_rep_too_big ||
++     op->status == nfserr_rep_too_big_to_cache) {
++  /*
++   * The operation may have already been encoded or
++   * partially encoded.  No op returns anything additional
++   * in the case of one of these three errors, so we can
++   * just truncate back to after the status.  But it's a
++   * bug if we had to do this on a non-idempotent op:
++   */
++  warn_on_nonidempotent_op(op);
++  resp->xdr.p = statp + 1;
++ }
+  if (so) {
+   so->so_replay.rp_status = op->status;
+   so->so_replay.rp_buflen = (char *)resp->xdr.p
+diff --git a/fs/nfsd/xdr4.h b/fs/nfsd/xdr4.h
+index f62a055..15ca477 100644
+--- a/fs/nfsd/xdr4.h
++++ b/fs/nfsd/xdr4.h
+@@ -536,6 +536,8 @@ static inline bool nfsd4_last_compound_op(struct svc_rqst *rqstp)
+  return argp->opcnt == resp->opcnt;
+ }
+ 
++void warn_on_nonidempotent_op(struct nfsd4_op *op);
++
+ #define NFS4_SVC_XDRSIZE  sizeof(struct nfsd4_compoundargs)
+ 
+ static inline void
+-- 
+1.7.1

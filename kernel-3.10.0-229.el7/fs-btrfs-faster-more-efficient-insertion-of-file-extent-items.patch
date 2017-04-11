@@ -1,0 +1,122 @@
+From 90880e15b24085c78894c7fa6da9f7006af9ff72 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:01:14 -0400
+Subject: [fs] btrfs: faster/more efficient insertion of file extent items
+
+Message-id: <1407179109-13714-188-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87121
+O-Subject: [RHEL7.1 PATCH 187/422] Btrfs: faster/more efficient insertion of file extent items
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Filipe David Borba Manana <fdmanana@gmail.com>
+
+commit d5f375270aa55794f4a7196b5247469f86278a8f
+Author: Filipe David Borba Manana <fdmanana@gmail.com>
+Date:   Sun Feb 9 23:45:12 2014 +0000
+
+    Btrfs: faster/more efficient insertion of file extent items
+
+    This is an extension to my previous commit titled:
+
+      "Btrfs: faster file extent item replace operations"
+      (hash 1acae57b161ef1282f565ef907f72aeed0eb71d9)
+
+    Instead of inserting the new file extent item if we deleted existing
+    file extent items covering our target file range, also allow to insert
+    the new file extent item if we didn't find any existing items to delete
+    and replace_extent != 0, since in this case our caller would do another
+    tree search to insert the new file extent item anyway, therefore just
+    combine the two tree searches into a single one, saving cpu time, reducing
+    lock contention and reducing btree node/leaf COW operations.
+
+    This covers the case where applications keep doing tail append writes to
+    files, which for example is the case of Apache CouchDB (its database and
+    view index files are always open with O_APPEND).
+
+    Signed-off-by: Filipe David Borba Manana <fdmanana@gmail.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 80f9b94..15b227d 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -720,7 +720,7 @@ int __btrfs_drop_extents(struct btrfs_trans_handle *trans,
+  if (drop_cache)
+   btrfs_drop_extent_cache(inode, start, end - 1, 0);
+ 
+- if (start >= BTRFS_I(inode)->disk_i_size)
++ if (start >= BTRFS_I(inode)->disk_i_size && !replace_extent)
+   modify_tree = 0;
+ 
+  while (1) {
+@@ -938,34 +938,42 @@ next_slot:
+    * Set path->slots[0] to first slot, so that after the delete
+    * if items are move off from our leaf to its immediate left or
+    * right neighbor leafs, we end up with a correct and adjusted
+-   * path->slots[0] for our insertion.
++   * path->slots[0] for our insertion (if replace_extent != 0).
+    */
+   path->slots[0] = del_slot;
+   ret = btrfs_del_items(trans, root, path, del_slot, del_nr);
+   if (ret)
+    btrfs_abort_transaction(trans, root, ret);
++ }
+ 
+-  leaf = path->nodes[0];
+-  /*
+-   * leaf eb has flag EXTENT_BUFFER_STALE if it was deleted (that
+-   * is, its contents got pushed to its neighbors), in which case
+-   * it means path->locks[0] == 0
+-   */
+-  if (!ret && replace_extent && leafs_visited == 1 &&
+-      path->locks[0] &&
+-      btrfs_leaf_free_space(root, leaf) >=
+-      sizeof(struct btrfs_item) + extent_item_size) {
+-
+-   key.objectid = ino;
+-   key.type = BTRFS_EXTENT_DATA_KEY;
+-   key.offset = start;
+-   setup_items_for_insert(root, path, &key,
+-            &extent_item_size,
+-            extent_item_size,
+-            sizeof(struct btrfs_item) +
+-            extent_item_size, 1);
+-   *key_inserted = 1;
++ leaf = path->nodes[0];
++ /*
++  * If btrfs_del_items() was called, it might have deleted a leaf, in
++  * which case it unlocked our path, so check path->locks[0] matches a
++  * write lock.
++  */
++ if (!ret && replace_extent && leafs_visited == 1 &&
++     (path->locks[0] == BTRFS_WRITE_LOCK_BLOCKING ||
++      path->locks[0] == BTRFS_WRITE_LOCK) &&
++     btrfs_leaf_free_space(root, leaf) >=
++     sizeof(struct btrfs_item) + extent_item_size) {
++
++  key.objectid = ino;
++  key.type = BTRFS_EXTENT_DATA_KEY;
++  key.offset = start;
++  if (!del_nr && path->slots[0] < btrfs_header_nritems(leaf)) {
++   struct btrfs_key slot_key;
++
++   btrfs_item_key_to_cpu(leaf, &slot_key, path->slots[0]);
++   if (btrfs_comp_cpu_keys(&key, &slot_key) > 0)
++    path->slots[0]++;
+   }
++  setup_items_for_insert(root, path, &key,
++           &extent_item_size,
++           extent_item_size,
++           sizeof(struct btrfs_item) +
++           extent_item_size, 1);
++  *key_inserted = 1;
+  }
+ 
+  if (!replace_extent || !(*key_inserted))
+-- 
+1.7.1

@@ -1,0 +1,161 @@
+From 837b5134fa694cf6d0842943cb4d21728fcb181e Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:11:45 -0400
+Subject: [powerpc] powernv: Remove PNV_EEH_STATE_REMOVED
+
+Message-id: <1410545655-205645-477-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94539
+O-Subject: [RHEL7 PATCH 476/626] powerpc/powernv: Remove PNV_EEH_STATE_REMOVED
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 467f79a9564b8fafa83adb53471aebe8cf75fb8e
+Author: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Date:   Thu Apr 24 18:00:08 2014 +1000
+
+    powerpc/powernv: Remove PNV_EEH_STATE_REMOVED
+
+    The PHB state PNV_EEH_STATE_REMOVED maintained in pnv_phb isn't
+    so useful any more and it's duplicated to EEH_PE_ISOLATED. The
+    patch replaces PNV_EEH_STATE_REMOVED with EEH_PE_ISOLATED.
+
+    Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/platforms/powernv/eeh-ioda.c b/arch/powerpc/platforms/powernv/eeh-ioda.c
+index 9f7cdd8..91da57d 100644
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@ -656,22 +656,6 @@ static void ioda_eeh_hub_diag(struct pci_controller *hose)
+  }
+ }
+ 
+-static int ioda_eeh_get_phb_pe(struct pci_controller *hose,
+-          struct eeh_pe **pe)
+-{
+- struct eeh_pe *phb_pe;
+-
+- phb_pe = eeh_phb_pe_get(hose);
+- if (!phb_pe) {
+-  pr_warning("%s Can't find PE for PHB#%d\n",
+-      __func__, hose->global_number);
+-  return -EEXIST;
+- }
+-
+- *pe = phb_pe;
+- return 0;
+-}
+-
+ static int ioda_eeh_get_pe(struct pci_controller *hose,
+       u16 pe_no, struct eeh_pe **pe)
+ {
+@@ -679,7 +663,8 @@ static int ioda_eeh_get_pe(struct pci_controller *hose,
+  struct eeh_dev dev;
+ 
+  /* Find the PHB PE */
+- if (ioda_eeh_get_phb_pe(hose, &phb_pe))
++ phb_pe = eeh_phb_pe_get(hose);
++ if (!phb_pe)
+   return -EEXIST;
+ 
+  /* Find the PE according to PE# */
+@@ -707,6 +692,7 @@ static int ioda_eeh_next_error(struct eeh_pe **pe)
+ {
+  struct pci_controller *hose;
+  struct pnv_phb *phb;
++ struct eeh_pe *phb_pe;
+  u64 frozen_pe_no;
+  u16 err_type, severity;
+  long rc;
+@@ -723,10 +709,12 @@ static int ioda_eeh_next_error(struct eeh_pe **pe)
+  list_for_each_entry(hose, &hose_list, list_node) {
+   /*
+    * If the subordinate PCI buses of the PHB has been
+-   * removed, we needn't take care of it any more.
++   * removed or is exactly under error recovery, we
++   * needn't take care of it any more.
+    */
+   phb = hose->private_data;
+-  if (phb->eeh_state & PNV_EEH_STATE_REMOVED)
++  phb_pe = eeh_phb_pe_get(hose);
++  if (!phb_pe || (phb_pe->state & EEH_PE_ISOLATED))
+    continue;
+ 
+   rc = opal_pci_next_error(phb->opal_id,
+@@ -759,12 +747,6 @@ static int ioda_eeh_next_error(struct eeh_pe **pe)
+   switch (err_type) {
+   case OPAL_EEH_IOC_ERROR:
+    if (severity == OPAL_EEH_SEV_IOC_DEAD) {
+-    list_for_each_entry(hose, &hose_list,
+-          list_node) {
+-     phb = hose->private_data;
+-     phb->eeh_state |= PNV_EEH_STATE_REMOVED;
+-    }
+-
+     pr_err("EEH: dead IOC detected\n");
+     ret = EEH_NEXT_ERR_DEAD_IOC;
+    } else if (severity == OPAL_EEH_SEV_INF) {
+@@ -777,17 +759,12 @@ static int ioda_eeh_next_error(struct eeh_pe **pe)
+    break;
+   case OPAL_EEH_PHB_ERROR:
+    if (severity == OPAL_EEH_SEV_PHB_DEAD) {
+-    if (ioda_eeh_get_phb_pe(hose, pe))
+-     break;
+-
++    *pe = phb_pe;
+     pr_err("EEH: dead PHB#%x detected\n",
+      hose->global_number);
+-    phb->eeh_state |= PNV_EEH_STATE_REMOVED;
+     ret = EEH_NEXT_ERR_DEAD_PHB;
+    } else if (severity == OPAL_EEH_SEV_PHB_FENCED) {
+-    if (ioda_eeh_get_phb_pe(hose, pe))
+-     break;
+-
++    *pe = phb_pe;
+     pr_err("EEH: fenced PHB#%x detected\n",
+      hose->global_number);
+     ret = EEH_NEXT_ERR_FENCED_PHB;
+@@ -807,15 +784,12 @@ static int ioda_eeh_next_error(struct eeh_pe **pe)
+     * fenced PHB so that it can be recovered.
+     */
+    if (ioda_eeh_get_pe(hose, frozen_pe_no, pe)) {
+-    if (!ioda_eeh_get_phb_pe(hose, pe)) {
+-     pr_err("EEH: Escalated fenced PHB#%x "
+-            "detected for PE#%llx\n",
+-      hose->global_number,
+-      frozen_pe_no);
+-     ret = EEH_NEXT_ERR_FENCED_PHB;
+-    } else {
+-     ret = EEH_NEXT_ERR_NONE;
+-    }
++    *pe = phb_pe;
++    pr_err("EEH: Escalated fenced PHB#%x "
++           "detected for PE#%llx\n",
++     hose->global_number,
++     frozen_pe_no);
++    ret = EEH_NEXT_ERR_FENCED_PHB;
+    } else {
+     pr_err("EEH: Frozen PE#%x on PHB#%x detected\n",
+      (*pe)->addr, (*pe)->phb->global_number);
+diff --git a/arch/powerpc/platforms/powernv/pci.h b/arch/powerpc/platforms/powernv/pci.h
+index 0467933..35148f6 100644
+--- a/arch/powerpc/platforms/powernv/pci.h
++++ b/arch/powerpc/platforms/powernv/pci.h
+@@ -82,7 +82,6 @@ struct pnv_eeh_ops {
+ };
+ 
+ #define PNV_EEH_STATE_ENABLED (1 << 0) /* EEH enabled */
+-#define PNV_EEH_STATE_REMOVED (1 << 1) /* PHB removed */
+ 
+ #endif /* CONFIG_EEH */
+ 
+-- 
+1.7.1

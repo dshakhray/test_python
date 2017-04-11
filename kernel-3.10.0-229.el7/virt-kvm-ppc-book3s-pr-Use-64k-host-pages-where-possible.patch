@@ -1,0 +1,266 @@
+From 3b11e2b37b8fe2ef0877004e38fdfc814bbd8778 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:06:01 -0400
+Subject: [virt] kvm/ppc: book3s pr - Use 64k host pages where possible
+
+Message-id: <1410545655-205645-133-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94173
+O-Subject: [RHEL7 PATCH 132/626] KVM: PPC: Book3S PR: Use 64k host pages where possible
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit c9029c341da646ab0c9911ea4c118eaa0a2eb0fa
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:45 2013 +1000
+
+    KVM: PPC: Book3S PR: Use 64k host pages where possible
+
+    Currently, PR KVM uses 4k pages for the host-side mappings of guest
+    memory, regardless of the host page size.  When the host page size is
+    64kB, we might as well use 64k host page mappings for guest mappings
+    of 64kB and larger pages and for guest real-mode mappings.  However,
+    the magic page has to remain a 4k page.
+
+    To implement this, we first add another flag bit to the guest VSID
+    values we use, to indicate that this segment is one where host pages
+    should be mapped using 64k pages.  For segments with this bit set
+    we set the bits in the shadow SLB entry to indicate a 64k base page
+    size.  When faulting in host HPTEs for this segment, we make them
+    64k HPTEs instead of 4k.  We record the pagesize in struct hpte_cache
+    for use when invalidating the HPTE.
+
+    For now we restrict the segment containing the magic page (if any) to
+    4k pages.  It should be possible to lift this restriction in future
+    by ensuring that the magic 4k page is appropriately positioned within
+    a host 64k page.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 1d4a120..6bf20b4 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -66,6 +66,7 @@ struct hpte_cache {
+  u64 pfn;
+  ulong slot;
+  struct kvmppc_pte pte;
++ int pagesize;
+ };
+ 
+ struct kvmppc_vcpu_book3s {
+@@ -113,8 +114,9 @@ struct kvmppc_vcpu_book3s {
+ #define CONTEXT_GUEST  1
+ #define CONTEXT_GUEST_END 2
+ 
+-#define VSID_REAL 0x0fffffffffc00000ULL
+-#define VSID_BAT 0x0fffffffffb00000ULL
++#define VSID_REAL 0x07ffffffffc00000ULL
++#define VSID_BAT 0x07ffffffffb00000ULL
++#define VSID_64K 0x0800000000000000ULL
+ #define VSID_1T  0x1000000000000000ULL
+ #define VSID_REAL_DR 0x2000000000000000ULL
+ #define VSID_REAL_IR 0x4000000000000000ULL
+diff --git a/arch/powerpc/kvm/book3s_32_mmu.c b/arch/powerpc/kvm/book3s_32_mmu.c
+index c8cefdd..af04553 100644
+--- a/arch/powerpc/kvm/book3s_32_mmu.c
++++ b/arch/powerpc/kvm/book3s_32_mmu.c
+@@ -308,6 +308,7 @@ static int kvmppc_mmu_book3s_32_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
+  ulong mp_ea = vcpu->arch.magic_page_ea;
+ 
+  pte->eaddr = eaddr;
++ pte->page_size = MMU_PAGE_4K;
+ 
+  /* Magic page override */
+  if (unlikely(mp_ea) &&
+diff --git a/arch/powerpc/kvm/book3s_64_mmu.c b/arch/powerpc/kvm/book3s_64_mmu.c
+index 8277264..ffcde01 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu.c
++++ b/arch/powerpc/kvm/book3s_64_mmu.c
+@@ -542,6 +542,16 @@ static void kvmppc_mmu_book3s_64_tlbie(struct kvm_vcpu *vcpu, ulong va,
+  kvmppc_mmu_pte_vflush(vcpu, va >> 12, mask);
+ }
+ 
++#ifdef CONFIG_PPC_64K_PAGES
++static int segment_contains_magic_page(struct kvm_vcpu *vcpu, ulong esid)
++{
++ ulong mp_ea = vcpu->arch.magic_page_ea;
++
++ return mp_ea && !(vcpu->arch.shared->msr & MSR_PR) &&
++  (mp_ea >> SID_SHIFT) == esid;
++}
++#endif
++
+ static int kvmppc_mmu_book3s_64_esid_to_vsid(struct kvm_vcpu *vcpu, ulong esid,
+           u64 *vsid)
+ {
+@@ -549,11 +559,13 @@ static int kvmppc_mmu_book3s_64_esid_to_vsid(struct kvm_vcpu *vcpu, ulong esid,
+  struct kvmppc_slb *slb;
+  u64 gvsid = esid;
+  ulong mp_ea = vcpu->arch.magic_page_ea;
++ int pagesize = MMU_PAGE_64K;
+ 
+  if (vcpu->arch.shared->msr & (MSR_DR|MSR_IR)) {
+   slb = kvmppc_mmu_book3s_64_find_slbe(vcpu, ea);
+   if (slb) {
+    gvsid = slb->vsid;
++   pagesize = slb->base_page_size;
+    if (slb->tb) {
+     gvsid <<= SID_SHIFT_1T - SID_SHIFT;
+     gvsid |= esid & ((1ul << (SID_SHIFT_1T - SID_SHIFT)) - 1);
+@@ -564,28 +576,41 @@ static int kvmppc_mmu_book3s_64_esid_to_vsid(struct kvm_vcpu *vcpu, ulong esid,
+ 
+  switch (vcpu->arch.shared->msr & (MSR_DR|MSR_IR)) {
+  case 0:
+-  *vsid = VSID_REAL | esid;
++  gvsid = VSID_REAL | esid;
+   break;
+  case MSR_IR:
+-  *vsid = VSID_REAL_IR | gvsid;
++  gvsid |= VSID_REAL_IR;
+   break;
+  case MSR_DR:
+-  *vsid = VSID_REAL_DR | gvsid;
++  gvsid |= VSID_REAL_DR;
+   break;
+  case MSR_DR|MSR_IR:
+   if (!slb)
+    goto no_slb;
+ 
+-  *vsid = gvsid;
+   break;
+  default:
+   BUG();
+   break;
+  }
+ 
++#ifdef CONFIG_PPC_64K_PAGES
++ /*
++  * Mark this as a 64k segment if the host is using
++  * 64k pages, the host MMU supports 64k pages and
++  * the guest segment page size is >= 64k,
++  * but not if this segment contains the magic page.
++  */
++ if (pagesize >= MMU_PAGE_64K &&
++     mmu_psize_defs[MMU_PAGE_64K].shift &&
++     !segment_contains_magic_page(vcpu, esid))
++  gvsid |= VSID_64K;
++#endif
++
+  if (vcpu->arch.shared->msr & MSR_PR)
+-  *vsid |= VSID_PR;
++  gvsid |= VSID_PR;
+ 
++ *vsid = gvsid;
+  return 0;
+ 
+ no_slb:
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_host.c b/arch/powerpc/kvm/book3s_64_mmu_host.c
+index e524052..6bda504 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_host.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_host.c
+@@ -34,7 +34,7 @@
+ void kvmppc_mmu_invalidate_pte(struct kvm_vcpu *vcpu, struct hpte_cache *pte)
+ {
+  ppc_md.hpte_invalidate(pte->slot, pte->host_vpn,
+-          MMU_PAGE_4K, MMU_PAGE_4K, MMU_SEGSIZE_256M,
++          pte->pagesize, pte->pagesize, MMU_SEGSIZE_256M,
+           false);
+ }
+ 
+@@ -90,6 +90,7 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte)
+  int attempt = 0;
+  struct kvmppc_sid_map *map;
+  int r = 0;
++ int hpsize = MMU_PAGE_4K;
+ 
+  /* Get host physical address for gpa */
+  hpaddr = kvmppc_gfn_to_pfn(vcpu, orig_pte->raddr >> PAGE_SHIFT);
+@@ -99,7 +100,6 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte)
+   goto out;
+  }
+  hpaddr <<= PAGE_SHIFT;
+- hpaddr |= orig_pte->raddr & (~0xfffULL & ~PAGE_MASK);
+ 
+  /* and write the mapping ea -> hpa into the pt */
+  vcpu->arch.mmu.esid_to_vsid(vcpu, orig_pte->eaddr >> SID_SHIFT, &vsid);
+@@ -117,8 +117,7 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte)
+   goto out;
+  }
+ 
+- vsid = map->host_vsid;
+- vpn = hpt_vpn(orig_pte->eaddr, vsid, MMU_SEGSIZE_256M);
++ vpn = hpt_vpn(orig_pte->eaddr, map->host_vsid, MMU_SEGSIZE_256M);
+ 
+  if (!orig_pte->may_write)
+   rflags |= HPTE_R_PP;
+@@ -130,7 +129,16 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte)
+  else
+   kvmppc_mmu_flush_icache(hpaddr >> PAGE_SHIFT);
+ 
+- hash = hpt_hash(vpn, PTE_SIZE, MMU_SEGSIZE_256M);
++ /*
++  * Use 64K pages if possible; otherwise, on 64K page kernels,
++  * we need to transfer 4 more bits from guest real to host real addr.
++  */
++ if (vsid & VSID_64K)
++  hpsize = MMU_PAGE_64K;
++ else
++  hpaddr |= orig_pte->raddr & (~0xfffULL & ~PAGE_MASK);
++
++ hash = hpt_hash(vpn, mmu_psize_defs[hpsize].shift, MMU_SEGSIZE_256M);
+ 
+ map_again:
+  hpteg = ((hash & htab_hash_mask) * HPTES_PER_GROUP);
+@@ -143,7 +151,7 @@ map_again:
+   }
+ 
+  ret = ppc_md.hpte_insert(hpteg, vpn, hpaddr, rflags, vflags,
+-     MMU_PAGE_4K, MMU_PAGE_4K, MMU_SEGSIZE_256M);
++     hpsize, hpsize, MMU_SEGSIZE_256M);
+ 
+  if (ret < 0) {
+   /* If we couldn't map a primary PTE, try a secondary */
+@@ -168,6 +176,7 @@ map_again:
+   pte->host_vpn = vpn;
+   pte->pte = *orig_pte;
+   pte->pfn = hpaddr >> PAGE_SHIFT;
++  pte->pagesize = hpsize;
+ 
+   kvmppc_mmu_hpte_cache_map(vcpu, pte);
+  }
+@@ -291,6 +300,12 @@ int kvmppc_mmu_map_segment(struct kvm_vcpu *vcpu, ulong eaddr)
+  slb_vsid &= ~SLB_VSID_KP;
+  slb_esid |= slb_index;
+ 
++#ifdef CONFIG_PPC_64K_PAGES
++ /* Set host segment base page size to 64K if possible */
++ if (gvsid & VSID_64K)
++  slb_vsid |= mmu_psize_defs[MMU_PAGE_64K].sllp;
++#endif
++
+  svcpu->slb[slb_index].esid = slb_esid;
+  svcpu->slb[slb_index].vsid = slb_vsid;
+ 
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 8edd7bc..2c2bf77 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -422,6 +422,7 @@ int kvmppc_handle_pagefault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+   pte.raddr = eaddr & KVM_PAM;
+   pte.eaddr = eaddr;
+   pte.vpage = eaddr >> 12;
++  pte.page_size = MMU_PAGE_64K;
+  }
+ 
+  switch (vcpu->arch.shared->msr & (MSR_DR|MSR_IR)) {
+-- 
+1.7.1

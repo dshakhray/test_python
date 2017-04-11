@@ -1,0 +1,209 @@
+From 65ec08184a6a2bd45c1c3bf87d55448dae24448d Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:56 -0400
+Subject: [virt] kvm/ppc: book3s hv - Add support for guest Program Priority Register
+
+Message-id: <1410545655-205645-128-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94134
+O-Subject: [RHEL7 PATCH 127/626] KVM: PPC: Book3S HV: Add support for guest Program Priority Register
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 4b8473c9c19dff1b0c672f182cc50b9952cf42e7
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:39 2013 +1000
+
+    KVM: PPC: Book3S HV: Add support for guest Program Priority Register
+
+    POWER7 and later IBM server processors have a register called the
+    Program Priority Register (PPR), which controls the priority of
+    each hardware CPU SMT thread, and affects how fast it runs compared
+    to other SMT threads.  This priority can be controlled by writing to
+    the PPR or by use of a set of instructions of the form or rN,rN,rN
+    which are otherwise no-ops but have been defined to set the priority
+    to particular levels.
+
+    This adds code to context switch the PPR when entering and exiting
+    guests and to make the PPR value accessible through the SET/GET_ONE_REG
+    interface.  When entering the guest, we set the PPR as late as
+    possible, because if we are setting a low thread priority it will
+    make the code run slowly from that point on.  Similarly, the
+    first-level interrupt handlers save the PPR value in the PACA very
+    early on, and set the thread priority to the medium level, so that
+    the interrupt handling code runs at a reasonable speed.
+
+    Acked-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index 2f8b976..7fdaa93 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -1849,6 +1849,7 @@ registers, find a list below:
+   PPC   | KVM_REG_PPC_ACOP | 64
+   PPC   | KVM_REG_PPC_VRSAVE | 32
+   PPC   | KVM_REG_PPC_LPCR | 64
++  PPC   | KVM_REG_PPC_PPR | 64
+   PPC   | KVM_REG_PPC_TM_GPR0 | 64
+           ...
+   PPC   | KVM_REG_PPC_TM_GPR31 | 64
+diff --git a/arch/powerpc/include/asm/exception-64s.h b/arch/powerpc/include/asm/exception-64s.h
+index cca12f0..402c1c4 100644
+--- a/arch/powerpc/include/asm/exception-64s.h
++++ b/arch/powerpc/include/asm/exception-64s.h
+@@ -204,6 +204,10 @@ do_kvm_##n:        \
+  ld r10,area+EX_CFAR(r13);     \
+  std r10,HSTATE_CFAR(r13);     \
+  END_FTR_SECTION_NESTED(CPU_FTR_CFAR,CPU_FTR_CFAR,947);  \
++ BEGIN_FTR_SECTION_NESTED(948)     \
++ ld r10,area+EX_PPR(r13);     \
++ std r10,HSTATE_PPR(r13);     \
++ END_FTR_SECTION_NESTED(CPU_FTR_HAS_PPR,CPU_FTR_HAS_PPR,948); \
+  ld r10,area+EX_R10(r13);     \
+  stw r9,HSTATE_SCRATCH1(r13);    \
+  ld r9,area+EX_R9(r13);     \
+@@ -217,6 +221,10 @@ do_kvm_##n:        \
+  ld r10,area+EX_R10(r13);     \
+  beq 89f;       \
+  stw r9,HSTATE_SCRATCH1(r13);   \
++ BEGIN_FTR_SECTION_NESTED(948)     \
++ ld r9,area+EX_PPR(r13);     \
++ std r9,HSTATE_PPR(r13);     \
++ END_FTR_SECTION_NESTED(CPU_FTR_HAS_PPR,CPU_FTR_HAS_PPR,948); \
+  ld r9,area+EX_R9(r13);     \
+  std r12,HSTATE_SCRATCH0(r13);   \
+  li r12,n;       \
+diff --git a/arch/powerpc/include/asm/kvm_book3s_asm.h b/arch/powerpc/include/asm/kvm_book3s_asm.h
+index 9039d3c..22f4606 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_asm.h
++++ b/arch/powerpc/include/asm/kvm_book3s_asm.h
+@@ -101,6 +101,7 @@ struct kvmppc_host_state {
+ #endif
+ #ifdef CONFIG_PPC_BOOK3S_64
+  u64 cfar;
++ u64 ppr;
+ #endif
+ };
+ 
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 788930a..8bd730c 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -465,6 +465,7 @@ struct kvm_vcpu_arch {
+  u32 ctrl;
+  ulong dabr;
+  ulong cfar;
++ ulong ppr;
+ #endif
+  u32 vrsave; /* also USPRG0 */
+  u32 mmucr;
+diff --git a/arch/powerpc/include/uapi/asm/kvm.h b/arch/powerpc/include/uapi/asm/kvm.h
+index e42127d..fab6bc1 100644
+--- a/arch/powerpc/include/uapi/asm/kvm.h
++++ b/arch/powerpc/include/uapi/asm/kvm.h
+@@ -534,6 +534,7 @@ struct kvm_get_htab_header {
+ 
+ #define KVM_REG_PPC_VRSAVE (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0xb4)
+ #define KVM_REG_PPC_LPCR (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0xb5)
++#define KVM_REG_PPC_PPR  (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb6)
+ 
+ /* Transactional Memory checkpointed state:
+  * This is all GPRs, all VSX regs and a subset of SPRs
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index c872725..b130c47 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -513,6 +513,7 @@ int main(void)
+  DEFINE(VCPU_TRAP, offsetof(struct kvm_vcpu, arch.trap));
+  DEFINE(VCPU_PTID, offsetof(struct kvm_vcpu, arch.ptid));
+  DEFINE(VCPU_CFAR, offsetof(struct kvm_vcpu, arch.cfar));
++ DEFINE(VCPU_PPR, offsetof(struct kvm_vcpu, arch.ppr));
+  DEFINE(VCORE_ENTRY_EXIT, offsetof(struct kvmppc_vcore, entry_exit_count));
+  DEFINE(VCORE_NAP_COUNT, offsetof(struct kvmppc_vcore, nap_count));
+  DEFINE(VCORE_IN_GUEST, offsetof(struct kvmppc_vcore, in_guest));
+@@ -598,6 +599,7 @@ int main(void)
+ 
+ #ifdef CONFIG_PPC_BOOK3S_64
+  HSTATE_FIELD(HSTATE_CFAR, cfar);
++ HSTATE_FIELD(HSTATE_PPR, ppr);
+ #endif /* CONFIG_PPC_BOOK3S_64 */
+ 
+ #else /* CONFIG_PPC_BOOK3S */
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index e32de93..0836a27 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -823,6 +823,9 @@ int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+  case KVM_REG_PPC_LPCR:
+   *val = get_reg_val(id, vcpu->arch.vcore->lpcr);
+   break;
++ case KVM_REG_PPC_PPR:
++  *val = get_reg_val(id, vcpu->arch.ppr);
++  break;
+  default:
+   r = -EINVAL;
+   break;
+@@ -930,6 +933,9 @@ int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+  case KVM_REG_PPC_LPCR:
+   kvmppc_set_lpcr(vcpu, set_reg_val(id, *val));
+   break;
++ case KVM_REG_PPC_PPR:
++  vcpu->arch.ppr = set_reg_val(id, *val);
++  break;
+  default:
+   r = -EINVAL;
+   break;
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index b0cb3c2..91d12c9 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -717,13 +717,15 @@ BEGIN_FTR_SECTION
+  ld r5, VCPU_CFAR(r4)
+  mtspr SPRN_CFAR, r5
+ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
++BEGIN_FTR_SECTION
++ ld r0, VCPU_PPR(r4)
++END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR)
+ 
+  ld r5, VCPU_LR(r4)
+  lwz r6, VCPU_CR(r4)
+  mtlr r5
+  mtcr r6
+ 
+- ld r0, VCPU_GPR(R0)(r4)
+  ld r1, VCPU_GPR(R1)(r4)
+  ld r2, VCPU_GPR(R2)(r4)
+  ld r3, VCPU_GPR(R3)(r4)
+@@ -737,6 +739,10 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
+  ld r12, VCPU_GPR(R12)(r4)
+  ld r13, VCPU_GPR(R13)(r4)
+ 
++BEGIN_FTR_SECTION
++ mtspr SPRN_PPR, r0
++END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR)
++ ld r0, VCPU_GPR(R0)(r4)
+  ld r4, VCPU_GPR(R4)(r4)
+ 
+  hrfid
+@@ -787,6 +793,10 @@ BEGIN_FTR_SECTION
+  ld r3, HSTATE_CFAR(r13)
+  std r3, VCPU_CFAR(r9)
+ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
++BEGIN_FTR_SECTION
++ ld r4, HSTATE_PPR(r13)
++ std r4, VCPU_PPR(r9)
++END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR)
+ 
+  /* Restore R1/R2 so we can handle faults */
+  ld r1, HSTATE_HOST_R1(r13)
+-- 
+1.7.1

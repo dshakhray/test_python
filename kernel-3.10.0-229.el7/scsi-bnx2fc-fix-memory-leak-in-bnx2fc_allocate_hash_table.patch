@@ -1,0 +1,86 @@
+From 72621a7218d7c8669f3bf732e4e0e8a9e8e876d7 Mon Sep 17 00:00:00 2001
+From: Maurizio Lombardi <mlombard@redhat.com>
+Date: Mon, 8 Sep 2014 11:07:40 -0400
+Subject: [scsi] bnx2fc: fix memory leak in bnx2fc_allocate_hash_table()
+
+Message-id: <1410174472-14981-6-git-send-email-mlombard@redhat.com>
+Patchwork-id: 91639
+O-Subject: [RHEL7.1 e-stor PATCH 05/17] bnx2fc: fix memory leak in bnx2fc_allocate_hash_table()
+Bugzilla: 1089399
+RH-Acked-by: Ewan Milne <emilne@redhat.com>
+RH-Acked-by: Rob Evers <revers@redhat.com>
+
+In case of error, the bnx2fc_allocate_hash_table() didn't free
+all the memory it allocated.
+
+Signed-off-by: Maurizio Lombardi <mlombard@redhat.com>
+Acked-by: Eddie Wai <eddie.wai@broadcom.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit fdbcbcab0eae6773430546697ace0b3fe48e7fbc)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/bnx2fc/bnx2fc_hwi.c b/drivers/scsi/bnx2fc/bnx2fc_hwi.c
+index f83bae4..512aed3 100644
+--- a/drivers/scsi/bnx2fc/bnx2fc_hwi.c
++++ b/drivers/scsi/bnx2fc/bnx2fc_hwi.c
+@@ -2026,7 +2026,7 @@ static int bnx2fc_allocate_hash_table(struct bnx2fc_hba *hba)
+  dma_segment_array = kzalloc(dma_segment_array_size, GFP_KERNEL);
+  if (!dma_segment_array) {
+   printk(KERN_ERR PFX "hash table pointers (dma) alloc failed\n");
+-  return -ENOMEM;
++  goto cleanup_ht;
+  }
+ 
+  for (i = 0; i < segment_count; ++i) {
+@@ -2037,15 +2037,7 @@ static int bnx2fc_allocate_hash_table(struct bnx2fc_hba *hba)
+         GFP_KERNEL);
+   if (!hba->hash_tbl_segments[i]) {
+    printk(KERN_ERR PFX "hash segment alloc failed\n");
+-   while (--i >= 0) {
+-    dma_free_coherent(&hba->pcidev->dev,
+-          BNX2FC_HASH_TBL_CHUNK_SIZE,
+-          hba->hash_tbl_segments[i],
+-          dma_segment_array[i]);
+-    hba->hash_tbl_segments[i] = NULL;
+-   }
+-   kfree(dma_segment_array);
+-   return -ENOMEM;
++   goto cleanup_dma;
+   }
+   memset(hba->hash_tbl_segments[i], 0,
+          BNX2FC_HASH_TBL_CHUNK_SIZE);
+@@ -2057,8 +2049,7 @@ static int bnx2fc_allocate_hash_table(struct bnx2fc_hba *hba)
+             GFP_KERNEL);
+  if (!hba->hash_tbl_pbl) {
+   printk(KERN_ERR PFX "hash table pbl alloc failed\n");
+-  kfree(dma_segment_array);
+-  return -ENOMEM;
++  goto cleanup_dma;
+  }
+  memset(hba->hash_tbl_pbl, 0, PAGE_SIZE);
+ 
+@@ -2083,6 +2074,22 @@ static int bnx2fc_allocate_hash_table(struct bnx2fc_hba *hba)
+  }
+  kfree(dma_segment_array);
+  return 0;
++
++cleanup_dma:
++ for (i = 0; i < segment_count; ++i) {
++  if (hba->hash_tbl_segments[i])
++   dma_free_coherent(&hba->pcidev->dev,
++         BNX2FC_HASH_TBL_CHUNK_SIZE,
++         hba->hash_tbl_segments[i],
++         dma_segment_array[i]);
++ }
++
++ kfree(dma_segment_array);
++
++cleanup_ht:
++ kfree(hba->hash_tbl_segments);
++ hba->hash_tbl_segments = NULL;
++ return -ENOMEM;
+ }
+ 
+ /**
+-- 
+1.7.1

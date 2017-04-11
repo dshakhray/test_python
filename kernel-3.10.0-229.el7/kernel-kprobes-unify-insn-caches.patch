@@ -1,0 +1,317 @@
+From 38bc138117d6b1fc5ca161d324eeabc0b58a5c87 Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Mon, 1 Sep 2014 15:35:27 -0400
+Subject: [kernel] kprobes: unify insn caches
+
+Message-id: <1409585729-18733-2-git-send-email-brueckner@redhat.com>
+Patchwork-id: 90110
+O-Subject: [RHEL7.1 PATCH 1/3] [kernel] kprobes: unify insn caches
+Bugzilla: 1123429
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+Description
+-----------
+commit c802d64a356b5cf349121ac4c5e005f037ce548d
+Author: Heiko Carstens <heiko.carstens@de.ibm.com>
+Commit: Linus Torvalds <torvalds@linux-foundation.org>
+
+    kprobes: unify insn caches
+
+    The current kpropes insn caches allocate memory areas for insn slots
+    with module_alloc().  The assumption is that the kernel image and module
+    area are both within the same +/- 2GB memory area.
+
+    This however is not true for s390 where the kernel image resides within
+    the first 2GB (DMA memory area), but the module area is far away in the
+    vmalloc area, usually somewhere close below the 4TB area.
+
+    For new pc relative instructions s390 needs insn slots that are within
+    +/- 2GB of each area.  That way we can patch displacements of
+    pc-relative instructions within the insn slots just like x86 and
+    powerpc.
+
+    The module area works already with the normal insn slot allocator,
+    however there is currently no way to get insn slots that are within the
+    first 2GB on s390 (aka DMA area).
+
+    Therefore this patch set modifies the kprobes insn slot cache code in
+    order to allow to specify a custom allocator for the insn slot cache
+    pages.  In addition architecure can now have private insn slot caches
+    withhout the need to modify common code.
+
+    Patch 1 unifies and simplifies the current insn and optinsn caches
+            implementation. This is a preparation which allows to add more
+            insn caches in a simple way.
+
+    Patch 2 adds the possibility to specify a custom allocator.
+
+    Patch 3 makes s390 use the new insn slot mechanisms and adds support for
+            pc-relative instructions with long displacements.
+
+    This patch (of 3):
+
+    The two insn caches (insn, and optinsn) each have an own mutex and
+    alloc/free functions (get_[opt]insn_slot() / free_[opt]insn_slot()).
+
+    Since there is the need for yet another insn cache which satifies dma
+    allocations on s390, unify and simplify the current implementation:
+
+    - Move the per insn cache mutex into struct kprobe_insn_cache.
+    - Move the alloc/free functions to kprobe.h so they are simply
+      wrappers for the generic __get_insn_slot/__free_insn_slot functions.
+      The implementation is done with a DEFINE_INSN_CACHE_OPS() macro
+      which provides the alloc/free functions for each cache if needed.
+    - move the struct kprobe_insn_cache to kprobe.h which allows to generate
+      architecture specific insn slot caches outside of the core kprobes
+      code.
+
+    Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+    Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+    Cc: Ananth N Mavinakayanahalli <ananth@in.ibm.com>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Bugzilla
+--------
+BZ 1123429
+https://bugzilla.redhat.com/show_bug.cgi?id=1123429
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version v3.12-rc1
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=c802d64a356b5cf349121ac4c5e005f037ce548d
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7893105
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/kprobes.h b/include/linux/kprobes.h
+index ca1d27a..077f653 100644
+--- a/include/linux/kprobes.h
++++ b/include/linux/kprobes.h
+@@ -264,10 +264,34 @@ extern void arch_arm_kprobe(struct kprobe *p);
+ extern void arch_disarm_kprobe(struct kprobe *p);
+ extern int arch_init_kprobes(void);
+ extern void show_registers(struct pt_regs *regs);
+-extern kprobe_opcode_t *get_insn_slot(void);
+-extern void free_insn_slot(kprobe_opcode_t *slot, int dirty);
+ extern void kprobes_inc_nmissed_count(struct kprobe *p);
+ 
++struct kprobe_insn_cache {
++ struct mutex mutex;
++ struct list_head pages; /* list of kprobe_insn_page */
++ size_t insn_size; /* size of instruction slot */
++ int nr_garbage;
++};
++
++extern kprobe_opcode_t *__get_insn_slot(struct kprobe_insn_cache *c);
++extern void __free_insn_slot(struct kprobe_insn_cache *c,
++        kprobe_opcode_t *slot, int dirty);
++
++#define DEFINE_INSN_CACHE_OPS(__name)     \
++extern struct kprobe_insn_cache kprobe_##__name##_slots;  \
++         \
++static inline kprobe_opcode_t *get_##__name##_slot(void)  \
++{         \
++ return __get_insn_slot(&kprobe_##__name##_slots);  \
++}         \
++         \
++static inline void free_##__name##_slot(kprobe_opcode_t *slot, int dirty)\
++{         \
++ __free_insn_slot(&kprobe_##__name##_slots, slot, dirty); \
++}         \
++
++DEFINE_INSN_CACHE_OPS(insn);
++
+ #ifdef CONFIG_OPTPROBES
+ /*
+  * Internal structure for direct jump optimized probe
+@@ -287,13 +311,13 @@ extern void arch_optimize_kprobes(struct list_head *oplist);
+ extern void arch_unoptimize_kprobes(struct list_head *oplist,
+         struct list_head *done_list);
+ extern void arch_unoptimize_kprobe(struct optimized_kprobe *op);
+-extern kprobe_opcode_t *get_optinsn_slot(void);
+-extern void free_optinsn_slot(kprobe_opcode_t *slot, int dirty);
+ extern int arch_within_optimized_kprobe(struct optimized_kprobe *op,
+      unsigned long addr);
+ 
+ extern void opt_pre_handler(struct kprobe *p, struct pt_regs *regs);
+ 
++DEFINE_INSN_CACHE_OPS(optinsn);
++
+ #ifdef CONFIG_SYSCTL
+ extern int sysctl_kprobes_optimization;
+ extern int proc_kprobes_optimization_handler(struct ctl_table *table,
+diff --git a/kernel/kprobes.c b/kernel/kprobes.c
+index bddf3b2..59b4a53 100644
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@ -121,12 +121,6 @@ struct kprobe_insn_page {
+  (offsetof(struct kprobe_insn_page, slot_used) + \
+   (sizeof(char) * (slots)))
+ 
+-struct kprobe_insn_cache {
+- struct list_head pages; /* list of kprobe_insn_page */
+- size_t insn_size; /* size of instruction slot */
+- int nr_garbage;
+-};
+-
+ static int slots_per_page(struct kprobe_insn_cache *c)
+ {
+  return PAGE_SIZE/(c->insn_size * sizeof(kprobe_opcode_t));
+@@ -138,8 +132,8 @@ enum kprobe_slot_state {
+  SLOT_USED = 2,
+ };
+ 
+-static DEFINE_MUTEX(kprobe_insn_mutex); /* Protects kprobe_insn_slots */
+-static struct kprobe_insn_cache kprobe_insn_slots = {
++struct kprobe_insn_cache kprobe_insn_slots = {
++ .mutex = __MUTEX_INITIALIZER(kprobe_insn_slots.mutex),
+  .pages = LIST_HEAD_INIT(kprobe_insn_slots.pages),
+  .insn_size = MAX_INSN_SIZE,
+  .nr_garbage = 0,
+@@ -150,10 +144,12 @@ static int __kprobes collect_garbage_slots(struct kprobe_insn_cache *c);
+  * __get_insn_slot() - Find a slot on an executable page for an instruction.
+  * We allocate an executable page if there's no room on existing ones.
+  */
+-static kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
++kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
+ {
+  struct kprobe_insn_page *kip;
++ kprobe_opcode_t *slot = NULL;
+ 
++ mutex_lock(&c->mutex);
+  retry:
+  list_for_each_entry(kip, &c->pages, list) {
+   if (kip->nused < slots_per_page(c)) {
+@@ -162,7 +158,8 @@ static kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
+     if (kip->slot_used[i] == SLOT_CLEAN) {
+      kip->slot_used[i] = SLOT_USED;
+      kip->nused++;
+-     return kip->insns + (i * c->insn_size);
++     slot = kip->insns + (i * c->insn_size);
++     goto out;
+     }
+    }
+    /* kip->nused is broken. Fix it. */
+@@ -178,7 +175,7 @@ static kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
+  /* All out of space.  Need to allocate a new page. */
+  kip = kmalloc(KPROBE_INSN_PAGE_SIZE(slots_per_page(c)), GFP_KERNEL);
+  if (!kip)
+-  return NULL;
++  goto out;
+ 
+  /*
+   * Use module_alloc so this page is within +/- 2GB of where the
+@@ -188,7 +185,7 @@ static kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
+  kip->insns = module_alloc(PAGE_SIZE);
+  if (!kip->insns) {
+   kfree(kip);
+-  return NULL;
++  goto out;
+  }
+  INIT_LIST_HEAD(&kip->list);
+  memset(kip->slot_used, SLOT_CLEAN, slots_per_page(c));
+@@ -196,19 +193,10 @@ static kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
+  kip->nused = 1;
+  kip->ngarbage = 0;
+  list_add(&kip->list, &c->pages);
+- return kip->insns;
+-}
+-
+-
+-kprobe_opcode_t __kprobes *get_insn_slot(void)
+-{
+- kprobe_opcode_t *ret = NULL;
+-
+- mutex_lock(&kprobe_insn_mutex);
+- ret = __get_insn_slot(&kprobe_insn_slots);
+- mutex_unlock(&kprobe_insn_mutex);
+-
+- return ret;
++ slot = kip->insns;
++out:
++ mutex_unlock(&c->mutex);
++ return slot;
+ }
+ 
+ /* Return 1 if all garbages are collected, otherwise 0. */
+@@ -255,11 +243,12 @@ static int __kprobes collect_garbage_slots(struct kprobe_insn_cache *c)
+  return 0;
+ }
+ 
+-static void __kprobes __free_insn_slot(struct kprobe_insn_cache *c,
+-           kprobe_opcode_t *slot, int dirty)
++void __kprobes __free_insn_slot(struct kprobe_insn_cache *c,
++    kprobe_opcode_t *slot, int dirty)
+ {
+  struct kprobe_insn_page *kip;
+ 
++ mutex_lock(&c->mutex);
+  list_for_each_entry(kip, &c->pages, list) {
+   long idx = ((long)slot - (long)kip->insns) /
+     (c->insn_size * sizeof(kprobe_opcode_t));
+@@ -272,45 +261,23 @@ static void __kprobes __free_insn_slot(struct kprobe_insn_cache *c,
+      collect_garbage_slots(c);
+    } else
+     collect_one_slot(kip, idx);
+-   return;
++   goto out;
+   }
+  }
+  /* Could not free this slot. */
+  WARN_ON(1);
++out:
++ mutex_unlock(&c->mutex);
+ }
+ 
+-void __kprobes free_insn_slot(kprobe_opcode_t * slot, int dirty)
+-{
+- mutex_lock(&kprobe_insn_mutex);
+- __free_insn_slot(&kprobe_insn_slots, slot, dirty);
+- mutex_unlock(&kprobe_insn_mutex);
+-}
+ #ifdef CONFIG_OPTPROBES
+ /* For optimized_kprobe buffer */
+-static DEFINE_MUTEX(kprobe_optinsn_mutex); /* Protects kprobe_optinsn_slots */
+-static struct kprobe_insn_cache kprobe_optinsn_slots = {
++struct kprobe_insn_cache kprobe_optinsn_slots = {
++ .mutex = __MUTEX_INITIALIZER(kprobe_optinsn_slots.mutex),
+  .pages = LIST_HEAD_INIT(kprobe_optinsn_slots.pages),
+  /* .insn_size is initialized later */
+  .nr_garbage = 0,
+ };
+-/* Get a slot for optimized_kprobe buffer */
+-kprobe_opcode_t __kprobes *get_optinsn_slot(void)
+-{
+- kprobe_opcode_t *ret = NULL;
+-
+- mutex_lock(&kprobe_optinsn_mutex);
+- ret = __get_insn_slot(&kprobe_optinsn_slots);
+- mutex_unlock(&kprobe_optinsn_mutex);
+-
+- return ret;
+-}
+-
+-void __kprobes free_optinsn_slot(kprobe_opcode_t * slot, int dirty)
+-{
+- mutex_lock(&kprobe_optinsn_mutex);
+- __free_insn_slot(&kprobe_optinsn_slots, slot, dirty);
+- mutex_unlock(&kprobe_optinsn_mutex);
+-}
+ #endif
+ #endif
+ 
+-- 
+1.7.1

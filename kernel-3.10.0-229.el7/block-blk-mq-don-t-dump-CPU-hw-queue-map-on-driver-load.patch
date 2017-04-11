@@ -1,0 +1,150 @@
+From 5ed31ee9327be119f53751953306f80bc5ca2a13 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:35:02 -0400
+Subject: [block] blk-mq: don't dump CPU -> hw queue map on driver load
+
+Message-id: <1402670238-13916-15-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83766
+O-Subject: [RHEL7.1 PATCH 014/150] blk-mq: don't dump CPU -> hw queue map on driver load
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit 676141e48af7463717896352e69c10f945ac22dd
+Author: Jens Axboe <axboe@fb.com>
+Date:   Thu Mar 20 13:29:18 2014 -0600
+
+    blk-mq: don't dump CPU -> hw queue map on driver load
+
+    Now that we are out of initial debug/bringup mode, remove
+    the verbose dump of the mapping table.
+
+    Provide the mapping table in sysfs, under the hardware queue
+    directory, in the cpu_list file.
+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq-cpumap.c b/block/blk-mq-cpumap.c
+index f872127..0979213 100644
+--- a/block/blk-mq-cpumap.c
++++ b/block/blk-mq-cpumap.c
+@@ -9,15 +9,6 @@
+ #include "blk.h"
+ #include "blk-mq.h"
+ 
+-static void show_map(unsigned int *map, unsigned int nr)
+-{
+- int i;
+-
+- pr_info("blk-mq: CPU -> queue map\n");
+- for_each_online_cpu(i)
+-  pr_info("  CPU%2u -> Queue %u\n", i, map[i]);
+-}
+-
+ static int cpu_to_queue_index(unsigned int nr_cpus, unsigned int nr_queues,
+          const int cpu)
+ {
+@@ -85,7 +76,6 @@ int blk_mq_update_queue_map(unsigned int *map, unsigned int nr_queues)
+    map[i] = map[first_sibling];
+  }
+ 
+- show_map(map, nr_cpus);
+  free_cpumask_var(cpus);
+  return 0;
+ }
+diff --git a/block/blk-mq-sysfs.c b/block/blk-mq-sysfs.c
+index b91ce75..b0ba264 100644
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@ -244,6 +244,32 @@ static ssize_t blk_mq_hw_sysfs_tags_show(struct blk_mq_hw_ctx *hctx, char *page)
+  return blk_mq_tag_sysfs_show(hctx->tags, page);
+ }
+ 
++static ssize_t blk_mq_hw_sysfs_cpus_show(struct blk_mq_hw_ctx *hctx, char *page)
++{
++ unsigned int i, queue_num, first = 1;
++ ssize_t ret = 0;
++
++ blk_mq_disable_hotplug();
++
++ for_each_online_cpu(i) {
++  queue_num = hctx->queue->mq_map[i];
++  if (queue_num != hctx->queue_num)
++   continue;
++
++  if (first)
++   ret += sprintf(ret + page, "%u", i);
++  else
++   ret += sprintf(ret + page, ", %u", i);
++
++  first = 0;
++ }
++
++ blk_mq_enable_hotplug();
++
++ ret += sprintf(ret + page, "\n");
++ return ret;
++}
++
+ static struct blk_mq_ctx_sysfs_entry blk_mq_sysfs_dispatched = {
+  .attr = {.name = "dispatched", .mode = S_IRUGO },
+  .show = blk_mq_sysfs_dispatched_show,
+@@ -294,6 +320,10 @@ static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_tags = {
+  .attr = {.name = "tags", .mode = S_IRUGO },
+  .show = blk_mq_hw_sysfs_tags_show,
+ };
++static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_cpus = {
++ .attr = {.name = "cpu_list", .mode = S_IRUGO },
++ .show = blk_mq_hw_sysfs_cpus_show,
++};
+ 
+ static struct attribute *default_hw_ctx_attrs[] = {
+  &blk_mq_hw_sysfs_queued.attr,
+@@ -302,6 +332,7 @@ static struct attribute *default_hw_ctx_attrs[] = {
+  &blk_mq_hw_sysfs_pending.attr,
+  &blk_mq_hw_sysfs_ipi.attr,
+  &blk_mq_hw_sysfs_tags.attr,
++ &blk_mq_hw_sysfs_cpus.attr,
+  NULL,
+ };
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index f8e89f9..3c28048 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1466,6 +1466,16 @@ static int blk_mq_queue_reinit_notify(struct notifier_block *nb,
+  return NOTIFY_OK;
+ }
+ 
++void blk_mq_disable_hotplug(void)
++{
++ mutex_lock(&all_q_mutex);
++}
++
++void blk_mq_enable_hotplug(void)
++{
++ mutex_unlock(&all_q_mutex);
++}
++
+ static int __init blk_mq_init(void)
+ {
+  blk_mq_cpu_init();
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 72beba1..ebbe6ba 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -39,6 +39,8 @@ void blk_mq_init_cpu_notifier(struct blk_mq_cpu_notifier *notifier,
+ void blk_mq_register_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ void blk_mq_unregister_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ void blk_mq_cpu_init(void);
++void blk_mq_enable_hotplug(void);
++void blk_mq_disable_hotplug(void);
+ 
+ /*
+  * CPU -> queue mappings
+-- 
+1.7.1

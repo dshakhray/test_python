@@ -1,0 +1,284 @@
+From 17857caff2285dff390f35c948de285eebc2fa2f Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:27:13 -0400
+Subject: [tools] perf/hists: Consolidate __hists__add_*entry()
+
+Message-id: <1408462094-14194-265-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88284
+O-Subject: [PATCH RHEL7.1 BZ1131394 264/325] perf hists: Consolidate __hists__add_*entry()
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 41a4e6e2a0237e8ac895f43158ef7c91ab7af157
+Author: Namhyung Kim <namhyung.kim@lge.com>
+Date: Thu Oct 31 15:56:03 2013 +0900
+
+description
+===========
+The __hists__add_{branch,mem}_entry() does almost the same thing that
+__hists__add_entry() does.  Consolidate them into one.
+
+[ Fixup clash with new COMM infrastructure ]
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-annotate.c b/tools/perf/builtin-annotate.c
+index 6c5ae57..4087ab1 100644
+--- a/tools/perf/builtin-annotate.c
++++ b/tools/perf/builtin-annotate.c
+@@ -65,7 +65,7 @@ static int perf_evsel__add_sample(struct perf_evsel *evsel,
+   return 0;
+  }
+ 
+- he = __hists__add_entry(&evsel->hists, al, NULL, 1, 1, 0);
++ he = __hists__add_entry(&evsel->hists, al, NULL, NULL, NULL, 1, 1, 0);
+  if (he == NULL)
+   return -ENOMEM;
+ 
+diff --git a/tools/perf/builtin-diff.c b/tools/perf/builtin-diff.c
+index b605009..3b67ea2 100644
+--- a/tools/perf/builtin-diff.c
++++ b/tools/perf/builtin-diff.c
+@@ -307,7 +307,8 @@ static int hists__add_entry(struct hists *hists,
+        struct addr_location *al, u64 period,
+        u64 weight, u64 transaction)
+ {
+- if (__hists__add_entry(hists, al, NULL, period, weight, transaction) != NULL)
++ if (__hists__add_entry(hists, al, NULL, NULL, NULL, period, weight,
++          transaction) != NULL)
+   return 0;
+  return -ENOMEM;
+ }
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 25f83d5..8cf8e66 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -115,7 +115,8 @@ static int perf_report__add_mem_hist_entry(struct perf_tool *tool,
+   * and this is indirectly achieved by passing period=weight here
+   * and the he_stat__add_period() function.
+   */
+- he = __hists__add_mem_entry(&evsel->hists, al, parent, mi, cost, cost);
++ he = __hists__add_entry(&evsel->hists, al, parent, NULL, mi,
++    cost, cost, 0);
+  if (!he)
+   return -ENOMEM;
+ 
+@@ -200,12 +201,16 @@ static int perf_report__add_branch_hist_entry(struct perf_tool *tool,
+ 
+   err = -ENOMEM;
+ 
++  /* overwrite the 'al' to branch-to info */
++  al->map = bi[i].to.map;
++  al->sym = bi[i].to.sym;
++  al->addr = bi[i].to.addr;
+   /*
+    * The report shows the percentage of total branches captured
+    * and not events sampled. Thus we use a pseudo period of 1.
+    */
+-  he = __hists__add_branch_entry(&evsel->hists, al, parent,
+-    &bi[i], 1, 1);
++  he = __hists__add_entry(&evsel->hists, al, parent, &bi[i], NULL,
++     1, 1, 0);
+   if (he) {
+    struct annotation *notes;
+    bx = he->branch_info;
+@@ -266,8 +271,9 @@ static int perf_evsel__add_hist_entry(struct perf_tool *tool,
+    return err;
+  }
+ 
+- he = __hists__add_entry(&evsel->hists, al, parent, sample->period,
+-    sample->weight, sample->transaction);
++ he = __hists__add_entry(&evsel->hists, al, parent, NULL, NULL,
++    sample->period, sample->weight,
++    sample->transaction);
+  if (he == NULL)
+   return -ENOMEM;
+ 
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index ca5ca37..21897f0 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -246,8 +246,9 @@ static struct hist_entry *perf_evsel__add_hist_entry(struct perf_evsel *evsel,
+  struct hist_entry *he;
+ 
+  pthread_mutex_lock(&evsel->hists.lock);
+- he = __hists__add_entry(&evsel->hists, al, NULL, sample->period,
+-    sample->weight, sample->transaction);
++ he = __hists__add_entry(&evsel->hists, al, NULL, NULL, NULL,
++    sample->period, sample->weight,
++    sample->transaction);
+  pthread_mutex_unlock(&evsel->hists.lock);
+  if (he == NULL)
+   return NULL;
+diff --git a/tools/perf/tests/hists_link.c b/tools/perf/tests/hists_link.c
+index 6c337e6..173bf42 100644
+--- a/tools/perf/tests/hists_link.c
++++ b/tools/perf/tests/hists_link.c
+@@ -223,7 +223,7 @@ static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
+     goto out;
+ 
+    he = __hists__add_entry(&evsel->hists, &al, NULL,
+-      1, 1, 0);
++      NULL, NULL, 1, 1, 0);
+    if (he == NULL)
+     goto out;
+ 
+@@ -245,8 +245,8 @@ static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
+          &sample) < 0)
+     goto out;
+ 
+-   he = __hists__add_entry(&evsel->hists, &al, NULL, 1, 1,
+-      0);
++   he = __hists__add_entry(&evsel->hists, &al, NULL,
++      NULL, NULL, 1, 1, 0);
+    if (he == NULL)
+     goto out;
+ 
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index 30793f9..822903e 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -407,73 +407,12 @@ out:
+  return he;
+ }
+ 
+-struct hist_entry *__hists__add_mem_entry(struct hists *hists,
+-       struct addr_location *al,
+-       struct symbol *sym_parent,
+-       struct mem_info *mi,
+-       u64 period,
+-       u64 weight)
+-{
+- struct hist_entry entry = {
+-  .thread = al->thread,
+-  .comm = thread__comm(al->thread),
+-  .ms = {
+-   .map = al->map,
+-   .sym = al->sym,
+-  },
+-  .stat = {
+-   .period = period,
+-   .weight = weight,
+-   .nr_events = 1,
+-  },
+-  .cpu = al->cpu,
+-  .ip = al->addr,
+-  .level = al->level,
+-  .parent = sym_parent,
+-  .filtered = symbol__parent_filter(sym_parent),
+-  .hists = hists,
+-  .mem_info = mi,
+-  .branch_info = NULL,
+- };
+- return add_hist_entry(hists, &entry, al, period, weight);
+-}
+-
+-struct hist_entry *__hists__add_branch_entry(struct hists *hists,
+-          struct addr_location *al,
+-          struct symbol *sym_parent,
+-          struct branch_info *bi,
+-          u64 period,
+-          u64 weight)
+-{
+- struct hist_entry entry = {
+-  .thread = al->thread,
+-  .comm = thread__comm(al->thread),
+-  .ms = {
+-   .map = bi->to.map,
+-   .sym = bi->to.sym,
+-  },
+-  .cpu = al->cpu,
+-  .ip = bi->to.addr,
+-  .level = al->level,
+-  .stat = {
+-   .period = period,
+-   .nr_events = 1,
+-   .weight = weight,
+-  },
+-  .parent = sym_parent,
+-  .filtered = symbol__parent_filter(sym_parent),
+-  .branch_info = bi,
+-  .hists = hists,
+-  .mem_info = NULL,
+- };
+-
+- return add_hist_entry(hists, &entry, al, period, weight);
+-}
+-
+ struct hist_entry *__hists__add_entry(struct hists *hists,
+           struct addr_location *al,
+-          struct symbol *sym_parent, u64 period,
+-          u64 weight, u64 transaction)
++          struct symbol *sym_parent,
++          struct branch_info *bi,
++          struct mem_info *mi,
++          u64 period, u64 weight, u64 transaction)
+ {
+  struct hist_entry entry = {
+   .thread = al->thread,
+@@ -486,15 +425,15 @@ struct hist_entry *__hists__add_entry(struct hists *hists,
+   .ip = al->addr,
+   .level = al->level,
+   .stat = {
+-   .period = period,
+    .nr_events = 1,
++   .period = period,
+    .weight = weight,
+   },
+   .parent = sym_parent,
+   .filtered = symbol__parent_filter(sym_parent),
+   .hists = hists,
+-  .branch_info = NULL,
+-  .mem_info = NULL,
++  .branch_info = bi,
++  .mem_info = mi,
+   .transaction = transaction,
+  };
+ 
+diff --git a/tools/perf/util/hist.h b/tools/perf/util/hist.h
+index 9d2d022..307f1c7 100644
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@ -86,7 +86,9 @@ struct hists {
+ 
+ struct hist_entry *__hists__add_entry(struct hists *self,
+           struct addr_location *al,
+-          struct symbol *parent, u64 period,
++          struct symbol *parent,
++          struct branch_info *bi,
++          struct mem_info *mi, u64 period,
+           u64 weight, u64 transaction);
+ int64_t hist_entry__cmp(struct hist_entry *left, struct hist_entry *right);
+ int64_t hist_entry__collapse(struct hist_entry *left, struct hist_entry *right);
+@@ -95,20 +97,6 @@ int hist_entry__sort_snprintf(struct hist_entry *self, char *bf, size_t size,
+          struct hists *hists);
+ void hist_entry__free(struct hist_entry *);
+ 
+-struct hist_entry *__hists__add_branch_entry(struct hists *self,
+-          struct addr_location *al,
+-          struct symbol *sym_parent,
+-          struct branch_info *bi,
+-          u64 period,
+-          u64 weight);
+-
+-struct hist_entry *__hists__add_mem_entry(struct hists *self,
+-       struct addr_location *al,
+-       struct symbol *sym_parent,
+-       struct mem_info *mi,
+-       u64 period,
+-       u64 weight);
+-
+ void hists__output_resort(struct hists *self);
+ void hists__collapse_resort(struct hists *self, struct ui_progress *prog);
+ 
+-- 
+1.7.1

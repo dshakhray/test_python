@@ -1,0 +1,116 @@
+From c4d7fb047a4fd6d3def2e48af34437471e01bdfd Mon Sep 17 00:00:00 2001
+From: Dave Young <dyoung@redhat.com>
+Date: Thu, 22 May 2014 02:43:03 -0400
+Subject: [x86] mm/pageattr: Add a PUD error unwinding path
+
+Message-id: <1400726607-13717-12-git-send-email-dyoung@redhat.com>
+Patchwork-id: 80112
+O-Subject: [RHEL7.1 PATCH 11/35] x86, pageattr: Add a PUD error unwinding path
+Bugzilla: 1080109
+RH-Acked-by: Chao WANG <chaowang@redhat.com>
+RH-Acked-by: Vivek Goyal <vgoyal@redhat.com>
+
+Resolves: bz1080109
+
+Brew build:
+https://brewweb.devel.redhat.com/taskinfo?taskID=7480539
+
+Test: Tested kexec/kdump on HP workstation and qemu.
+
+Upstream commit:
+commit 0bb8aeee7b73b21e09d3ea12f2120d974f70b669
+Author: Borislav Petkov <bp@suse.de>
+Date:   Thu Oct 31 17:25:05 2013 +0100
+
+    x86/mm/pageattr: Add a PUD error unwinding path
+
+    In case we encounter an error during the mapping of a region, we want to
+    unwind what we've established so far exactly the way we did the mapping.
+    This is the PUD part kept deliberately small for easier review.
+
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/mm/pageattr.c b/arch/x86/mm/pageattr.c
+index 2a1308a..1cbdbbc 100644
+--- a/arch/x86/mm/pageattr.c
++++ b/arch/x86/mm/pageattr.c
+@@ -666,6 +666,51 @@ static int split_large_page(pte_t *kpte, unsigned long address)
+  return 0;
+ }
+ 
++#define unmap_pmd_range(pud, start, pre_end)  do {} while (0)
++
++static void unmap_pud_range(pgd_t *pgd, unsigned long start, unsigned long end)
++{
++ pud_t *pud = pud_offset(pgd, start);
++
++ /*
++  * Not on a GB page boundary?
++  */
++ if (start & (PUD_SIZE - 1)) {
++  unsigned long next_page = (start + PUD_SIZE) & PUD_MASK;
++  unsigned long pre_end = min_t(unsigned long, end, next_page);
++
++  unmap_pmd_range(pud, start, pre_end);
++
++  start = pre_end;
++  pud++;
++ }
++
++ /*
++  * Try to unmap in 1G chunks?
++  */
++ while (end - start >= PUD_SIZE) {
++
++  if (pud_large(*pud))
++   pud_clear(pud);
++  else
++   unmap_pmd_range(pud, start, start + PUD_SIZE);
++
++  start += PUD_SIZE;
++  pud++;
++ }
++
++ /*
++  * 2M leftovers?
++  */
++ if (start < end)
++  unmap_pmd_range(pud, start, end);
++
++ /*
++  * No need to try to free the PUD page because we'll free it in
++  * populate_pgd's error path
++  */
++}
++
+ static int alloc_pte_page(pmd_t *pmd)
+ {
+  pte_t *pte = (pte_t *)get_zeroed_page(GFP_KERNEL | __GFP_NOTRACK);
+@@ -883,9 +928,20 @@ static int populate_pgd(struct cpa_data *cpa, unsigned long addr)
+  pgprot_val(pgprot) |=  pgprot_val(cpa->mask_set);
+ 
+  ret = populate_pud(cpa, addr, pgd_entry, pgprot);
+- if (ret < 0)
+-  return ret;
++ if (ret < 0) {
++  unmap_pud_range(pgd_entry, addr,
++    addr + (cpa->numpages << PAGE_SHIFT));
+ 
++  if (allocd_pgd) {
++   /*
++    * If I allocated this PUD page, I can just as well
++    * free it in this error path.
++    */
++   pgd_clear(pgd_entry);
++   free_page((unsigned long)pud);
++  }
++  return ret;
++ }
+  cpa->numpages = ret;
+  return 0;
+ }
+-- 
+1.7.1

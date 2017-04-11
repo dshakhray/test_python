@@ -1,0 +1,401 @@
+From 45147afb4e42ce6997d529ab412ea95c7943bac2 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:36:38 -0400
+Subject: [block] add blk_rq_set_block_pc()
+
+Message-id: <1402670238-13916-111-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83861
+O-Subject: [RHEL7.1 PATCH 110/150] block: add blk_rq_set_block_pc()
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit f27b087b81b70513b8c61ec20596c868f7b93474
+Author: Jens Axboe <axboe@fb.com>
+Date:   Fri Jun 6 07:57:37 2014 -0600
+
+    block: add blk_rq_set_block_pc()
+
+    With the optimizations around not clearing the full request at alloc
+    time, we are leaving some of the needed init for REQ_TYPE_BLOCK_PC
+    up to the user allocating the request.
+
+    Add a blk_rq_set_block_pc() that sets the command type to
+    REQ_TYPE_BLOCK_PC, and properly initializes the members associated
+    with this type of request. Update callers to use this function instead
+    of manipulating rq->cmd_type directly.
+
+    Includes fixes from Christoph Hellwig <hch@lst.de> for my half-assed
+    attempt.
+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 212c813..2788b10 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1217,6 +1217,8 @@ struct request *blk_make_request(struct request_queue *q, struct bio *bio,
+  if (unlikely(!rq))
+   return ERR_PTR(-ENOMEM);
+ 
++ blk_rq_set_block_pc(rq);
++
+  for_each_bio(bio) {
+   struct bio *bounce_bio = bio;
+   int ret;
+@@ -1234,6 +1236,22 @@ struct request *blk_make_request(struct request_queue *q, struct bio *bio,
+ EXPORT_SYMBOL(blk_make_request);
+ 
+ /**
++ * blk_rq_set_block_pc - initialize a requeest to type BLOCK_PC
++ * @rq:  request to be initialized
++ *
++ */
++void blk_rq_set_block_pc(struct request *rq)
++{
++ rq->cmd_type = REQ_TYPE_BLOCK_PC;
++ rq->__data_len = 0;
++ rq->__sector = (sector_t) -1;
++ rq->bio = rq->biotail = NULL;
++ memset(rq->__cmd, 0, sizeof(rq->__cmd));
++ rq->cmd = rq->__cmd;
++}
++EXPORT_SYMBOL(blk_rq_set_block_pc);
++
++/**
+  * blk_requeue_request - put a request back on queue
+  * @q:  request queue where request should be inserted
+  * @rq:  request to be inserted
+diff --git a/block/bsg.c b/block/bsg.c
+index dedd83c..8ea52fc 100644
+--- a/block/bsg.c
++++ b/block/bsg.c
+@@ -196,7 +196,6 @@ static int blk_fill_sgv4_hdr_rq(struct request_queue *q, struct request *rq,
+   * fill in request structure
+   */
+  rq->cmd_len = hdr->request_len;
+- rq->cmd_type = REQ_TYPE_BLOCK_PC;
+ 
+  rq->timeout = msecs_to_jiffies(hdr->timeout);
+  if (!rq->timeout)
+@@ -273,6 +272,8 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
+  rq = blk_get_request(q, rw, GFP_KERNEL);
+  if (!rq)
+   return ERR_PTR(-ENOMEM);
++ blk_rq_set_block_pc(rq);
++
+  ret = blk_fill_sgv4_hdr_rq(q, rq, hdr, bd, has_write_perm);
+  if (ret)
+   goto out;
+diff --git a/block/scsi_ioctl.c b/block/scsi_ioctl.c
+index 10173c0..ce3bacd 100644
+--- a/block/scsi_ioctl.c
++++ b/block/scsi_ioctl.c
+@@ -232,7 +232,6 @@ static int blk_fill_sghdr_rq(struct request_queue *q, struct request *rq,
+   * fill in request structure
+   */
+  rq->cmd_len = hdr->cmd_len;
+- rq->cmd_type = REQ_TYPE_BLOCK_PC;
+ 
+  rq->timeout = msecs_to_jiffies(hdr->timeout);
+  if (!rq->timeout)
+@@ -313,6 +312,7 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
+  rq = blk_get_request(q, writing ? WRITE : READ, GFP_KERNEL);
+  if (!rq)
+   return -ENOMEM;
++ blk_rq_set_block_pc(rq);
+ 
+  if (blk_fill_sghdr_rq(q, rq, hdr, mode)) {
+   blk_put_request(rq);
+@@ -511,7 +511,7 @@ int sg_scsi_ioctl(struct request_queue *q, struct gendisk *disk, fmode_t mode,
+  memset(sense, 0, sizeof(sense));
+  rq->sense = sense;
+  rq->sense_len = 0;
+- rq->cmd_type = REQ_TYPE_BLOCK_PC;
++ blk_rq_set_block_pc(rq);
+ 
+  blk_execute_rq(q, disk, rq, 0);
+ 
+@@ -544,7 +544,7 @@ static int __blk_send_generic(struct request_queue *q, struct gendisk *bd_disk,
+  int err;
+ 
+  rq = blk_get_request(q, WRITE, __GFP_WAIT);
+- rq->cmd_type = REQ_TYPE_BLOCK_PC;
++ blk_rq_set_block_pc(rq);
+  rq->timeout = BLK_DEFAULT_SG_TIMEOUT;
+  rq->cmd[0] = cmd;
+  rq->cmd[4] = data;
+diff --git a/drivers/block/pktcdvd.c b/drivers/block/pktcdvd.c
+index f5d0ea1..caddb5d 100644
+--- a/drivers/block/pktcdvd.c
++++ b/drivers/block/pktcdvd.c
+@@ -712,6 +712,7 @@ static int pkt_generic_packet(struct pktcdvd_device *pd, struct packet_command *
+ 
+  rq = blk_get_request(q, (cgc->data_direction == CGC_DATA_WRITE) ?
+         WRITE : READ, __GFP_WAIT);
++ blk_rq_set_block_pc(rq);
+ 
+  if (cgc->buflen) {
+   if (blk_rq_map_kern(q, rq, cgc->buffer, cgc->buflen, __GFP_WAIT))
+@@ -722,7 +723,6 @@ static int pkt_generic_packet(struct pktcdvd_device *pd, struct packet_command *
+  memcpy(rq->cmd, cgc->cmd, CDROM_PACKET_SIZE);
+ 
+  rq->timeout = 60*HZ;
+- rq->cmd_type = REQ_TYPE_BLOCK_PC;
+  if (cgc->quiet)
+   rq->cmd_flags |= REQ_QUIET;
+ 
+diff --git a/drivers/cdrom/cdrom.c b/drivers/cdrom/cdrom.c
+index 8a3aff7..1ca0772 100644
+--- a/drivers/cdrom/cdrom.c
++++ b/drivers/cdrom/cdrom.c
+@@ -2165,6 +2165,7 @@ static int cdrom_read_cdda_bpc(struct cdrom_device_info *cdi, __u8 __user *ubuf,
+    ret = -ENOMEM;
+    break;
+   }
++  blk_rq_set_block_pc(rq);
+ 
+   ret = blk_rq_map_user(q, rq, NULL, ubuf, len, GFP_KERNEL);
+   if (ret) {
+@@ -2184,7 +2185,6 @@ static int cdrom_read_cdda_bpc(struct cdrom_device_info *cdi, __u8 __user *ubuf,
+   rq->cmd[9] = 0xf8;
+ 
+   rq->cmd_len = 12;
+-  rq->cmd_type = REQ_TYPE_BLOCK_PC;
+   rq->timeout = 60 * HZ;
+   bio = rq->bio;
+ 
+diff --git a/drivers/scsi/device_handler/scsi_dh_alua.c b/drivers/scsi/device_handler/scsi_dh_alua.c
+index 5248c88..7bcf67e 100644
+--- a/drivers/scsi/device_handler/scsi_dh_alua.c
++++ b/drivers/scsi/device_handler/scsi_dh_alua.c
+@@ -120,6 +120,7 @@ static struct request *get_alua_req(struct scsi_device *sdev,
+        "%s: blk_get_request failed\n", __func__);
+   return NULL;
+  }
++ blk_rq_set_block_pc(rq);
+ 
+  if (buflen && blk_rq_map_kern(q, rq, buffer, buflen, GFP_NOIO)) {
+   blk_put_request(rq);
+@@ -128,7 +129,6 @@ static struct request *get_alua_req(struct scsi_device *sdev,
+   return NULL;
+  }
+ 
+- rq->cmd_type = REQ_TYPE_BLOCK_PC;
+  rq->cmd_flags |= REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT |
+     REQ_FAILFAST_DRIVER;
+  rq->retries = ALUA_FAILOVER_RETRIES;
+diff --git a/drivers/scsi/device_handler/scsi_dh_emc.c b/drivers/scsi/device_handler/scsi_dh_emc.c
+index e1c8be0..6f07f7f 100644
+--- a/drivers/scsi/device_handler/scsi_dh_emc.c
++++ b/drivers/scsi/device_handler/scsi_dh_emc.c
+@@ -280,6 +280,7 @@ static struct request *get_req(struct scsi_device *sdev, int cmd,
+   return NULL;
+  }
+ 
++ blk_rq_set_block_pc(rq);
+  rq->cmd_len = COMMAND_SIZE(cmd);
+  rq->cmd[0] = cmd;
+ 
+@@ -304,7 +305,6 @@ static struct request *get_req(struct scsi_device *sdev, int cmd,
+   break;
+  }
+ 
+- rq->cmd_type = REQ_TYPE_BLOCK_PC;
+  rq->cmd_flags |= REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT |
+     REQ_FAILFAST_DRIVER;
+  rq->timeout = CLARIION_TIMEOUT;
+diff --git a/drivers/scsi/device_handler/scsi_dh_hp_sw.c b/drivers/scsi/device_handler/scsi_dh_hp_sw.c
+index 084062b..e9d9fea 100644
+--- a/drivers/scsi/device_handler/scsi_dh_hp_sw.c
++++ b/drivers/scsi/device_handler/scsi_dh_hp_sw.c
+@@ -120,7 +120,7 @@ retry:
+  if (!req)
+   return SCSI_DH_RES_TEMP_UNAVAIL;
+ 
+- req->cmd_type = REQ_TYPE_BLOCK_PC;
++ blk_rq_set_block_pc(req);
+  req->cmd_flags |= REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT |
+      REQ_FAILFAST_DRIVER;
+  req->cmd_len = COMMAND_SIZE(TEST_UNIT_READY);
+@@ -250,7 +250,7 @@ static int hp_sw_start_stop(struct hp_sw_dh_data *h)
+  if (!req)
+   return SCSI_DH_RES_TEMP_UNAVAIL;
+ 
+- req->cmd_type = REQ_TYPE_BLOCK_PC;
++ blk_rq_set_block_pc(req);
+  req->cmd_flags |= REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT |
+      REQ_FAILFAST_DRIVER;
+  req->cmd_len = COMMAND_SIZE(START_STOP);
+diff --git a/drivers/scsi/device_handler/scsi_dh_rdac.c b/drivers/scsi/device_handler/scsi_dh_rdac.c
+index 4b9cf93..826069d 100644
+--- a/drivers/scsi/device_handler/scsi_dh_rdac.c
++++ b/drivers/scsi/device_handler/scsi_dh_rdac.c
+@@ -279,6 +279,7 @@ static struct request *get_rdac_req(struct scsi_device *sdev,
+     "get_rdac_req: blk_get_request failed.\n");
+   return NULL;
+  }
++ blk_rq_set_block_pc(rq);
+ 
+  if (buflen && blk_rq_map_kern(q, rq, buffer, buflen, GFP_NOIO)) {
+   blk_put_request(rq);
+@@ -287,7 +288,6 @@ static struct request *get_rdac_req(struct scsi_device *sdev,
+   return NULL;
+  }
+ 
+- rq->cmd_type = REQ_TYPE_BLOCK_PC;
+  rq->cmd_flags |= REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT |
+     REQ_FAILFAST_DRIVER;
+  rq->retries = RDAC_RETRIES;
+diff --git a/drivers/scsi/osd/osd_initiator.c b/drivers/scsi/osd/osd_initiator.c
+index aa66361..11bd87e 100644
+--- a/drivers/scsi/osd/osd_initiator.c
++++ b/drivers/scsi/osd/osd_initiator.c
+@@ -1570,6 +1570,7 @@ static struct request *_make_request(struct request_queue *q, bool has_write,
+   if (unlikely(!req))
+    return ERR_PTR(-ENOMEM);
+ 
++  blk_rq_set_block_pc(req);
+   return req;
+  }
+ }
+@@ -1590,7 +1591,6 @@ static int _init_blk_request(struct osd_request *or,
+  }
+ 
+  or->request = req;
+- req->cmd_type = REQ_TYPE_BLOCK_PC;
+  req->cmd_flags |= REQ_QUIET;
+ 
+  req->timeout = or->timeout;
+@@ -1608,7 +1608,7 @@ static int _init_blk_request(struct osd_request *or,
+     ret = PTR_ERR(req);
+     goto out;
+    }
+-   req->cmd_type = REQ_TYPE_BLOCK_PC;
++   blk_rq_set_block_pc(req);
+    or->in.req = or->request->next_rq = req;
+   }
+  } else if (has_in)
+diff --git a/drivers/scsi/osst.c b/drivers/scsi/osst.c
+index 21883a2..0727ea7 100644
+--- a/drivers/scsi/osst.c
++++ b/drivers/scsi/osst.c
+@@ -365,7 +365,7 @@ static int osst_execute(struct osst_request *SRpnt, const unsigned char *cmd,
+  if (!req)
+   return DRIVER_ERROR << 24;
+ 
+- req->cmd_type = REQ_TYPE_BLOCK_PC;
++ blk_rq_set_block_pc(req);
+  req->cmd_flags |= REQ_QUIET;
+ 
+  SRpnt->bio = NULL;
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index 9d4e5ad..d5ab987 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -1951,6 +1951,8 @@ static void scsi_eh_lock_door(struct scsi_device *sdev)
+   */
+  req = blk_get_request(sdev->request_queue, READ, GFP_KERNEL);
+ 
++ blk_rq_set_block_pc(req);
++
+  req->cmd[0] = ALLOW_MEDIUM_REMOVAL;
+  req->cmd[1] = 0;
+  req->cmd[2] = 0;
+@@ -1960,7 +1962,6 @@ static void scsi_eh_lock_door(struct scsi_device *sdev)
+ 
+  req->cmd_len = COMMAND_SIZE(req->cmd[0]);
+ 
+- req->cmd_type = REQ_TYPE_BLOCK_PC;
+  req->cmd_flags |= REQ_QUIET;
+  req->timeout = 10 * HZ;
+  req->retries = 5;
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index c2b0f7a..6e60838 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -239,6 +239,7 @@ int scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
+  req = blk_get_request(sdev->request_queue, write, __GFP_WAIT);
+  if (!req)
+   return ret;
++ blk_rq_set_block_pc(req);
+ 
+  if (bufflen && blk_rq_map_kern(sdev->request_queue, req,
+      buffer, bufflen, __GFP_WAIT))
+@@ -250,7 +251,6 @@ int scsi_execute(struct scsi_device *sdev, const unsigned char *cmd,
+  req->sense_len = 0;
+  req->retries = retries;
+  req->timeout = timeout;
+- req->cmd_type = REQ_TYPE_BLOCK_PC;
+  req->cmd_flags |= flags | REQ_QUIET | REQ_PREEMPT;
+ 
+  /*
+diff --git a/drivers/scsi/sg.c b/drivers/scsi/sg.c
+index 533e789..53fdf22 100644
+--- a/drivers/scsi/sg.c
++++ b/drivers/scsi/sg.c
+@@ -1654,10 +1654,9 @@ static int sg_start_req(Sg_request *srp, unsigned char *cmd)
+  if (!rq)
+   return -ENOMEM;
+ 
++ blk_rq_set_block_pc(rq);
+  memcpy(rq->cmd, cmd, hp->cmd_len);
+-
+  rq->cmd_len = hp->cmd_len;
+- rq->cmd_type = REQ_TYPE_BLOCK_PC;
+ 
+  srp->rq = rq;
+  rq->end_io_data = srp;
+diff --git a/drivers/scsi/st.c b/drivers/scsi/st.c
+index a66a44b..b4e69f4 100644
+--- a/drivers/scsi/st.c
++++ b/drivers/scsi/st.c
+@@ -484,7 +484,7 @@ static int st_scsi_execute(struct st_request *SRpnt, const unsigned char *cmd,
+  if (!req)
+   return DRIVER_ERROR << 24;
+ 
+- req->cmd_type = REQ_TYPE_BLOCK_PC;
++ blk_rq_set_block_pc(req);
+  req->cmd_flags |= REQ_QUIET;
+ 
+  mdata->null_mapped = 1;
+diff --git a/drivers/target/target_core_pscsi.c b/drivers/target/target_core_pscsi.c
+index 3250ba2..0f5a96c 100644
+--- a/drivers/target/target_core_pscsi.c
++++ b/drivers/target/target_core_pscsi.c
+@@ -1056,6 +1056,8 @@ pscsi_execute_cmd(struct se_cmd *cmd)
+    ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+    goto fail;
+   }
++
++  blk_rq_set_block_pc(req);
+  } else {
+   BUG_ON(!cmd->data_length);
+ 
+@@ -1072,7 +1074,6 @@ pscsi_execute_cmd(struct se_cmd *cmd)
+   }
+  }
+ 
+- req->cmd_type = REQ_TYPE_BLOCK_PC;
+  req->end_io = pscsi_req_done;
+  req->end_io_data = cmd;
+  req->cmd_len = scsi_command_size(pt->pscsi_cdb);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index d692be5..df63e09 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -805,6 +805,7 @@ extern void __blk_put_request(struct request_queue *, struct request *);
+ extern struct request *blk_get_request(struct request_queue *, int, gfp_t);
+ extern struct request *blk_make_request(struct request_queue *, struct bio *,
+      gfp_t);
++extern void blk_rq_set_block_pc(struct request *);
+ extern void blk_requeue_request(struct request_queue *, struct request *);
+ extern void blk_add_request_payload(struct request *rq, struct page *page,
+   unsigned int len);
+-- 
+1.7.1

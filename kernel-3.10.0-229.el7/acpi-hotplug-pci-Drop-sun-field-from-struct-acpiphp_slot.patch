@@ -1,0 +1,130 @@
+From 2434f369cdc183913799bdf0492c3689efa0cf11 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:01:47 -0400
+Subject: [acpi] hotplug/pci: Drop sun field from struct acpiphp_slot
+
+Message-id: <20140710010147.22146.48847.stgit@gir.stowe>
+Patchwork-id: 85573
+O-Subject: [RHEL7.1 PATCH 034/105] ACPI / hotplug / PCI: Drop sun field from struct acpiphp_slot
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: 7342798d0ab850a630877a362bc5a4f033100f37
+
+commit 7342798d0ab850a630877a362bc5a4f033100f37
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Sat Jul 13 23:27:25 2013 +0200
+
+    ACPI / hotplug / PCI: Drop sun field from struct acpiphp_slot
+
+    If the slot unique number is passed as an additional argument to
+    acpiphp_register_hotplug_slot(), the 'sun' field in struct
+    acpiphp_slot is only used by ibm_[s|g]et_attention_status(),
+    but then it's more efficient to store it in struct slot.
+
+    Thus move the 'sun' field from struct acpiphp_slot to struct slot
+    changing its data type to unsigned int in the process, and redefine
+    acpiphp_register_hotplug_slot() to take the slot number as separate
+    argument.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/hotplug/acpiphp.h b/drivers/pci/hotplug/acpiphp.h
+index 7fc0187..23c308f 100644
+--- a/drivers/pci/hotplug/acpiphp.h
++++ b/drivers/pci/hotplug/acpiphp.h
+@@ -50,6 +50,7 @@ struct slot {
+  struct hotplug_slot *hotplug_slot;
+  struct acpiphp_slot *acpi_slot;
+  struct hotplug_slot_info info;
++ unsigned int sun; /* ACPI _SUN (Slot User Number) value */
+ };
+ 
+ static inline const char *slot_name(struct slot *slot)
+@@ -96,8 +97,6 @@ struct acpiphp_slot {
+  struct mutex crit_sect;
+ 
+  u8  device;  /* pci device# */
+-
+- unsigned long long sun;  /* ACPI _SUN (slot unique number) */
+  u32  flags;  /* see below */
+ };
+ 
+@@ -169,7 +168,7 @@ struct acpiphp_attention_info
+ /* acpiphp_core.c */
+ int acpiphp_register_attention(struct acpiphp_attention_info*info);
+ int acpiphp_unregister_attention(struct acpiphp_attention_info *info);
+-int acpiphp_register_hotplug_slot(struct acpiphp_slot *slot);
++int acpiphp_register_hotplug_slot(struct acpiphp_slot *slot, unsigned int sun);
+ void acpiphp_unregister_hotplug_slot(struct acpiphp_slot *slot);
+ 
+ /* acpiphp_glue.c */
+diff --git a/drivers/pci/hotplug/acpiphp_core.c b/drivers/pci/hotplug/acpiphp_core.c
+index 548bab8..567ce95 100644
+--- a/drivers/pci/hotplug/acpiphp_core.c
++++ b/drivers/pci/hotplug/acpiphp_core.c
+@@ -289,7 +289,8 @@ static void release_slot(struct hotplug_slot *hotplug_slot)
+ }
+ 
+ /* callback routine to initialize 'struct slot' for each slot */
+-int acpiphp_register_hotplug_slot(struct acpiphp_slot *acpiphp_slot)
++int acpiphp_register_hotplug_slot(struct acpiphp_slot *acpiphp_slot,
++      unsigned int sun)
+ {
+  struct slot *slot;
+  int retval = -ENOMEM;
+@@ -316,7 +317,8 @@ int acpiphp_register_hotplug_slot(struct acpiphp_slot *acpiphp_slot)
+  slot->hotplug_slot->info->adapter_status = acpiphp_get_adapter_status(slot->acpi_slot);
+ 
+  acpiphp_slot->slot = slot;
+- snprintf(name, SLOT_NAME_SIZE, "%llu", slot->acpi_slot->sun);
++ slot->sun = sun;
++ snprintf(name, SLOT_NAME_SIZE, "%u", sun);
+ 
+  retval = pci_hp_register(slot->hotplug_slot,
+      acpiphp_slot->bridge->pci_bus,
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index b03654e..744c72b 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -352,16 +352,15 @@ static acpi_status register_slot(acpi_handle handle, u32 lvl, void *data,
+   if (ACPI_FAILURE(status))
+    sun = bridge->nr_slots;
+ 
+-  slot->sun = sun;
+   pr_debug("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+-      slot->sun, pci_domain_nr(pbus), pbus->number, device);
++      sun, pci_domain_nr(pbus), pbus->number, device);
+ 
+-  retval = acpiphp_register_hotplug_slot(slot);
++  retval = acpiphp_register_hotplug_slot(slot, sun);
+   if (retval) {
+    bridge->nr_slots--;
+    if (retval == -EBUSY)
+     pr_warn("Slot %llu already registered by another "
+-     "hotplug driver\n", slot->sun);
++     "hotplug driver\n", sun);
+    else
+     pr_warn("acpiphp_register_hotplug_slot failed "
+      "(err code = 0x%x)\n", retval);
+diff --git a/drivers/pci/hotplug/acpiphp_ibm.c b/drivers/pci/hotplug/acpiphp_ibm.c
+index 46db43e..d75d89c 100644
+--- a/drivers/pci/hotplug/acpiphp_ibm.c
++++ b/drivers/pci/hotplug/acpiphp_ibm.c
+@@ -56,7 +56,7 @@ MODULE_VERSION(DRIVER_VERSION);
+ #define IBM_HARDWARE_ID1 "IBM37D0"
+ #define IBM_HARDWARE_ID2 "IBM37D4"
+ 
+-#define hpslot_to_sun(A) (((struct slot *)((A)->private))->acpi_slot->sun)
++#define hpslot_to_sun(A) (((struct slot *)((A)->private))->sun)
+ 
+ /* union apci_descriptor - allows access to the
+  * various device descriptors that are embedded in the
+-- 
+1.7.1

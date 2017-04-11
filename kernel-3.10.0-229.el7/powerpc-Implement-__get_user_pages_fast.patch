@@ -1,0 +1,132 @@
+From ce074ba0b3ee1442d10b031a5edea65b131ddc47 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:04:32 -0400
+Subject: [powerpc] Implement __get_user_pages_fast()
+
+Message-id: <1410545655-205645-44-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94094
+O-Subject: [RHEL7 PATCH 043/626] powerpc: Implement __get_user_pages_fast()
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 1f7bf028763cacf5a5674731e8f679c4718f2cfa
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Mon Aug 5 14:11:23 2013 +1000
+
+    powerpc: Implement __get_user_pages_fast()
+
+    Other architectures have a __get_user_pages_fast(), in addition to the
+    regular get_user_pages_fast(), which doesn't call get_user_pages() on
+    failure, and thus doesn't attempt to fault pages in or COW them.  The
+    generic KVM code uses __get_user_pages_fast() to detect whether a page
+    for which we have only requested read access is actually writable.
+
+    This provides an implementation of __get_user_pages_fast() by
+    splitting the existing get_user_pages_fast() in two.  With this, the
+    generic KVM code will get the right answer instead of always
+    considering such pages non-writable.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/mm/gup.c b/arch/powerpc/mm/gup.c
+index 49822d9..6936547 100644
+--- a/arch/powerpc/mm/gup.c
++++ b/arch/powerpc/mm/gup.c
+@@ -117,8 +117,8 @@ static int gup_pud_range(pgd_t pgd, unsigned long addr, unsigned long end,
+  return 1;
+ }
+ 
+-int get_user_pages_fast(unsigned long start, int nr_pages, int write,
+-   struct page **pages)
++int __get_user_pages_fast(unsigned long start, int nr_pages, int write,
++     struct page **pages)
+ {
+  struct mm_struct *mm = current->mm;
+  unsigned long addr, len, end;
+@@ -135,7 +135,7 @@ int get_user_pages_fast(unsigned long start, int nr_pages, int write,
+ 
+  if (unlikely(!access_ok(write ? VERIFY_WRITE : VERIFY_READ,
+      start, len)))
+-  goto slow_irqon;
++  return 0;
+ 
+  pr_devel("  aligned: %lx .. %lx\n", start, end);
+ 
+@@ -166,30 +166,35 @@ int get_user_pages_fast(unsigned long start, int nr_pages, int write,
+     (void *)pgd_val(pgd));
+   next = pgd_addr_end(addr, end);
+   if (pgd_none(pgd))
+-   goto slow;
++   break;
+   if (pgd_huge(pgd)) {
+    if (!gup_hugepte((pte_t *)pgdp, PGDIR_SIZE, addr, next,
+       write, pages, &nr))
+-    goto slow;
++    break;
+   } else if (is_hugepd(pgdp)) {
+    if (!gup_hugepd((hugepd_t *)pgdp, PGDIR_SHIFT,
+      addr, next, write, pages, &nr))
+-    goto slow;
++    break;
+   } else if (!gup_pud_range(pgd, addr, next, write, pages, &nr))
+-   goto slow;
++   break;
+  } while (pgdp++, addr = next, addr != end);
+ 
+  local_irq_enable();
+ 
+- VM_BUG_ON(nr != (end - start) >> PAGE_SHIFT);
+  return nr;
++}
+ 
+- {
+-  int ret;
++int get_user_pages_fast(unsigned long start, int nr_pages, int write,
++   struct page **pages)
++{
++ struct mm_struct *mm = current->mm;
++ int nr, ret;
++
++ start &= PAGE_MASK;
++ nr = __get_user_pages_fast(start, nr_pages, write, pages);
++ ret = nr;
+ 
+-slow:
+-  local_irq_enable();
+-slow_irqon:
++ if (nr < nr_pages) {
+   pr_devel("  slow path ! nr = %d\n", nr);
+ 
+   /* Try to get the remaining pages with get_user_pages */
+@@ -198,7 +203,7 @@ slow_irqon:
+ 
+   down_read(&mm->mmap_sem);
+   ret = get_user_pages(current, mm, start,
+-   (end - start) >> PAGE_SHIFT, write, 0, pages, NULL);
++         nr_pages - nr, write, 0, pages, NULL);
+   up_read(&mm->mmap_sem);
+ 
+   /* Have to be a bit careful with return values */
+@@ -208,9 +213,9 @@ slow_irqon:
+    else
+     ret += nr;
+   }
+-
+-  return ret;
+  }
++
++ return ret;
+ }
+ 
+ #endif /* __HAVE_ARCH_PTE_SPECIAL */
+-- 
+1.7.1

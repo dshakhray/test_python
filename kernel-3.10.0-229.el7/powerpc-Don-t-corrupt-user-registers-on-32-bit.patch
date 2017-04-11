@@ -1,0 +1,131 @@
+From cbd2465afe84959516452671699ee5a8bd25af0f Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:06:28 -0400
+Subject: [powerpc] Don't corrupt user registers on 32-bit
+
+Message-id: <1410545655-205645-160-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94675
+O-Subject: [RHEL7 PATCH 159/626] powerpc: Don't corrupt user registers on 32-bit
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 955c1cab809edfb5429603c68493363074ac20cf
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Wed Oct 23 09:40:02 2013 +0100
+
+    powerpc: Don't corrupt user registers on 32-bit
+
+    Commit de79f7b9f6 ("powerpc: Put FP/VSX and VR state into structures")
+    modified load_up_fpu() and load_up_altivec() in such a way that they
+    now use r7 and r8.  Unfortunately, the callers of these functions on
+    32-bit machines then return to userspace via fast_exception_return,
+    which doesn't restore all of the volatile GPRs, but only r1, r3 -- r6
+    and r9 -- r12.  This was causing userspace segfaults and other
+    userspace misbehaviour on 32-bit machines.
+
+    This fixes the problem by changing the register usage of load_up_fpu()
+    and load_up_altivec() to avoid using r7 and r8 and instead use r6 and
+    r10.  This also adds comments to those functions saying which registers
+    may be used.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Tested-by: Scott Wood <scottwood@freescale.com> (on e500mc, so no altivec)
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/fpu.S b/arch/powerpc/kernel/fpu.S
+index 8bfe3c1..9ad236e 100644
+--- a/arch/powerpc/kernel/fpu.S
++++ b/arch/powerpc/kernel/fpu.S
+@@ -122,6 +122,8 @@ _GLOBAL(store_fp_state)
+  * and save its floating-point registers in its thread_struct.
+  * Load up this task's FP registers from its thread_struct,
+  * enable the FPU for the current task and return to the task.
++ * Note that on 32-bit this can only use registers that will be
++ * restored by fast_exception_return, i.e. r3 - r6, r10 and r11.
+  */
+ _GLOBAL(load_up_fpu)
+  mfmsr r5
+@@ -147,10 +149,10 @@ END_FTR_SECTION_IFSET(CPU_FTR_VSX)
+  beq 1f
+  toreal(r4)
+  addi r4,r4,THREAD  /* want last_task_used_math->thread */
+- addi r8,r4,THREAD_FPSTATE
+- SAVE_32FPVSRS(0, R5, R8)
++ addi r10,r4,THREAD_FPSTATE
++ SAVE_32FPVSRS(0, R5, R10)
+  mffs fr0
+- stfd fr0,FPSTATE_FPSCR(r8)
++ stfd fr0,FPSTATE_FPSCR(r10)
+  PPC_LL r5,PT_REGS(r4)
+  toreal(r5)
+  PPC_LL r4,_MSR-STACK_FRAME_OVERHEAD(r5)
+@@ -173,10 +175,10 @@ END_FTR_SECTION_IFSET(CPU_FTR_VSX)
+  or r12,r12,r4
+  std r12,_MSR(r1)
+ #endif
+- addi r7,r5,THREAD_FPSTATE
+- lfd fr0,FPSTATE_FPSCR(r7)
++ addi r10,r5,THREAD_FPSTATE
++ lfd fr0,FPSTATE_FPSCR(r10)
+  MTFSF_L(fr0)
+- REST_32FPVSRS(0, R4, R7)
++ REST_32FPVSRS(0, R4, R10)
+ #ifndef CONFIG_SMP
+  subi r4,r5,THREAD
+  fromreal(r4)
+diff --git a/arch/powerpc/kernel/vector.S b/arch/powerpc/kernel/vector.S
+index 4998ec7..74f8050 100644
+--- a/arch/powerpc/kernel/vector.S
++++ b/arch/powerpc/kernel/vector.S
+@@ -74,6 +74,9 @@ _GLOBAL(store_vr_state)
+  * Enables the VMX for use in the kernel on return.
+  * On SMP we know the VMX is free, since we give it up every
+  * switch (ie, no lazy save of the vector registers).
++ *
++ * Note that on 32-bit this can only use registers that will be
++ * restored by fast_exception_return, i.e. r3 - r6, r10 and r11.
+  */
+ _GLOBAL(load_up_altivec)
+  mfmsr r5   /* grab the current MSR */
+@@ -99,11 +102,11 @@ _GLOBAL(load_up_altivec)
+  /* Save VMX state to last_task_used_altivec's THREAD struct */
+  toreal(r4)
+  addi r4,r4,THREAD
+- addi r7,r4,THREAD_VRSTATE
+- SAVE_32VRS(0,r5,r7)
++ addi r6,r4,THREAD_VRSTATE
++ SAVE_32VRS(0,r5,r6)
+  mfvscr vr0
+  li r10,VRSTATE_VSCR
+- stvx vr0,r10,r7
++ stvx vr0,r10,r6
+  /* Disable VMX for last_task_used_altivec */
+  PPC_LL r5,PT_REGS(r4)
+  toreal(r5)
+@@ -135,13 +138,13 @@ _GLOBAL(load_up_altivec)
+  oris r12,r12,MSR_VEC@h
+  std r12,_MSR(r1)
+ #endif
+- addi r7,r5,THREAD_VRSTATE
++ addi r6,r5,THREAD_VRSTATE
+  li r4,1
+  li r10,VRSTATE_VSCR
+  stw r4,THREAD_USED_VR(r5)
+- lvx vr0,r10,r7
++ lvx vr0,r10,r6
+  mtvscr vr0
+- REST_32VRS(0,r4,r7)
++ REST_32VRS(0,r4,r6)
+ #ifndef CONFIG_SMP
+  /* Update last_task_used_altivec to 'current' */
+  subi r4,r5,THREAD  /* Back to 'current' */
+-- 
+1.7.1

@@ -1,0 +1,115 @@
+From cf0664e9396e0ee57695b82515cd62b2c29bc522 Mon Sep 17 00:00:00 2001
+From: Abhijith Das <adas@redhat.com>
+Date: Fri, 15 Aug 2014 19:56:29 -0400
+Subject: [fs] gfs2: Make two similar quota code fragments into a function
+
+Message-id: <1408132603-52384-4-git-send-email-adas@redhat.com>
+Patchwork-id: 87809
+O-Subject: [RHEL7.1 PATCH 03/17] GFS2: Make two similar quota code fragments into a function
+Bugzilla: 1026406
+RH-Acked-by: Robert S Peterson <rpeterso@redhat.com>
+RH-Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+
+There should be no functional change bar the removal of a
+test of the MS_READONLY flag which would never be reachable.
+This merges the common code from qd_fish and qd_trylock into
+a single function and calls it from both those places.
+
+Resolves: rhbz#1026406
+Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+Cc: Abhijith Das <adas@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index 649fd8a..88f7d28 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -379,6 +379,25 @@ static void bh_put(struct gfs2_quota_data *qd)
+  mutex_unlock(&sdp->sd_quota_mutex);
+ }
+ 
++static int qd_check_sync(struct gfs2_sbd *sdp, struct gfs2_quota_data *qd,
++    u64 *sync_gen)
++{
++ if (test_bit(QDF_LOCKED, &qd->qd_flags) ||
++     !test_bit(QDF_CHANGE, &qd->qd_flags) ||
++     (sync_gen && (qd->qd_sync_gen >= *sync_gen)))
++  return 0;
++
++ list_move_tail(&qd->qd_list, &sdp->sd_quota_list);
++
++ set_bit(QDF_LOCKED, &qd->qd_flags);
++ gfs2_assert_warn(sdp, atomic_read(&qd->qd_count));
++ atomic_inc(&qd->qd_count);
++ qd->qd_change_sync = qd->qd_change;
++ gfs2_assert_warn(sdp, qd->qd_slot_count);
++ qd->qd_slot_count++;
++ return 1;
++}
++
+ static int qd_fish(struct gfs2_sbd *sdp, struct gfs2_quota_data **qdp)
+ {
+  struct gfs2_quota_data *qd = NULL;
+@@ -393,22 +412,9 @@ static int qd_fish(struct gfs2_sbd *sdp, struct gfs2_quota_data **qdp)
+  spin_lock(&qd_lru_lock);
+ 
+  list_for_each_entry(qd, &sdp->sd_quota_list, qd_list) {
+-  if (test_bit(QDF_LOCKED, &qd->qd_flags) ||
+-      !test_bit(QDF_CHANGE, &qd->qd_flags) ||
+-      qd->qd_sync_gen >= sdp->sd_quota_sync_gen)
+-   continue;
+-
+-  list_move_tail(&qd->qd_list, &sdp->sd_quota_list);
+-
+-  set_bit(QDF_LOCKED, &qd->qd_flags);
+-  gfs2_assert_warn(sdp, atomic_read(&qd->qd_count));
+-  atomic_inc(&qd->qd_count);
+-  qd->qd_change_sync = qd->qd_change;
+-  gfs2_assert_warn(sdp, qd->qd_slot_count);
+-  qd->qd_slot_count++;
+-  found = 1;
+-
+-  break;
++  found = qd_check_sync(sdp, qd, &sdp->sd_quota_sync_gen);
++  if (found)
++   break;
+  }
+ 
+  if (!found)
+@@ -435,28 +441,14 @@ static int qd_fish(struct gfs2_sbd *sdp, struct gfs2_quota_data **qdp)
+ static int qd_trylock(struct gfs2_quota_data *qd)
+ {
+  struct gfs2_sbd *sdp = qd->qd_gl->gl_sbd;
+-
+- if (sdp->sd_vfs->s_flags & MS_RDONLY)
+-  return 0;
++ int found;
+ 
+  spin_lock(&qd_lru_lock);
++ found = qd_check_sync(sdp, qd, NULL);
++ spin_unlock(&qd_lru_lock);
+ 
+- if (test_bit(QDF_LOCKED, &qd->qd_flags) ||
+-     !test_bit(QDF_CHANGE, &qd->qd_flags)) {
+-  spin_unlock(&qd_lru_lock);
++ if (!found)
+   return 0;
+- }
+-
+- list_move_tail(&qd->qd_list, &sdp->sd_quota_list);
+-
+- set_bit(QDF_LOCKED, &qd->qd_flags);
+- gfs2_assert_warn(sdp, atomic_read(&qd->qd_count));
+- atomic_inc(&qd->qd_count);
+- qd->qd_change_sync = qd->qd_change;
+- gfs2_assert_warn(sdp, qd->qd_slot_count);
+- qd->qd_slot_count++;
+-
+- spin_unlock(&qd_lru_lock);
+ 
+  gfs2_assert_warn(sdp, qd->qd_change_sync);
+  if (bh_get(qd)) {
+-- 
+1.7.1

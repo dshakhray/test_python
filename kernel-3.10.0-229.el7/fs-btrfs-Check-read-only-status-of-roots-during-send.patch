@@ -1,0 +1,198 @@
+From 11d6f01a422cda242745c4f03533c7b7748b40e1 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 18:59:12 -0400
+Subject: [fs] btrfs: Check read-only status of roots during send
+
+Message-id: <1407179109-13714-66-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87001
+O-Subject: [RHEL7.1 PATCH 065/422] btrfs: Check read-only status of roots during send
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: David Sterba <dsterba@suse.cz>
+
+commit 2c68653787f91c62f8891209dc1f617088c822e4
+Author: David Sterba <dsterba@suse.cz>
+Date:   Mon Dec 16 17:34:17 2013 +0100
+
+    btrfs: Check read-only status of roots during send
+
+    All the subvolues that are involved in send must be read-only during the
+    whole operation. The ioctl SUBVOL_SETFLAGS could be used to change the
+    status to read-write and the result of send stream is undefined if the
+    data change unexpectedly.
+
+    Fix that by adding a refcount for all involved roots and verify that
+    there's no send in progress during SUBVOL_SETFLAGS ioctl call that does
+    read-only -> read-write transition.
+
+    We need refcounts because there are no restrictions on number of send
+    parallel operations currently run on a single subvolume, be it source,
+    parent or one of the multiple clone sources.
+
+    Kernel is silent when the RO checks fail and returns EPERM. The same set
+    of checks is done already in userspace before send starts.
+
+    Signed-off-by: David Sterba <dsterba@suse.cz>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 3c9053a..9318c75 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1814,6 +1814,12 @@ struct btrfs_root {
+  struct list_head ordered_extents;
+  struct list_head ordered_root;
+  u64 nr_ordered_extents;
++
++ /*
++  * Number of currently running SEND ioctls to prevent
++  * manipulation with the read-only status via SUBVOL_SETFLAGS
++  */
++ int send_in_progress;
+ };
+ 
+ struct btrfs_ioctl_defrag_range_args {
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index 7417db9..7768af3 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -1706,12 +1706,28 @@ static noinline int btrfs_ioctl_subvol_setflags(struct file *file,
+   goto out_drop_sem;
+ 
+  root_flags = btrfs_root_flags(&root->root_item);
+- if (flags & BTRFS_SUBVOL_RDONLY)
++ if (flags & BTRFS_SUBVOL_RDONLY) {
+   btrfs_set_root_flags(&root->root_item,
+          root_flags | BTRFS_ROOT_SUBVOL_RDONLY);
+- else
+-  btrfs_set_root_flags(&root->root_item,
++ } else {
++  /*
++   * Block RO -> RW transition if this subvolume is involved in
++   * send
++   */
++  spin_lock(&root->root_item_lock);
++  if (root->send_in_progress == 0) {
++   btrfs_set_root_flags(&root->root_item,
+          root_flags & ~BTRFS_ROOT_SUBVOL_RDONLY);
++   spin_unlock(&root->root_item_lock);
++  } else {
++   spin_unlock(&root->root_item_lock);
++   btrfs_warn(root->fs_info,
++   "Attempt to set subvolume %llu read-write during send",
++     root->root_key.objectid);
++   ret = -EPERM;
++   goto out_drop_sem;
++  }
++ }
+ 
+  trans = btrfs_start_transaction(root, 1);
+  if (IS_ERR(trans)) {
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index e98c9bc..572e8c7 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -4769,6 +4769,7 @@ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+  struct send_ctx *sctx = NULL;
+  u32 i;
+  u64 *clone_sources_tmp = NULL;
++ int clone_sources_to_rollback = 0;
+ 
+  if (!capable(CAP_SYS_ADMIN))
+   return -EPERM;
+@@ -4777,6 +4778,14 @@ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+  fs_info = send_root->fs_info;
+ 
+  /*
++  * The subvolume must remain read-only during send, protect against
++  * making it RW.
++  */
++ spin_lock(&send_root->root_item_lock);
++ send_root->send_in_progress++;
++ spin_unlock(&send_root->root_item_lock);
++
++ /*
+   * This is done when we lookup the root, it should already be complete
+   * by the time we get here.
+   */
+@@ -4811,6 +4820,15 @@ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+   up_read(&send_root->fs_info->extent_commit_sem);
+  }
+ 
++ /*
++  * Userspace tools do the checks and warn the user if it's
++  * not RO.
++  */
++ if (!btrfs_root_readonly(send_root)) {
++  ret = -EPERM;
++  goto out;
++ }
++
+  arg = memdup_user(arg_, sizeof(*arg));
+  if (IS_ERR(arg)) {
+   ret = PTR_ERR(arg);
+@@ -4897,6 +4915,15 @@ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+     ret = PTR_ERR(clone_root);
+     goto out;
+    }
++   clone_sources_to_rollback = i + 1;
++   spin_lock(&clone_root->root_item_lock);
++   clone_root->send_in_progress++;
++   if (!btrfs_root_readonly(clone_root)) {
++    spin_unlock(&clone_root->root_item_lock);
++    ret = -EPERM;
++    goto out;
++   }
++   spin_unlock(&clone_root->root_item_lock);
+    sctx->clone_roots[i].root = clone_root;
+   }
+   vfree(clone_sources_tmp);
+@@ -4912,6 +4939,14 @@ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+    ret = PTR_ERR(sctx->parent_root);
+    goto out;
+   }
++  spin_lock(&sctx->parent_root->root_item_lock);
++  sctx->parent_root->send_in_progress++;
++  if (!btrfs_root_readonly(sctx->parent_root)) {
++   spin_unlock(&sctx->parent_root->root_item_lock);
++   ret = -EPERM;
++   goto out;
++  }
++  spin_unlock(&sctx->parent_root->root_item_lock);
+  }
+ 
+  /*
+@@ -4940,6 +4975,25 @@ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+  }
+ 
+ out:
++ for (i = 0; sctx && i < clone_sources_to_rollback; i++) {
++  struct btrfs_root *r = sctx->clone_roots[i].root;
++
++  spin_lock(&r->root_item_lock);
++  r->send_in_progress--;
++  spin_unlock(&r->root_item_lock);
++ }
++ if (sctx && !IS_ERR_OR_NULL(sctx->parent_root)) {
++  struct btrfs_root *r = sctx->parent_root;
++
++  spin_lock(&r->root_item_lock);
++  r->send_in_progress--;
++  spin_unlock(&r->root_item_lock);
++ }
++
++ spin_lock(&send_root->root_item_lock);
++ send_root->send_in_progress--;
++ spin_unlock(&send_root->root_item_lock);
++
+  kfree(arg);
+  vfree(clone_sources_tmp);
+ 
+-- 
+1.7.1

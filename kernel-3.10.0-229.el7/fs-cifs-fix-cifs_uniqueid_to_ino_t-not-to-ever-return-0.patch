@@ -1,0 +1,85 @@
+From 89f469dc3d532dfcecc93ce297c406fe07c81029 Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:50 -0400
+Subject: [fs] cifs: fix cifs_uniqueid_to_ino_t not to ever return 0
+
+Message-id: <1406549822-10376-58-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86773
+O-Subject: [RHEL7.1 PATCH 57/69] [bz1082049]cifs: fix cifs_uniqueid_to_ino_t not to ever return 0
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Jeff Layton <jlayton@poochiereds.net>
+
+Currently, when the top and bottom 32-bit words are equivalent and the
+host is a 32-bit arch, cifs_uniqueid_to_ino_t returns 0 as the ino_t
+value. All we're doing to hash the value down to 32 bits is xor'ing the
+top and bottom 32-bit words and that obviously results in 0 if they are
+equivalent.
+
+The kernel doesn't really care if it returns this value, but some
+userland apps (like "ls") will ignore dirents that have a zero d_ino
+value.
+
+Change this function to use hash_64 to convert this value to a 31 bit
+value and then add 1 to ensure that it doesn't ever return 0. Also,
+there's no need to check the sizeof(ino_t) at runtime so create two
+different cifs_uniqueid_to_ino_t functions based on whether
+BITS_PER_LONG is 64 for not.
+
+This should fix:
+
+    https://bugzilla.kernel.org/show_bug.cgi?id=19282
+
+Reported-by: Eric <copet_eric@emc.com>
+Reported-by: <per-ola@sadata.se>
+Signed-off-by: Jeff Layton <jlayton@poochiereds.net>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 02323db17e3a73dd335690b7b1a2392912b05513)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/cifsfs.h b/fs/cifs/cifsfs.h
+index cc77885..b8edd80 100644
+--- a/fs/cifs/cifsfs.h
++++ b/fs/cifs/cifsfs.h
+@@ -22,20 +22,28 @@
+ #ifndef _CIFSFS_H
+ #define _CIFSFS_H
+ 
++#include <linux/hash.h>
++
+ #define ROOT_I 2
+ 
+ /*
+  * ino_t is 32-bits on 32-bit arch. We have to squash the 64-bit value down
+- * so that it will fit.
++ * so that it will fit. We use hash_64 to convert the value to 31 bits, and
++ * then add 1, to ensure that we don't end up with a 0 as the value.
+  */
++#if BITS_PER_LONG == 64
+ static inline ino_t
+ cifs_uniqueid_to_ino_t(u64 fileid)
+ {
+- ino_t ino = (ino_t) fileid;
+- if (sizeof(ino_t) < sizeof(u64))
+-  ino ^= fileid >> (sizeof(u64)-sizeof(ino_t)) * 8;
+- return ino;
++ return (ino_t)fileid;
+ }
++#else
++static inline ino_t
++cifs_uniqueid_to_ino_t(u64 fileid)
++{
++ return (ino_t)hash_64(fileid, (sizeof(ino_t) * 8) - 1) + 1;
++}
++#endif
+ 
+ extern struct file_system_type cifs_fs_type;
+ extern const struct address_space_operations cifs_addr_ops;
+-- 
+1.7.1

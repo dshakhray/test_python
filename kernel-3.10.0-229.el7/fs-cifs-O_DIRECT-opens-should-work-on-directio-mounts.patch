@@ -1,0 +1,95 @@
+From cb4df73f5a691381d16c63375e899472586f31d4 Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:21 -0400
+Subject: [fs] cifs: O_DIRECT opens should work on directio mounts
+
+Message-id: <1406549822-10376-29-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86754
+O-Subject: [RHEL7.1 PATCH 28/69] [bz1082049][CIFS] O_DIRECT opens should work on directio mounts
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Steve French <smfrench@gmail.com>
+
+Opens on current cifs/smb2/smb3 mounts with O_DIRECT flag fail
+even when caching is disabled on the mount.  This was
+reported by those running SMB2 benchmarks who need to
+be able to pass O_DIRECT on many of their open calls to
+reduce caching effects, but would also be needed by other
+applications.
+
+When mounting with forcedirectio ("cache=none") cifs and smb2/smb3
+do not go through the page cache and thus opens with O_DIRECT flag
+should work (when posix extensions are negotiated we even are
+able to send the flag to the server). This patch fixes that
+in a simple way.
+
+The 9P client has a similar situation (caching is often disabled)
+and takes the same approach to O_DIRECT support ie works if caching
+disabled, but if client caching enabled it fails with EINVAL.
+
+A followon idea for a future patch as Pavel noted, could
+be that files opened with O_DIRECT could cause us to change
+inode->i_fop on the fly from
+
+cifs_file_strict_ops
+
+to
+
+cifs_file_direct_ops
+
+which would allow us to support this on non-forcedirectio mounts
+(cache=strict and cache=loose) as well.
+
+Reviewed-by: Pavel Shilovsky <piastry@etersoft.ru>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit dca692880e887739a669f6c41a80ca68ce2b09fc)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index 89c2efe..0d503fe 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -3715,6 +3715,27 @@ void cifs_oplock_break(struct work_struct *work)
+  cifs_done_oplock_break(cinode);
+ }
+ 
++/*
++ * The presence of cifs_direct_io() in the address space ops vector
++ * allowes open() O_DIRECT flags which would have failed otherwise.
++ *
++ * In the non-cached mode (mount with cache=none), we shunt off direct read and write requests
++ * so this method should never be called.
++ *
++ * Direct IO is not yet supported in the cached mode. 
++ */
++static ssize_t
++cifs_direct_io(int rw, struct kiocb *iocb, const struct iovec *iov,
++               loff_t pos, unsigned long nr_segs)
++{
++        /*
++         * FIXME
++         * Eventually need to support direct IO for non forcedirectio mounts
++         */
++        return -EINVAL;
++}
++
++
+ const struct address_space_operations cifs_addr_ops = {
+  .readpage = cifs_readpage,
+  .readpages = cifs_readpages,
+@@ -3724,6 +3745,7 @@ const struct address_space_operations cifs_addr_ops = {
+  .write_end = cifs_write_end,
+  .set_page_dirty = __set_page_dirty_nobuffers,
+  .releasepage = cifs_release_page,
++ .direct_IO = cifs_direct_io,
+  .invalidatepage = cifs_invalidate_page,
+  .launder_page = cifs_launder_page,
+ };
+-- 
+1.7.1

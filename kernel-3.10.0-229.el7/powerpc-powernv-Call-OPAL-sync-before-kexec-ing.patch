@@ -1,0 +1,121 @@
+From fb9b17a7341227e640072b1b5e7c2aac74afff49 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:08:19 -0400
+Subject: [powerpc] powernv: Call OPAL sync before kexec'ing
+
+Message-id: <1410545655-205645-271-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94318
+O-Subject: [RHEL7 PATCH 270/626] powerpc/powernv: Call OPAL sync before kexec'ing
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit f7d98d18a01ece2863984d4fb5ae949b18b02715
+Author: Vasant Hegde <hegdevasant@linux.vnet.ibm.com>
+Date:   Wed Jan 15 17:02:04 2014 +1100
+
+    powerpc/powernv: Call OPAL sync before kexec'ing
+
+    Its possible that OPAL may be writing to host memory during
+    kexec (like dump retrieve scenario). In this situation we might
+    end up corrupting host memory.
+
+    This patch makes OPAL sync call to make sure OPAL stops
+    writing to host memory before kexec'ing.
+
+    Signed-off-by: Vasant Hegde <hegdevasant@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 9a87b44..40157e2 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -156,6 +156,7 @@ extern int opal_enter_rtas(struct rtas_args *args,
+ #define OPAL_FLASH_UPDATE   78
+ #define OPAL_GET_MSG    85
+ #define OPAL_CHECK_ASYNC_COMPLETION  86
++#define OPAL_SYNC_HOST_REBOOT   87
+ 
+ #ifndef __ASSEMBLY__
+ 
+@@ -828,6 +829,7 @@ int64_t opal_update_flash(uint64_t blk_list);
+ 
+ int64_t opal_get_msg(uint64_t buffer, size_t size);
+ int64_t opal_check_completion(uint64_t buffer, size_t size, uint64_t token);
++int64_t opal_sync_host_reboot(void);
+ 
+ /* Internal functions */
+ extern int early_init_dt_scan_opal(unsigned long node, const char *uname, int depth, void *data);
+diff --git a/arch/powerpc/platforms/powernv/opal-wrappers.S b/arch/powerpc/platforms/powernv/opal-wrappers.S
+index 719aa5c..3e8829c 100644
+--- a/arch/powerpc/platforms/powernv/opal-wrappers.S
++++ b/arch/powerpc/platforms/powernv/opal-wrappers.S
+@@ -128,3 +128,4 @@ OPAL_CALL(opal_manage_flash,   OPAL_FLASH_MANAGE);
+ OPAL_CALL(opal_update_flash,   OPAL_FLASH_UPDATE);
+ OPAL_CALL(opal_get_msg,    OPAL_GET_MSG);
+ OPAL_CALL(opal_check_completion,  OPAL_CHECK_ASYNC_COMPLETION);
++OPAL_CALL(opal_sync_host_reboot,  OPAL_SYNC_HOST_REBOOT);
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index 7a184a0..65499ad 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -20,6 +20,7 @@
+ #include <linux/slab.h>
+ #include <linux/sched.h>
+ #include <linux/kobject.h>
++#include <linux/delay.h>
+ #include <asm/opal.h>
+ #include <asm/firmware.h>
+ #include <asm/mce.h>
+@@ -482,10 +483,25 @@ subsys_initcall(opal_init);
+ void opal_shutdown(void)
+ {
+  unsigned int i;
++ long rc = OPAL_BUSY;
+ 
++ /* First free interrupts, which will also mask them */
+  for (i = 0; i < opal_irq_count; i++) {
+   if (opal_irqs[i])
+    free_irq(opal_irqs[i], NULL);
+   opal_irqs[i] = 0;
+  }
++
++ /*
++  * Then sync with OPAL which ensure anything that can
++  * potentially write to our memory has completed such
++  * as an ongoing dump retrieval
++  */
++ while (rc == OPAL_BUSY || rc == OPAL_BUSY_EVENT) {
++  rc = opal_sync_host_reboot();
++  if (rc == OPAL_BUSY)
++   opal_poll_events(NULL);
++  else
++   mdelay(10);
++ }
+ }
+diff --git a/arch/powerpc/platforms/powernv/setup.c b/arch/powerpc/platforms/powernv/setup.c
+index 19884b2..a932feb 100644
+--- a/arch/powerpc/platforms/powernv/setup.c
++++ b/arch/powerpc/platforms/powernv/setup.c
+@@ -145,8 +145,10 @@ static void pnv_shutdown(void)
+  /* Let the PCI code clear up IODA tables */
+  pnv_pci_shutdown();
+ 
+- /* And unregister all OPAL interrupts so they don't fire
+-  * up while we kexec
++ /*
++  * Stop OPAL activity: Unregister all OPAL interrupts so they
++  * don't fire up while we kexec and make sure all potentially
++  * DMA'ing ops are complete (such as dump retrieval).
+   */
+  opal_shutdown();
+ }
+-- 
+1.7.1

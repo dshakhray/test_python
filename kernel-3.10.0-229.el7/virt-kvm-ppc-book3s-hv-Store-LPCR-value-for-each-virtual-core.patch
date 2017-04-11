@@ -1,0 +1,338 @@
+From 09cb362a9b4913f6ebf1f6ebc8c6c3f21136d9b3 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:55 -0400
+Subject: [virt] kvm/ppc: book3s hv - Store LPCR value for each virtual core
+
+Message-id: <1410545655-205645-127-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94626
+O-Subject: [RHEL7 PATCH 126/626] KVM: PPC: Book3S HV: Store LPCR value for each virtual core
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit a0144e2a6b0b4a137a32f0102354782547bf0935
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:38 2013 +1000
+
+    KVM: PPC: Book3S HV: Store LPCR value for each virtual core
+
+    This adds the ability to have a separate LPCR (Logical Partitioning
+    Control Register) value relating to a guest for each virtual core,
+    rather than only having a single value for the whole VM.  This
+    corresponds to what real POWER hardware does, where there is a LPCR
+    per CPU thread but most of the fields are required to have the same
+    value on all active threads in a core.
+
+    The per-virtual-core LPCR can be read and written using the
+    GET/SET_ONE_REG interface.  Userspace can can only modify the
+    following fields of the LPCR value:
+
+    DPFD Default prefetch depth
+    ILE Interrupt little-endian
+    TC Translation control (secondary HPT hash group search disable)
+
+    We still maintain a per-VM default LPCR value in kvm->arch.lpcr, which
+    contains bits relating to memory management, i.e. the Virtualized
+    Partition Memory (VPM) bits and the bits relating to guest real mode.
+    When this default value is updated, the update needs to be propagated
+    to the per-vcore values, so we add a kvmppc_update_lpcr() helper to do
+    that.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    [agraf: fix whitespace]
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index 58ccf0a..2f8b976 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -1848,6 +1848,7 @@ registers, find a list below:
+   PPC   | KVM_REG_PPC_PID | 64
+   PPC   | KVM_REG_PPC_ACOP | 64
+   PPC   | KVM_REG_PPC_VRSAVE | 32
++  PPC   | KVM_REG_PPC_LPCR | 64
+   PPC   | KVM_REG_PPC_TM_GPR0 | 64
+           ...
+   PPC   | KVM_REG_PPC_TM_GPR31 | 64
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index fa19e2f..14a4741 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -172,6 +172,8 @@ extern long kvmppc_do_h_remove(struct kvm *kvm, unsigned long flags,
+    unsigned long *hpret);
+ extern long kvmppc_hv_get_dirty_log(struct kvm *kvm,
+    struct kvm_memory_slot *memslot, unsigned long *map);
++extern void kvmppc_update_lpcr(struct kvm *kvm, unsigned long lpcr,
++   unsigned long mask);
+ 
+ extern void kvmppc_entry_trampoline(void);
+ extern void kvmppc_hv_entry_trampoline(void);
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 9741bf0..788930a 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -295,6 +295,7 @@ struct kvmppc_vcore {
+  u64 preempt_tb;
+  struct kvm_vcpu *runner;
+  u64 tb_offset;  /* guest timebase - host timebase */
++ ulong lpcr;
+ };
+ 
+ #define VCORE_ENTRY_COUNT(vc) ((vc)->entry_exit_count & 0xff)
+diff --git a/arch/powerpc/include/asm/reg.h b/arch/powerpc/include/asm/reg.h
+index 3afa76b..86bb9f5 100644
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -290,6 +290,7 @@
+ #define   LPCR_ISL (1ul << (63-2))
+ #define   LPCR_VC_SH (63-2)
+ #define   LPCR_DPFD_SH (63-11)
++#define   LPCR_DPFD (7ul << LPCR_DPFD_SH)
+ #define   LPCR_VRMASD (0x1ful << (63-16))
+ #define   LPCR_VRMA_L (1ul << (63-12))
+ #define   LPCR_VRMA_LP0 (1ul << (63-15))
+@@ -306,6 +307,7 @@
+ #define     LPCR_PECE2 0x00001000 /* machine check etc can cause exit */
+ #define   LPCR_MER 0x00000800 /* Mediated External Exception */
+ #define   LPCR_MER_SH 11
++#define   LPCR_TC      0x00000200 /* Translation control */
+ #define   LPCR_LPES    0x0000000c
+ #define   LPCR_LPES0   0x00000008      /* LPAR Env selector 0 */
+ #define   LPCR_LPES1   0x00000004      /* LPAR Env selector 1 */
+@@ -427,6 +429,7 @@
+ #define  HID4_RMLS2_SH  (63 - 2) /* Real mode limit bottom 2 bits */
+ #define  HID4_LPID5_SH  (63 - 6) /* partition ID bottom 4 bits */
+ #define  HID4_RMOR_SH  (63 - 22) /* real mode offset (16 bits) */
++#define  HID4_RMOR  (0xFFFFul << HID4_RMOR_SH)
+ #define  HID4_LPES1  (1 << (63-57)) /* LPAR env. sel. bit 1 */
+ #define  HID4_RMLS0_SH  (63 - 58) /* Real mode limit top bit */
+ #define  HID4_LPID1_SH  0  /* partition ID top 2 bits */
+diff --git a/arch/powerpc/include/uapi/asm/kvm.h b/arch/powerpc/include/uapi/asm/kvm.h
+index b98bf3f..e42127d 100644
+--- a/arch/powerpc/include/uapi/asm/kvm.h
++++ b/arch/powerpc/include/uapi/asm/kvm.h
+@@ -533,6 +533,7 @@ struct kvm_get_htab_header {
+ #define KVM_REG_PPC_ACOP (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb3)
+ 
+ #define KVM_REG_PPC_VRSAVE (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0xb4)
++#define KVM_REG_PPC_LPCR (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0xb5)
+ 
+ /* Transactional Memory checkpointed state:
+  * This is all GPRs, all VSX regs and a subset of SPRs
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index d961326..c872725 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -518,6 +518,7 @@ int main(void)
+  DEFINE(VCORE_IN_GUEST, offsetof(struct kvmppc_vcore, in_guest));
+  DEFINE(VCORE_NAPPING_THREADS, offsetof(struct kvmppc_vcore, napping_threads));
+  DEFINE(VCORE_TB_OFFSET, offsetof(struct kvmppc_vcore, tb_offset));
++ DEFINE(VCORE_LPCR, offsetof(struct kvmppc_vcore, lpcr));
+  DEFINE(VCPU_SVCPU, offsetof(struct kvmppc_vcpu_book3s, shadow_vcpu) -
+       offsetof(struct kvmppc_vcpu_book3s, vcpu));
+  DEFINE(VCPU_SLB_E, offsetof(struct kvmppc_slb, orige));
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 043eec8..ccb89a0 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -1512,9 +1512,8 @@ static ssize_t kvm_htab_write(struct file *file, const char __user *buf,
+ 
+     kvm->arch.vrma_slb_v = senc | SLB_VSID_B_1T |
+      (VRMA_VSID << SLB_VSID_SHIFT_1T);
+-    lpcr = kvm->arch.lpcr & ~LPCR_VRMASD;
+-    lpcr |= senc << (LPCR_VRMASD_SH - 4);
+-    kvm->arch.lpcr = lpcr;
++    lpcr = senc << (LPCR_VRMASD_SH - 4);
++    kvmppc_update_lpcr(kvm, lpcr, LPCR_VRMASD);
+     rma_setup = 1;
+    }
+    ++i;
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index d2bb0ca..e32de93 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -195,7 +195,7 @@ void kvmppc_dump_regs(struct kvm_vcpu *vcpu)
+   pr_err("  ESID = %.16llx VSID = %.16llx\n",
+          vcpu->arch.slb[r].orige, vcpu->arch.slb[r].origv);
+  pr_err("lpcr = %.16lx sdr1 = %.16lx last_inst = %.8x\n",
+-        vcpu->kvm->arch.lpcr, vcpu->kvm->arch.sdr1,
++        vcpu->arch.vcore->lpcr, vcpu->kvm->arch.sdr1,
+         vcpu->arch.last_inst);
+ }
+ 
+@@ -723,6 +723,21 @@ int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
+  return 0;
+ }
+ 
++static void kvmppc_set_lpcr(struct kvm_vcpu *vcpu, u64 new_lpcr)
++{
++ struct kvmppc_vcore *vc = vcpu->arch.vcore;
++ u64 mask;
++
++ spin_lock(&vc->lock);
++ /*
++  * Userspace can only modify DPFD (default prefetch depth),
++  * ILE (interrupt little-endian) and TC (translation control).
++  */
++ mask = LPCR_DPFD | LPCR_ILE | LPCR_TC;
++ vc->lpcr = (vc->lpcr & ~mask) | (new_lpcr & mask);
++ spin_unlock(&vc->lock);
++}
++
+ int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+ {
+  int r = 0;
+@@ -805,6 +820,9 @@ int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+  case KVM_REG_PPC_TB_OFFSET:
+   *val = get_reg_val(id, vcpu->arch.vcore->tb_offset);
+   break;
++ case KVM_REG_PPC_LPCR:
++  *val = get_reg_val(id, vcpu->arch.vcore->lpcr);
++  break;
+  default:
+   r = -EINVAL;
+   break;
+@@ -909,6 +927,9 @@ int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+   vcpu->arch.vcore->tb_offset =
+    ALIGN(set_reg_val(id, *val), 1UL << 24);
+   break;
++ case KVM_REG_PPC_LPCR:
++  kvmppc_set_lpcr(vcpu, set_reg_val(id, *val));
++  break;
+  default:
+   r = -EINVAL;
+   break;
+@@ -969,6 +990,7 @@ struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
+    spin_lock_init(&vcore->lock);
+    init_waitqueue_head(&vcore->wq);
+    vcore->preempt_tb = TB_NIL;
++   vcore->lpcr = kvm->arch.lpcr;
+   }
+   kvm->arch.vcores[core] = vcore;
+   kvm->arch.online_vcores++;
+@@ -1758,6 +1780,32 @@ void kvmppc_core_commit_memory_region(struct kvm *kvm,
+  }
+ }
+ 
++/*
++ * Update LPCR values in kvm->arch and in vcores.
++ * Caller must hold kvm->lock.
++ */
++void kvmppc_update_lpcr(struct kvm *kvm, unsigned long lpcr, unsigned long mask)
++{
++ long int i;
++ u32 cores_done = 0;
++
++ if ((kvm->arch.lpcr & mask) == lpcr)
++  return;
++
++ kvm->arch.lpcr = (kvm->arch.lpcr & ~mask) | lpcr;
++
++ for (i = 0; i < KVM_MAX_VCORES; ++i) {
++  struct kvmppc_vcore *vc = kvm->arch.vcores[i];
++  if (!vc)
++   continue;
++  spin_lock(&vc->lock);
++  vc->lpcr = (vc->lpcr & ~mask) | lpcr;
++  spin_unlock(&vc->lock);
++  if (++cores_done >= kvm->arch.online_vcores)
++   break;
++ }
++}
++
+ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu)
+ {
+  int err = 0;
+@@ -1766,7 +1814,8 @@ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu)
+  unsigned long hva;
+  struct kvm_memory_slot *memslot;
+  struct vm_area_struct *vma;
+- unsigned long lpcr, senc;
++ unsigned long lpcr = 0, senc;
++ unsigned long lpcr_mask = 0;
+  unsigned long psize, porder;
+  unsigned long rma_size;
+  unsigned long rmls;
+@@ -1831,9 +1880,9 @@ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu)
+   senc = slb_pgsize_encoding(psize);
+   kvm->arch.vrma_slb_v = senc | SLB_VSID_B_1T |
+    (VRMA_VSID << SLB_VSID_SHIFT_1T);
+-  lpcr = kvm->arch.lpcr & ~LPCR_VRMASD;
+-  lpcr |= senc << (LPCR_VRMASD_SH - 4);
+-  kvm->arch.lpcr = lpcr;
++  lpcr_mask = LPCR_VRMASD;
++  /* the -4 is to account for senc values starting at 0x10 */
++  lpcr = senc << (LPCR_VRMASD_SH - 4);
+ 
+   /* Create HPTEs in the hash page table for the VRMA */
+   kvmppc_map_vrma(vcpu, memslot, porder);
+@@ -1854,23 +1903,21 @@ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu)
+   kvm->arch.rma = ri;
+ 
+   /* Update LPCR and RMOR */
+-  lpcr = kvm->arch.lpcr;
+   if (cpu_has_feature(CPU_FTR_ARCH_201)) {
+    /* PPC970; insert RMLS value (split field) in HID4 */
+-   lpcr &= ~((1ul << HID4_RMLS0_SH) |
+-      (3ul << HID4_RMLS2_SH));
+-   lpcr |= ((rmls >> 2) << HID4_RMLS0_SH) |
++   lpcr_mask = (1ul << HID4_RMLS0_SH) |
++    (3ul << HID4_RMLS2_SH) | HID4_RMOR;
++   lpcr = ((rmls >> 2) << HID4_RMLS0_SH) |
+     ((rmls & 3) << HID4_RMLS2_SH);
+    /* RMOR is also in HID4 */
+    lpcr |= ((ri->base_pfn >> (26 - PAGE_SHIFT)) & 0xffff)
+     << HID4_RMOR_SH;
+   } else {
+    /* POWER7 */
+-   lpcr &= ~(LPCR_VPM0 | LPCR_VRMA_L);
+-   lpcr |= rmls << LPCR_RMLS_SH;
++   lpcr_mask = LPCR_VPM0 | LPCR_VRMA_L | LPCR_RMLS;
++   lpcr = rmls << LPCR_RMLS_SH;
+    kvm->arch.rmor = ri->base_pfn << PAGE_SHIFT;
+   }
+-  kvm->arch.lpcr = lpcr;
+   pr_info("KVM: Using RMO at %lx size %lx (LPCR = %lx)\n",
+    ri->base_pfn << PAGE_SHIFT, rma_size, lpcr);
+ 
+@@ -1889,6 +1936,8 @@ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu)
+   }
+  }
+ 
++ kvmppc_update_lpcr(kvm, lpcr, lpcr_mask);
++
+  /* Order updates to kvm->arch.lpcr etc. vs. rma_setup_done */
+  smp_wmb();
+  kvm->arch.rma_setup_done = 1;
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index f8c6b29..b0cb3c2 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -509,7 +509,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+  beq 20b
+ 
+  /* Set LPCR and RMOR. */
+-10: ld r8,KVM_LPCR(r9)
++10: ld r8,VCORE_LPCR(r5)
+  mtspr SPRN_LPCR,r8
+  ld r8,KVM_RMOR(r9)
+  mtspr SPRN_RMOR,r8
+@@ -571,7 +571,8 @@ toc_tlbie_lock:
+  bne 24b
+  isync
+ 
+- ld r7,KVM_LPCR(r9)  /* use kvm->arch.lpcr to store HID4 */
++ ld r5,HSTATE_KVM_VCORE(r13)
++ ld r7,VCORE_LPCR(r5) /* use vcore->lpcr to store HID4 */
+  li r0,0x18f
+  rotldi r0,r0,HID4_LPID5_SH /* all lpid bits in HID4 = 1 */
+  or r0,r7,r0
+-- 
+1.7.1

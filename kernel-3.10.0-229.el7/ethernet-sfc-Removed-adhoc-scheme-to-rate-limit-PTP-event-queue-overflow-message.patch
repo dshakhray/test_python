@@ -1,0 +1,102 @@
+From 31af54783888921b8d1bc6dec1d355e047974c51 Mon Sep 17 00:00:00 2001
+From: Nikolay Aleksandrov <nikolay@redhat.com>
+Date: Fri, 5 Sep 2014 11:03:42 -0400
+Subject: [ethernet] sfc: Removed adhoc scheme to rate limit PTP event queue overflow message
+
+Message-id: <1409915048-26438-7-git-send-email-nikolay@redhat.com>
+Patchwork-id: 91402
+O-Subject: [RHEL7.1 PATCH BZ 1110888 06/32] sfc: Removed adhoc scheme to rate limit PTP event queue overflow message
+Bugzilla: 1110888
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Laurence Evans <levans@solarflare.com>
+
+Use conventional net_ratelimit() instead.
+
+Signed-off-by: Ben Hutchings <bhutchings@solarflare.com>
+Signed-off-by: Shradha Shah <sshah@solarflare.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f9fd7ec786e41a3730916bbc1bc1d9d347f07ec5)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/sfc/ptp.c b/drivers/net/ethernet/sfc/ptp.c
+index eb75fbd..52be63d 100644
+--- a/drivers/net/ethernet/sfc/ptp.c
++++ b/drivers/net/ethernet/sfc/ptp.c
+@@ -223,7 +223,6 @@ struct efx_ptp_timeset {
+  * @evt_list: List of MC receive events awaiting packets
+  * @evt_free_list: List of free events
+  * @evt_lock: Lock for manipulating evt_list and evt_free_list
+- * @evt_overflow: Boolean indicating that event list has overflowed
+  * @rx_evts: Instantiated events (on evt_list and evt_free_list)
+  * @workwq: Work queue for processing pending PTP operations
+  * @work: Work task
+@@ -275,7 +274,6 @@ struct efx_ptp_data {
+  struct list_head evt_list;
+  struct list_head evt_free_list;
+  spinlock_t evt_lock;
+- bool evt_overflow;
+  struct efx_ptp_event_rx rx_evts[MAX_RECEIVE_EVENTS];
+  struct workqueue_struct *workwq;
+  struct work_struct work;
+@@ -941,11 +939,6 @@ static void efx_ptp_drop_time_expired_events(struct efx_nic *efx)
+    }
+   }
+  }
+- /* If the event overflow flag is set and the event list is now empty
+-  * clear the flag to re-enable the overflow warning message.
+-  */
+- if (ptp->evt_overflow && list_empty(&ptp->evt_list))
+-  ptp->evt_overflow = false;
+  spin_unlock_bh(&ptp->evt_lock);
+ }
+ 
+@@ -989,11 +982,6 @@ static enum ptp_packet_state efx_ptp_match_rx(struct efx_nic *efx,
+    break;
+   }
+  }
+- /* If the event overflow flag is set and the event list is now empty
+-  * clear the flag to re-enable the overflow warning message.
+-  */
+- if (ptp->evt_overflow && list_empty(&ptp->evt_list))
+-  ptp->evt_overflow = false;
+  spin_unlock_bh(&ptp->evt_lock);
+ 
+  return rc;
+@@ -1147,7 +1135,6 @@ static int efx_ptp_stop(struct efx_nic *efx)
+  list_for_each_safe(cursor, next, &efx->ptp_data->evt_list) {
+   list_move(cursor, &efx->ptp_data->evt_free_list);
+  }
+- ptp->evt_overflow = false;
+  spin_unlock_bh(&efx->ptp_data->evt_lock);
+ 
+  return rc;
+@@ -1253,7 +1240,6 @@ int efx_ptp_probe(struct efx_nic *efx, struct efx_channel *channel)
+  spin_lock_init(&ptp->evt_lock);
+  for (pos = 0; pos < MAX_RECEIVE_EVENTS; pos++)
+   list_add(&ptp->rx_evts[pos].link, &ptp->evt_free_list);
+- ptp->evt_overflow = false;
+ 
+  /* Get the NIC PTP attributes and set up time conversions */
+  rc = efx_ptp_get_attributes(efx);
+@@ -1635,13 +1621,9 @@ static void ptp_event_rx(struct efx_nic *efx, struct efx_ptp_data *ptp)
+   list_add_tail(&evt->link, &ptp->evt_list);
+ 
+   queue_work(ptp->workwq, &ptp->work);
+- } else if (!ptp->evt_overflow) {
+-  /* Log a warning message and set the event overflow flag.
+-   * The message won't be logged again until the event queue
+-   * becomes empty.
+-   */
++ } else if (net_ratelimit()) {
++  /* Log a rate-limited warning message. */
+   netif_err(efx, rx_err, efx->net_dev, "PTP event queue overflow\n");
+-  ptp->evt_overflow = true;
+  }
+  spin_unlock_bh(&ptp->evt_lock);
+ }
+-- 
+1.7.1

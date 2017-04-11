@@ -1,0 +1,92 @@
+From ebefec9d81af3833ef6d4471d5f0320563a1ba07 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Fri, 12 Sep 2014 01:56:53 -0400
+Subject: [drm] i915: take display port power domain in DP HPD handler
+
+Message-id: <1410487019-24661-16-git-send-email-airlied@redhat.com>
+Patchwork-id: 93926
+O-Subject: [RHEL7.1 BZ1140440 PATCH 15/21] drm/i915: take display port power domain in DP HPD handler
+Bugzilla: 1140440
+RH-Acked-by: Jerome Glisse <jglisse@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Rob Clark <rclark@redhat.com>
+
+From: Imre Deak <imre.deak@intel.com>
+
+bugzilla: 1140440
+upstream: 1c767b339b3938b19076ffdc9d70aa1e4235a45b
+
+Ville noticed that we can call ibx_digital_port_connected() which accesses
+the HW without holding any power well/runtime pm reference. Fix this by
+holding a display port power domain reference around the whole hpd_pulse
+handler.
+
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Ville Syrjala <ville.syrjala@linux.intel.com>
+Reviewed-by: Dave Airlie <airlied@redhat.com>
+Cc: stable@vger.kernel.org (3.16+)
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 25ed7b0..5ba5364 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -3896,15 +3896,21 @@ bool
+ intel_dp_hpd_pulse(struct intel_digital_port *intel_dig_port, bool long_hpd)
+ {
+  struct intel_dp *intel_dp = &intel_dig_port->dp;
++ struct intel_encoder *intel_encoder = &intel_dig_port->base;
+  struct drm_device *dev = intel_dig_port->base.base.dev;
+  struct drm_i915_private *dev_priv = dev->dev_private;
+- int ret;
++ enum intel_display_power_domain power_domain;
++ bool ret = true;
++
+  if (intel_dig_port->base.type != INTEL_OUTPUT_EDP)
+   intel_dig_port->base.type = INTEL_OUTPUT_DISPLAYPORT;
+ 
+  DRM_DEBUG_KMS("got hpd irq on port %d - %s\n", intel_dig_port->port,
+         long_hpd ? "long" : "short");
+ 
++ power_domain = intel_display_port_power_domain(intel_encoder);
++ intel_display_power_get(dev_priv, power_domain);
++
+  if (long_hpd) {
+   if (!ibx_digital_port_connected(dev_priv, intel_dig_port))
+    goto mst_fail;
+@@ -3920,8 +3926,7 @@ intel_dp_hpd_pulse(struct intel_digital_port *intel_dig_port, bool long_hpd)
+ 
+  } else {
+   if (intel_dp->is_mst) {
+-   ret = intel_dp_check_mst_status(intel_dp);
+-   if (ret == -EINVAL)
++   if (intel_dp_check_mst_status(intel_dp) == -EINVAL)
+     goto mst_fail;
+   }
+ 
+@@ -3935,7 +3940,8 @@ intel_dp_hpd_pulse(struct intel_digital_port *intel_dig_port, bool long_hpd)
+    drm_modeset_unlock(&dev->mode_config.connection_mutex);
+   }
+  }
+- return false;
++ ret = false;
++ goto put_power;
+ mst_fail:
+  /* if we were in MST mode, and device is not there get out of MST mode */
+  if (intel_dp->is_mst) {
+@@ -3943,7 +3949,10 @@ mst_fail:
+   intel_dp->is_mst = false;
+   drm_dp_mst_topology_mgr_set_mst(&intel_dp->mst_mgr, intel_dp->is_mst);
+  }
+- return true;
++put_power:
++ intel_display_power_put(dev_priv, power_domain);
++
++ return ret;
+ }
+ 
+ /* Return which DP Port should be selected for Transcoder DP control */
+-- 
+1.7.1

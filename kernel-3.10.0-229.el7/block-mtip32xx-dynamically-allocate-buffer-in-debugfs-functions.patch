@@ -1,0 +1,144 @@
+From 6d884bd05c258abf398fca8a8521a9c489030c3b Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 15:30:04 -0400
+Subject: [block] mtip32xx: dynamically allocate buffer in debugfs functions
+
+Message-id: <1402673421-17117-2-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83916
+O-Subject: [RHEL7.1 PATCH 01/18] mtip32xx: dynamically allocate buffer in debugfs functions
+Bugzilla: 1105703
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+
+BZ: 1105703
+
+Upstream commit c8afd0dcbd14e2352258f2e2d359b36d0edd459f
+Author: David Milburn <dmilburn@redhat.com>
+Date:   Thu May 23 16:23:45 2013 -0500
+
+    mtip32xx: dynamically allocate buffer in debugfs functions
+
+    Dynamically allocate buf to prevent warnings:
+
+    drivers/block/mtip32xx/mtip32xx.c: In function 'mtip_hw_read_device_status':
+    drivers/block/mtip32xx/mtip32xx.c:2823: warning: the frame size of 1056 bytes is larger than 1024 bytes
+    drivers/block/mtip32xx/mtip32xx.c: In function 'mtip_hw_read_registers':
+    drivers/block/mtip32xx/mtip32xx.c:2894: warning: the frame size of 1056 bytes is larger than 1024 bytes
+    drivers/block/mtip32xx/mtip32xx.c: In function 'mtip_hw_read_flags':
+    drivers/block/mtip32xx/mtip32xx.c:2917: warning: the frame size of 1056 bytes is larger than 1024 bytes
+
+    Signed-off-by: David Milburn <dmilburn@redhat.com>
+    Acked-by: Asai Thambi S P <asamymuthupa@micron.com>
+    Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/mtip32xx/mtip32xx.c b/drivers/block/mtip32xx/mtip32xx.c
+index 1a5d481..99c49b1 100644
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@ -2820,34 +2820,51 @@ static ssize_t show_device_status(struct device_driver *drv, char *buf)
+ static ssize_t mtip_hw_read_device_status(struct file *f, char __user *ubuf,
+       size_t len, loff_t *offset)
+ {
++ struct driver_data *dd =  (struct driver_data *)f->private_data;
+  int size = *offset;
+- char buf[MTIP_DFS_MAX_BUF_SIZE];
++ char *buf;
++ int rv = 0;
+ 
+  if (!len || *offset)
+   return 0;
+ 
++ buf = kzalloc(MTIP_DFS_MAX_BUF_SIZE, GFP_KERNEL);
++ if (!buf) {
++  dev_err(&dd->pdev->dev,
++   "Memory allocation: status buffer\n");
++  return -ENOMEM;
++ }
++
+  size += show_device_status(NULL, buf);
+ 
+  *offset = size <= len ? size : len;
+  size = copy_to_user(ubuf, buf, *offset);
+  if (size)
+-  return -EFAULT;
++  rv = -EFAULT;
+ 
+- return *offset;
++ kfree(buf);
++ return rv ? rv : *offset;
+ }
+ 
+ static ssize_t mtip_hw_read_registers(struct file *f, char __user *ubuf,
+       size_t len, loff_t *offset)
+ {
+  struct driver_data *dd =  (struct driver_data *)f->private_data;
+- char buf[MTIP_DFS_MAX_BUF_SIZE];
++ char *buf;
+  u32 group_allocated;
+  int size = *offset;
+- int n;
++ int n, rv = 0;
+ 
+  if (!len || size)
+   return 0;
+ 
++ buf = kzalloc(MTIP_DFS_MAX_BUF_SIZE, GFP_KERNEL);
++ if (!buf) {
++  dev_err(&dd->pdev->dev,
++   "Memory allocation: register buffer\n");
++  return -ENOMEM;
++ }
++
+  size += sprintf(&buf[size], "H/ S ACTive      : [ 0x");
+ 
+  for (n = dd->slot_groups-1; n >= 0; n--)
+@@ -2902,21 +2919,30 @@ static ssize_t mtip_hw_read_registers(struct file *f, char __user *ubuf,
+  *offset = size <= len ? size : len;
+  size = copy_to_user(ubuf, buf, *offset);
+  if (size)
+-  return -EFAULT;
++  rv = -EFAULT;
+ 
+- return *offset;
++ kfree(buf);
++ return rv ? rv : *offset;
+ }
+ 
+ static ssize_t mtip_hw_read_flags(struct file *f, char __user *ubuf,
+       size_t len, loff_t *offset)
+ {
+  struct driver_data *dd =  (struct driver_data *)f->private_data;
+- char buf[MTIP_DFS_MAX_BUF_SIZE];
++ char *buf;
+  int size = *offset;
++ int rv = 0;
+ 
+  if (!len || size)
+   return 0;
+ 
++ buf = kzalloc(MTIP_DFS_MAX_BUF_SIZE, GFP_KERNEL);
++ if (!buf) {
++  dev_err(&dd->pdev->dev,
++   "Memory allocation: flag buffer\n");
++  return -ENOMEM;
++ }
++
+  size += sprintf(&buf[size], "Flag-port : [ %08lX ]\n",
+        dd->port->flags);
+  size += sprintf(&buf[size], "Flag-dd   : [ %08lX ]\n",
+@@ -2925,9 +2951,10 @@ static ssize_t mtip_hw_read_flags(struct file *f, char __user *ubuf,
+  *offset = size <= len ? size : len;
+  size = copy_to_user(ubuf, buf, *offset);
+  if (size)
+-  return -EFAULT;
++  rv = -EFAULT;
+ 
+- return *offset;
++ kfree(buf);
++ return rv ? rv : *offset;
+ }
+ 
+ static const struct file_operations mtip_device_status_fops = {
+-- 
+1.7.1

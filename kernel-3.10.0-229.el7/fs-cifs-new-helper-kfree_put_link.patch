@@ -1,0 +1,193 @@
+From a985b850c314b1aead18d84ba66d6d4eb37469b9 Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:05 -0400
+Subject: [fs] cifs: new helper kfree_put_link()
+
+Message-id: <1406549822-10376-13-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86761
+O-Subject: [RHEL7.1 PATCH 12/69] [bz1082049]new helper: kfree_put_link()
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Al Viro <viro@zeniv.linux.org.uk>
+
+duplicated to hell and back...
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 87dc800be2499128efb3a6f059d75dc8e1e6d503)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+index aaad06a..2411829 100644
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -874,7 +874,7 @@ const struct inode_operations cifs_file_inode_ops = {
+ const struct inode_operations cifs_symlink_inode_ops = {
+  .readlink = generic_readlink,
+  .follow_link = cifs_follow_link,
+- .put_link = cifs_put_link,
++ .put_link = kfree_put_link,
+  .permission = cifs_permission,
+  /* BB add the following two eventually */
+  /* revalidate: cifs_revalidate,
+diff --git a/fs/cifs/cifsfs.h b/fs/cifs/cifsfs.h
+index 729d31b..cc77885 100644
+--- a/fs/cifs/cifsfs.h
++++ b/fs/cifs/cifsfs.h
+@@ -115,8 +115,6 @@ extern struct vfsmount *cifs_dfs_d_automount(struct path *path);
+ 
+ /* Functions related to symlinks */
+ extern void *cifs_follow_link(struct dentry *direntry, struct nameidata *nd);
+-extern void cifs_put_link(struct dentry *direntry,
+-     struct nameidata *nd, void *);
+ extern int cifs_readlink(struct dentry *direntry, char __user *buffer,
+     int buflen);
+ extern int cifs_symlink(struct inode *inode, struct dentry *direntry,
+diff --git a/fs/cifs/link.c b/fs/cifs/link.c
+index 79fcbc1..e22927b 100644
+--- a/fs/cifs/link.c
++++ b/fs/cifs/link.c
+@@ -594,10 +594,3 @@ symlink_exit:
+  free_xid(xid);
+  return rc;
+ }
+-
+-void cifs_put_link(struct dentry *direntry, struct nameidata *nd, void *cookie)
+-{
+- char *p = nd_get_link(nd);
+- if (!IS_ERR(p))
+-  kfree(p);
+-}
+diff --git a/fs/ecryptfs/inode.c b/fs/ecryptfs/inode.c
+index 4cbbf63..445bd30 100644
+--- a/fs/ecryptfs/inode.c
++++ b/fs/ecryptfs/inode.c
+@@ -704,16 +704,6 @@ out:
+  return NULL;
+ }
+ 
+-static void
+-ecryptfs_put_link(struct dentry *dentry, struct nameidata *nd, void *ptr)
+-{
+- char *buf = nd_get_link(nd);
+- if (!IS_ERR(buf)) {
+-  /* Free the char* */
+-  kfree(buf);
+- }
+-}
+-
+ /**
+  * upper_size_to_lower_size
+  * @crypt_stat: Crypt_stat associated with file
+@@ -1122,7 +1112,7 @@ out:
+ const struct inode_operations ecryptfs_symlink_iops = {
+  .readlink = generic_readlink,
+  .follow_link = ecryptfs_follow_link,
+- .put_link = ecryptfs_put_link,
++ .put_link = kfree_put_link,
+  .permission = ecryptfs_permission,
+  .setattr = ecryptfs_setattr,
+  .getattr = ecryptfs_getattr_link,
+diff --git a/fs/gfs2/inode.c b/fs/gfs2/inode.c
+index 2a329ec..0acd355 100644
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@ -1522,13 +1522,6 @@ out:
+  return NULL;
+ }
+ 
+-static void gfs2_put_link(struct dentry *dentry, struct nameidata *nd, void *p)
+-{
+- char *s = nd_get_link(nd);
+- if (!IS_ERR(s))
+-  kfree(s);
+-}
+-
+ /**
+  * gfs2_permission -
+  * @inode: The inode
+@@ -1894,7 +1887,7 @@ const struct inode_operations gfs2_dir_iops = {
+ const struct inode_operations gfs2_symlink_iops = {
+  .readlink = generic_readlink,
+  .follow_link = gfs2_follow_link,
+- .put_link = gfs2_put_link,
++ .put_link = kfree_put_link,
+  .permission = gfs2_permission,
+  .setattr = gfs2_setattr,
+  .getattr = gfs2_getattr,
+diff --git a/fs/libfs.c b/fs/libfs.c
+index 2850272..0431513 100644
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -10,6 +10,7 @@
+ #include <linux/vfs.h>
+ #include <linux/quotaops.h>
+ #include <linux/mutex.h>
++#include <linux/namei.h>
+ #include <linux/exportfs.h>
+ #include <linux/writeback.h>
+ #include <linux/buffer_head.h> /* sync_mapping_buffers */
+@@ -1013,6 +1014,15 @@ int noop_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+ }
+ EXPORT_SYMBOL(noop_fsync);
+ 
++void kfree_put_link(struct dentry *dentry, struct nameidata *nd,
++    void *cookie)
++{
++ char *s = nd_get_link(nd);
++ if (!IS_ERR(s))
++  kfree(s);
++}
++EXPORT_SYMBOL(kfree_put_link);
++
+ /*
+  * nop .set_page_dirty method so that people can use .page_mkwrite on
+  * anon inodes.
+@@ -1055,4 +1065,3 @@ struct inode *alloc_anon_inode(struct super_block *s)
+  return inode;
+ }
+ EXPORT_SYMBOL(alloc_anon_inode);
+-
+diff --git a/fs/proc/self.c b/fs/proc/self.c
+index 6b6a993..ffeb202 100644
+--- a/fs/proc/self.c
++++ b/fs/proc/self.c
+@@ -36,18 +36,10 @@ static void *proc_self_follow_link(struct dentry *dentry, struct nameidata *nd)
+  return NULL;
+ }
+ 
+-static void proc_self_put_link(struct dentry *dentry, struct nameidata *nd,
+-    void *cookie)
+-{
+- char *s = nd_get_link(nd);
+- if (!IS_ERR(s))
+-  kfree(s);
+-}
+-
+ static const struct inode_operations proc_self_inode_operations = {
+  .readlink = proc_self_readlink,
+  .follow_link = proc_self_follow_link,
+- .put_link = proc_self_put_link,
++ .put_link = kfree_put_link,
+ };
+ 
+ static unsigned self_inum;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index e37b2d3..21f2119 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2555,6 +2555,7 @@ extern int __page_symlink(struct inode *inode, const char *symname, int len,
+   int nofs);
+ extern int page_symlink(struct inode *inode, const char *symname, int len);
+ extern const struct inode_operations page_symlink_inode_operations;
++extern void kfree_put_link(struct dentry *, struct nameidata *, void *);
+ extern int generic_readlink(struct dentry *, char __user *, int);
+ extern void generic_fillattr(struct inode *, struct kstat *);
+ extern int vfs_getattr(struct path *, struct kstat *);
+-- 
+1.7.1

@@ -1,0 +1,204 @@
+From d8b4c2f24af64a2e81850b4eb66ebf356481a7a0 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:33:15 -0400
+Subject: [fs] nfs: Be more aggressive in using readdirplus for 'ls -l' situations
+
+Message-id: <1403796815-28580-10-git-send-email-steved@redhat.com>
+Patchwork-id: 84845
+O-Subject: [RHEL7.1 PATCH 09/29] NFS: Be more aggressive in using readdirplus for 'ls -l' situations
+Bugzilla: 1111170
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+Try to detect 'ls -l' by having nfs_getattr() look at whether or not
+there is an opendir() file descriptor for the parent directory.
+If so, then assume that we want to force use of readdirplus in order
+to avoid the multiple GETATTR calls over the wire.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upsteam Id: 311324ad1713666a6e803aecf0d4e1a136a5b34a
+Bugzilla: 1111170
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 7e40a5f..7eaaf7d 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -69,21 +69,28 @@ const struct address_space_operations nfs_dir_aops = {
+ 
+ static struct nfs_open_dir_context *alloc_nfs_open_dir_context(struct inode *dir, struct rpc_cred *cred)
+ {
++ struct nfs_inode *nfsi = NFS_I(dir);
+  struct nfs_open_dir_context *ctx;
+  ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+  if (ctx != NULL) {
+   ctx->duped = 0;
+-  ctx->attr_gencount = NFS_I(dir)->attr_gencount;
++  ctx->attr_gencount = nfsi->attr_gencount;
+   ctx->dir_cookie = 0;
+   ctx->dup_cookie = 0;
+   ctx->cred = get_rpccred(cred);
++  spin_lock(&dir->i_lock);
++  list_add(&ctx->list, &nfsi->open_files);
++  spin_unlock(&dir->i_lock);
+   return ctx;
+  }
+  return  ERR_PTR(-ENOMEM);
+ }
+ 
+-static void put_nfs_open_dir_context(struct nfs_open_dir_context *ctx)
++static void put_nfs_open_dir_context(struct inode *dir, struct nfs_open_dir_context *ctx)
+ {
++ spin_lock(&dir->i_lock);
++ list_del(&ctx->list);
++ spin_unlock(&dir->i_lock);
+  put_rpccred(ctx->cred);
+  kfree(ctx);
+ }
+@@ -126,7 +133,7 @@ out:
+ static int
+ nfs_closedir(struct inode *inode, struct file *filp)
+ {
+- put_nfs_open_dir_context(filp->private_data);
++ put_nfs_open_dir_context(filp->f_path.dentry->d_inode, filp->private_data);
+  return 0;
+ }
+ 
+@@ -436,6 +443,22 @@ void nfs_advise_use_readdirplus(struct inode *dir)
+  set_bit(NFS_INO_ADVISE_RDPLUS, &NFS_I(dir)->flags);
+ }
+ 
++/*
++ * This function is mainly for use by nfs_getattr().
++ *
++ * If this is an 'ls -l', we want to force use of readdirplus.
++ * Do this by checking if there is an active file descriptor
++ * and calling nfs_advise_use_readdirplus, then forcing a
++ * cache flush.
++ */
++void nfs_force_use_readdirplus(struct inode *dir)
++{
++ if (!list_empty(&NFS_I(dir)->open_files)) {
++  nfs_advise_use_readdirplus(dir);
++  nfs_zap_mapping(dir, dir->i_mapping);
++ }
++}
++
+ static
+ void nfs_prime_dcache(struct dentry *parent, struct nfs_entry *entry)
+ {
+@@ -817,6 +840,17 @@ int uncached_readdir(nfs_readdir_descriptor_t *desc, void *dirent,
+  goto out;
+ }
+ 
++static bool nfs_dir_mapping_need_revalidate(struct inode *dir)
++{
++ struct nfs_inode *nfsi = NFS_I(dir);
++
++ if (nfs_attribute_cache_expired(dir))
++  return true;
++ if (nfsi->cache_validity & NFS_INO_INVALID_DATA)
++  return true;
++ return false;
++}
++
+ /* The file offset position represents the dirent entry number.  A
+    last cookie cache takes care of the common case of reading the
+    whole directory.
+@@ -848,7 +882,7 @@ static int nfs_readdir(struct file *filp, void *dirent, filldir_t filldir)
+  desc->plus = nfs_use_readdirplus(inode, filp) ? 1 : 0;
+ 
+  nfs_block_sillyrename(dentry);
+- if (filp->f_pos == 0 || nfs_attribute_cache_expired(inode))
++ if (filp->f_pos == 0 || nfs_dir_mapping_need_revalidate(inode))
+   res = nfs_revalidate_mapping(inode, filp->f_mapping);
+  if (res < 0)
+   goto out;
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index 8496d34..a0eddba 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -603,6 +603,25 @@ void nfs_setattr_update_inode(struct inode *inode, struct iattr *attr)
+ }
+ EXPORT_SYMBOL_GPL(nfs_setattr_update_inode);
+ 
++static void nfs_request_parent_use_readdirplus(struct dentry *dentry)
++{
++ struct dentry *parent;
++
++ parent = dget_parent(dentry);
++ nfs_force_use_readdirplus(parent->d_inode);
++ dput(parent);
++}
++
++static bool nfs_need_revalidate_inode(struct inode *inode)
++{
++ if (NFS_I(inode)->cache_validity &
++   (NFS_INO_INVALID_ATTR|NFS_INO_INVALID_LABEL))
++  return true;
++ if (nfs_attribute_cache_expired(inode))
++  return true;
++ return false;
++}
++
+ int nfs_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat)
+ {
+  struct inode *inode = dentry->d_inode;
+@@ -631,10 +650,13 @@ int nfs_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat)
+       ((mnt->mnt_flags & MNT_NODIRATIME) && S_ISDIR(inode->i_mode)))
+   need_atime = 0;
+ 
+- if (need_atime)
+-  err = __nfs_revalidate_inode(NFS_SERVER(inode), inode);
+- else
+-  err = nfs_revalidate_inode(NFS_SERVER(inode), inode);
++ if (need_atime || nfs_need_revalidate_inode(inode)) {
++  struct nfs_server *server = NFS_SERVER(inode);
++
++  if (server->caps & NFS_CAP_READDIRPLUS)
++   nfs_request_parent_use_readdirplus(dentry);
++  err = __nfs_revalidate_inode(server, inode);
++ }
+  if (!err) {
+   generic_fillattr(inode, stat);
+   stat->ino = nfs_compat_user_ino64(NFS_FILEID(inode));
+@@ -976,9 +998,7 @@ int nfs_attribute_cache_expired(struct inode *inode)
+  */
+ int nfs_revalidate_inode(struct nfs_server *server, struct inode *inode)
+ {
+- if (!(NFS_I(inode)->cache_validity &
+-   (NFS_INO_INVALID_ATTR|NFS_INO_INVALID_LABEL))
+-   && !nfs_attribute_cache_expired(inode))
++ if (!nfs_need_revalidate_inode(inode))
+   return NFS_STALE(inode) ? -ESTALE : 0;
+  return __nfs_revalidate_inode(server, inode);
+ }
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index e6a70b6..63457ee 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -303,6 +303,7 @@ extern struct nfs_client *nfs_init_client(struct nfs_client *clp,
+ /* dir.c */
+ extern int nfs_access_cache_shrinker(struct shrinker *shrink,
+      struct shrink_control *sc);
++extern void nfs_force_use_readdirplus(struct inode *dir);
+ struct dentry *nfs_lookup(struct inode *, struct dentry *, unsigned int);
+ int nfs_create(struct inode *, struct dentry *, umode_t, bool);
+ int nfs_mkdir(struct inode *, struct dentry *, umode_t);
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index e8e8117..2049f4d 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -92,6 +92,7 @@ struct nfs_open_context {
+ };
+ 
+ struct nfs_open_dir_context {
++ struct list_head list;
+  struct rpc_cred *cred;
+  unsigned long attr_gencount;
+  __u64 dir_cookie;
+-- 
+1.7.1

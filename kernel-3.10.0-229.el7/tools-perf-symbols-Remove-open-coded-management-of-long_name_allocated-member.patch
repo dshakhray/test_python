@@ -1,0 +1,149 @@
+From b8ad5972c7af304fe12910af1037aff4728662f1 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:50:18 -0400
+Subject: [tools] perf/symbols: Remove open coded management of long_name_allocated member
+
+Message-id: <1408953210-26343-131-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88870
+O-Subject: [PATCH RHEL7.1 BZ1133083 130/322] perf symbols: Remove open coded management of long_name_allocated member
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 7e155d4d5e2912f75443c18c02dd6f1dbd4eef84
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date: Tue Dec 10 15:08:44 2013 -0300
+
+description
+===========
+Instead of expecting callers to set this member accodingly so that later
+at dso destruction it can, if needed, be correctly free()d, make it a
+requirement by passing it as a parameter to dso__set_long_name.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index f8c8497..ecb37d6 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -386,12 +386,17 @@ struct dso *dso__kernel_findnew(struct machine *machine, const char *name,
+  return dso;
+ }
+ 
+-void dso__set_long_name(struct dso *dso, char *name)
++void dso__set_long_name(struct dso *dso, char *name, bool name_allocated)
+ {
+  if (name == NULL)
+   return;
+- dso->long_name = name;
+- dso->long_name_len = strlen(name);
++
++ if (dso->long_name_allocated)
++  free(dso->long_name);
++
++ dso->long_name   = name;
++ dso->long_name_len  = strlen(name);
++ dso->long_name_allocated = name_allocated;
+ }
+ 
+ void dso__set_short_name(struct dso *dso, const char *name, bool name_allocated)
+@@ -444,7 +449,7 @@ struct dso *dso__new(const char *name)
+  if (dso != NULL) {
+   int i;
+   strcpy(dso->name, name);
+-  dso__set_long_name(dso, dso->name);
++  dso__set_long_name(dso, dso->name, false);
+   dso__set_short_name(dso, dso->name, false);
+   for (i = 0; i < MAP__NR_TYPES; ++i)
+    dso->symbols[i] = dso->symbol_names[i] = RB_ROOT;
+diff --git a/tools/perf/util/dso.h b/tools/perf/util/dso.h
+index 8eceab7..7b43469 100644
+--- a/tools/perf/util/dso.h
++++ b/tools/perf/util/dso.h
+@@ -111,7 +111,7 @@ struct dso *dso__new(const char *name);
+ void dso__delete(struct dso *dso);
+ 
+ void dso__set_short_name(struct dso *dso, const char *name, bool name_allocated);
+-void dso__set_long_name(struct dso *dso, char *name);
++void dso__set_long_name(struct dso *dso, char *name, bool name_allocated);
+ 
+ int dso__name_len(const struct dso *dso);
+ 
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index 09d5c66..751454b 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -763,8 +763,7 @@ static int map_groups__set_modules_path_dir(struct map_groups *mg,
+     ret = -1;
+     goto out;
+    }
+-   dso__set_long_name(map->dso, long_name);
+-   map->dso->long_name_allocated = 1;
++   dso__set_long_name(map->dso, long_name, true);
+    dso__kernel_module_get_build_id(map->dso, "");
+   }
+  }
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index 9a5de88..5029ee1 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -1159,7 +1159,7 @@ static int dso__load_kcore(struct dso *dso, struct map *map,
+   dso->data_type = DSO_BINARY_TYPE__GUEST_KCORE;
+  else
+   dso->data_type = DSO_BINARY_TYPE__KCORE;
+- dso__set_long_name(dso, strdup(kcore_filename));
++ dso__set_long_name(dso, strdup(kcore_filename), true);
+ 
+  close(fd);
+ 
+@@ -1438,8 +1438,7 @@ int dso__load_vmlinux(struct dso *dso, struct map *map,
+    dso->data_type = DSO_BINARY_TYPE__GUEST_VMLINUX;
+   else
+    dso->data_type = DSO_BINARY_TYPE__VMLINUX;
+-  dso__set_long_name(dso, (char *)vmlinux);
+-  dso->long_name_allocated = vmlinux_allocated;
++  dso__set_long_name(dso, (char *)vmlinux, vmlinux_allocated);
+   dso__set_loaded(dso, map->type);
+   pr_debug("Using %s for symbols\n", symfs_vmlinux);
+  }
+@@ -1631,7 +1630,7 @@ do_kallsyms:
+  free(kallsyms_allocated_filename);
+ 
+  if (err > 0 && !dso__is_kcore(dso)) {
+-  dso__set_long_name(dso, strdup("[kernel.kallsyms]"));
++  dso__set_long_name(dso, strdup("[kernel.kallsyms]"), true);
+   map__fixup_start(map);
+   map__fixup_end(map);
+  }
+@@ -1679,7 +1678,7 @@ static int dso__load_guest_kernel_sym(struct dso *dso, struct map *map,
+   pr_debug("Using %s for symbols\n", kallsyms_filename);
+  if (err > 0 && !dso__is_kcore(dso)) {
+   machine__mmap_name(machine, path, sizeof(path));
+-  dso__set_long_name(dso, strdup(path));
++  dso__set_long_name(dso, strdup(path), true);
+   map__fixup_start(map);
+   map__fixup_end(map);
+  }
+diff --git a/tools/perf/util/vdso.c b/tools/perf/util/vdso.c
+index 3915982..0ddb3b8 100644
+--- a/tools/perf/util/vdso.c
++++ b/tools/perf/util/vdso.c
+@@ -103,7 +103,7 @@ struct dso *vdso__dso_findnew(struct list_head *head)
+   dso = dso__new(VDSO__MAP_NAME);
+   if (dso != NULL) {
+    dsos__add(head, dso);
+-   dso__set_long_name(dso, file);
++   dso__set_long_name(dso, file, false);
+   }
+  }
+ 
+-- 
+1.7.1

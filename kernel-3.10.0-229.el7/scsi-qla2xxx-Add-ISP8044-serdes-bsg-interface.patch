@@ -1,0 +1,254 @@
+From 6894a650df274aeae8392dd0f43c0b3e6965eaf1 Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Mon, 18 Aug 2014 19:56:37 -0400
+Subject: [scsi] qla2xxx: Add ISP8044 serdes bsg interface
+
+Message-id: <1408391817-6389-50-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 87942
+O-Subject: [PATCH RHEL 7.1 e-stor 49/69] qla2xxx: Add ISP8044 serdes bsg interface.
+Bugzilla: 1089346
+RH-Acked-by: Rob Evers <revers@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Joe Carnuccio <joe.carnuccio@qlogic.com>
+
+scsi commit id e8887c51f01911f3063e65c229e1f3be102031ba
+
+Signed-off-by: Joe Carnuccio <joe.carnuccio@qlogic.com>
+Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.c b/drivers/scsi/qla2xxx/qla_bsg.c
+index 71ff340..467c694 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.c
++++ b/drivers/scsi/qla2xxx/qla_bsg.c
+@@ -2054,9 +2054,49 @@ qla26xx_serdes_op(struct fc_bsg_job *bsg_job)
+   bsg_job->reply->reply_payload_rcv_len = sizeof(sr);
+   break;
+  default:
+-  ql_log(ql_log_warn, vha, 0x708c,
++  ql_dbg(ql_dbg_user, vha, 0x708c,
+       "Unknown serdes cmd %x.\n", sr.cmd);
+-  rval = -EDOM;
++  rval = -EINVAL;
++  break;
++ }
++
++ bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
++     rval ? EXT_STATUS_MAILBOX : 0;
++
++ bsg_job->reply_len = sizeof(struct fc_bsg_reply);
++ bsg_job->reply->result = DID_OK << 16;
++ bsg_job->job_done(bsg_job);
++ return 0;
++}
++
++static int
++qla8044_serdes_op(struct fc_bsg_job *bsg_job)
++{
++ struct Scsi_Host *host = bsg_job->shost;
++ scsi_qla_host_t *vha = shost_priv(host);
++ int rval = 0;
++ struct qla_serdes_reg_ex sr;
++
++ memset(&sr, 0, sizeof(sr));
++
++ sg_copy_to_buffer(bsg_job->request_payload.sg_list,
++     bsg_job->request_payload.sg_cnt, &sr, sizeof(sr));
++
++ switch (sr.cmd) {
++ case INT_SC_SERDES_WRITE_REG:
++  rval = qla8044_write_serdes_word(vha, sr.addr, sr.val);
++  bsg_job->reply->reply_payload_rcv_len = 0;
++  break;
++ case INT_SC_SERDES_READ_REG:
++  rval = qla8044_read_serdes_word(vha, sr.addr, &sr.val);
++  sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
++      bsg_job->reply_payload.sg_cnt, &sr, sizeof(sr));
++  bsg_job->reply->reply_payload_rcv_len = sizeof(sr);
++  break;
++ default:
++  ql_dbg(ql_dbg_user, vha, 0x70cf,
++      "Unknown serdes cmd %x.\n", sr.cmd);
++  rval = -EINVAL;
+   break;
+  }
+ 
+@@ -2121,6 +2161,9 @@ qla2x00_process_vendor_specific(struct fc_bsg_job *bsg_job)
+  case QL_VND_SERDES_OP:
+   return qla26xx_serdes_op(bsg_job);
+ 
++ case QL_VND_SERDES_OP_EX:
++  return qla8044_serdes_op(bsg_job);
++
+  default:
+   return -ENOSYS;
+  }
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.h b/drivers/scsi/qla2xxx/qla_bsg.h
+index e5c2126..4e49d0a 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.h
++++ b/drivers/scsi/qla2xxx/qla_bsg.h
+@@ -24,6 +24,7 @@
+ #define QL_VND_READ_I2C  0x11
+ #define QL_VND_FX00_MGMT_CMD 0x12
+ #define QL_VND_SERDES_OP 0x13
++#define QL_VND_SERDES_OP_EX 0x14
+ 
+ /* BSG Vendor specific subcode returns */
+ #define EXT_STATUS_OK   0
+@@ -225,4 +226,10 @@ struct qla_serdes_reg {
+  uint16_t val;
+ } __packed;
+ 
++struct qla_serdes_reg_ex {
++ uint16_t cmd;
++ uint32_t addr;
++ uint32_t val;
++} __packed;
++
+ #endif
+diff --git a/drivers/scsi/qla2xxx/qla_dbg.c b/drivers/scsi/qla2xxx/qla_dbg.c
+index 4a4a179..abacd3d 100644
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@ -11,13 +11,14 @@
+  * ----------------------------------------------------------------------
+  * |             Level            |   Last Value Used  |     Holes |
+  * ----------------------------------------------------------------------
+- * | Module Init and Probe        |       0x015b       | 0x4b,0xba,0xfa |
+- * |                              |                    | 0x0x015a |
+- * | Mailbox commands             |       0x1187       | 0x111a-0x111b  |
+- * |                              |                    | 0x1155-0x1158  |
+- * |                              |                    | 0x1018-0x1019  |
++ * | Module Init and Probe        |       0x017d       | 0x004b,0x0141 |
++ * |                              |                    | 0x0144,0x0146 |
++ * |                              |                    | 0x015b-0x0160 |
++ * |                              |                    | 0x016e-0x0170 |
++ * | Mailbox commands             |       0x118d       | 0x1018-0x1019 |
++ * |                              |                    | 0x10ca         |
+  * |                              |                    | 0x1115-0x1116  |
+- * |                              |                    | 0x10ca  |
++ * |                              |                    | 0x111a-0x111b |
+  * | Device Discovery             |       0x2095       | 0x2020-0x2022, |
+  * |                              |                    | 0x2011-0x2012, |
+  * |                              |                    | 0x2016         |
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index d4046fa..e983fa2 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -964,6 +964,13 @@ struct mbx_cmd_32 {
+  */
+ #define MBC_WRITE_MPI_REGISTER  0x01    /* Write MPI Register. */
+ 
++/*
++ * ISP8044 mailbox commands
++ */
++#define MBC_SET_GET_ETH_SERDES_REG 0x150
++#define HCS_WRITE_SERDES  0x3
++#define HCS_READ_SERDES   0x4
++
+ /* Firmware return data sizes */
+ #define FCAL_MAP_SIZE 128
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index 34782f9..06d85ce 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -344,6 +344,11 @@ extern int
+ qla2x00_read_serdes_word(scsi_qla_host_t *, uint16_t, uint16_t *);
+ 
+ extern int
++qla8044_write_serdes_word(scsi_qla_host_t *, uint32_t, uint32_t);
++extern int
++qla8044_read_serdes_word(scsi_qla_host_t *, uint32_t, uint32_t *);
++
++extern int
+ qla2x00_set_serdes_params(scsi_qla_host_t *, uint16_t, uint16_t, uint16_t);
+ 
+ extern int
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index 05ddd66..74e1c0f 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -2875,6 +2875,78 @@ qla2x00_read_serdes_word(scsi_qla_host_t *vha, uint16_t addr, uint16_t *data)
+  return rval;
+ }
+ 
++int
++qla8044_write_serdes_word(scsi_qla_host_t *vha, uint32_t addr, uint32_t data)
++{
++ int rval;
++ mbx_cmd_t mc;
++ mbx_cmd_t *mcp = &mc;
++
++ if (!IS_QLA8044(vha->hw))
++  return QLA_FUNCTION_FAILED;
++
++ ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1186,
++     "Entered %s.\n", __func__);
++
++ mcp->mb[0] = MBC_SET_GET_ETH_SERDES_REG;
++ mcp->mb[1] = HCS_WRITE_SERDES;
++ mcp->mb[3] = LSW(addr);
++ mcp->mb[4] = MSW(addr);
++ mcp->mb[5] = LSW(data);
++ mcp->mb[6] = MSW(data);
++ mcp->out_mb = MBX_6|MBX_5|MBX_4|MBX_3|MBX_1|MBX_0;
++ mcp->in_mb = MBX_0;
++ mcp->tov = MBX_TOV_SECONDS;
++ mcp->flags = 0;
++ rval = qla2x00_mailbox_command(vha, mcp);
++
++ if (rval != QLA_SUCCESS) {
++  ql_dbg(ql_dbg_mbx, vha, 0x1187,
++      "Failed=%x mb[0]=%x.\n", rval, mcp->mb[0]);
++ } else {
++  ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1188,
++      "Done %s.\n", __func__);
++ }
++
++ return rval;
++}
++
++int
++qla8044_read_serdes_word(scsi_qla_host_t *vha, uint32_t addr, uint32_t *data)
++{
++ int rval;
++ mbx_cmd_t mc;
++ mbx_cmd_t *mcp = &mc;
++
++ if (!IS_QLA8044(vha->hw))
++  return QLA_FUNCTION_FAILED;
++
++ ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1189,
++     "Entered %s.\n", __func__);
++
++ mcp->mb[0] = MBC_SET_GET_ETH_SERDES_REG;
++ mcp->mb[1] = HCS_READ_SERDES;
++ mcp->mb[3] = LSW(addr);
++ mcp->mb[4] = MSW(addr);
++ mcp->out_mb = MBX_4|MBX_3|MBX_1|MBX_0;
++ mcp->in_mb = MBX_2|MBX_1|MBX_0;
++ mcp->tov = MBX_TOV_SECONDS;
++ mcp->flags = 0;
++ rval = qla2x00_mailbox_command(vha, mcp);
++
++ *data = mcp->mb[2] << 16 | mcp->mb[1];
++
++ if (rval != QLA_SUCCESS) {
++  ql_dbg(ql_dbg_mbx, vha, 0x118a,
++      "Failed=%x mb[0]=%x.\n", rval, mcp->mb[0]);
++ } else {
++  ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x118b,
++      "Done %s.\n", __func__);
++ }
++
++ return rval;
++}
++
+ /**
+  * qla2x00_set_serdes_params() -
+  * @ha: HA context
+-- 
+1.7.1

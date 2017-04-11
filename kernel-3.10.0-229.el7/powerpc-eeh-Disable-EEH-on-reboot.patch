@@ -1,0 +1,98 @@
+From 264359ff160fa3f3a9dd8e01807ef0bf5c0de129 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:08:43 -0400
+Subject: [powerpc] eeh: Disable EEH on reboot
+
+Message-id: <1410545655-205645-295-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94330
+O-Subject: [RHEL7 PATCH 294/626] powerpc/eeh: Disable EEH on reboot
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 66f9af83e56bfa12964d251df9d60fb571579913
+Author: Gavin Shan <shangw@linux.vnet.ibm.com>
+Date:   Wed Feb 12 15:24:56 2014 +0800
+
+    powerpc/eeh: Disable EEH on reboot
+
+    We possiblly detect EEH errors during reboot, particularly in kexec
+    path, but it's impossible for device drivers and EEH core to handle
+    or recover them properly.
+
+    The patch registers one reboot notifier for EEH and disable EEH
+    subsystem during reboot. That means the EEH errors is going to be
+    cleared by hardware reset or second kernel during early stage of
+    PCI probe.
+
+    Signed-off-by: Gavin Shan <shangw@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index a69a4ad..bd3ec20 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -28,6 +28,7 @@
+ #include <linux/pci.h>
+ #include <linux/proc_fs.h>
+ #include <linux/rbtree.h>
++#include <linux/reboot.h>
+ #include <linux/seq_file.h>
+ #include <linux/spinlock.h>
+ #include <linux/export.h>
+@@ -748,6 +749,17 @@ int __exit eeh_ops_unregister(const char *name)
+  return -EEXIST;
+ }
+ 
++static int eeh_reboot_notifier(struct notifier_block *nb,
++          unsigned long action, void *unused)
++{
++ eeh_set_enable(false);
++ return NOTIFY_DONE;
++}
++
++static struct notifier_block eeh_reboot_nb = {
++ .notifier_call = eeh_reboot_notifier,
++};
++
+ /**
+  * eeh_init - EEH initialization
+  *
+@@ -779,6 +791,14 @@ int eeh_init(void)
+  if (machine_is(powernv) && cnt++ <= 0)
+   return ret;
+ 
++ /* Register reboot notifier */
++ ret = register_reboot_notifier(&eeh_reboot_nb);
++ if (ret) {
++  pr_warn("%s: Failed to register notifier (%d)\n",
++   __func__, ret);
++  return ret;
++ }
++
+  /* call platform initialization function */
+  if (!eeh_ops) {
+   pr_warning("%s: Platform EEH operation not found\n",
+diff --git a/arch/powerpc/platforms/powernv/eeh-ioda.c b/arch/powerpc/platforms/powernv/eeh-ioda.c
+index 4e38525..cf1d0eb 100644
+--- a/arch/powerpc/platforms/powernv/eeh-ioda.c
++++ b/arch/powerpc/platforms/powernv/eeh-ioda.c
+@@ -45,7 +45,8 @@ static int ioda_eeh_event(struct notifier_block *nb,
+ 
+  /* We simply send special EEH event */
+  if ((changed_evts & OPAL_EVENT_PCI_ERROR) &&
+-     (events & OPAL_EVENT_PCI_ERROR))
++     (events & OPAL_EVENT_PCI_ERROR) &&
++     eeh_enabled())
+   eeh_send_failure_event(NULL);
+ 
+  return 0;
+-- 
+1.7.1

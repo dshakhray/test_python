@@ -1,0 +1,128 @@
+From 24c1a956d0145936f757265d02df2e7f9e3f9155 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:48 -0400
+Subject: [virt] kvm/ppc: book3s hv - Save/restore SIAR and SDAR along with other PMU registers
+
+Message-id: <1410545655-205645-120-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94365
+O-Subject: [RHEL7 PATCH 119/626] KVM: PPC: Book3S HV: Save/restore SIAR and SDAR along with other PMU registers
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 14941789f2a13cd89e2dd567c4f708e571ab714e
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 6 13:11:18 2013 +1000
+
+    KVM: PPC: Book3S HV: Save/restore SIAR and SDAR along with other PMU registers
+
+    Currently we are not saving and restoring the SIAR and SDAR registers in
+    the PMU (performance monitor unit) on guest entry and exit.  The result
+    is that performance monitoring tools in the guest could get false
+    information about where a program was executing and what data it was
+    accessing at the time of a performance monitor interrupt.  This fixes
+    it by saving and restoring these registers along with the other PMU
+    registers on guest entry/exit.
+
+    This also provides a way for userspace to access these values for a
+    vcpu via the one_reg interface.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 3328353..91b833d 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -498,6 +498,8 @@ struct kvm_vcpu_arch {
+ 
+  u64 mmcr[3];
+  u32 pmc[8];
++ u64 siar;
++ u64 sdar;
+ 
+ #ifdef CONFIG_KVM_EXIT_TIMING
+  struct mutex exit_timing_lock;
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 6278edd..20428f6 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -502,6 +502,8 @@ int main(void)
+  DEFINE(VCPU_PRODDED, offsetof(struct kvm_vcpu, arch.prodded));
+  DEFINE(VCPU_MMCR, offsetof(struct kvm_vcpu, arch.mmcr));
+  DEFINE(VCPU_PMC, offsetof(struct kvm_vcpu, arch.pmc));
++ DEFINE(VCPU_SIAR, offsetof(struct kvm_vcpu, arch.siar));
++ DEFINE(VCPU_SDAR, offsetof(struct kvm_vcpu, arch.sdar));
+  DEFINE(VCPU_SLB, offsetof(struct kvm_vcpu, arch.slb));
+  DEFINE(VCPU_SLB_MAX, offsetof(struct kvm_vcpu, arch.slb_max));
+  DEFINE(VCPU_SLB_NR, offsetof(struct kvm_vcpu, arch.slb_nr));
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index f703a66..cfcee84 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -749,6 +749,12 @@ int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+   i = id - KVM_REG_PPC_PMC1;
+   *val = get_reg_val(id, vcpu->arch.pmc[i]);
+   break;
++ case KVM_REG_PPC_SIAR:
++  *val = get_reg_val(id, vcpu->arch.siar);
++  break;
++ case KVM_REG_PPC_SDAR:
++  *val = get_reg_val(id, vcpu->arch.sdar);
++  break;
+ #ifdef CONFIG_VSX
+  case KVM_REG_PPC_FPR0 ... KVM_REG_PPC_FPR31:
+   if (cpu_has_feature(CPU_FTR_VSX)) {
+@@ -833,6 +839,12 @@ int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+   i = id - KVM_REG_PPC_PMC1;
+   vcpu->arch.pmc[i] = set_reg_val(id, *val);
+   break;
++ case KVM_REG_PPC_SIAR:
++  vcpu->arch.siar = set_reg_val(id, *val);
++  break;
++ case KVM_REG_PPC_SDAR:
++  vcpu->arch.sdar = set_reg_val(id, *val);
++  break;
+ #ifdef CONFIG_VSX
+  case KVM_REG_PPC_FPR0 ... KVM_REG_PPC_FPR31:
+   if (cpu_has_feature(CPU_FTR_VSX)) {
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index c71103b..2efff8a 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -200,8 +200,12 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+  ld r3, VCPU_MMCR(r4)
+  ld r5, VCPU_MMCR + 8(r4)
+  ld r6, VCPU_MMCR + 16(r4)
++ ld r7, VCPU_SIAR(r4)
++ ld r8, VCPU_SDAR(r4)
+  mtspr SPRN_MMCR1, r5
+  mtspr SPRN_MMCRA, r6
++ mtspr SPRN_SIAR, r7
++ mtspr SPRN_SDAR, r8
+  mtspr SPRN_MMCR0, r3
+  isync
+ 
+@@ -1134,9 +1138,13 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_206)
+  std r3, VCPU_MMCR(r9) /* if not, set saved MMCR0 to FC */
+  b 22f
+ 21: mfspr r5, SPRN_MMCR1
++ mfspr r7, SPRN_SIAR
++ mfspr r8, SPRN_SDAR
+  std r4, VCPU_MMCR(r9)
+  std r5, VCPU_MMCR + 8(r9)
+  std r6, VCPU_MMCR + 16(r9)
++ std r7, VCPU_SIAR(r9)
++ std r8, VCPU_SDAR(r9)
+  mfspr r3, SPRN_PMC1
+  mfspr r4, SPRN_PMC2
+  mfspr r5, SPRN_PMC3
+-- 
+1.7.1

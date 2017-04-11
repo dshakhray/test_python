@@ -1,0 +1,98 @@
+From b03f8091ff92759eb7db095b0a4c425dfda4f3ca Mon Sep 17 00:00:00 2001
+From: Rob Evers <revers@redhat.com>
+Date: Wed, 25 Jun 2014 14:11:35 -0400
+Subject: [scsi] be2iscsi: Fix retreving MCCQ_WRB in non-embedded Mbox path
+
+Message-id: <1403705504-27660-2-git-send-email-revers@redhat.com>
+Patchwork-id: 84802
+O-Subject: [RHEL7.1 e-stor PATCH 01/10] scsi: be2iscsi: Fix retreving MCCQ_WRB in non-embedded Mbox path
+Bugzilla: 1088576
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Tomas Henzl <thenzl@redhat.com>
+RH-Acked-by: Maurizio Lombardi <mlombard@redhat.com>
+
+From: sjohn@emulex.com <sjohn@emulex.com>
+
+http://www.spinics.net/lists/linux-scsi/msg74143.html
+
+ Getting WRB for MCCQ posting was done before looking if tag is
+ available or not. This lead to increase phba->ctrl.mcc_obj.q.used
+ variable and the WARN_ON message was coming from wrb_from_mccq().
+ Moved getting wrb from mccq after checking for the tag.
+
+ In wrb_from_mccq(), memset is done before returning wrb ptr.
+ Removed memset of mccq wrb from all other functions.
+
+Signed-off-by: John Soni Jose <sony.john-n@emulex.com>
+Signed-off-by: Jayamohan Kallickal <jayamohan.kallickal@emulex.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.c b/drivers/scsi/be2iscsi/be_mgmt.c
+index 088bdf7..712911f 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@ -447,8 +447,8 @@ unsigned int mgmt_vendor_specific_fw_cmd(struct be_ctrl_info *ctrl,
+       struct be_dma_mem *nonemb_cmd)
+ {
+  struct be_cmd_resp_hdr *resp;
+- struct be_mcc_wrb *wrb = wrb_from_mccq(phba);
+- struct be_sge *mcc_sge = nonembedded_sgl(wrb);
++ struct be_mcc_wrb *wrb;
++ struct be_sge *mcc_sge;
+  unsigned int tag = 0;
+  struct iscsi_bsg_request *bsg_req = job->request;
+  struct be_bsg_vendor_cmd *req = nonemb_cmd->va;
+@@ -465,7 +465,6 @@ unsigned int mgmt_vendor_specific_fw_cmd(struct be_ctrl_info *ctrl,
+  req->sector = sector;
+  req->offset = offset;
+  spin_lock(&ctrl->mbox_lock);
+- memset(wrb, 0, sizeof(*wrb));
+ 
+  switch (bsg_req->rqst_data.h_vendor.vendor_cmd[0]) {
+  case BEISCSI_WRITE_FLASH:
+@@ -495,6 +494,8 @@ unsigned int mgmt_vendor_specific_fw_cmd(struct be_ctrl_info *ctrl,
+   return tag;
+  }
+ 
++ wrb = wrb_from_mccq(phba);
++ mcc_sge = nonembedded_sgl(wrb);
+  be_wrb_hdr_prepare(wrb, nonemb_cmd->size, false,
+       job->request_payload.sg_cnt);
+  mcc_sge->pa_hi = cpu_to_le32(upper_32_bits(nonemb_cmd->dma));
+@@ -525,7 +526,6 @@ int mgmt_epfw_cleanup(struct beiscsi_hba *phba, unsigned short ulp_num)
+  int status = 0;
+ 
+  spin_lock(&ctrl->mbox_lock);
+- memset(wrb, 0, sizeof(*wrb));
+ 
+  be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+  be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI,
+@@ -702,7 +702,6 @@ int mgmt_open_connection(struct beiscsi_hba *phba,
+   return tag;
+  }
+  wrb = wrb_from_mccq(phba);
+- memset(wrb, 0, sizeof(*wrb));
+  sge = nonembedded_sgl(wrb);
+ 
+  req = nonemb_cmd->va;
+@@ -804,7 +803,7 @@ static int mgmt_exec_nonemb_cmd(struct beiscsi_hba *phba,
+     int resp_buf_len)
+ {
+  struct be_ctrl_info *ctrl = &phba->ctrl;
+- struct be_mcc_wrb *wrb = wrb_from_mccq(phba);
++ struct be_mcc_wrb *wrb;
+  struct be_sge *sge;
+  unsigned int tag;
+  int rc = 0;
+@@ -816,7 +815,8 @@ static int mgmt_exec_nonemb_cmd(struct beiscsi_hba *phba,
+   rc = -ENOMEM;
+   goto free_cmd;
+  }
+- memset(wrb, 0, sizeof(*wrb));
++
++ wrb = wrb_from_mccq(phba);
+  wrb->tag0 |= tag;
+  sge = nonembedded_sgl(wrb);
+ 
+-- 
+1.7.1

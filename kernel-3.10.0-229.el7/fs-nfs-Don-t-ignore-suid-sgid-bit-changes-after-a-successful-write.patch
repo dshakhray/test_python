@@ -1,0 +1,80 @@
+From 35d0f8c665d83e2a7f71f84e26ca10ba5d686275 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:53:22 -0400
+Subject: [fs] nfs: Don't ignore suid/sgid bit changes after a successful write
+
+Message-id: <1403798077-28799-4-git-send-email-steved@redhat.com>
+Patchwork-id: 84875
+O-Subject: [RHEL7.1 PATCH 03/78] NFS: Don't ignore suid/sgid bit changes after a successful write
+Bugzilla: 1113248
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+If we suspect that the server may have cleared the suid/sgid bit,
+then mark the inode for revalidation.
+
+Reported-by: Kinglong Mee <kinglongmee@gmail.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upsteam Id: 1f2edbe3fe2111a59fcd1bb3b9725066bc9ed686
+Bugzilla: 1113248
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index aaa16b3..22f83f9 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -1355,6 +1355,30 @@ static const struct rpc_call_ops nfs_write_common_ops = {
+  .rpc_release = nfs_writeback_release_common,
+ };
+ 
++/*
++ * Special version of should_remove_suid() that ignores capabilities.
++ */
++static int nfs_should_remove_suid(const struct inode *inode)
++{
++ umode_t mode = inode->i_mode;
++ int kill = 0;
++
++ /* suid always must be killed */
++ if (unlikely(mode & S_ISUID))
++  kill = ATTR_KILL_SUID;
++
++ /*
++  * sgid without any exec bits is just a mandatory locking mark; leave
++  * it alone.  If some exec bits are set, it's a real sgid; kill it.
++  */
++ if (unlikely((mode & S_ISGID) && (mode & S_IXGRP)))
++  kill |= ATTR_KILL_SGID;
++
++ if (unlikely(kill && S_ISREG(mode)))
++  return kill;
++
++ return 0;
++}
+ 
+ /*
+  * This function is called when the WRITE call is complete.
+@@ -1403,9 +1427,16 @@ void nfs_writeback_done(struct rpc_task *task, struct nfs_write_data *data)
+   }
+  }
+ #endif
+- if (task->tk_status < 0)
++ if (task->tk_status < 0) {
+   nfs_set_pgio_error(data->header, task->tk_status, argp->offset);
+- else if (resp->count < argp->count) {
++  return;
++ }
++
++ /* Deal with the suid/sgid bit corner case */
++ if (nfs_should_remove_suid(inode))
++  nfs_mark_for_revalidate(inode);
++
++ if (resp->count < argp->count) {
+   static unsigned long    complain;
+ 
+   /* This a short write! */
+-- 
+1.7.1

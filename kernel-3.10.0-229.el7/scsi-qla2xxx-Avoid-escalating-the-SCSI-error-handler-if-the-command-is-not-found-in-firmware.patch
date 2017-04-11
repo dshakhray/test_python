@@ -1,0 +1,107 @@
+From ad1265bd7080f93694dda5039aec9ef810413409 Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Mon, 23 Jun 2014 20:01:09 -0400
+Subject: [scsi] qla2xxx: Avoid escalating the SCSI error handler if the command is not found in firmware
+
+Message-id: <1403553672-3844-4-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 84413
+O-Subject: [PATCH RHEL 7.1 e-stor 3/6] qla2xxx: Avoid escalating the SCSI error handler if the command is not found in firmware.
+Bugzilla: 1090378
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Rob Evers <revers@redhat.com>
+
+From: Chad Dupuis <chad.dupuis@qlogic.com>
+
+scsi commit id f934c9d082f9062a583c4a3980c1902814b7e950
+
+If the firmware cannot find the command specified then return SUCCESS to the
+error handler so as not to needlessly escalate.  Also cleanup the resources for
+the command since we cannot expect the original command to returned in
+interrupt context.
+
+Signed-off-by: Chad Dupuis <chad.dupuis@qlogic.com>
+Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 82b18c0..9462196 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -1770,6 +1770,8 @@ typedef struct {
+ #define CS_PORT_CONFIG_CHG 0x2A /* Port Configuration Changed */
+ #define CS_PORT_BUSY  0x2B /* Port Busy */
+ #define CS_COMPLETE_CHKCOND 0x30 /* Error? */
++#define CS_IOCB_ERROR  0x31 /* Generic error for IOCB request
++        failure */
+ #define CS_BAD_PAYLOAD  0x80 /* Driver defined */
+ #define CS_UNKNOWN  0x81 /* Driver defined */
+ #define CS_RETRY  0x82 /* Driver defined */
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index c825d1d..3d48ba2 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -2636,7 +2636,10 @@ qla24xx_abort_command(srb_t *sp)
+   ql_dbg(ql_dbg_mbx, vha, 0x1090,
+       "Failed to complete IOCB -- completion status (%x).\n",
+       le16_to_cpu(abt->nport_handle));
+-  rval = QLA_FUNCTION_FAILED;
++  if (abt->nport_handle == CS_IOCB_ERROR)
++   rval = QLA_FUNCTION_PARAMETER_ERROR;
++  else
++   rval = QLA_FUNCTION_FAILED;
+  } else {
+   ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x1091,
+       "Done %s.\n", __func__);
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 69a3af3..df2a8fc 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -943,7 +943,7 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
+  int ret;
+  unsigned int id, lun;
+  unsigned long flags;
+- int wait = 0;
++ int rval, wait = 0;
+  struct qla_hw_data *ha = vha->hw;
+ 
+  if (!CMD_SP(cmd))
+@@ -972,10 +972,20 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
+  sp_get(sp);
+ 
+  spin_unlock_irqrestore(&ha->hardware_lock, flags);
+- if (ha->isp_ops->abort_command(sp)) {
+-  ret = FAILED;
++ rval = ha->isp_ops->abort_command(sp);
++ if (rval) {
++  if (rval == QLA_FUNCTION_PARAMETER_ERROR) {
++   /*
++    * Decrement the ref_count since we can't find the
++    * command
++    */
++   atomic_dec(&sp->ref_count);
++   ret = SUCCESS;
++  } else
++   ret = FAILED;
++
+   ql_dbg(ql_dbg_taskm, vha, 0x8003,
+-      "Abort command mbx failed cmd=%p.\n", cmd);
++      "Abort command mbx failed cmd=%p, rval=%x.\n", cmd, rval);
+  } else {
+   ql_dbg(ql_dbg_taskm, vha, 0x8004,
+       "Abort command mbx success cmd=%p.\n", cmd);
+@@ -983,6 +993,12 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
+  }
+ 
+  spin_lock_irqsave(&ha->hardware_lock, flags);
++ /*
++  * Clear the slot in the oustanding_cmds array if we can't find the
++  * command to reclaim the resources.
++  */
++ if (rval == QLA_FUNCTION_PARAMETER_ERROR)
++  vha->req->outstanding_cmds[sp->handle] = NULL;
+  sp->done(ha, sp, 0);
+  spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ 
+-- 
+1.7.1

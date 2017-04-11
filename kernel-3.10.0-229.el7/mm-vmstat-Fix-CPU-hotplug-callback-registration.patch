@@ -1,0 +1,93 @@
+From 64f4f0a5efc4074f96e9da7efbf90864e9d92488 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Wed, 16 Jul 2014 12:34:24 -0400
+Subject: [mm] vmstat: Fix CPU hotplug callback registration
+
+Message-id: <1405514064-11178-2-git-send-email-prarit@redhat.com>
+Patchwork-id: 85854
+O-Subject: [RHEL7.1 PATCH BZ 1119078 37/35] mm, vmstat: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit 0be94bad0b601df94b8558c0cbd28f7e6633c9e8
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:12:27 2014 +0530
+
+    mm, vmstat: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the vmstat code in the MM subsystem by using this latter form of callback
+    registration.
+
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Johannes Weiner <hannes@cmpxchg.org>
+    Cc: Cody P Schafer <cody@linux.vnet.ibm.com>
+    Cc: Toshi Kani <toshi.kani@hp.com>
+    Cc: Dave Hansen <dave@sr71.net>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Christoph Lameter <cl@linux.com>
+    Acked-by: Rik van Riel <riel@redhat.com>
+    Reviewed-by: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Larry Woodman <lwoodman@redhat.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Rafael Aquini <aquini@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index c887725..63f5256 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1243,14 +1243,14 @@ static int __init setup_vmstat(void)
+ #ifdef CONFIG_SMP
+  int cpu;
+ 
+- register_cpu_notifier(&vmstat_notifier);
++ cpu_notifier_register_begin();
++ __register_cpu_notifier(&vmstat_notifier);
+ 
+- get_online_cpus();
+  for_each_online_cpu(cpu) {
+   start_cpu_timer(cpu);
+   node_set_state(cpu_to_node(cpu), N_CPU);
+  }
+- put_online_cpus();
++ cpu_notifier_register_done();
+ #endif
+ #ifdef CONFIG_PROC_FS
+  proc_create("buddyinfo", S_IRUGO, NULL, &fragmentation_file_operations);
+-- 
+1.7.1

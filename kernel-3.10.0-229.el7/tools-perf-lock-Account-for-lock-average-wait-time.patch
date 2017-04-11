@@ -1,0 +1,123 @@
+From f12250fa48ded5c0671d04a533edb695a3d516ef Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:24:45 -0400
+Subject: [tools] perf/lock: Account for lock average wait time
+
+Message-id: <1408462094-14194-117-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88141
+O-Subject: [PATCH RHEL7.1 BZ1131394 116/325] perf lock: Account for lock average wait time
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit f37376cd721a539ac398cbb7718b72fce83cd49b
+Author: Davidlohr Bueso <davidlohr@hp.com>
+Date: Sun Sep 8 19:19:19 2013 -0700
+
+description
+===========
+While perf-lock currently reports both the total wait time and the
+number of contentions, it doesn't explicitly show the average wait time.
+Having this value immediately in the report can be quite useful when
+looking into performance issues.
+
+Furthermore, allowing report to sort by averages is another handy
+feature to have - and thus do not only print the value, but add it to
+the lock_stat structure.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/Documentation/perf-lock.txt b/tools/perf/Documentation/perf-lock.txt
+index c7f5f55..ab25be2 100644
+--- a/tools/perf/Documentation/perf-lock.txt
++++ b/tools/perf/Documentation/perf-lock.txt
+@@ -48,7 +48,7 @@ REPORT OPTIONS
+ -k::
+ --key=<value>::
+         Sorting key. Possible values: acquired (default), contended,
+-        wait_total, wait_max, wait_min.
++ avg_wait, wait_total, wait_max, wait_min.
+ 
+ INFO OPTIONS
+ ------------
+diff --git a/tools/perf/builtin-lock.c b/tools/perf/builtin-lock.c
+index 972310c..6a9076f 100644
+--- a/tools/perf/builtin-lock.c
++++ b/tools/perf/builtin-lock.c
+@@ -56,7 +56,9 @@ struct lock_stat {
+ 
+  unsigned int  nr_readlock;
+  unsigned int  nr_trylock;
++
+  /* these times are in nano sec. */
++ u64                     avg_wait_time;
+  u64   wait_time_total;
+  u64   wait_time_min;
+  u64   wait_time_max;
+@@ -208,6 +210,7 @@ static struct thread_stat *thread_stat_findnew_first(u32 tid)
+ 
+ SINGLE_KEY(nr_acquired)
+ SINGLE_KEY(nr_contended)
++SINGLE_KEY(avg_wait_time)
+ SINGLE_KEY(wait_time_total)
+ SINGLE_KEY(wait_time_max)
+ 
+@@ -244,6 +247,7 @@ static struct rb_root  result; /* place to store sorted data */
+ struct lock_key keys[] = {
+  DEF_KEY_LOCK(acquired, nr_acquired),
+  DEF_KEY_LOCK(contended, nr_contended),
++ DEF_KEY_LOCK(avg_wait, avg_wait_time),
+  DEF_KEY_LOCK(wait_total, wait_time_total),
+  DEF_KEY_LOCK(wait_min, wait_time_min),
+  DEF_KEY_LOCK(wait_max, wait_time_max),
+@@ -516,6 +520,7 @@ static int report_lock_acquired_event(struct perf_evsel *evsel,
+ 
+  seq->state = SEQ_STATE_ACQUIRED;
+  ls->nr_acquired++;
++ ls->avg_wait_time = ls->nr_contended ? ls->wait_time_total/ls->nr_contended : 0;
+  seq->prev_event_time = sample->time;
+ end:
+  return 0;
+@@ -570,6 +575,7 @@ static int report_lock_contended_event(struct perf_evsel *evsel,
+ 
+  seq->state = SEQ_STATE_CONTENDED;
+  ls->nr_contended++;
++ ls->avg_wait_time = ls->wait_time_total/ls->nr_contended;
+  seq->prev_event_time = sample->time;
+ end:
+  return 0;
+@@ -703,6 +709,7 @@ static void print_result(void)
+  pr_info("%10s ", "acquired");
+  pr_info("%10s ", "contended");
+ 
++ pr_info("%15s ", "avg wait (ns)");
+  pr_info("%15s ", "total wait (ns)");
+  pr_info("%15s ", "max wait (ns)");
+  pr_info("%15s ", "min wait (ns)");
+@@ -734,6 +741,7 @@ static void print_result(void)
+   pr_info("%10u ", st->nr_acquired);
+   pr_info("%10u ", st->nr_contended);
+ 
++  pr_info("%15" PRIu64 " ", st->avg_wait_time);
+   pr_info("%15" PRIu64 " ", st->wait_time_total);
+   pr_info("%15" PRIu64 " ", st->wait_time_max);
+   pr_info("%15" PRIu64 " ", st->wait_time_min == ULLONG_MAX ?
+@@ -940,7 +948,7 @@ int cmd_lock(int argc, const char **argv, const char *prefix __maybe_unused)
+  };
+  const struct option report_options[] = {
+  OPT_STRING('k', "key", &sort_key, "acquired",
+-      "key for sorting (acquired / contended / wait_total / wait_max / wait_min)"),
++      "key for sorting (acquired / contended / avg_wait / wait_total / wait_max / wait_min)"),
+  /* TODO: type */
+  OPT_END()
+  };
+-- 
+1.7.1

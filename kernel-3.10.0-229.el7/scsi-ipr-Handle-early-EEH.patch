@@ -1,0 +1,556 @@
+From a041a6d07a910d3b98f5dd20f53bb56cfd6a2197 Mon Sep 17 00:00:00 2001
+From: Gustavo Duarte <gduarte@redhat.com>
+Date: Mon, 1 Sep 2014 21:18:18 -0400
+Subject: [scsi] ipr: Handle early EEH
+
+Message-id: <1409606300-27001-5-git-send-email-gduarte@redhat.com>
+Patchwork-id: 90132
+O-Subject: [RHEL7.1 PATCH BZ 1088561 4/6] ipr: Handle early EEH
+Bugzilla: 1088561
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1088561
+Upstream Status: 6270e5932a01d6536dbce27782e8adf2180598d8
+
+commit 6270e5932a01d6536dbce27782e8adf2180598d8
+Author: Brian King <brking@linux.vnet.ibm.com>
+Date:   Tue Jan 21 12:16:41 2014 -0600
+
+    [SCSI] ipr: Handle early EEH
+
+    If, when the ipr driver loads, the adapter is in an EEH error state,
+    it will currently oops and not be able to recover, as it attempts
+    to access memory that has not yet been allocated. We've seen this
+    occur in some kexec scenarios. The following patch fixes the oops
+    and also allows the driver to recover from these probe time EEH errors.
+
+    [jejb: checkpatch fix]
+    Signed-off-by: Wen Xiong <wenxiong@linux.vnet.ibm.com>
+    Signed-off-by: Brian King <brking@linux.vnet.ibm.com>
+    Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/ipr.c b/drivers/scsi/ipr.c
+index dfaa47f..25dc6e5 100644
+--- a/drivers/scsi/ipr.c
++++ b/drivers/scsi/ipr.c
+@@ -8645,6 +8645,25 @@ static int ipr_reset_freeze(struct ipr_cmnd *ipr_cmd)
+ }
+ 
+ /**
++ * ipr_pci_mmio_enabled - Called when MMIO has been re-enabled
++ * @pdev: PCI device struct
++ *
++ * Description: This routine is called to tell us that the MMIO
++ * access to the IOA has been restored
++ */
++static pci_ers_result_t ipr_pci_mmio_enabled(struct pci_dev *pdev)
++{
++ unsigned long flags = 0;
++ struct ipr_ioa_cfg *ioa_cfg = pci_get_drvdata(pdev);
++
++ spin_lock_irqsave(ioa_cfg->host->host_lock, flags);
++ if (!ioa_cfg->probe_done)
++  pci_save_state(pdev);
++ spin_unlock_irqrestore(ioa_cfg->host->host_lock, flags);
++ return PCI_ERS_RESULT_NEED_RESET;
++}
++
++/**
+  * ipr_pci_frozen - Called when slot has experienced a PCI bus error.
+  * @pdev: PCI device struct
+  *
+@@ -8658,7 +8677,8 @@ static void ipr_pci_frozen(struct pci_dev *pdev)
+  struct ipr_ioa_cfg *ioa_cfg = pci_get_drvdata(pdev);
+ 
+  spin_lock_irqsave(ioa_cfg->host->host_lock, flags);
+- _ipr_initiate_ioa_reset(ioa_cfg, ipr_reset_freeze, IPR_SHUTDOWN_NONE);
++ if (ioa_cfg->probe_done)
++  _ipr_initiate_ioa_reset(ioa_cfg, ipr_reset_freeze, IPR_SHUTDOWN_NONE);
+  spin_unlock_irqrestore(ioa_cfg->host->host_lock, flags);
+ }
+ 
+@@ -8676,11 +8696,14 @@ static pci_ers_result_t ipr_pci_slot_reset(struct pci_dev *pdev)
+  struct ipr_ioa_cfg *ioa_cfg = pci_get_drvdata(pdev);
+ 
+  spin_lock_irqsave(ioa_cfg->host->host_lock, flags);
+- if (ioa_cfg->needs_warm_reset)
+-  ipr_initiate_ioa_reset(ioa_cfg, IPR_SHUTDOWN_NONE);
+- else
+-  _ipr_initiate_ioa_reset(ioa_cfg, ipr_reset_restore_cfg_space,
+-     IPR_SHUTDOWN_NONE);
++ if (ioa_cfg->probe_done) {
++  if (ioa_cfg->needs_warm_reset)
++   ipr_initiate_ioa_reset(ioa_cfg, IPR_SHUTDOWN_NONE);
++  else
++   _ipr_initiate_ioa_reset(ioa_cfg, ipr_reset_restore_cfg_space,
++      IPR_SHUTDOWN_NONE);
++ } else
++  wake_up_all(&ioa_cfg->eeh_wait_q);
+  spin_unlock_irqrestore(ioa_cfg->host->host_lock, flags);
+  return PCI_ERS_RESULT_RECOVERED;
+ }
+@@ -8699,17 +8722,20 @@ static void ipr_pci_perm_failure(struct pci_dev *pdev)
+  int i;
+ 
+  spin_lock_irqsave(ioa_cfg->host->host_lock, flags);
+- if (ioa_cfg->sdt_state == WAIT_FOR_DUMP)
+-  ioa_cfg->sdt_state = ABORT_DUMP;
+- ioa_cfg->reset_retries = IPR_NUM_RESET_RELOAD_RETRIES - 1;
+- ioa_cfg->in_ioa_bringdown = 1;
+- for (i = 0; i < ioa_cfg->hrrq_num; i++) {
+-  spin_lock(&ioa_cfg->hrrq[i]._lock);
+-  ioa_cfg->hrrq[i].allow_cmds = 0;
+-  spin_unlock(&ioa_cfg->hrrq[i]._lock);
+- }
+- wmb();
+- ipr_initiate_ioa_reset(ioa_cfg, IPR_SHUTDOWN_NONE);
++ if (ioa_cfg->probe_done) {
++  if (ioa_cfg->sdt_state == WAIT_FOR_DUMP)
++   ioa_cfg->sdt_state = ABORT_DUMP;
++  ioa_cfg->reset_retries = IPR_NUM_RESET_RELOAD_RETRIES - 1;
++  ioa_cfg->in_ioa_bringdown = 1;
++  for (i = 0; i < ioa_cfg->hrrq_num; i++) {
++   spin_lock(&ioa_cfg->hrrq[i]._lock);
++   ioa_cfg->hrrq[i].allow_cmds = 0;
++   spin_unlock(&ioa_cfg->hrrq[i]._lock);
++  }
++  wmb();
++  ipr_initiate_ioa_reset(ioa_cfg, IPR_SHUTDOWN_NONE);
++ } else
++  wake_up_all(&ioa_cfg->eeh_wait_q);
+  spin_unlock_irqrestore(ioa_cfg->host->host_lock, flags);
+ }
+ 
+@@ -8729,7 +8755,7 @@ static pci_ers_result_t ipr_pci_error_detected(struct pci_dev *pdev,
+  switch (state) {
+  case pci_channel_io_frozen:
+   ipr_pci_frozen(pdev);
+-  return PCI_ERS_RESULT_NEED_RESET;
++  return PCI_ERS_RESULT_CAN_RECOVER;
+  case pci_channel_io_perm_failure:
+   ipr_pci_perm_failure(pdev);
+   return PCI_ERS_RESULT_DISCONNECT;
+@@ -8759,6 +8785,7 @@ static int ipr_probe_ioa_part2(struct ipr_ioa_cfg *ioa_cfg)
+  ENTER;
+  spin_lock_irqsave(ioa_cfg->host->host_lock, host_lock_flags);
+  dev_dbg(&ioa_cfg->pdev->dev, "ioa_cfg adx: 0x%p\n", ioa_cfg);
++ ioa_cfg->probe_done = 1;
+  if (ioa_cfg->needs_hard_reset) {
+   ioa_cfg->needs_hard_reset = 0;
+   ipr_initiate_ioa_reset(ioa_cfg, IPR_SHUTDOWN_NONE);
+@@ -9034,16 +9061,6 @@ static int ipr_alloc_mem(struct ipr_ioa_cfg *ioa_cfg)
+  if (!ioa_cfg->vpd_cbs)
+   goto out_free_res_entries;
+ 
+- for (i = 0; i < ioa_cfg->hrrq_num; i++) {
+-  INIT_LIST_HEAD(&ioa_cfg->hrrq[i].hrrq_free_q);
+-  INIT_LIST_HEAD(&ioa_cfg->hrrq[i].hrrq_pending_q);
+-  spin_lock_init(&ioa_cfg->hrrq[i]._lock);
+-  if (i == 0)
+-   ioa_cfg->hrrq[i].lock = ioa_cfg->host->host_lock;
+-  else
+-   ioa_cfg->hrrq[i].lock = &ioa_cfg->hrrq[i]._lock;
+- }
+-
+  if (ipr_alloc_cmd_blks(ioa_cfg))
+   goto out_free_vpd_cbs;
+ 
+@@ -9144,6 +9161,48 @@ static void ipr_initialize_bus_attr(struct ipr_ioa_cfg *ioa_cfg)
+ }
+ 
+ /**
++ * ipr_init_regs - Initialize IOA registers
++ * @ioa_cfg: ioa config struct
++ *
++ * Return value:
++ * none
++ **/
++static void ipr_init_regs(struct ipr_ioa_cfg *ioa_cfg)
++{
++ const struct ipr_interrupt_offsets *p;
++ struct ipr_interrupts *t;
++ void __iomem *base;
++
++ p = &ioa_cfg->chip_cfg->regs;
++ t = &ioa_cfg->regs;
++ base = ioa_cfg->hdw_dma_regs;
++
++ t->set_interrupt_mask_reg = base + p->set_interrupt_mask_reg;
++ t->clr_interrupt_mask_reg = base + p->clr_interrupt_mask_reg;
++ t->clr_interrupt_mask_reg32 = base + p->clr_interrupt_mask_reg32;
++ t->sense_interrupt_mask_reg = base + p->sense_interrupt_mask_reg;
++ t->sense_interrupt_mask_reg32 = base + p->sense_interrupt_mask_reg32;
++ t->clr_interrupt_reg = base + p->clr_interrupt_reg;
++ t->clr_interrupt_reg32 = base + p->clr_interrupt_reg32;
++ t->sense_interrupt_reg = base + p->sense_interrupt_reg;
++ t->sense_interrupt_reg32 = base + p->sense_interrupt_reg32;
++ t->ioarrin_reg = base + p->ioarrin_reg;
++ t->sense_uproc_interrupt_reg = base + p->sense_uproc_interrupt_reg;
++ t->sense_uproc_interrupt_reg32 = base + p->sense_uproc_interrupt_reg32;
++ t->set_uproc_interrupt_reg = base + p->set_uproc_interrupt_reg;
++ t->set_uproc_interrupt_reg32 = base + p->set_uproc_interrupt_reg32;
++ t->clr_uproc_interrupt_reg = base + p->clr_uproc_interrupt_reg;
++ t->clr_uproc_interrupt_reg32 = base + p->clr_uproc_interrupt_reg32;
++
++ if (ioa_cfg->sis64) {
++  t->init_feedback_reg = base + p->init_feedback_reg;
++  t->dump_addr_reg = base + p->dump_addr_reg;
++  t->dump_data_reg = base + p->dump_data_reg;
++  t->endian_swap_reg = base + p->endian_swap_reg;
++ }
++}
++
++/**
+  * ipr_init_ioa_cfg - Initialize IOA config struct
+  * @ioa_cfg: ioa config struct
+  * @host:  scsi host struct
+@@ -9155,9 +9214,7 @@ static void ipr_initialize_bus_attr(struct ipr_ioa_cfg *ioa_cfg)
+ static void ipr_init_ioa_cfg(struct ipr_ioa_cfg *ioa_cfg,
+         struct Scsi_Host *host, struct pci_dev *pdev)
+ {
+- const struct ipr_interrupt_offsets *p;
+- struct ipr_interrupts *t;
+- void __iomem *base;
++ int i;
+ 
+  ioa_cfg->host = host;
+  ioa_cfg->pdev = pdev;
+@@ -9177,6 +9234,7 @@ static void ipr_init_ioa_cfg(struct ipr_ioa_cfg *ioa_cfg,
+  INIT_WORK(&ioa_cfg->work_q, ipr_worker_thread);
+  init_waitqueue_head(&ioa_cfg->reset_wait_q);
+  init_waitqueue_head(&ioa_cfg->msi_wait_q);
++ init_waitqueue_head(&ioa_cfg->eeh_wait_q);
+  ioa_cfg->sdt_state = INACTIVE;
+ 
+  ipr_initialize_bus_attr(ioa_cfg);
+@@ -9187,44 +9245,33 @@ static void ipr_init_ioa_cfg(struct ipr_ioa_cfg *ioa_cfg,
+   host->max_lun = IPR_MAX_SIS64_LUNS_PER_TARGET;
+   if (ipr_max_devs > IPR_MAX_SIS64_DEVS)
+    ioa_cfg->max_devs_supported = IPR_MAX_SIS64_DEVS;
++  ioa_cfg->cfg_table_size = (sizeof(struct ipr_config_table_hdr64)
++        + ((sizeof(struct ipr_config_table_entry64)
++            * ioa_cfg->max_devs_supported)));
+  } else {
+   host->max_id = IPR_MAX_NUM_TARGETS_PER_BUS;
+   host->max_lun = IPR_MAX_NUM_LUNS_PER_TARGET;
+   if (ipr_max_devs > IPR_MAX_PHYSICAL_DEVS)
+    ioa_cfg->max_devs_supported = IPR_MAX_PHYSICAL_DEVS;
++  ioa_cfg->cfg_table_size = (sizeof(struct ipr_config_table_hdr)
++        + ((sizeof(struct ipr_config_table_entry)
++            * ioa_cfg->max_devs_supported)));
+  }
++
+  host->max_channel = IPR_MAX_BUS_TO_SCAN;
+  host->unique_id = host->host_no;
+  host->max_cmd_len = IPR_MAX_CDB_LEN;
+  host->can_queue = ioa_cfg->max_cmds;
+  pci_set_drvdata(pdev, ioa_cfg);
+ 
+- p = &ioa_cfg->chip_cfg->regs;
+- t = &ioa_cfg->regs;
+- base = ioa_cfg->hdw_dma_regs;
+-
+- t->set_interrupt_mask_reg = base + p->set_interrupt_mask_reg;
+- t->clr_interrupt_mask_reg = base + p->clr_interrupt_mask_reg;
+- t->clr_interrupt_mask_reg32 = base + p->clr_interrupt_mask_reg32;
+- t->sense_interrupt_mask_reg = base + p->sense_interrupt_mask_reg;
+- t->sense_interrupt_mask_reg32 = base + p->sense_interrupt_mask_reg32;
+- t->clr_interrupt_reg = base + p->clr_interrupt_reg;
+- t->clr_interrupt_reg32 = base + p->clr_interrupt_reg32;
+- t->sense_interrupt_reg = base + p->sense_interrupt_reg;
+- t->sense_interrupt_reg32 = base + p->sense_interrupt_reg32;
+- t->ioarrin_reg = base + p->ioarrin_reg;
+- t->sense_uproc_interrupt_reg = base + p->sense_uproc_interrupt_reg;
+- t->sense_uproc_interrupt_reg32 = base + p->sense_uproc_interrupt_reg32;
+- t->set_uproc_interrupt_reg = base + p->set_uproc_interrupt_reg;
+- t->set_uproc_interrupt_reg32 = base + p->set_uproc_interrupt_reg32;
+- t->clr_uproc_interrupt_reg = base + p->clr_uproc_interrupt_reg;
+- t->clr_uproc_interrupt_reg32 = base + p->clr_uproc_interrupt_reg32;
+-
+- if (ioa_cfg->sis64) {
+-  t->init_feedback_reg = base + p->init_feedback_reg;
+-  t->dump_addr_reg = base + p->dump_addr_reg;
+-  t->dump_data_reg = base + p->dump_data_reg;
+-  t->endian_swap_reg = base + p->endian_swap_reg;
++ for (i = 0; i < ARRAY_SIZE(ioa_cfg->hrrq); i++) {
++  INIT_LIST_HEAD(&ioa_cfg->hrrq[i].hrrq_free_q);
++  INIT_LIST_HEAD(&ioa_cfg->hrrq[i].hrrq_pending_q);
++  spin_lock_init(&ioa_cfg->hrrq[i]._lock);
++  if (i == 0)
++   ioa_cfg->hrrq[i].lock = ioa_cfg->host->host_lock;
++  else
++   ioa_cfg->hrrq[i].lock = &ioa_cfg->hrrq[i]._lock;
+  }
+ }
+ 
+@@ -9247,6 +9294,26 @@ ipr_get_chip_info(const struct pci_device_id *dev_id)
+  return NULL;
+ }
+ 
++/**
++ * ipr_wait_for_pci_err_recovery - Wait for any PCI error recovery to complete
++ *      during probe time
++ * @ioa_cfg: ioa config struct
++ *
++ * Return value:
++ *  None
++ **/
++static void ipr_wait_for_pci_err_recovery(struct ipr_ioa_cfg *ioa_cfg)
++{
++ struct pci_dev *pdev = ioa_cfg->pdev;
++
++ if (pci_channel_offline(pdev)) {
++  wait_event_timeout(ioa_cfg->eeh_wait_q,
++       !pci_channel_offline(pdev),
++       IPR_PCI_ERROR_RECOVERY_TIMEOUT);
++  pci_restore_state(pdev);
++ }
++}
++
+ static int ipr_enable_msix(struct ipr_ioa_cfg *ioa_cfg)
+ {
+  struct msix_entry entries[IPR_MAX_MSIX_VECTORS];
+@@ -9261,6 +9328,7 @@ static int ipr_enable_msix(struct ipr_ioa_cfg *ioa_cfg)
+    vectors = err;
+ 
+  if (err < 0) {
++  ipr_wait_for_pci_err_recovery(ioa_cfg);
+   pci_disable_msix(ioa_cfg->pdev);
+   return err;
+  }
+@@ -9284,6 +9352,7 @@ static int ipr_enable_msi(struct ipr_ioa_cfg *ioa_cfg)
+    vectors = err;
+ 
+  if (err < 0) {
++  ipr_wait_for_pci_err_recovery(ioa_cfg);
+   pci_disable_msi(ioa_cfg->pdev);
+   return err;
+  }
+@@ -9438,19 +9507,13 @@ static int ipr_probe_ioa(struct pci_dev *pdev,
+ 
+  ENTER;
+ 
+- if ((rc = pci_enable_device(pdev))) {
+-  dev_err(&pdev->dev, "Cannot enable adapter\n");
+-  goto out;
+- }
+-
+  dev_info(&pdev->dev, "Found IOA with IRQ: %d\n", pdev->irq);
+-
+  host = scsi_host_alloc(&driver_template, sizeof(*ioa_cfg));
+ 
+  if (!host) {
+   dev_err(&pdev->dev, "call to scsi_host_alloc failed!\n");
+   rc = -ENOMEM;
+-  goto out_disable;
++  goto out;
+  }
+ 
+  ioa_cfg = (struct ipr_ioa_cfg *)host->hostdata;
+@@ -9480,6 +9543,8 @@ static int ipr_probe_ioa(struct pci_dev *pdev,
+ 
+  ioa_cfg->revid = pdev->revision;
+ 
++ ipr_init_ioa_cfg(ioa_cfg, host, pdev);
++
+  ipr_regs_pci = pci_resource_start(pdev, 0);
+ 
+  rc = pci_request_regions(pdev, IPR_NAME);
+@@ -9489,22 +9554,35 @@ static int ipr_probe_ioa(struct pci_dev *pdev,
+   goto out_scsi_host_put;
+  }
+ 
++ rc = pci_enable_device(pdev);
++
++ if (rc || pci_channel_offline(pdev)) {
++  if (pci_channel_offline(pdev)) {
++   ipr_wait_for_pci_err_recovery(ioa_cfg);
++   rc = pci_enable_device(pdev);
++  }
++
++  if (rc) {
++   dev_err(&pdev->dev, "Cannot enable adapter\n");
++   ipr_wait_for_pci_err_recovery(ioa_cfg);
++   goto out_release_regions;
++  }
++ }
++
+  ipr_regs = pci_ioremap_bar(pdev, 0);
+ 
+  if (!ipr_regs) {
+   dev_err(&pdev->dev,
+    "Couldn't map memory range of registers\n");
+   rc = -ENOMEM;
+-  goto out_release_regions;
++  goto out_disable;
+  }
+ 
+  ioa_cfg->hdw_dma_regs = ipr_regs;
+  ioa_cfg->hdw_dma_regs_pci = ipr_regs_pci;
+  ioa_cfg->ioa_mailbox = ioa_cfg->chip_cfg->mailbox + ipr_regs;
+ 
+- ipr_init_ioa_cfg(ioa_cfg, host, pdev);
+-
+- pci_set_master(pdev);
++ ipr_init_regs(ioa_cfg);
+ 
+  if (ioa_cfg->sis64) {
+   rc = pci_set_dma_mask(pdev, DMA_BIT_MASK(64));
+@@ -9512,7 +9590,6 @@ static int ipr_probe_ioa(struct pci_dev *pdev,
+    dev_dbg(&pdev->dev, "Failed to set 64 bit PCI DMA mask\n");
+    rc = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+   }
+-
+  } else
+   rc = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+ 
+@@ -9526,10 +9603,15 @@ static int ipr_probe_ioa(struct pci_dev *pdev,
+ 
+  if (rc != PCIBIOS_SUCCESSFUL) {
+   dev_err(&pdev->dev, "Write of cache line size failed\n");
++  ipr_wait_for_pci_err_recovery(ioa_cfg);
+   rc = -EIO;
+   goto cleanup_nomem;
+  }
+ 
++ /* Issue MMIO read to ensure card is not in EEH */
++ interrupts = readl(ioa_cfg->regs.sense_interrupt_reg);
++ ipr_wait_for_pci_err_recovery(ioa_cfg);
++
+  if (ipr_number_of_msix > IPR_MAX_MSIX_VECTORS) {
+   dev_err(&pdev->dev, "The max number of MSIX is %d\n",
+    IPR_MAX_MSIX_VECTORS);
+@@ -9548,10 +9630,22 @@ static int ipr_probe_ioa(struct pci_dev *pdev,
+   dev_info(&pdev->dev, "Cannot enable MSI.\n");
+  }
+ 
++ pci_set_master(pdev);
++
++ if (pci_channel_offline(pdev)) {
++  ipr_wait_for_pci_err_recovery(ioa_cfg);
++  pci_set_master(pdev);
++  if (pci_channel_offline(pdev)) {
++   rc = -EIO;
++   goto out_msi_disable;
++  }
++ }
++
+  if (ioa_cfg->intr_flag == IPR_USE_MSI ||
+      ioa_cfg->intr_flag == IPR_USE_MSIX) {
+   rc = ipr_test_msi(ioa_cfg, pdev);
+   if (rc == -EOPNOTSUPP) {
++   ipr_wait_for_pci_err_recovery(ioa_cfg);
+    if (ioa_cfg->intr_flag == IPR_USE_MSI) {
+     ioa_cfg->intr_flag &= ~IPR_USE_MSI;
+     pci_disable_msi(pdev);
+@@ -9581,30 +9675,12 @@ static int ipr_probe_ioa(struct pci_dev *pdev,
+     (unsigned int)num_online_cpus(),
+     (unsigned int)IPR_MAX_HRRQ_NUM);
+ 
+- /* Save away PCI config space for use following IOA reset */
+- rc = pci_save_state(pdev);
+-
+- if (rc != PCIBIOS_SUCCESSFUL) {
+-  dev_err(&pdev->dev, "Failed to save PCI config space\n");
+-  rc = -EIO;
+-  goto out_msi_disable;
+- }
+-
+  if ((rc = ipr_save_pcix_cmd_reg(ioa_cfg)))
+   goto out_msi_disable;
+ 
+  if ((rc = ipr_set_pcix_cmd_reg(ioa_cfg)))
+   goto out_msi_disable;
+ 
+- if (ioa_cfg->sis64)
+-  ioa_cfg->cfg_table_size = (sizeof(struct ipr_config_table_hdr64)
+-    + ((sizeof(struct ipr_config_table_entry64)
+-    * ioa_cfg->max_devs_supported)));
+- else
+-  ioa_cfg->cfg_table_size = (sizeof(struct ipr_config_table_hdr)
+-    + ((sizeof(struct ipr_config_table_entry)
+-    * ioa_cfg->max_devs_supported)));
+-
+  rc = ipr_alloc_mem(ioa_cfg);
+  if (rc < 0) {
+   dev_err(&pdev->dev,
+@@ -9612,6 +9688,15 @@ static int ipr_probe_ioa(struct pci_dev *pdev,
+   goto out_msi_disable;
+  }
+ 
++ /* Save away PCI config space for use following IOA reset */
++ rc = pci_save_state(pdev);
++
++ if (rc != PCIBIOS_SUCCESSFUL) {
++  dev_err(&pdev->dev, "Failed to save PCI config space\n");
++  rc = -EIO;
++  goto cleanup_nolog;
++ }
++
+  /*
+   * If HRRQ updated interrupt is not masked, or reset alert is set,
+   * the card is in an unknown state and needs a hard reset
+@@ -9668,18 +9753,19 @@ out:
+ cleanup_nolog:
+  ipr_free_mem(ioa_cfg);
+ out_msi_disable:
++ ipr_wait_for_pci_err_recovery(ioa_cfg);
+  if (ioa_cfg->intr_flag == IPR_USE_MSI)
+   pci_disable_msi(pdev);
+  else if (ioa_cfg->intr_flag == IPR_USE_MSIX)
+   pci_disable_msix(pdev);
+ cleanup_nomem:
+  iounmap(ipr_regs);
++out_disable:
++ pci_disable_device(pdev);
+ out_release_regions:
+  pci_release_regions(pdev);
+ out_scsi_host_put:
+  scsi_host_put(host);
+-out_disable:
+- pci_disable_device(pdev);
+  goto out;
+ }
+ 
+@@ -10017,6 +10103,7 @@ MODULE_DEVICE_TABLE(pci, ipr_pci_table);
+ 
+ static const struct pci_error_handlers ipr_err_handler = {
+  .error_detected = ipr_pci_error_detected,
++ .mmio_enabled = ipr_pci_mmio_enabled,
+  .slot_reset = ipr_pci_slot_reset,
+ };
+ 
+diff --git a/drivers/scsi/ipr.h b/drivers/scsi/ipr.h
+index c756ff0..649d8f6 100644
+--- a/drivers/scsi/ipr.h
++++ b/drivers/scsi/ipr.h
+@@ -231,6 +231,7 @@
+ #define IPR_WAIT_FOR_RESET_TIMEOUT  (2 * HZ)
+ #define IPR_CHECK_FOR_RESET_TIMEOUT  (HZ / 10)
+ #define IPR_WAIT_FOR_BIST_TIMEOUT  (2 * HZ)
++#define IPR_PCI_ERROR_RECOVERY_TIMEOUT (120 * HZ)
+ #define IPR_PCI_RESET_TIMEOUT   (HZ / 2)
+ #define IPR_SIS32_DUMP_TIMEOUT   (15 * HZ)
+ #define IPR_SIS64_DUMP_TIMEOUT   (40 * HZ)
+@@ -1443,6 +1444,7 @@ struct ipr_ioa_cfg {
+  u8 dump_timeout:1;
+  u8 cfg_locked:1;
+  u8 clear_isr:1;
++ u8 probe_done:1;
+ 
+  u8 revid;
+ 
+@@ -1521,6 +1523,7 @@ struct ipr_ioa_cfg {
+ 
+  wait_queue_head_t reset_wait_q;
+  wait_queue_head_t msi_wait_q;
++ wait_queue_head_t eeh_wait_q;
+ 
+  struct ipr_dump *dump;
+  enum ipr_sdt_state sdt_state;
+-- 
+1.7.1

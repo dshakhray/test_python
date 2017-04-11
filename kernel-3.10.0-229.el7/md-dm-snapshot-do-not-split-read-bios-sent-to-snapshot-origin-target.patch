@@ -1,0 +1,82 @@
+From cbf3190a87e79a2a865b69f242eb8027b05130b6 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Wed, 16 Jul 2014 20:42:15 -0400
+Subject: [md] dm-snapshot: do not split read bios sent to snapshot-origin target
+
+Message-id: <1405543364-20901-12-git-send-email-snitzer@redhat.com>
+Patchwork-id: 85891
+O-Subject: [RHEL7.1 PATCH 11/40] dm snapshot: do not split read bios sent to snapshot-origin target
+Bugzilla: 1117872
+RH-Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+
+BZ: 1117872
+
+Upstream commit 298eaa89b02e88dc9081f8761a957f7cd5e8b201
+Author: Mikulas Patocka <mpatocka@redhat.com>
+Date:   Fri Mar 14 18:43:07 2014 -0400
+
+    dm snapshot: do not split read bios sent to snapshot-origin target
+
+    Change the snapshot-origin target so that only write bios are split on
+    chunk boundary.  Read bios are passed unchanged to the underlying
+    device, so they don't have to be split.
+
+    Later, we could change the target so that it accepts a larger write bio
+    if it spans an area that is completely covered by snapshot exceptions.
+
+    Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-snap.c b/drivers/md/dm-snap.c
+index 18d757e..a8a7bed 100644
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@ -2142,6 +2142,7 @@ static int origin_write_extent(struct dm_snapshot *merging_snap,
+ 
+ struct dm_origin {
+  struct dm_dev *dev;
++ unsigned split_boundary;
+ };
+ 
+ /*
+@@ -2193,13 +2194,24 @@ static void origin_dtr(struct dm_target *ti)
+ static int origin_map(struct dm_target *ti, struct bio *bio)
+ {
+  struct dm_origin *o = ti->private;
++ unsigned available_sectors;
++
+  bio->bi_bdev = o->dev->bdev;
+ 
+- if (bio->bi_rw & REQ_FLUSH)
++ if (unlikely(bio->bi_rw & REQ_FLUSH))
++  return DM_MAPIO_REMAPPED;
++
++ if (bio_rw(bio) != WRITE)
+   return DM_MAPIO_REMAPPED;
+ 
++ available_sectors = o->split_boundary -
++  ((unsigned)bio->bi_sector & (o->split_boundary - 1));
++
++ if (bio_sectors(bio) > available_sectors)
++  dm_accept_partial_bio(bio, available_sectors);
++
+  /* Only tell snapshots if this is a write */
+- return (bio_rw(bio) == WRITE) ? do_origin(o->dev, bio) : DM_MAPIO_REMAPPED;
++ return do_origin(o->dev, bio);
+ }
+ 
+ /*
+@@ -2210,7 +2222,7 @@ static void origin_resume(struct dm_target *ti)
+ {
+  struct dm_origin *o = ti->private;
+ 
+- ti->max_io_len = get_origin_minimum_chunksize(o->dev->bdev);
++ o->split_boundary = get_origin_minimum_chunksize(o->dev->bdev);
+ }
+ 
+ static void origin_status(struct dm_target *ti, status_type_t type,
+-- 
+1.7.1

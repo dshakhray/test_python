@@ -1,0 +1,231 @@
+From 8a1722484f34f2d381dbdd1fc39dadea7093e459 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:06 -0400
+Subject: [powerpc] pseries: Use remove_memory() to remove memory
+
+Message-id: <1410545655-205645-318-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94260
+O-Subject: [RHEL7 PATCH 317/626] powerpc/pseries: Use remove_memory() to remove memory
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 9ac8cde938481cd0e3f700b8f071c4eca989c9f6
+Author: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+Date:   Mon Jan 27 10:54:06 2014 -0600
+
+    powerpc/pseries: Use remove_memory() to remove memory
+
+    The memory remove code for powerpc/pseries should call remove_memory()
+    so that we are holding the hotplug_memory lock during memory remove
+    operations.
+
+    This patch updates the memory node remove handler to call remove_memory()
+    and adds a ppc_md.remove_memory() entry to handle pseries specific work
+    that is called from arch_remove_memory().
+
+    During memory remove in pseries_remove_memblock() we have to stay with
+    removing memory one section at a time. This is needed because of how memory
+    resources are handled. During memory add for pseries (via the probe file in
+    sysfs) we add memory one section at a time which gives us a memory resource
+    for each section. Future patches will aim to address this so will not have
+    to remove memory one section at a time.
+
+    Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/machdep.h b/arch/powerpc/include/asm/machdep.h
+index dcfbfc7..2404260 100644
+--- a/arch/powerpc/include/asm/machdep.h
++++ b/arch/powerpc/include/asm/machdep.h
+@@ -270,6 +270,10 @@ struct machdep_calls {
+ #ifdef CONFIG_ARCH_RANDOM
+  int (*get_random_long)(unsigned long *v);
+ #endif
++
++#ifdef CONFIG_MEMORY_HOTREMOVE
++ int (*remove_memory)(u64, u64);
++#endif
+ };
+ 
+ extern void e500_idle(void);
+diff --git a/arch/powerpc/mm/mem.c b/arch/powerpc/mm/mem.c
+index 9dbe09e..363269f 100644
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@ -139,9 +139,14 @@ int arch_remove_memory(u64 start, u64 size)
+  unsigned long start_pfn = start >> PAGE_SHIFT;
+  unsigned long nr_pages = size >> PAGE_SHIFT;
+  struct zone *zone;
++ int ret;
+ 
+  zone = page_zone(pfn_to_page(start_pfn));
+- return __remove_pages(zone, start_pfn, nr_pages);
++ ret = __remove_pages(zone, start_pfn, nr_pages);
++ if (!ret && (ppc_md.remove_memory))
++  ret = ppc_md.remove_memory(start, size);
++
++ return ret;
+ }
+ #endif
+ #endif /* CONFIG_MEMORY_HOTPLUG */
+diff --git a/arch/powerpc/platforms/pseries/hotplug-memory.c b/arch/powerpc/platforms/pseries/hotplug-memory.c
+index 9590dbb..573b488 100644
+--- a/arch/powerpc/platforms/pseries/hotplug-memory.c
++++ b/arch/powerpc/platforms/pseries/hotplug-memory.c
+@@ -14,6 +14,7 @@
+ #include <linux/memblock.h>
+ #include <linux/vmalloc.h>
+ #include <linux/memory.h>
++#include <linux/memory_hotplug.h>
+ 
+ #include <asm/firmware.h>
+ #include <asm/machdep.h>
+@@ -75,13 +76,27 @@ unsigned long memory_block_size_bytes(void)
+ }
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+-static int pseries_remove_memblock(unsigned long base, unsigned int memblock_size)
++static int pseries_remove_memory(u64 start, u64 size)
+ {
+- unsigned long start, start_pfn;
+- struct zone *zone;
+  int ret;
+- unsigned long section;
+- unsigned long sections_to_remove;
++
++ /* Remove htab bolted mappings for this section of memory */
++ start = (unsigned long)__va(start);
++ ret = remove_section_mapping(start, start + size);
++
++ /* Ensure all vmalloc mappings are flushed in case they also
++  * hit that section of memory
++  */
++ vm_unmap_aliases();
++
++ return ret;
++}
++
++static int pseries_remove_memblock(unsigned long base, unsigned int memblock_size)
++{
++ unsigned long block_sz, start_pfn;
++ int sections_per_block;
++ int i, nid;
+ 
+  start_pfn = base >> PAGE_SHIFT;
+ 
+@@ -90,45 +105,21 @@ static int pseries_remove_memblock(unsigned long base, unsigned int memblock_siz
+   return 0;
+  }
+ 
+- zone = page_zone(pfn_to_page(start_pfn));
++ block_sz = memory_block_size_bytes();
++ sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
++ nid = memory_add_physaddr_to_nid(base);
+ 
+- /*
+-  * Remove section mappings and sysfs entries for the
+-  * section of the memory we are removing.
+-  *
+-  * NOTE: Ideally, this should be done in generic code like
+-  * remove_memory(). But remove_memory() gets called by writing
+-  * to sysfs "state" file and we can't remove sysfs entries
+-  * while writing to it. So we have to defer it to here.
+-  */
+- sections_to_remove = (memblock_size >> PAGE_SHIFT) / PAGES_PER_SECTION;
+- for (section = 0; section < sections_to_remove; section++) {
+-  unsigned long pfn = start_pfn + section * PAGES_PER_SECTION;
+-  ret = __remove_pages(zone, pfn, PAGES_PER_SECTION);
+-  if (ret)
+-   return ret;
++ for (i = 0; i < sections_per_block; i++) {
++  remove_memory(nid, base, MIN_MEMORY_BLOCK_SIZE);
++  base += MIN_MEMORY_BLOCK_SIZE;
+  }
+ 
+- /*
+-  * Update memory regions for memory remove
+-  */
++ /* Update memory regions for memory remove */
+  memblock_remove(base, memblock_size);
+-
+- /*
+-  * Remove htab bolted mappings for this section of memory
+-  */
+- start = (unsigned long)__va(base);
+- ret = remove_section_mapping(start, start + memblock_size);
+-
+- /* Ensure all vmalloc mappings are flushed in case they also
+-  * hit that section of memory
+-  */
+- vm_unmap_aliases();
+-
+- return ret;
++ return 0;
+ }
+ 
+-static int pseries_remove_memory(struct device_node *np)
++static int pseries_remove_mem_node(struct device_node *np)
+ {
+  const char *type;
+  const unsigned int *regs;
+@@ -153,8 +144,8 @@ static int pseries_remove_memory(struct device_node *np)
+  base = *(unsigned long *)regs;
+  lmb_size = regs[3];
+ 
+- ret = pseries_remove_memblock(base, lmb_size);
+- return ret;
++ pseries_remove_memblock(base, lmb_size);
++ return 0;
+ }
+ #else
+ static inline int pseries_remove_memblock(unsigned long base,
+@@ -162,13 +153,13 @@ static inline int pseries_remove_memblock(unsigned long base,
+ {
+  return -EOPNOTSUPP;
+ }
+-static inline int pseries_remove_memory(struct device_node *np)
++static inline int pseries_remove_mem_node(struct device_node *np)
+ {
+  return -EOPNOTSUPP;
+ }
+ #endif /* CONFIG_MEMORY_HOTREMOVE */
+ 
+-static int pseries_add_memory(struct device_node *np)
++static int pseries_add_mem_node(struct device_node *np)
+ {
+  const char *type;
+  const unsigned int *regs;
+@@ -254,10 +245,10 @@ static int pseries_memory_notifier(struct notifier_block *nb,
+ 
+  switch (action) {
+  case OF_RECONFIG_ATTACH_NODE:
+-  err = pseries_add_memory(node);
++  err = pseries_add_mem_node(node);
+   break;
+  case OF_RECONFIG_DETACH_NODE:
+-  err = pseries_remove_memory(node);
++  err = pseries_remove_mem_node(node);
+   break;
+  case OF_RECONFIG_UPDATE_PROPERTY:
+   pr = (struct of_prop_reconfig *)node;
+@@ -277,6 +268,10 @@ static int __init pseries_memory_hotplug_init(void)
+  if (firmware_has_feature(FW_FEATURE_LPAR))
+   of_reconfig_notifier_register(&pseries_mem_nb);
+ 
++#ifdef CONFIG_MEMORY_HOTREMOVE
++ ppc_md.remove_memory = pseries_remove_memory;
++#endif
++
+  return 0;
+ }
+ machine_device_initcall(pseries, pseries_memory_hotplug_init);
+-- 
+1.7.1

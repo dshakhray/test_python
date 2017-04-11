@@ -1,0 +1,81 @@
+From 57b2ceb2a478cc72fef3c391faad1464ef14d69a Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:00:04 -0400
+Subject: [fs] btrfs: fix extent state leak on transaction abortion
+
+Message-id: <1407179109-13714-118-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87076
+O-Subject: [RHEL7.1 PATCH 117/422] Btrfs: fix extent state leak on transaction abortion
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Liu Bo <bo.li.liu@oracle.com>
+
+commit 1a4319cc3c495d5b6b8e41f4d4c73b950d54c2be
+Author: Liu Bo <bo.li.liu@oracle.com>
+Date:   Mon Jan 13 19:53:53 2014 +0800
+
+    Btrfs: fix extent state leak on transaction abortion
+
+    When transaction is aborted, we fail to commit transaction, instead we do
+    cleanup work.  After that when we umount btrfs, we get to free fs roots' log
+    trees respectively, but that happens after we unpin extents, so those extents
+    pinned by freeing log trees will remain in memory and lead to the leak.
+
+    Signed-off-by: Liu Bo <bo.li.liu@oracle.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index f73d5ba..49d7cab 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -2064,6 +2064,12 @@ static void del_fs_roots(struct btrfs_fs_info *fs_info)
+   for (i = 0; i < ret; i++)
+    btrfs_drop_and_free_fs_root(fs_info, gang[i]);
+  }
++
++ if (test_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state)) {
++  btrfs_free_log_root_tree(NULL, fs_info);
++  btrfs_destroy_pinned_extent(fs_info->tree_root,
++         fs_info->pinned_extents);
++ }
+ }
+ 
+ int open_ctree(struct super_block *sb,
+@@ -3454,10 +3460,8 @@ void btrfs_drop_and_free_fs_root(struct btrfs_fs_info *fs_info,
+  if (btrfs_root_refs(&root->root_item) == 0)
+   synchronize_srcu(&fs_info->subvol_srcu);
+ 
+- if (test_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state)) {
++ if (test_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state))
+   btrfs_free_log(NULL, root);
+-  btrfs_free_log_root_tree(NULL, fs_info);
+- }
+ 
+  __btrfs_remove_free_space_cache(root->free_ino_pinned);
+  __btrfs_remove_free_space_cache(root->free_ino_ctl);
+@@ -3568,8 +3572,6 @@ int close_ctree(struct btrfs_root *root)
+  if (test_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state))
+   btrfs_error_commit_super(root);
+ 
+- btrfs_put_block_group_cache(fs_info);
+-
+  kthread_stop(fs_info->transaction_kthread);
+  kthread_stop(fs_info->cleaner_kthread);
+ 
+@@ -3587,6 +3589,8 @@ int close_ctree(struct btrfs_root *root)
+ 
+  del_fs_roots(fs_info);
+ 
++ btrfs_put_block_group_cache(fs_info);
++
+  btrfs_free_block_groups(fs_info);
+ 
+  btrfs_stop_all_workers(fs_info);
+-- 
+1.7.1

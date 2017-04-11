@@ -1,0 +1,173 @@
+From f2c1158cbee905cd31b41b3d95f9e0ea51fcf587 Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@redhat.com>
+Date: Fri, 5 Sep 2014 15:06:09 -0400
+Subject: [net] ipv6: add sysctl_mld_qrv to configure query robustness variable
+
+Message-id: <6f5f4b13e185e6b6e5ee64715944ffd8b380be2b.1409929553.git.hannes@redhat.com>
+Patchwork-id: 91460
+O-Subject: [PATCH RHEL7.1 net 1/2] ipv6: add sysctl_mld_qrv to configure query robustness variable
+Bugzilla: 1110118
+RH-Acked-by: Flavio Leitner <fbl@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110118
+Upstream Status: 2f711939d2ea9dfaecebecd1324d2ec7a7a21f65 (in net-next)
+Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=7923537
+Tested on beaker instances with multicast listener and interface enabling.
+
+Upstream Commit:
+commit 2f711939d2ea9dfaecebecd1324d2ec7a7a21f65
+Author: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date:   Tue Sep 2 15:49:25 2014 +0200
+
+    ipv6: add sysctl_mld_qrv to configure query robustness variable
+
+    This patch adds a new sysctl_mld_qrv knob to configure the mldv1/v2 query
+    robustness variable. It specifies how many retransmit of unsolicited mld
+    retransmit should happen. Admins might want to tune this on lossy links.
+
+    Also reset mld state on interface down/up, so we pick up new sysctl
+    settings during interface up event.
+
+    IPv6 certification requests this knob to be available.
+
+    I didn't make this knob netns specific, as it is mostly a setting in a
+    physical environment and should be per host.
+
+    Cc: Flavio Leitner <fbl@redhat.com>
+    Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Acked-by: Flavio Leitner <fbl@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Hannes Frederic Sowa <hannes@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index 1997f9a..a95ffab 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -1063,6 +1063,11 @@ bindv6only - BOOLEAN
+ 
+  Default: FALSE (as specified in RFC3493)
+ 
++mld_qrv - INTEGER
++ Controls the MLD query robustness variable (see RFC3810 9.1).
++ Default: 2 (as specified by RFC3810 9.1)
++ Minimum: 1 (as specified by RFC6636 4.5)
++
+ IPv6 Fragmentation:
+ 
+ ip6frag_high_thresh - INTEGER
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+index face22b..ff2fc75 100644
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -116,6 +116,7 @@ struct frag_hdr {
+ 
+ /* sysctls */
+ extern int sysctl_mld_max_msf;
++extern int sysctl_mld_qrv;
+ 
+ #define _DEVINC(net, statname, modifier, idev, field)   \
+ ({         \
+diff --git a/net/ipv6/mcast.c b/net/ipv6/mcast.c
+index e4ba797..2ba022f 100644
+--- a/net/ipv6/mcast.c
++++ b/net/ipv6/mcast.c
+@@ -121,6 +121,7 @@ static int ip6_mc_leave_src(struct sock *sk, struct ipv6_mc_socklist *iml,
+ #define IPV6_MLD_MAX_MSF 64
+ 
+ int sysctl_mld_max_msf __read_mostly = IPV6_MLD_MAX_MSF;
++int sysctl_mld_qrv __read_mostly = MLD_QRV_DEFAULT;
+ 
+ /*
+  * socket join on multicast group
+@@ -1191,15 +1192,16 @@ static void mld_update_qrv(struct inet6_dev *idev,
+   * and SHOULD NOT be one. Catch this here if we ever run
+   * into such a case in future.
+   */
++ const int min_qrv = min(MLD_QRV_DEFAULT, sysctl_mld_qrv);
+  WARN_ON(idev->mc_qrv == 0);
+ 
+  if (mlh2->mld2q_qrv > 0)
+   idev->mc_qrv = mlh2->mld2q_qrv;
+ 
+- if (unlikely(idev->mc_qrv < 2)) {
++ if (unlikely(idev->mc_qrv < min_qrv)) {
+   net_warn_ratelimited("IPv6: MLD: clamping QRV from %u to %u!\n",
+-         idev->mc_qrv, MLD_QRV_DEFAULT);
+-  idev->mc_qrv = MLD_QRV_DEFAULT;
++         idev->mc_qrv, min_qrv);
++  idev->mc_qrv = min_qrv;
+  }
+ }
+ 
+@@ -2477,6 +2479,14 @@ void ipv6_mc_down(struct inet6_dev *idev)
+  mld_clear_delrec(idev);
+ }
+ 
++static void ipv6_mc_reset(struct inet6_dev *idev)
++{
++ idev->mc_qrv = sysctl_mld_qrv;
++ idev->mc_qi = MLD_QI_DEFAULT;
++ idev->mc_qri = MLD_QRI_DEFAULT;
++ idev->mc_v1_seen = 0;
++ idev->mc_maxdelay = unsolicited_report_interval(idev);
++}
+ 
+ /* Device going up */
+ 
+@@ -2487,6 +2497,7 @@ void ipv6_mc_up(struct inet6_dev *idev)
+  /* Install multicast list, except for all-nodes (already installed) */
+ 
+  read_lock_bh(&idev->lock);
++ ipv6_mc_reset(idev);
+  for (i = idev->mc_list; i; i=i->next)
+   igmp6_group_added(i);
+  read_unlock_bh(&idev->lock);
+@@ -2507,13 +2518,7 @@ void ipv6_mc_init_dev(struct inet6_dev *idev)
+    (unsigned long)idev);
+  setup_timer(&idev->mc_dad_timer, mld_dad_timer_expire,
+       (unsigned long)idev);
+-
+- idev->mc_qrv = MLD_QRV_DEFAULT;
+- idev->mc_qi = MLD_QI_DEFAULT;
+- idev->mc_qri = MLD_QRI_DEFAULT;
+-
+- idev->mc_maxdelay = unsolicited_report_interval(idev);
+- idev->mc_v1_seen = 0;
++ ipv6_mc_reset(idev);
+  write_unlock_bh(&idev->lock);
+ }
+ 
+diff --git a/net/ipv6/sysctl_net_ipv6.c b/net/ipv6/sysctl_net_ipv6.c
+index 107b2f1..2d528c9 100644
+--- a/net/ipv6/sysctl_net_ipv6.c
++++ b/net/ipv6/sysctl_net_ipv6.c
+@@ -16,6 +16,8 @@
+ #include <net/addrconf.h>
+ #include <net/inet_frag.h>
+ 
++static int one = 1;
++
+ static struct ctl_table ipv6_table_template[] = {
+  {
+   .procname = "bindv6only",
+@@ -35,6 +37,14 @@ static struct ctl_table ipv6_rotable[] = {
+   .mode  = 0644,
+   .proc_handler = proc_dointvec
+  },
++ {
++  .procname = "mld_qrv",
++  .data  = &sysctl_mld_qrv,
++  .maxlen  = sizeof(int),
++  .mode  = 0644,
++  .proc_handler = proc_dointvec_minmax,
++  .extra1  = &one
++ },
+  { }
+ };
+ 
+-- 
+1.7.1

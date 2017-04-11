@@ -1,0 +1,150 @@
+From 62610addac1c1b8c701004356833d7ea6df3cb80 Mon Sep 17 00:00:00 2001
+From: Rob Clark <rclark@redhat.com>
+Date: Thu, 28 Aug 2014 22:18:45 -0400
+Subject: [mm] introduce helper function mem_init_print_info() to simplify mem_init()
+
+Message-id: <1409264329-9232-3-git-send-email-rclark@redhat.com>
+Patchwork-id: 89869
+O-Subject: [RHEL7 drm 2/6] mm: introduce helper function mem_init_print_info() to simplify mem_init()
+Bugzilla: 1101269
+RH-Acked-by: Jerome Glisse <jglisse@redhat.com>
+RH-Acked-by: Dave Airlie <airlied@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+RH-Acked-by: Larry Woodman <lwoodman@redhat.com>
+
+RHBZ: 1101269
+Backport from upstream
+
+commit 7ee3d4e8cd560500192d80ca84d7f15d6dee0807
+Author:     Jiang Liu <liuj97@gmail.com>
+AuthorDate: Wed Jul 3 15:03:41 2013 -0700
+Commit:     Linus Torvalds <torvalds@linux-foundation.org>
+CommitDate: Wed Jul 3 16:07:35 2013 -0700
+
+    mm: introduce helper function mem_init_print_info() to simplify mem_init()
+
+    Introduce helper function mem_init_print_info() to simplify mem_init()
+    across different architectures, which also unifies the format and
+    information printed.
+
+    Function mem_init_print_info() calculates memory statistics information
+    without walking each page, so it should be a little faster on some
+    architectures.
+
+    Also introduce another helper get_num_physpages() to kill the global
+    variable num_physpages.
+
+    Signed-off-by: Jiang Liu <jiang.liu@huawei.com>
+    Cc: Mel Gorman <mgorman@suse.de>
+    Cc: Michel Lespinasse <walken@google.com>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Minchan Kim <minchan@kernel.org>
+    Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: Rob Clark <rclark@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index da7e693..0510566 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1493,6 +1493,7 @@ static inline void adjust_managed_page_count(struct page *page, long count)
+ {
+  totalram_pages += count;
+ }
++extern void mem_init_print_info(const char *str);
+ 
+ /* Free the reserved page into the buddy system, so it gets managed. */
+ static inline void __free_reserved_page(struct page *page)
+@@ -1528,6 +1529,17 @@ static inline unsigned long free_initmem_default(int poison)
+       poison, "unused kernel");
+ }
+ 
++static inline unsigned long get_num_physpages(void)
++{
++ int nid;
++ unsigned long phys_pages = 0;
++
++ for_each_online_node(nid)
++  phys_pages += node_present_pages(nid);
++
++ return phys_pages;
++}
++
+ #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+ /*
+  * With CONFIG_HAVE_MEMBLOCK_NODE_MAP set, an architecture may initialise its
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index ee6c799..09cc9cd 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -61,6 +61,7 @@
+ #include <linux/hugetlb.h>
+ #include <linux/sched/rt.h>
+ 
++#include <asm/sections.h>
+ #include <asm/tlbflush.h>
+ #include <asm/div64.h>
+ #include "internal.h"
+@@ -5244,6 +5245,57 @@ void free_highmem_page(struct page *page)
+ }
+ #endif
+ 
++
++void __init mem_init_print_info(const char *str)
++{
++ unsigned long physpages, codesize, datasize, rosize, bss_size;
++ unsigned long init_code_size, init_data_size;
++
++ physpages = get_num_physpages();
++ codesize = _etext - _stext;
++ datasize = _edata - _sdata;
++ rosize = __end_rodata - __start_rodata;
++ bss_size = __bss_stop - __bss_start;
++ init_data_size = __init_end - __init_begin;
++ init_code_size = _einittext - _sinittext;
++
++ /*
++  * Detect special cases and adjust section sizes accordingly:
++  * 1) .init.* may be embedded into .data sections
++  * 2) .init.text.* may be out of [__init_begin, __init_end],
++  *    please refer to arch/tile/kernel/vmlinux.lds.S.
++  * 3) .rodata.* may be embedded into .text or .data sections.
++  */
++#define adj_init_size(start, end, size, pos, adj) \
++ if (start <= pos && pos < end && size > adj) \
++  size -= adj;
++
++ adj_init_size(__init_begin, __init_end, init_data_size,
++       _sinittext, init_code_size);
++ adj_init_size(_stext, _etext, codesize, _sinittext, init_code_size);
++ adj_init_size(_sdata, _edata, datasize, __init_begin, init_data_size);
++ adj_init_size(_stext, _etext, codesize, __start_rodata, rosize);
++ adj_init_size(_sdata, _edata, datasize, __start_rodata, rosize);
++
++#undef adj_init_size
++
++ printk("Memory: %luK/%luK available "
++        "(%luK kernel code, %luK rwdata, %luK rodata, "
++        "%luK init, %luK bss, %luK reserved"
++#ifdef CONFIG_HIGHMEM
++        ", %luK highmem"
++#endif
++        "%s%s)\n",
++        nr_free_pages() << (PAGE_SHIFT-10), physpages << (PAGE_SHIFT-10),
++        codesize >> 10, datasize >> 10, rosize >> 10,
++        (init_data_size + init_code_size) >> 10, bss_size >> 10,
++        (physpages - totalram_pages) << (PAGE_SHIFT-10),
++#ifdef CONFIG_HIGHMEM
++        totalhigh_pages << (PAGE_SHIFT-10),
++#endif
++        str ? ", " : "", str ? str : "");
++}
++
+ /**
+  * set_dma_reserve - set the specified number of pages reserved in the first zone
+  * @new_dma_reserve: The number of pages to mark reserved
+-- 
+1.7.1

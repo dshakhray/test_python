@@ -1,0 +1,116 @@
+From 7f87bd0c037222926f058819649a5e93523660eb Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:38:17 -0400
+Subject: [virt] kvm/emulator: Rename VendorSpecific flag
+
+Message-id: <1406040016-3289-103-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86181
+O-Subject: [RHEL7 PATCH v2 102/221] kvm, emulator: Rename VendorSpecific flag
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Borislav Petkov <bp@suse.de>
+
+Call it EmulateOnUD which is exactly what we're trying to do with
+vendor-specific instructions.
+
+Rename ->only_vendor_specific_insn to something shorter, while at it.
+
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b51e974fcdabd00c8f5943ee7943c4ea788f57b6)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/kvm_emulate.h b/arch/x86/include/asm/kvm_emulate.h
+index 92a176a..24ec121 100644
+--- a/arch/x86/include/asm/kvm_emulate.h
++++ b/arch/x86/include/asm/kvm_emulate.h
+@@ -274,7 +274,7 @@ struct x86_emulate_ctxt {
+ 
+  bool guest_mode; /* guest running a nested guest */
+  bool perm_ok; /* do not check permissions if true */
+- bool only_vendor_specific_insn;
++ bool ud; /* inject an #UD if host doesn't support insn */
+ 
+  bool have_exception;
+  struct x86_exception exception;
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index 23a276e..3a23546 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -130,7 +130,7 @@
+ #define Mov         (1<<20)
+ /* Misc flags */
+ #define Prot        (1<<21) /* instruction generates #UD if not in prot-mode */
+-#define VendorSpecific (1<<22) /* Vendor specific instruction */
++#define EmulateOnUD (1<<22) /* Emulate if unsupported by the host */
+ #define NoAccess    (1<<23) /* Don't access memory (lea/invlpg/verr etc) */
+ #define Op3264      (1<<24) /* Operand is 64b in long mode, 32b otherwise */
+ #define Undefined   (1<<25) /* No Such Instruction */
+@@ -3514,7 +3514,7 @@ static const struct opcode group7_rm1[] = {
+ 
+ static const struct opcode group7_rm3[] = {
+  DIP(SrcNone | Prot | Priv,  vmrun,  check_svme_pa),
+- II(SrcNone  | Prot | VendorSpecific, em_vmmcall, vmmcall),
++ II(SrcNone  | Prot | EmulateOnUD, em_vmmcall, vmmcall),
+  DIP(SrcNone | Prot | Priv,  vmload,  check_svme_pa),
+  DIP(SrcNone | Prot | Priv,  vmsave,  check_svme_pa),
+  DIP(SrcNone | Prot | Priv,  stgi,  check_svme),
+@@ -3599,7 +3599,7 @@ static const struct group_dual group7 = { {
+  II(SrcMem16 | Mov | Priv,  em_lmsw, lmsw),
+  II(SrcMem | ByteOp | Priv | NoAccess, em_invlpg, invlpg),
+ }, {
+- I(SrcNone | Priv | VendorSpecific, em_vmcall),
++ I(SrcNone | Priv | EmulateOnUD, em_vmcall),
+  EXT(0, group7_rm1),
+  N, EXT(0, group7_rm3),
+  II(SrcNone | DstMem | Mov,  em_smsw, smsw), N,
+@@ -3827,7 +3827,7 @@ static const struct opcode opcode_table[256] = {
+ static const struct opcode twobyte_table[256] = {
+  /* 0x00 - 0x0F */
+  G(0, group6), GD(0, &group7), N, N,
+- N, I(ImplicitOps | VendorSpecific, em_syscall),
++ N, I(ImplicitOps | EmulateOnUD, em_syscall),
+  II(ImplicitOps | Priv, em_clts, clts), N,
+  DI(ImplicitOps | Priv, invd), DI(ImplicitOps | Priv, wbinvd), N, N,
+  N, D(ImplicitOps | ModRM), N, N,
+@@ -3849,8 +3849,8 @@ static const struct opcode twobyte_table[256] = {
+  IIP(ImplicitOps, em_rdtsc, rdtsc, check_rdtsc),
+  II(ImplicitOps | Priv, em_rdmsr, rdmsr),
+  IIP(ImplicitOps, em_rdpmc, rdpmc, check_rdpmc),
+- I(ImplicitOps | VendorSpecific, em_sysenter),
+- I(ImplicitOps | Priv | VendorSpecific, em_sysexit),
++ I(ImplicitOps | EmulateOnUD, em_sysenter),
++ I(ImplicitOps | Priv | EmulateOnUD, em_sysexit),
+  N, N,
+  N, N, N, N, N, N, N, N,
+  /* 0x40 - 0x4F */
+@@ -4290,7 +4290,7 @@ done_prefixes:
+  if (ctxt->d == 0 || (ctxt->d & NotImpl))
+   return EMULATION_FAILED;
+ 
+- if (!(ctxt->d & VendorSpecific) && ctxt->only_vendor_specific_insn)
++ if (!(ctxt->d & EmulateOnUD) && ctxt->ud)
+   return EMULATION_FAILED;
+ 
+  if (mode == X86EMUL_MODE_PROT64 && (ctxt->d & Stack))
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index a9c636b..f9f1aa2 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5140,8 +5140,7 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu,
+   ctxt->have_exception = false;
+   ctxt->perm_ok = false;
+ 
+-  ctxt->only_vendor_specific_insn
+-   = emulation_type & EMULTYPE_TRAP_UD;
++  ctxt->ud = emulation_type & EMULTYPE_TRAP_UD;
+ 
+   r = x86_decode_insn(ctxt, insn, insn_len);
+ 
+-- 
+1.7.1

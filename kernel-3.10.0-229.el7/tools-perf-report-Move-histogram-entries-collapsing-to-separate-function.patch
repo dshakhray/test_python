@@ -1,0 +1,129 @@
+From 36fbafa238730ec24cb47550ea309a66dac44157 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:52:06 -0400
+Subject: [tools] perf/report: Move histogram entries collapsing to separate function
+
+Message-id: <1408953210-26343-239-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88877
+O-Subject: [PATCH RHEL7.1 BZ1133083 238/322] perf report: Move histogram entries collapsing to separate function
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit f6d8b0571c9ac8f273d18c112c2fc3c9533c9f0a
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date: Wed Jan 8 14:45:24 2014 -0300
+
+description
+===========
+Further uncluttering the main 'report' function by group related code in
+separate function.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 03941ad..cff9465 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -486,13 +486,55 @@ static int report__browse_hists(struct report *rep)
+  return ret;
+ }
+ 
++static u64 report__collapse_hists(struct report *rep)
++{
++ struct ui_progress prog;
++ struct perf_evsel *pos;
++ u64 nr_samples = 0;
++ /*
++   * Count number of histogram entries to use when showing progress,
++   * reusing nr_samples variable.
++   */
++ list_for_each_entry(pos, &rep->session->evlist->entries, node)
++  nr_samples += pos->hists.nr_entries;
++
++ ui_progress__init(&prog, nr_samples, "Merging related events...");
++ /*
++  * Count total number of samples, will be used to check if this
++   * session had any.
++   */
++ nr_samples = 0;
++
++ list_for_each_entry(pos, &rep->session->evlist->entries, node) {
++  struct hists *hists = &pos->hists;
++
++  if (pos->idx == 0)
++   hists->symbol_filter_str = rep->symbol_filter_str;
++
++  hists__collapse_resort(hists, &prog);
++  nr_samples += hists->stats.nr_events[PERF_RECORD_SAMPLE];
++
++  /* Non-group events are considered as leader */
++  if (symbol_conf.event_group &&
++      !perf_evsel__is_group_leader(pos)) {
++   struct hists *leader_hists = &pos->leader->hists;
++
++   hists__match(leader_hists, hists);
++   hists__link(leader_hists, hists);
++  }
++ }
++
++ ui_progress__finish();
++
++ return nr_samples;
++}
++
+ static int __cmd_report(struct report *rep)
+ {
+- int ret = -EINVAL;
++ int ret;
+  u64 nr_samples;
+  struct perf_session *session = rep->session;
+  struct perf_evsel *pos;
+- struct ui_progress prog;
+  struct perf_data_file *file = session->file;
+ 
+  signal(SIGINT, sig_handler);
+@@ -530,32 +572,7 @@ static int __cmd_report(struct report *rep)
+   }
+  }
+ 
+- nr_samples = 0;
+- list_for_each_entry(pos, &session->evlist->entries, node)
+-  nr_samples += pos->hists.nr_entries;
+-
+- ui_progress__init(&prog, nr_samples, "Merging related events...");
+-
+- nr_samples = 0;
+- list_for_each_entry(pos, &session->evlist->entries, node) {
+-  struct hists *hists = &pos->hists;
+-
+-  if (pos->idx == 0)
+-   hists->symbol_filter_str = rep->symbol_filter_str;
+-
+-  hists__collapse_resort(hists, &prog);
+-  nr_samples += hists->stats.nr_events[PERF_RECORD_SAMPLE];
+-
+-  /* Non-group events are considered as leader */
+-  if (symbol_conf.event_group &&
+-      !perf_evsel__is_group_leader(pos)) {
+-   struct hists *leader_hists = &pos->leader->hists;
+-
+-   hists__match(leader_hists, hists);
+-   hists__link(leader_hists, hists);
+-  }
+- }
+- ui_progress__finish();
++ nr_samples = report__collapse_hists(rep);
+ 
+  if (session_done())
+   return 0;
+-- 
+1.7.1

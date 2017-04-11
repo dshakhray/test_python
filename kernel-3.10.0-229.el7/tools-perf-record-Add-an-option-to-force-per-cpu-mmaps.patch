@@ -1,0 +1,123 @@
+From 6ebcf8324e207a2b6d59cae4d035d26ef0ae31a9 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:28:08 -0400
+Subject: [tools] perf/record: Add an option to force per-cpu mmaps
+
+Message-id: <1408462094-14194-320-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88271
+O-Subject: [PATCH RHEL7.1 BZ1131394 319/325] perf record: Add an option to force per-cpu mmaps
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 539e6bb71e350541105e67e3d6c31392d9da25ef
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Fri Nov 1 15:51:34 2013 +0200
+
+description
+===========
+By default, when tasks are specified (i.e. -p, -t or -u options)
+per-thread mmaps are created.
+
+Add an option to override that and force per-cpu mmaps.
+
+Further comments by peterz:
+
+So this option allows -t/-p/-u to create one buffer per cpu and attach
+all the various thread/process/user tasks' their counters to that one
+buffer?
+
+As opposed to the current state where each such counter would have its
+own buffer.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/Documentation/perf-record.txt b/tools/perf/Documentation/perf-record.txt
+index 052f7c4..43b42c4 100644
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@ -201,6 +201,12 @@ abort events and some memory events in precise mode on modern Intel CPUs.
+ --transaction::
+ Record transaction flags for transaction related events.
+ 
++--force-per-cpu::
++Force the use of per-cpu mmaps.  By default, when tasks are specified (i.e. -p,
++-t or -u options) per-thread mmaps are created.  This option overrides that and
++forces per-cpu mmaps.  A side-effect of that is that inheritance is
++automatically enabled.  Add the -i option also to disable inheritance.
++
+ SEE ALSO
+ --------
+ linkperf:perf-stat[1], linkperf:perf-list[1]
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index 4d644fe..7c8020a 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -888,6 +888,8 @@ const struct option record_options[] = {
+       "sample by weight (on special events only)"),
+  OPT_BOOLEAN(0, "transaction", &record.opts.sample_transaction,
+       "sample transaction flags (special events only)"),
++ OPT_BOOLEAN(0, "force-per-cpu", &record.opts.target.force_per_cpu,
++      "force the use of per-cpu mmaps"),
+  OPT_END()
+ };
+ 
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index 5ce2ace..bbc746a 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -819,7 +819,9 @@ int perf_evlist__create_maps(struct perf_evlist *evlist, struct target *target)
+  if (evlist->threads == NULL)
+   return -1;
+ 
+- if (target__has_task(target))
++ if (target->force_per_cpu)
++  evlist->cpus = cpu_map__new(target->cpu_list);
++ else if (target__has_task(target))
+   evlist->cpus = cpu_map__dummy_new();
+  else if (!target__has_cpu(target) && !target->uses_mmap)
+   evlist->cpus = cpu_map__dummy_new();
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 18f7c18..46dd4c2 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -645,7 +645,7 @@ void perf_evsel__config(struct perf_evsel *evsel,
+   }
+  }
+ 
+- if (target__has_cpu(&opts->target))
++ if (target__has_cpu(&opts->target) || opts->target.force_per_cpu)
+   perf_evsel__set_sample_bit(evsel, CPU);
+ 
+  if (opts->period)
+@@ -653,7 +653,7 @@ void perf_evsel__config(struct perf_evsel *evsel,
+ 
+  if (!perf_missing_features.sample_id_all &&
+      (opts->sample_time || !opts->no_inherit ||
+-      target__has_cpu(&opts->target)))
++      target__has_cpu(&opts->target) || opts->target.force_per_cpu))
+   perf_evsel__set_sample_bit(evsel, TIME);
+ 
+  if (opts->raw_samples) {
+diff --git a/tools/perf/util/target.h b/tools/perf/util/target.h
+index 89bab71..2d0c506 100644
+--- a/tools/perf/util/target.h
++++ b/tools/perf/util/target.h
+@@ -12,6 +12,7 @@ struct target {
+  uid_t      uid;
+  bool      system_wide;
+  bool      uses_mmap;
++ bool      force_per_cpu;
+ };
+ 
+ enum target_errno {
+-- 
+1.7.1

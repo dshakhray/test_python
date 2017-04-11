@@ -1,0 +1,71 @@
+From 9166386f45b0fb638e4155430dc0572a89064e99 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:23:10 -0400
+Subject: [tools] perf: Optimize perf_output_begin()
+
+Message-id: <1408462094-14194-22-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88005
+O-Subject: [PATCH RHEL7.1 BZ1131394 021/325] perf: Optimize perf_output_begin()
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 85f59edf9684603026c64c902791748116d29478
+Author: Peter Zijlstra <peterz@infradead.org>
+Date: Thu Oct 31 17:25:38 2013 +0100
+
+description
+===========
+There's no point in re-doing the memory-barrier when we fail the
+cmpxchg(). Also placing it after the space reservation loop makes it
+clearer it only separates the userpage->tail read from the data
+stores.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 383cde4..6ed16ec 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -141,15 +141,7 @@ int perf_output_begin(struct perf_output_handle *handle,
+  perf_output_get_handle(handle);
+ 
+  do {
+-  /*
+-   * Userspace could choose to issue a mb() before updating the
+-   * tail pointer. So that all reads will be completed before the
+-   * write is issued.
+-   *
+-   * See perf_output_put_handle().
+-   */
+   tail = ACCESS_ONCE(rb->user_page->data_tail);
+-  smp_mb();
+   offset = head = local_read(&rb->head);
+   if (!rb->overwrite &&
+       unlikely(CIRC_SPACE(head, tail, perf_data_size(rb)) < size))
+@@ -157,6 +149,15 @@ int perf_output_begin(struct perf_output_handle *handle,
+   head += size;
+  } while (local_cmpxchg(&rb->head, offset, head) != offset);
+ 
++ /*
++  * Separate the userpage->tail read from the data stores below.
++  * Matches the MB userspace SHOULD issue after reading the data
++  * and before storing the new tail position.
++  *
++  * See perf_output_put_handle().
++  */
++ smp_mb();
++
+  if (unlikely(head - local_read(&rb->wakeup) > rb->watermark))
+   local_add(rb->watermark, &rb->wakeup);
+ 
+-- 
+1.7.1

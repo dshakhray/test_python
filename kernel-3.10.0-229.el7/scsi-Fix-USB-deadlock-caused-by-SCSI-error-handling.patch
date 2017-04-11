@@ -1,0 +1,55 @@
+From 25368af5906401a95b61ad87be3e51597545294b Mon Sep 17 00:00:00 2001
+From: Ewan Milne <emilne@redhat.com>
+Date: Tue, 24 Jun 2014 18:38:11 -0400
+Subject: [scsi] Fix USB deadlock caused by SCSI error handling
+
+Message-id: <1403635094-26187-4-git-send-email-emilne@redhat.com>
+Patchwork-id: 84677
+O-Subject: [RHEL7.0 PATCH 3/6] [SCSI] Fix USB deadlock caused by SCSI error handling
+Bugzilla: 1103881
+RH-Acked-by: Bryn M. Reeves <bmr@redhat.com>
+RH-Acked-by: Rob Evers <revers@redhat.com>
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+
+USB requires that every command be aborted first before we escalate to reset.
+In particular, USB will deadlock if we try to reset first before aborting the
+command.
+
+Unfortunately, the flag we use to tell if a command has already been aborted:
+SCSI_EH_ABORT_SCHEDULED is not cleared properly leading to cases where we can
+requeue a command with the flag set and proceed immediately to reset if it
+fails (thus causing USB to deadlock).
+
+Fix by clearing the SCSI_EH_ABORT_SCHEDULED flag if it has been set.  Which
+means this will be the second time scsi_abort_command() has been called for
+the same command.  IE the first abort went out, did its thing, but now the
+same command has timed out again.
+
+So this flag gets cleared, and scsi_abort_command() returns FAILED, and _no_
+asynchronous abort is being scheduled.  scsi_times_out() will then proceed to
+call scsi_eh_scmd_add().  But as we've cleared the SCSI_EH_ABORT_SCHEDULED
+flag the SCSI_EH_CANCEL_CMD flag will continue to be set, and the command will
+be aborted with the main SCSI EH routine.
+
+Reported-by: Alan Stern <stern@rowland.harvard.edu>
+Tested-by: Andreas Reis <andreas.reis@gmail.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+(cherry picked from commit 7daf480483e60898f30e0a2a84fecada7a7cfac0)
+Signed-off-by: Ewan D. Milne <emilne@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index ca03236..8c62ae2 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -189,6 +189,7 @@ scsi_abort_command(struct scsi_cmnd *scmd)
+   /*
+    * Retry after abort failed, escalate to next level.
+    */
++  scmd->eh_eflags &= ~SCSI_EH_ABORT_SCHEDULED;
+   SCSI_LOG_ERROR_RECOVERY(3,
+    scmd_printk(KERN_INFO, scmd,
+         "scmd %p previous abort failed\n", scmd));
+-- 
+1.7.1

@@ -1,0 +1,87 @@
+From bc51d49a0e9e56928a6f2afdd0f658f9a5de3be8 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:26:04 -0400
+Subject: [tools] perf/trace: Improve event processing exit
+
+Message-id: <1408462094-14194-196-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88222
+O-Subject: [PATCH RHEL7.1 BZ1131394 195/325] perf trace: Improve event processing exit
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit ba209f856380891a6ea6cdb07b2b068faccbff73
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date: Wed Oct 16 11:57:33 2013 -0300
+
+description
+===========
+We need to differentiate SIGCHLD from SIGINT, the later should cause as
+immediate as possible exit, while the former should wait to process the
+events that may be perceived in the ring buffer after the SIGCHLD is
+handled.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-trace.c b/tools/perf/builtin-trace.c
+index 8f2e7ad..90582e3 100644
+--- a/tools/perf/builtin-trace.c
++++ b/tools/perf/builtin-trace.c
+@@ -1098,10 +1098,12 @@ static size_t trace__fprintf_tstamp(struct trace *trace, u64 tstamp, FILE *fp)
+ }
+ 
+ static bool done = false;
++static bool interrupted = false;
+ 
+-static void sig_handler(int sig __maybe_unused)
++static void sig_handler(int sig)
+ {
+  done = true;
++ interrupted = sig == SIGINT;
+ }
+ 
+ static size_t trace__fprintf_entry_head(struct trace *trace, struct thread *thread,
+@@ -1773,24 +1775,23 @@ again:
+ next_event:
+    perf_evlist__mmap_consume(evlist, i);
+ 
+-   if (done)
+-    goto out_unmap_evlist;
++   if (interrupted)
++    goto out_disable;
+   }
+  }
+ 
+  if (trace->nr_events == before) {
+-  if (done)
+-   goto out_unmap_evlist;
++  int timeout = done ? 100 : -1;
+ 
+-  poll(evlist->pollfd, evlist->nr_fds, -1);
++  if (poll(evlist->pollfd, evlist->nr_fds, timeout) > 0)
++   goto again;
++ } else {
++  goto again;
+  }
+ 
+- if (done)
+-  perf_evlist__disable(evlist);
+- else
+-  goto again;
++out_disable:
++ perf_evlist__disable(evlist);
+ 
+-out_unmap_evlist:
+  if (!err) {
+   if (trace->summary)
+    trace__fprintf_thread_summary(trace, trace->output);
+-- 
+1.7.1

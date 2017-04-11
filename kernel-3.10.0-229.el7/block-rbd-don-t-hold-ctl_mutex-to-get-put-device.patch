@@ -1,0 +1,117 @@
+From 09e917f371cbcbc11c1717bb89683e3e5eec3d70 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:22:00 -0400
+Subject: [block] rbd: don't hold ctl_mutex to get/put device
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-14-git-send-email-sweil@redhat.com>
+Patchwork-id: 89698
+O-Subject: [PATCH 013/303] rbd: don't hold ctl_mutex to get/put device
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Alex Elder <elder@inktank.com>
+
+When an rbd device is first getting mapped, its device registration
+is protected the control mutex.  There is no need to do that though,
+because the device has already been assigned an id that's guaranteed
+to be unique.
+
+An unmap of an rbd device won't proceed if the device has a non-zero
+open count or is already being unmapped.  So there's no need to hold
+the control mutex in that case either.
+
+Finally, an rbd device can't be opened if it is being removed, and
+it won't go away if there is a non-zero open count.  So here too
+there's no need to hold the control mutex while getting or putting a
+reference to an rbd device's Linux device structure.
+
+Drop the mutex calls in these cases.
+
+Signed-off-by: Alex Elder <elder@inktank.com>
+Reviewed-by: Josh Durgin <josh.durgin@inktank.com>
+(cherry picked from commit 1ba0f1e7975ad07557f7a931522bdcd813ae35f6)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 199e829..e98ea72 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -489,10 +489,8 @@ static int rbd_open(struct block_device *bdev, fmode_t mode)
+  if (removing)
+   return -ENOENT;
+ 
+- mutex_lock_nested(&ctl_mutex, SINGLE_DEPTH_NESTING);
+  (void) get_device(&rbd_dev->dev);
+  set_device_ro(bdev, rbd_dev->mapping.read_only);
+- mutex_unlock(&ctl_mutex);
+ 
+  return 0;
+ }
+@@ -507,9 +505,7 @@ static void rbd_release(struct gendisk *disk, fmode_t mode)
+  spin_unlock_irq(&rbd_dev->lock);
+  rbd_assert(open_count_before > 0);
+ 
+- mutex_lock_nested(&ctl_mutex, SINGLE_DEPTH_NESTING);
+  put_device(&rbd_dev->dev);
+- mutex_unlock(&ctl_mutex);
+ }
+ 
+ static const struct block_device_operations rbd_bd_ops = {
+@@ -4332,8 +4328,6 @@ static int rbd_bus_add_dev(struct rbd_device *rbd_dev)
+  struct device *dev;
+  int ret;
+ 
+- mutex_lock_nested(&ctl_mutex, SINGLE_DEPTH_NESTING);
+-
+  dev = &rbd_dev->dev;
+  dev->bus = &rbd_bus_type;
+  dev->type = &rbd_device_type;
+@@ -4342,8 +4336,6 @@ static int rbd_bus_add_dev(struct rbd_device *rbd_dev)
+  dev_set_name(dev, "%d", rbd_dev->dev_id);
+  ret = device_register(dev);
+ 
+- mutex_unlock(&ctl_mutex);
+-
+  return ret;
+ }
+ 
+@@ -5149,8 +5141,6 @@ static ssize_t rbd_remove(struct bus_type *bus,
+  if (dev_id != ul)
+   return -EINVAL;
+ 
+- mutex_lock_nested(&ctl_mutex, SINGLE_DEPTH_NESTING);
+-
+  ret = -ENOENT;
+  spin_lock(&rbd_dev_list_lock);
+  list_for_each(tmp, &rbd_dev_list) {
+@@ -5171,7 +5161,7 @@ static ssize_t rbd_remove(struct bus_type *bus,
+  }
+  spin_unlock(&rbd_dev_list_lock);
+  if (ret < 0 || already)
+-  goto done;
++  return ret;
+ 
+  rbd_bus_del_dev(rbd_dev);
+  ret = rbd_dev_header_watch_sync(rbd_dev, false);
+@@ -5179,11 +5169,8 @@ static ssize_t rbd_remove(struct bus_type *bus,
+   rbd_warn(rbd_dev, "failed to cancel watch event (%d)\n", ret);
+  rbd_dev_image_release(rbd_dev);
+  module_put(THIS_MODULE);
+- ret = count;
+-done:
+- mutex_unlock(&ctl_mutex);
+ 
+- return ret;
++ return count;
+ }
+ 
+ /*
+-- 
+1.7.1

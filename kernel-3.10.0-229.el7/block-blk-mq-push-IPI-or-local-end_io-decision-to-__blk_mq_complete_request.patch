@@ -1,0 +1,82 @@
+From be026600d0dd3e8b5da619011b6c1f5342b31bac Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:36:28 -0400
+Subject: [block] blk-mq: push IPI or local end_io decision to __blk_mq_complete_request()
+
+Message-id: <1402670238-13916-101-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83841
+O-Subject: [RHEL7.1 PATCH 100/150] blk-mq: push IPI or local end_io decision to __blk_mq_complete_request()
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit ed851860b4552fc8963ecf71eab9f6f7a5c19d74
+Author: Jens Axboe <axboe@fb.com>
+Date:   Fri May 30 21:20:50 2014 -0600
+
+    blk-mq: push IPI or local end_io decision to __blk_mq_complete_request()
+
+    We have callers outside of the blk-mq proper (like timeouts) that
+    want to call __blk_mq_complete_request(), so rename the function
+    and put the decision code for whether to use ->softirq_done_fn
+    or blk_mq_endio() into __blk_mq_complete_request().
+
+    This also makes the interface more logical again.
+    blk_mq_complete_request() attempts to atomically mark the request
+    completed, and calls __blk_mq_complete_request() if successful.
+    __blk_mq_complete_request() then just ends the request.
+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 5443aea..0f5879c 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -359,7 +359,7 @@ static void __blk_mq_complete_request_remote(void *data)
+  rq->q->softirq_done_fn(rq);
+ }
+ 
+-void __blk_mq_complete_request(struct request *rq)
++static void blk_mq_ipi_complete_request(struct request *rq)
+ {
+  struct blk_mq_ctx *ctx = rq->mq_ctx;
+  bool shared = false;
+@@ -385,6 +385,16 @@ void __blk_mq_complete_request(struct request *rq)
+  put_cpu();
+ }
+ 
++void __blk_mq_complete_request(struct request *rq)
++{
++ struct request_queue *q = rq->q;
++
++ if (!q->softirq_done_fn)
++  blk_mq_end_io(rq, rq->errors);
++ else
++  blk_mq_ipi_complete_request(rq);
++}
++
+ /**
+  * blk_mq_complete_request - end I/O on a request
+  * @rq:  the request being processed
+@@ -399,12 +409,8 @@ void blk_mq_complete_request(struct request *rq)
+ 
+  if (unlikely(blk_should_fake_timeout(q)))
+   return;
+- if (!blk_mark_rq_complete(rq)) {
+-  if (q->softirq_done_fn)
+-   __blk_mq_complete_request(rq);
+-  else
+-   blk_mq_end_io(rq, rq->errors);
+- }
++ if (!blk_mark_rq_complete(rq))
++  __blk_mq_complete_request(rq);
+ }
+ EXPORT_SYMBOL(blk_mq_complete_request);
+ 
+-- 
+1.7.1

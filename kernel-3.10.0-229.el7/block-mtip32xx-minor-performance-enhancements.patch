@@ -1,0 +1,141 @@
+From 1f2fa0e84ed39fe1940c94a4416bb9fb6866d027 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 15:30:21 -0400
+Subject: [block] mtip32xx: minor performance enhancements
+
+Message-id: <1402673421-17117-19-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83920
+O-Subject: [RHEL7.1 PATCH 18/18] mtip32xx: minor performance enhancements
+Bugzilla: 1105703
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+
+BZ: 1105703
+
+Upstream commit f45c40a92d2c6915a0e88ff8a947095be2ba1c8e
+Author: Sam Bradshaw <sbradshaw@micron.com>
+Date:   Fri Jun 6 13:28:48 2014 -0600
+
+    mtip32xx: minor performance enhancements
+
+    This patch adds the following:
+
+    1) Compiler hinting in the fast path.
+    2) A prefetch of port->flags to eliminate moderate cpu stalling later
+    in mtip_hw_submit_io().
+    3) Eliminate a redundant rq_data_dir().
+    4) Reorder members of driver_data to eliminate false cacheline sharing
+    between irq_workers_active and unal_qdepth.
+
+    With some workload and topology configurations, I'm seeing ~1.5%
+    throughput improvement in small block random read benchmarks as well
+    as improved latency std. dev.
+
+    Signed-off-by: Sam Bradshaw <sbradshaw@micron.com>
+
+    Add include of <linux/prefetch.h>
+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/mtip32xx/mtip32xx.c b/drivers/block/mtip32xx/mtip32xx.c
+index 06985e7..9f86fb6 100644
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@ -39,6 +39,7 @@
+ #include <../drivers/ata/ahci.h>
+ #include <linux/export.h>
+ #include <linux/debugfs.h>
++#include <linux/prefetch.h>
+ #include "mtip32xx.h"
+ 
+ #define HW_CMD_SLOT_SZ  (MTIP_MAX_COMMAND_SLOTS * 32)
+@@ -2380,6 +2381,8 @@ static void mtip_hw_submit_io(struct driver_data *dd, struct request *rq,
+  /* Map the scatter list for DMA access */
+  nents = dma_map_sg(&dd->pdev->dev, command->sg, nents, dma_dir);
+ 
++ prefetch(&port->flags);
++
+  command->scatter_ents = nents;
+ 
+  /*
+@@ -2392,7 +2395,7 @@ static void mtip_hw_submit_io(struct driver_data *dd, struct request *rq,
+  fis = command->command;
+  fis->type        = 0x27;
+  fis->opts        = 1 << 7;
+- if (rq_data_dir(rq) == READ)
++ if (dma_dir == DMA_FROM_DEVICE)
+   fis->command = ATA_CMD_FPDMA_READ;
+  else
+   fis->command = ATA_CMD_FPDMA_WRITE;
+@@ -2412,7 +2415,7 @@ static void mtip_hw_submit_io(struct driver_data *dd, struct request *rq,
+  fis->res3        = 0;
+  fill_command_sg(dd, command, nents);
+ 
+- if (command->unaligned)
++ if (unlikely(command->unaligned))
+   fis->device |= 1 << 7;
+ 
+  /* Populate the command header */
+@@ -2433,7 +2436,7 @@ static void mtip_hw_submit_io(struct driver_data *dd, struct request *rq,
+   * To prevent this command from being issued
+   * if an internal command is in progress or error handling is active.
+   */
+- if (port->flags & MTIP_PF_PAUSE_IO) {
++ if (unlikely(port->flags & MTIP_PF_PAUSE_IO)) {
+   set_bit(rq->tag, port->cmds_to_issue);
+   set_bit(MTIP_PF_ISSUE_CMDS_BIT, &port->flags);
+   return;
+@@ -3754,7 +3757,7 @@ static bool mtip_check_unal_depth(struct blk_mq_hw_ctx *hctx,
+  struct driver_data *dd = hctx->queue->queuedata;
+  struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
+ 
+- if (!dd->unal_qdepth || rq_data_dir(rq) == READ)
++ if (rq_data_dir(rq) == READ || !dd->unal_qdepth)
+   return false;
+ 
+  /*
+@@ -3776,11 +3779,11 @@ static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ {
+  int ret;
+ 
+- if (mtip_check_unal_depth(hctx, rq))
++ if (unlikely(mtip_check_unal_depth(hctx, rq)))
+   return BLK_MQ_RQ_QUEUE_BUSY;
+ 
+  ret = mtip_submit_request(hctx, rq);
+- if (!ret)
++ if (likely(!ret))
+   return BLK_MQ_RQ_QUEUE_OK;
+ 
+  rq->errors = ret;
+diff --git a/drivers/block/mtip32xx/mtip32xx.h b/drivers/block/mtip32xx/mtip32xx.h
+index 4b9b554..ba1b31e 100644
+--- a/drivers/block/mtip32xx/mtip32xx.h
++++ b/drivers/block/mtip32xx/mtip32xx.h
+@@ -493,19 +493,19 @@ struct driver_data {
+ 
+  struct workqueue_struct *isr_workq;
+ 
+- struct mtip_work work[MTIP_MAX_SLOT_GROUPS];
+-
+  atomic_t irq_workers_active;
+ 
++ struct mtip_work work[MTIP_MAX_SLOT_GROUPS];
++
+  int isr_binding;
+ 
+  struct block_device *bdev;
+ 
+- int unal_qdepth; /* qdepth of unaligned IO queue */
+-
+  struct list_head online_list; /* linkage for online list */
+ 
+  struct list_head remove_list; /* linkage for removing list */
++
++ int unal_qdepth; /* qdepth of unaligned IO queue */
+ };
+ 
+ #endif
+-- 
+1.7.1

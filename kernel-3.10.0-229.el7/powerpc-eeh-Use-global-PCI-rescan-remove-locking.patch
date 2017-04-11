@@ -1,0 +1,113 @@
+From a398e58edf4f50c335cb06a9e8d5357c60f53e4d Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Sat, 19 Jul 2014 04:29:46 -0400
+Subject: [powerpc] eeh: Use global PCI rescan-remove locking
+
+Message-id: <20140719042945.19438.38103.stgit@gir.stowe>
+Patchwork-id: 86029
+O-Subject: [RHEL7.1 PATCH 67/81] powerpc/eeh: Use global PCI rescan-remove locking
+Bugzilla: 1110895
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110895
+Upstream Status: 1c2042c83aa7af10579b71a1fe5e22bbae69f08c
+
+commit 1c2042c83aa7af10579b71a1fe5e22bbae69f08c
+Author: Rafael J. Wysocki <rjw@rjwysocki.net>
+Date:   Wed Jan 15 14:33:20 2014 +0100
+
+    powerpc/eeh: Use global PCI rescan-remove locking
+
+    Race conditions are theoretically possible between the PCI device addition
+    and removal in the PPC64 PCI error recovery driver and the generic PCI bus
+    rescan and device removal that can be triggered via sysfs.
+
+    To avoid those race conditions make PPC64 PCI error recovery driver use
+    global PCI rescan-remove locking around PCI device addition and removal.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/eeh_driver.c b/arch/powerpc/kernel/eeh_driver.c
+index 5dab821..0a2586c 100644
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@ -373,7 +373,9 @@ static void *eeh_rmv_device(void *data, void *userdata)
+  edev->mode |= EEH_DEV_DISCONNECTED;
+  (*removed)++;
+ 
++ pci_lock_rescan_remove();
+  pci_stop_and_remove_bus_device(dev);
++ pci_unlock_rescan_remove();
+ 
+  return NULL;
+ }
+@@ -420,10 +422,13 @@ static int eeh_reset_device(struct eeh_pe *pe, struct pci_bus *bus)
+   * into pcibios_add_pci_devices().
+   */
+  eeh_pe_state_mark(pe, EEH_PE_KEEP);
+- if (bus)
++ if (bus) {
++  pci_lock_rescan_remove();
+   pcibios_remove_pci_devices(bus);
+- else if (frozen_bus)
++  pci_unlock_rescan_remove();
++ } else if (frozen_bus) {
+   eeh_pe_dev_traverse(pe, eeh_rmv_device, &removed);
++ }
+ 
+  /* Reset the pci controller. (Asserts RST#; resets config space).
+   * Reconfigure bridges and devices. Don't try to bring the system
+@@ -433,6 +438,8 @@ static int eeh_reset_device(struct eeh_pe *pe, struct pci_bus *bus)
+  if (rc)
+   return rc;
+ 
++ pci_lock_rescan_remove();
++
+  /* Restore PE */
+  eeh_ops->configure_bridge(pe);
+  eeh_pe_restore_bars(pe);
+@@ -466,6 +473,7 @@ static int eeh_reset_device(struct eeh_pe *pe, struct pci_bus *bus)
+  pe->tstamp = tstamp;
+  pe->freeze_count = cnt;
+ 
++ pci_unlock_rescan_remove();
+  return 0;
+ }
+ 
+@@ -622,8 +630,11 @@ perm_error:
+  eeh_pe_dev_traverse(pe, eeh_report_failure, NULL);
+ 
+  /* Shut down the device drivers for good. */
+- if (frozen_bus)
++ if (frozen_bus) {
++  pci_lock_rescan_remove();
+   pcibios_remove_pci_devices(frozen_bus);
++  pci_unlock_rescan_remove();
++ }
+ }
+ 
+ static void eeh_handle_special_event(void)
+@@ -696,6 +707,7 @@ static void eeh_handle_special_event(void)
+  if (rc == 2 || rc == 1)
+   eeh_handle_normal_event(pe);
+  else {
++  pci_lock_rescan_remove();
+   list_for_each_entry_safe(hose, tmp,
+    &hose_list, list_node) {
+    phb_pe = eeh_phb_pe_get(hose);
+@@ -707,6 +719,7 @@ static void eeh_handle_special_event(void)
+    eeh_pe_dev_traverse(pe, eeh_report_failure, NULL);
+    pcibios_remove_pci_devices(bus);
+   }
++  pci_unlock_rescan_remove();
+  }
+ }
+ 
+-- 
+1.7.1

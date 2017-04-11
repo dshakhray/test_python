@@ -1,0 +1,106 @@
+From 545e91a8e21927969f9b6df8ecb8f676655ecfd2 Mon Sep 17 00:00:00 2001
+From: Stefan Assmann <sassmann@redhat.com>
+Date: Tue, 2 Sep 2014 14:38:26 -0400
+Subject: [ethernet] enic: alloc/free rx_cpu_rmap
+
+Message-id: <1409668716-4814-15-git-send-email-sassmann@redhat.com>
+Patchwork-id: 90643
+O-Subject: [RHEL7.1 PATCH 14/24] enic: alloc/free rx_cpu_rmap
+Bugzilla: 1107934
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+From: Govindarajulu Varadarajan <_govind@gmx.com>
+
+rx_cpu_rmap provides the reverse irq cpu affinity. This patch allocates and
+sets drivers netdev->rx_cpu_rmap accordingly.
+
+rx_cpu_rmap is set in enic_request_intr() which is called by enic_open and
+rx_cpu_rmap is freed in enic_free_intr() which is called by enic_stop.
+
+This is used by Accelerated RFS.
+
+Signed-off-by: Govindarajulu Varadarajan <_govind@gmx.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Stefan Assmann <sassmann@redhat.com>
+(cherry picked from commit b6e97c132bbca469d57634622dd7bdacb21f018f)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/cisco/enic/enic_main.c b/drivers/net/ethernet/cisco/enic/enic_main.c
+index d5a220d..1815c36 100644
+--- a/drivers/net/ethernet/cisco/enic/enic_main.c
++++ b/drivers/net/ethernet/cisco/enic/enic_main.c
+@@ -39,6 +39,9 @@
+ #include <linux/prefetch.h>
+ #include <net/ip6_checksum.h>
+ #include <linux/ktime.h>
++#ifdef CONFIG_RFS_ACCEL
++#include <linux/cpu_rmap.h>
++#endif
+ 
+ #include "cq_enet_desc.h"
+ #include "vnic_dev.h"
+@@ -1235,6 +1238,44 @@ static void enic_calc_int_moderation(struct enic *enic, struct vnic_rq *rq)
+  pkt_size_counter->small_pkt_bytes_cnt = 0;
+ }
+ 
++#ifdef CONFIG_RFS_ACCEL
++static void enic_free_rx_cpu_rmap(struct enic *enic)
++{
++ free_irq_cpu_rmap(enic->netdev->rx_cpu_rmap);
++ enic->netdev->rx_cpu_rmap = NULL;
++}
++
++static void enic_set_rx_cpu_rmap(struct enic *enic)
++{
++ int i, res;
++
++ if (vnic_dev_get_intr_mode(enic->vdev) == VNIC_DEV_INTR_MODE_MSIX) {
++  enic->netdev->rx_cpu_rmap = alloc_irq_cpu_rmap(enic->rq_count);
++  if (unlikely(!enic->netdev->rx_cpu_rmap))
++   return;
++  for (i = 0; i < enic->rq_count; i++) {
++   res = irq_cpu_rmap_add(enic->netdev->rx_cpu_rmap,
++            enic->msix_entry[i].vector);
++   if (unlikely(res)) {
++    enic_free_rx_cpu_rmap(enic);
++    return;
++   }
++  }
++ }
++}
++
++#else
++
++static void enic_free_rx_cpu_rmap(struct enic *enic)
++{
++}
++
++static void enic_set_rx_cpu_rmap(struct enic *enic)
++{
++}
++
++#endif /* CONFIG_RFS_ACCEL */
++
+ static int enic_poll_msix(struct napi_struct *napi, int budget)
+ {
+  struct net_device *netdev = napi->dev;
+@@ -1310,6 +1351,7 @@ static void enic_free_intr(struct enic *enic)
+  struct net_device *netdev = enic->netdev;
+  unsigned int i;
+ 
++ enic_free_rx_cpu_rmap(enic);
+  switch (vnic_dev_get_intr_mode(enic->vdev)) {
+  case VNIC_DEV_INTR_MODE_INTX:
+   free_irq(enic->pdev->irq, netdev);
+@@ -1334,6 +1376,7 @@ static int enic_request_intr(struct enic *enic)
+  unsigned int i, intr;
+  int err = 0;
+ 
++ enic_set_rx_cpu_rmap(enic);
+  switch (vnic_dev_get_intr_mode(enic->vdev)) {
+ 
+  case VNIC_DEV_INTR_MODE_INTX:
+-- 
+1.7.1

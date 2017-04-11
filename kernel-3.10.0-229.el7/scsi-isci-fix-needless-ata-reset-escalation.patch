@@ -1,0 +1,80 @@
+From af621938af79152c676882e37076ec9281bef838 Mon Sep 17 00:00:00 2001
+From: David Milburn <dmilburn@redhat.com>
+Date: Thu, 17 Apr 2014 16:14:08 -0400
+Subject: [scsi] isci: fix needless ata reset escalation
+
+Message-id: <1397751248-21537-1-git-send-email-dmilburn@redhat.com>
+Patchwork-id: 78960
+O-Subject: [RHEL7.1 PATCH] isci: fix needless ata reset escalation
+Bugzilla: 1074984
+RH-Acked-by: Ivan Vecera <ivecera@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+
+commit 2193b1b16cc7c690f74f917c50004dd00c99088e
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Thu Feb 6 12:23:15 2014 -0800
+
+    [SCSI] isci: fix needless ata reset escalations
+
+    isci is needlessly tying libata's hands by returning
+    SAM_STAT_CHECK_CONDITION to some ata errors.  Instead, prefer
+    SAS_PROTO_RESPONSE to let libata (via sas_ata_task_done()) disposition
+    the device-to-host fis.
+
+    For example isci is triggering an HSM Violation where AHCI is showing a
+    simple media error for the same bus condition:
+
+    isci:
+    ata7.00: failed command: READ VERIFY SECTOR(S)
+    ata7.00: cmd 40/00:01:00:00:00/00:00:00:00:00/e0 tag 0
+             res 01/04:00:00:00:00/00:00:00:00:00/e0 Emask 0x3 (HSM violation)
+
+    ahci:
+    ata6.00: failed command: READ VERIFY SECTOR(S)
+    ata6.00: cmd 40/00:01:00:00:00/00:00:00:00:00/e0 tag 0
+             res 51/40:01:00:00:00/00:00:00:00:00/e0 Emask 0x9 (media error)
+
+    Note that the isci response matches this from sas_ata_task_done():
+     /* We saw a SAS error. Send a vague error. */
+     [..]
+     dev->sata_dev.fis[3] = 0x04; /* status err */
+     dev->sata_dev.fis[2] = ATA_ERR;
+
+    The end effect is that isci is needlessly triggering hard resets when
+    they are not necessary.
+
+    Reported-by: Xun Ni <xun.ni@intel.com>
+    Tested-by: Nelson Cheng <nelson.cheng@intel.com>
+    Acked-by: Lukasz Dorau <lukasz.dorau@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+    Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+
+Intel has verified patched test kernel.
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1074984
+https://brewweb.devel.redhat.com/taskinfo?taskID=7288291
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/isci/request.c b/drivers/scsi/isci/request.c
+index e3e3bcb..72ab509 100644
+--- a/drivers/scsi/isci/request.c
++++ b/drivers/scsi/isci/request.c
+@@ -2723,13 +2723,9 @@ static void isci_process_stp_response(struct sas_task *task, struct dev_to_host_
+  memcpy(resp->ending_fis, fis, sizeof(*fis));
+  ts->buf_valid_size = sizeof(*resp);
+ 
+- /* If the device fault bit is set in the status register, then
+-  * set the sense data and return.
+-  */
+- if (fis->status & ATA_DF)
++ /* If an error is flagged let libata decode the fis */
++ if (ac_err_mask(fis->status))
+   ts->stat = SAS_PROTO_RESPONSE;
+- else if (fis->status & ATA_ERR)
+-  ts->stat = SAM_STAT_CHECK_CONDITION;
+  else
+   ts->stat = SAM_STAT_GOOD;
+ 
+-- 
+1.7.1

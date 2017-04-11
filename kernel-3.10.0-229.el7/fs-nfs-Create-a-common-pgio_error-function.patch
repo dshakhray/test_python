@@ -1,0 +1,169 @@
+From aa1e66638cc573e2e25b865960e7ff8318f4ab28 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:53:38 -0400
+Subject: [fs] nfs: Create a common pgio_error function
+
+Message-id: <1403798077-28799-20-git-send-email-steved@redhat.com>
+Patchwork-id: 84896
+O-Subject: [RHEL7.1 PATCH 19/78] NFS: Create a common pgio_error function
+Bugzilla: 1113248
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Anna Schumaker <Anna.Schumaker@netapp.com>
+
+At this point, the read and write versions of this function look
+identical so both should use the same function.
+
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 844c9e691d8723853ca8f2de0207683538645824
+Bugzilla: 1113248
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index b11b156..c5a3047 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -242,6 +242,7 @@ struct nfs_rw_header *nfs_rw_header_alloc(const struct nfs_rw_ops *);
+ void nfs_rw_header_free(struct nfs_pgio_header *);
+ struct nfs_pgio_data *nfs_pgio_data_alloc(struct nfs_pgio_header *, unsigned int);
+ void nfs_pgio_data_release(struct nfs_pgio_data *);
++int nfs_pgio_error(struct nfs_pageio_descriptor *, struct nfs_pgio_header *);
+ void nfs_pgio_rpcsetup(struct nfs_pgio_data *, unsigned int, unsigned int, int,
+          struct nfs_commit_info *);
+ 
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 0ccd951..b0a98da 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -447,6 +447,26 @@ static void nfs_pgio_prepare(struct rpc_task *task, void *calldata)
+ }
+ 
+ /**
++ * nfs_pgio_error - Clean up from a pageio error
++ * @desc: IO descriptor
++ * @hdr: pageio header
++ */
++int nfs_pgio_error(struct nfs_pageio_descriptor *desc,
++     struct nfs_pgio_header *hdr)
++{
++ struct nfs_pgio_data *data;
++
++ set_bit(NFS_IOHDR_REDO, &hdr->flags);
++ while (!list_empty(&hdr->rpc_list)) {
++  data = list_first_entry(&hdr->rpc_list, struct nfs_pgio_data, list);
++  list_del(&data->list);
++  nfs_pgio_data_release(data);
++ }
++ desc->pg_completion_ops->error_cleanup(&desc->pg_list);
++ return -ENOMEM;
++}
++
++/**
+  * nfs_pgio_release - Release pageio data
+  * @calldata: The pageio data to release
+  */
+diff --git a/fs/nfs/read.c b/fs/nfs/read.c
+index 0c88c60..64f8eef 100644
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@ -237,19 +237,6 @@ static const struct nfs_pgio_completion_ops nfs_async_read_completion_ops = {
+  .completion = nfs_read_completion,
+ };
+ 
+-static void nfs_pagein_error(struct nfs_pageio_descriptor *desc,
+-  struct nfs_pgio_header *hdr)
+-{
+- set_bit(NFS_IOHDR_REDO, &hdr->flags);
+- while (!list_empty(&hdr->rpc_list)) {
+-  struct nfs_pgio_data *data = list_first_entry(&hdr->rpc_list,
+-    struct nfs_pgio_data, list);
+-  list_del(&data->list);
+-  nfs_pgio_data_release(data);
+- }
+- desc->pg_completion_ops->error_cleanup(&desc->pg_list);
+-}
+-
+ /*
+  * Generate multiple requests to fill a single page.
+  *
+@@ -278,10 +265,8 @@ static int nfs_pagein_multi(struct nfs_pageio_descriptor *desc,
+   size_t len = min(nbytes,rsize);
+ 
+   data = nfs_pgio_data_alloc(hdr, 1);
+-  if (!data) {
+-   nfs_pagein_error(desc, hdr);
+-   return -ENOMEM;
+-  }
++  if (!data)
++   return nfs_pgio_error(desc, hdr);
+   data->pages.pagevec[0] = page;
+   nfs_pgio_rpcsetup(data, len, offset, 0, NULL);
+   list_add(&data->list, &hdr->rpc_list);
+@@ -305,10 +290,8 @@ static int nfs_pagein_one(struct nfs_pageio_descriptor *desc,
+ 
+  data = nfs_pgio_data_alloc(hdr, nfs_page_array_len(desc->pg_base,
+          desc->pg_count));
+- if (!data) {
+-  nfs_pagein_error(desc, hdr);
+-  return -ENOMEM;
+- }
++ if (!data)
++  return nfs_pgio_error(desc, hdr);
+ 
+  pages = data->pages.pagevec;
+  while (!list_empty(head)) {
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 3d80115..3c2be36 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -1046,19 +1046,6 @@ static const struct nfs_pgio_completion_ops nfs_async_write_completion_ops = {
+  .completion = nfs_write_completion,
+ };
+ 
+-static void nfs_flush_error(struct nfs_pageio_descriptor *desc,
+-  struct nfs_pgio_header *hdr)
+-{
+- set_bit(NFS_IOHDR_REDO, &hdr->flags);
+- while (!list_empty(&hdr->rpc_list)) {
+-  struct nfs_pgio_data *data = list_first_entry(&hdr->rpc_list,
+-    struct nfs_pgio_data, list);
+-  list_del(&data->list);
+-  nfs_pgio_data_release(data);
+- }
+- desc->pg_completion_ops->error_cleanup(&desc->pg_list);
+-}
+-
+ /*
+  * Generate multiple small requests to write out a single
+  * contiguous dirty area on one page.
+@@ -1088,10 +1075,8 @@ static int nfs_flush_multi(struct nfs_pageio_descriptor *desc,
+   size_t len = min(nbytes, wsize);
+ 
+   data = nfs_pgio_data_alloc(hdr, 1);
+-  if (!data) {
+-   nfs_flush_error(desc, hdr);
+-   return -ENOMEM;
+-  }
++  if (!data)
++   return nfs_pgio_error(desc, hdr);
+   data->pages.pagevec[0] = page;
+   nfs_pgio_rpcsetup(data, len, offset, desc->pg_ioflags, &cinfo);
+   list_add(&data->list, &hdr->rpc_list);
+@@ -1124,10 +1109,8 @@ static int nfs_flush_one(struct nfs_pageio_descriptor *desc,
+ 
+  data = nfs_pgio_data_alloc(hdr, nfs_page_array_len(desc->pg_base,
+           desc->pg_count));
+- if (!data) {
+-  nfs_flush_error(desc, hdr);
+-  return -ENOMEM;
+- }
++ if (!data)
++  return nfs_pgio_error(desc, hdr);
+ 
+  nfs_init_cinfo(&cinfo, desc->pg_inode, desc->pg_dreq);
+  pages = data->pages.pagevec;
+-- 
+1.7.1

@@ -1,0 +1,793 @@
+From 5ddee012a4769755f034794e876045440758aac7 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:59 -0400
+Subject: [virt] kvm/ppc: Book3S PR - Keep volatile reg values in vcpu rather than shadow_vcpu
+
+Message-id: <1410545655-205645-131-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94164
+O-Subject: [RHEL7 PATCH 130/626] KVM: PPC: Book3S PR: Keep volatile reg values in vcpu rather than shadow_vcpu
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit a2d56020d1d91934e7bb3e7c8a5a3b5921ce121b
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:43 2013 +1000
+
+    KVM: PPC: Book3S PR: Keep volatile reg values in vcpu rather than shadow_vcpu
+
+    Currently PR-style KVM keeps the volatile guest register values
+    (R0 - R13, CR, LR, CTR, XER, PC) in a shadow_vcpu struct rather than
+    the main kvm_vcpu struct.  For 64-bit, the shadow_vcpu exists in two
+    places, a kmalloc'd struct and in the PACA, and it gets copied back
+    and forth in kvmppc_core_vcpu_load/put(), because the real-mode code
+    can't rely on being able to access the kmalloc'd struct.
+
+    This changes the code to copy the volatile values into the shadow_vcpu
+    as one of the last things done before entering the guest.  Similarly
+    the values are copied back out of the shadow_vcpu to the kvm_vcpu
+    immediately after exiting the guest.  We arrange for interrupts to be
+    still disabled at this point so that we can't get preempted on 64-bit
+    and end up copying values from the wrong PACA.
+
+    This means that the accessor functions in kvm_book3s.h for these
+    registers are greatly simplified, and are same between PR and HV KVM.
+    In places where accesses to shadow_vcpu fields are now replaced by
+    accesses to the kvm_vcpu, we can also remove the svcpu_get/put pairs.
+    Finally, on 64-bit, we don't need the kmalloc'd struct at all any more.
+
+    With this, the time to read the PVR one million times in a loop went
+    from 567.7ms to 575.5ms (averages of 6 values), an increase of about
+    1.4% for this worse-case test for guest entries and exits.  The
+    standard deviation of the measurements is about 11ms, so the
+    difference is only marginally significant statistically.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 14a4741..40f22d9 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -200,140 +200,76 @@ extern void kvm_return_point(void);
+ #include <asm/kvm_book3s_64.h>
+ #endif
+ 
+-#ifdef CONFIG_KVM_BOOK3S_PR
+-
+-static inline unsigned long kvmppc_interrupt_offset(struct kvm_vcpu *vcpu)
+-{
+- return to_book3s(vcpu)->hior;
+-}
+-
+-static inline void kvmppc_update_int_pending(struct kvm_vcpu *vcpu,
+-   unsigned long pending_now, unsigned long old_pending)
+-{
+- if (pending_now)
+-  vcpu->arch.shared->int_pending = 1;
+- else if (old_pending)
+-  vcpu->arch.shared->int_pending = 0;
+-}
+-
+ static inline void kvmppc_set_gpr(struct kvm_vcpu *vcpu, int num, ulong val)
+ {
+- if ( num < 14 ) {
+-  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+-  svcpu->gpr[num] = val;
+-  svcpu_put(svcpu);
+-  to_book3s(vcpu)->shadow_vcpu->gpr[num] = val;
+- } else
+-  vcpu->arch.gpr[num] = val;
++ vcpu->arch.gpr[num] = val;
+ }
+ 
+ static inline ulong kvmppc_get_gpr(struct kvm_vcpu *vcpu, int num)
+ {
+- if ( num < 14 ) {
+-  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+-  ulong r = svcpu->gpr[num];
+-  svcpu_put(svcpu);
+-  return r;
+- } else
+-  return vcpu->arch.gpr[num];
++ return vcpu->arch.gpr[num];
+ }
+ 
+ static inline void kvmppc_set_cr(struct kvm_vcpu *vcpu, u32 val)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- svcpu->cr = val;
+- svcpu_put(svcpu);
+- to_book3s(vcpu)->shadow_vcpu->cr = val;
++ vcpu->arch.cr = val;
+ }
+ 
+ static inline u32 kvmppc_get_cr(struct kvm_vcpu *vcpu)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- u32 r;
+- r = svcpu->cr;
+- svcpu_put(svcpu);
+- return r;
++ return vcpu->arch.cr;
+ }
+ 
+ static inline void kvmppc_set_xer(struct kvm_vcpu *vcpu, u32 val)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- svcpu->xer = val;
+- to_book3s(vcpu)->shadow_vcpu->xer = val;
+- svcpu_put(svcpu);
++ vcpu->arch.xer = val;
+ }
+ 
+ static inline u32 kvmppc_get_xer(struct kvm_vcpu *vcpu)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- u32 r;
+- r = svcpu->xer;
+- svcpu_put(svcpu);
+- return r;
++ return vcpu->arch.xer;
+ }
+ 
+ static inline void kvmppc_set_ctr(struct kvm_vcpu *vcpu, ulong val)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- svcpu->ctr = val;
+- svcpu_put(svcpu);
++ vcpu->arch.ctr = val;
+ }
+ 
+ static inline ulong kvmppc_get_ctr(struct kvm_vcpu *vcpu)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- ulong r;
+- r = svcpu->ctr;
+- svcpu_put(svcpu);
+- return r;
++ return vcpu->arch.ctr;
+ }
+ 
+ static inline void kvmppc_set_lr(struct kvm_vcpu *vcpu, ulong val)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- svcpu->lr = val;
+- svcpu_put(svcpu);
++ vcpu->arch.lr = val;
+ }
+ 
+ static inline ulong kvmppc_get_lr(struct kvm_vcpu *vcpu)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- ulong r;
+- r = svcpu->lr;
+- svcpu_put(svcpu);
+- return r;
++ return vcpu->arch.lr;
+ }
+ 
+ static inline void kvmppc_set_pc(struct kvm_vcpu *vcpu, ulong val)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- svcpu->pc = val;
+- svcpu_put(svcpu);
++ vcpu->arch.pc = val;
+ }
+ 
+ static inline ulong kvmppc_get_pc(struct kvm_vcpu *vcpu)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- ulong r;
+- r = svcpu->pc;
+- svcpu_put(svcpu);
+- return r;
++ return vcpu->arch.pc;
+ }
+ 
+ static inline u32 kvmppc_get_last_inst(struct kvm_vcpu *vcpu)
+ {
+  ulong pc = kvmppc_get_pc(vcpu);
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- u32 r;
+ 
+  /* Load the instruction manually if it failed to do so in the
+   * exit path */
+- if (svcpu->last_inst == KVM_INST_FETCH_FAILED)
+-  kvmppc_ld(vcpu, &pc, sizeof(u32), &svcpu->last_inst, false);
++ if (vcpu->arch.last_inst == KVM_INST_FETCH_FAILED)
++  kvmppc_ld(vcpu, &pc, sizeof(u32), &vcpu->arch.last_inst, false);
+ 
+- r = svcpu->last_inst;
+- svcpu_put(svcpu);
+- return r;
++ return vcpu->arch.last_inst;
+ }
+ 
+ /*
+@@ -344,26 +280,34 @@ static inline u32 kvmppc_get_last_inst(struct kvm_vcpu *vcpu)
+ static inline u32 kvmppc_get_last_sc(struct kvm_vcpu *vcpu)
+ {
+  ulong pc = kvmppc_get_pc(vcpu) - 4;
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- u32 r;
+ 
+  /* Load the instruction manually if it failed to do so in the
+   * exit path */
+- if (svcpu->last_inst == KVM_INST_FETCH_FAILED)
+-  kvmppc_ld(vcpu, &pc, sizeof(u32), &svcpu->last_inst, false);
++ if (vcpu->arch.last_inst == KVM_INST_FETCH_FAILED)
++  kvmppc_ld(vcpu, &pc, sizeof(u32), &vcpu->arch.last_inst, false);
+ 
+- r = svcpu->last_inst;
+- svcpu_put(svcpu);
+- return r;
++ return vcpu->arch.last_inst;
+ }
+ 
+ static inline ulong kvmppc_get_fault_dar(struct kvm_vcpu *vcpu)
+ {
+- struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+- ulong r;
+- r = svcpu->fault_dar;
+- svcpu_put(svcpu);
+- return r;
++ return vcpu->arch.fault_dar;
++}
++
++#ifdef CONFIG_KVM_BOOK3S_PR
++
++static inline unsigned long kvmppc_interrupt_offset(struct kvm_vcpu *vcpu)
++{
++ return to_book3s(vcpu)->hior;
++}
++
++static inline void kvmppc_update_int_pending(struct kvm_vcpu *vcpu,
++   unsigned long pending_now, unsigned long old_pending)
++{
++ if (pending_now)
++  vcpu->arch.shared->int_pending = 1;
++ else if (old_pending)
++  vcpu->arch.shared->int_pending = 0;
+ }
+ 
+ static inline bool kvmppc_critical_section(struct kvm_vcpu *vcpu)
+@@ -397,100 +341,6 @@ static inline void kvmppc_update_int_pending(struct kvm_vcpu *vcpu,
+ {
+ }
+ 
+-static inline void kvmppc_set_gpr(struct kvm_vcpu *vcpu, int num, ulong val)
+-{
+- vcpu->arch.gpr[num] = val;
+-}
+-
+-static inline ulong kvmppc_get_gpr(struct kvm_vcpu *vcpu, int num)
+-{
+- return vcpu->arch.gpr[num];
+-}
+-
+-static inline void kvmppc_set_cr(struct kvm_vcpu *vcpu, u32 val)
+-{
+- vcpu->arch.cr = val;
+-}
+-
+-static inline u32 kvmppc_get_cr(struct kvm_vcpu *vcpu)
+-{
+- return vcpu->arch.cr;
+-}
+-
+-static inline void kvmppc_set_xer(struct kvm_vcpu *vcpu, u32 val)
+-{
+- vcpu->arch.xer = val;
+-}
+-
+-static inline u32 kvmppc_get_xer(struct kvm_vcpu *vcpu)
+-{
+- return vcpu->arch.xer;
+-}
+-
+-static inline void kvmppc_set_ctr(struct kvm_vcpu *vcpu, ulong val)
+-{
+- vcpu->arch.ctr = val;
+-}
+-
+-static inline ulong kvmppc_get_ctr(struct kvm_vcpu *vcpu)
+-{
+- return vcpu->arch.ctr;
+-}
+-
+-static inline void kvmppc_set_lr(struct kvm_vcpu *vcpu, ulong val)
+-{
+- vcpu->arch.lr = val;
+-}
+-
+-static inline ulong kvmppc_get_lr(struct kvm_vcpu *vcpu)
+-{
+- return vcpu->arch.lr;
+-}
+-
+-static inline void kvmppc_set_pc(struct kvm_vcpu *vcpu, ulong val)
+-{
+- vcpu->arch.pc = val;
+-}
+-
+-static inline ulong kvmppc_get_pc(struct kvm_vcpu *vcpu)
+-{
+- return vcpu->arch.pc;
+-}
+-
+-static inline u32 kvmppc_get_last_inst(struct kvm_vcpu *vcpu)
+-{
+- ulong pc = kvmppc_get_pc(vcpu);
+-
+- /* Load the instruction manually if it failed to do so in the
+-  * exit path */
+- if (vcpu->arch.last_inst == KVM_INST_FETCH_FAILED)
+-  kvmppc_ld(vcpu, &pc, sizeof(u32), &vcpu->arch.last_inst, false);
+-
+- return vcpu->arch.last_inst;
+-}
+-
+-/*
+- * Like kvmppc_get_last_inst(), but for fetching a sc instruction.
+- * Because the sc instruction sets SRR0 to point to the following
+- * instruction, we have to fetch from pc - 4.
+- */
+-static inline u32 kvmppc_get_last_sc(struct kvm_vcpu *vcpu)
+-{
+- ulong pc = kvmppc_get_pc(vcpu) - 4;
+-
+- /* Load the instruction manually if it failed to do so in the
+-  * exit path */
+- if (vcpu->arch.last_inst == KVM_INST_FETCH_FAILED)
+-  kvmppc_ld(vcpu, &pc, sizeof(u32), &vcpu->arch.last_inst, false);
+-
+- return vcpu->arch.last_inst;
+-}
+-
+-static inline ulong kvmppc_get_fault_dar(struct kvm_vcpu *vcpu)
+-{
+- return vcpu->arch.fault_dar;
+-}
+-
+ static inline bool kvmppc_critical_section(struct kvm_vcpu *vcpu)
+ {
+  return false;
+diff --git a/arch/powerpc/include/asm/kvm_book3s_asm.h b/arch/powerpc/include/asm/kvm_book3s_asm.h
+index 22f4606..6273711 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_asm.h
++++ b/arch/powerpc/include/asm/kvm_book3s_asm.h
+@@ -109,14 +109,14 @@ struct kvmppc_book3s_shadow_vcpu {
+  ulong gpr[14];
+  u32 cr;
+  u32 xer;
+-
+- u32 fault_dsisr;
+- u32 last_inst;
+  ulong ctr;
+  ulong lr;
+  ulong pc;
++
+  ulong shadow_srr1;
+  ulong fault_dar;
++ u32 fault_dsisr;
++ u32 last_inst;
+ 
+ #ifdef CONFIG_PPC_BOOK3S_32
+  u32     sr[16];   /* Guest SRs */
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 82daa12..933ae29 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -468,6 +468,7 @@ struct kvm_vcpu_arch {
+  ulong dabr;
+  ulong cfar;
+  ulong ppr;
++ ulong shadow_srr1;
+ #endif
+  u32 vrsave; /* also USPRG0 */
+  u32 mmucr;
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index f2a6239..b3da708 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -514,6 +514,7 @@ int main(void)
+  DEFINE(VCPU_PTID, offsetof(struct kvm_vcpu, arch.ptid));
+  DEFINE(VCPU_CFAR, offsetof(struct kvm_vcpu, arch.cfar));
+  DEFINE(VCPU_PPR, offsetof(struct kvm_vcpu, arch.ppr));
++ DEFINE(VCPU_SHADOW_SRR1, offsetof(struct kvm_vcpu, arch.shadow_srr1));
+  DEFINE(VCORE_ENTRY_EXIT, offsetof(struct kvmppc_vcore, entry_exit_count));
+  DEFINE(VCORE_NAP_COUNT, offsetof(struct kvmppc_vcore, nap_count));
+  DEFINE(VCORE_IN_GUEST, offsetof(struct kvmppc_vcore, in_guest));
+@@ -521,14 +522,13 @@ int main(void)
+  DEFINE(VCORE_TB_OFFSET, offsetof(struct kvmppc_vcore, tb_offset));
+  DEFINE(VCORE_LPCR, offsetof(struct kvmppc_vcore, lpcr));
+  DEFINE(VCORE_PCR, offsetof(struct kvmppc_vcore, pcr));
+- DEFINE(VCPU_SVCPU, offsetof(struct kvmppc_vcpu_book3s, shadow_vcpu) -
+-      offsetof(struct kvmppc_vcpu_book3s, vcpu));
+  DEFINE(VCPU_SLB_E, offsetof(struct kvmppc_slb, orige));
+  DEFINE(VCPU_SLB_V, offsetof(struct kvmppc_slb, origv));
+  DEFINE(VCPU_SLB_SIZE, sizeof(struct kvmppc_slb));
+ 
+ #ifdef CONFIG_PPC_BOOK3S_64
+ #ifdef CONFIG_KVM_BOOK3S_PR
++ DEFINE(PACA_SVCPU, offsetof(struct paca_struct, shadow_vcpu));
+ # define SVCPU_FIELD(x, f) DEFINE(x, offsetof(struct paca_struct, shadow_vcpu.f))
+ #else
+ # define SVCPU_FIELD(x, f)
+diff --git a/arch/powerpc/kvm/book3s_emulate.c b/arch/powerpc/kvm/book3s_emulate.c
+index 1f6344c..2a7210c 100644
+--- a/arch/powerpc/kvm/book3s_emulate.c
++++ b/arch/powerpc/kvm/book3s_emulate.c
+@@ -267,12 +267,9 @@ int kvmppc_core_emulate_op(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 
+    r = kvmppc_st(vcpu, &addr, 32, zeros, true);
+    if ((r == -ENOENT) || (r == -EPERM)) {
+-    struct kvmppc_book3s_shadow_vcpu *svcpu;
+-
+-    svcpu = svcpu_get(vcpu);
+     *advance = 0;
+     vcpu->arch.shared->dar = vaddr;
+-    svcpu->fault_dar = vaddr;
++    vcpu->arch.fault_dar = vaddr;
+ 
+     dsisr = DSISR_ISSTORE;
+     if (r == -ENOENT)
+@@ -281,8 +278,7 @@ int kvmppc_core_emulate_op(struct kvm_run *run, struct kvm_vcpu *vcpu,
+      dsisr |= DSISR_PROTFAULT;
+ 
+     vcpu->arch.shared->dsisr = dsisr;
+-    svcpu->fault_dsisr = dsisr;
+-    svcpu_put(svcpu);
++    vcpu->arch.fault_dsisr = dsisr;
+ 
+     kvmppc_book3s_queue_irqprio(vcpu,
+      BOOK3S_INTERRUPT_DATA_STORAGE);
+diff --git a/arch/powerpc/kvm/book3s_interrupts.S b/arch/powerpc/kvm/book3s_interrupts.S
+index 17cfae5..d4e30d8 100644
+--- a/arch/powerpc/kvm/book3s_interrupts.S
++++ b/arch/powerpc/kvm/book3s_interrupts.S
+@@ -26,8 +26,12 @@
+ 
+ #if defined(CONFIG_PPC_BOOK3S_64)
+ #define FUNC(name)   GLUE(.,name)
++#define GET_SHADOW_VCPU(reg)    addi reg, r13, PACA_SVCPU
++
+ #elif defined(CONFIG_PPC_BOOK3S_32)
+ #define FUNC(name)  name
++#define GET_SHADOW_VCPU(reg) lwz     reg, (THREAD + THREAD_KVM_SVCPU)(r2)
++
+ #endif /* CONFIG_PPC_BOOK3S_XX */
+ 
+ #define VCPU_LOAD_NVGPRS(vcpu) \
+@@ -87,8 +91,14 @@ kvm_start_entry:
+  VCPU_LOAD_NVGPRS(r4)
+ 
+ kvm_start_lightweight:
++ /* Copy registers into shadow vcpu so we can access them in real mode */
++ GET_SHADOW_VCPU(r3)
++ bl FUNC(kvmppc_copy_to_svcpu)
++ nop
++ REST_GPR(4, r1)
+ 
+ #ifdef CONFIG_PPC_BOOK3S_64
++ /* Get the dcbz32 flag */
+  PPC_LL r3, VCPU_HFLAGS(r4)
+  rldicl r3, r3, 0, 63  /* r3 &= 1 */
+  stb r3, HSTATE_RESTORE_HID5(r13)
+@@ -125,18 +135,31 @@ kvmppc_handler_highmem:
+   *
+   */
+ 
+- /* R7 = vcpu */
+- PPC_LL r7, GPR4(r1)
++ /* Transfer reg values from shadow vcpu back to vcpu struct */
++ /* On 64-bit, interrupts are still off at this point */
++ PPC_LL r3, GPR4(r1)  /* vcpu pointer */
++ GET_SHADOW_VCPU(r4)
++ bl FUNC(kvmppc_copy_from_svcpu)
++ nop
+ 
+ #ifdef CONFIG_PPC_BOOK3S_64
++ /* Re-enable interrupts */
++ ld r3, HSTATE_HOST_MSR(r13)
++ ori r3, r3, MSR_EE
++ MTMSR_EERI(r3)
++
+  /*
+   * Reload kernel SPRG3 value.
+   * No need to save guest value as usermode can't modify SPRG3.
+   */
+  ld r3, PACA_SPRG3(r13)
+  mtspr SPRN_SPRG3, r3
++
+ #endif /* CONFIG_PPC_BOOK3S_64 */
+ 
++ /* R7 = vcpu */
++ PPC_LL r7, GPR4(r1)
++
+  PPC_STL r14, VCPU_GPR(R14)(r7)
+  PPC_STL r15, VCPU_GPR(R15)(r7)
+  PPC_STL r16, VCPU_GPR(R16)(r7)
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index c0b48f9..487148e 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -61,8 +61,6 @@ void kvmppc_core_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ #ifdef CONFIG_PPC_BOOK3S_64
+  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+  memcpy(svcpu->slb, to_book3s(vcpu)->slb_shadow, sizeof(svcpu->slb));
+- memcpy(&get_paca()->shadow_vcpu, to_book3s(vcpu)->shadow_vcpu,
+-        sizeof(get_paca()->shadow_vcpu));
+  svcpu->slb_max = to_book3s(vcpu)->slb_shadow_max;
+  svcpu_put(svcpu);
+ #endif
+@@ -77,8 +75,6 @@ void kvmppc_core_vcpu_put(struct kvm_vcpu *vcpu)
+ #ifdef CONFIG_PPC_BOOK3S_64
+  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+  memcpy(to_book3s(vcpu)->slb_shadow, svcpu->slb, sizeof(svcpu->slb));
+- memcpy(to_book3s(vcpu)->shadow_vcpu, &get_paca()->shadow_vcpu,
+-        sizeof(get_paca()->shadow_vcpu));
+  to_book3s(vcpu)->slb_shadow_max = svcpu->slb_max;
+  svcpu_put(svcpu);
+ #endif
+@@ -87,6 +83,60 @@ void kvmppc_core_vcpu_put(struct kvm_vcpu *vcpu)
+  vcpu->cpu = -1;
+ }
+ 
++/* Copy data needed by real-mode code from vcpu to shadow vcpu */
++void kvmppc_copy_to_svcpu(struct kvmppc_book3s_shadow_vcpu *svcpu,
++     struct kvm_vcpu *vcpu)
++{
++ svcpu->gpr[0] = vcpu->arch.gpr[0];
++ svcpu->gpr[1] = vcpu->arch.gpr[1];
++ svcpu->gpr[2] = vcpu->arch.gpr[2];
++ svcpu->gpr[3] = vcpu->arch.gpr[3];
++ svcpu->gpr[4] = vcpu->arch.gpr[4];
++ svcpu->gpr[5] = vcpu->arch.gpr[5];
++ svcpu->gpr[6] = vcpu->arch.gpr[6];
++ svcpu->gpr[7] = vcpu->arch.gpr[7];
++ svcpu->gpr[8] = vcpu->arch.gpr[8];
++ svcpu->gpr[9] = vcpu->arch.gpr[9];
++ svcpu->gpr[10] = vcpu->arch.gpr[10];
++ svcpu->gpr[11] = vcpu->arch.gpr[11];
++ svcpu->gpr[12] = vcpu->arch.gpr[12];
++ svcpu->gpr[13] = vcpu->arch.gpr[13];
++ svcpu->cr  = vcpu->arch.cr;
++ svcpu->xer = vcpu->arch.xer;
++ svcpu->ctr = vcpu->arch.ctr;
++ svcpu->lr  = vcpu->arch.lr;
++ svcpu->pc  = vcpu->arch.pc;
++}
++
++/* Copy data touched by real-mode code from shadow vcpu back to vcpu */
++void kvmppc_copy_from_svcpu(struct kvm_vcpu *vcpu,
++       struct kvmppc_book3s_shadow_vcpu *svcpu)
++{
++ vcpu->arch.gpr[0] = svcpu->gpr[0];
++ vcpu->arch.gpr[1] = svcpu->gpr[1];
++ vcpu->arch.gpr[2] = svcpu->gpr[2];
++ vcpu->arch.gpr[3] = svcpu->gpr[3];
++ vcpu->arch.gpr[4] = svcpu->gpr[4];
++ vcpu->arch.gpr[5] = svcpu->gpr[5];
++ vcpu->arch.gpr[6] = svcpu->gpr[6];
++ vcpu->arch.gpr[7] = svcpu->gpr[7];
++ vcpu->arch.gpr[8] = svcpu->gpr[8];
++ vcpu->arch.gpr[9] = svcpu->gpr[9];
++ vcpu->arch.gpr[10] = svcpu->gpr[10];
++ vcpu->arch.gpr[11] = svcpu->gpr[11];
++ vcpu->arch.gpr[12] = svcpu->gpr[12];
++ vcpu->arch.gpr[13] = svcpu->gpr[13];
++ vcpu->arch.cr  = svcpu->cr;
++ vcpu->arch.xer = svcpu->xer;
++ vcpu->arch.ctr = svcpu->ctr;
++ vcpu->arch.lr  = svcpu->lr;
++ vcpu->arch.pc  = svcpu->pc;
++ vcpu->arch.shadow_srr1 = svcpu->shadow_srr1;
++ vcpu->arch.fault_dar   = svcpu->fault_dar;
++ vcpu->arch.fault_dsisr = svcpu->fault_dsisr;
++ vcpu->arch.last_inst   = svcpu->last_inst;
++}
++
+ int kvmppc_core_check_requests(struct kvm_vcpu *vcpu)
+ {
+  int r = 1; /* Indicate we want to get back into the guest */
+@@ -388,22 +438,18 @@ int kvmppc_handle_pagefault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 
+  if (page_found == -ENOENT) {
+   /* Page not found in guest PTE entries */
+-  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+   vcpu->arch.shared->dar = kvmppc_get_fault_dar(vcpu);
+-  vcpu->arch.shared->dsisr = svcpu->fault_dsisr;
++  vcpu->arch.shared->dsisr = vcpu->arch.fault_dsisr;
+   vcpu->arch.shared->msr |=
+-   (svcpu->shadow_srr1 & 0x00000000f8000000ULL);
+-  svcpu_put(svcpu);
++   vcpu->arch.shadow_srr1 & 0x00000000f8000000ULL;
+   kvmppc_book3s_queue_irqprio(vcpu, vec);
+  } else if (page_found == -EPERM) {
+   /* Storage protection */
+-  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+   vcpu->arch.shared->dar = kvmppc_get_fault_dar(vcpu);
+-  vcpu->arch.shared->dsisr = svcpu->fault_dsisr & ~DSISR_NOHPTE;
++  vcpu->arch.shared->dsisr = vcpu->arch.fault_dsisr & ~DSISR_NOHPTE;
+   vcpu->arch.shared->dsisr |= DSISR_PROTFAULT;
+   vcpu->arch.shared->msr |=
+-   svcpu->shadow_srr1 & 0x00000000f8000000ULL;
+-  svcpu_put(svcpu);
++   vcpu->arch.shadow_srr1 & 0x00000000f8000000ULL;
+   kvmppc_book3s_queue_irqprio(vcpu, vec);
+  } else if (page_found == -EINVAL) {
+   /* Page not found in guest SLB */
+@@ -643,21 +689,26 @@ int kvmppc_handle_exit(struct kvm_run *run, struct kvm_vcpu *vcpu,
+  switch (exit_nr) {
+  case BOOK3S_INTERRUPT_INST_STORAGE:
+  {
+-  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+-  ulong shadow_srr1 = svcpu->shadow_srr1;
++  ulong shadow_srr1 = vcpu->arch.shadow_srr1;
+   vcpu->stat.pf_instruc++;
+ 
+ #ifdef CONFIG_PPC_BOOK3S_32
+   /* We set segments as unused segments when invalidating them. So
+    * treat the respective fault as segment fault. */
+-  if (svcpu->sr[kvmppc_get_pc(vcpu) >> SID_SHIFT] == SR_INVALID) {
+-   kvmppc_mmu_map_segment(vcpu, kvmppc_get_pc(vcpu));
+-   r = RESUME_GUEST;
++  {
++   struct kvmppc_book3s_shadow_vcpu *svcpu;
++   u32 sr;
++
++   svcpu = svcpu_get(vcpu);
++   sr = svcpu->sr[kvmppc_get_pc(vcpu) >> SID_SHIFT];
+    svcpu_put(svcpu);
+-   break;
++   if (sr == SR_INVALID) {
++    kvmppc_mmu_map_segment(vcpu, kvmppc_get_pc(vcpu));
++    r = RESUME_GUEST;
++    break;
++   }
+   }
+ #endif
+-  svcpu_put(svcpu);
+ 
+   /* only care about PTEG not found errors, but leave NX alone */
+   if (shadow_srr1 & 0x40000000) {
+@@ -682,21 +733,26 @@ int kvmppc_handle_exit(struct kvm_run *run, struct kvm_vcpu *vcpu,
+  case BOOK3S_INTERRUPT_DATA_STORAGE:
+  {
+   ulong dar = kvmppc_get_fault_dar(vcpu);
+-  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+-  u32 fault_dsisr = svcpu->fault_dsisr;
++  u32 fault_dsisr = vcpu->arch.fault_dsisr;
+   vcpu->stat.pf_storage++;
+ 
+ #ifdef CONFIG_PPC_BOOK3S_32
+   /* We set segments as unused segments when invalidating them. So
+    * treat the respective fault as segment fault. */
+-  if ((svcpu->sr[dar >> SID_SHIFT]) == SR_INVALID) {
+-   kvmppc_mmu_map_segment(vcpu, dar);
+-   r = RESUME_GUEST;
++  {
++   struct kvmppc_book3s_shadow_vcpu *svcpu;
++   u32 sr;
++
++   svcpu = svcpu_get(vcpu);
++   sr = svcpu->sr[dar >> SID_SHIFT];
+    svcpu_put(svcpu);
+-   break;
++   if (sr == SR_INVALID) {
++    kvmppc_mmu_map_segment(vcpu, dar);
++    r = RESUME_GUEST;
++    break;
++   }
+   }
+ #endif
+-  svcpu_put(svcpu);
+ 
+   /* The only case we need to handle is missing shadow PTEs */
+   if (fault_dsisr & DSISR_NOHPTE) {
+@@ -743,13 +799,10 @@ int kvmppc_handle_exit(struct kvm_run *run, struct kvm_vcpu *vcpu,
+  case BOOK3S_INTERRUPT_H_EMUL_ASSIST:
+  {
+   enum emulation_result er;
+-  struct kvmppc_book3s_shadow_vcpu *svcpu;
+   ulong flags;
+ 
+ program_interrupt:
+-  svcpu = svcpu_get(vcpu);
+-  flags = svcpu->shadow_srr1 & 0x1f0000ull;
+-  svcpu_put(svcpu);
++  flags = vcpu->arch.shadow_srr1 & 0x1f0000ull;
+ 
+   if (vcpu->arch.shared->msr & MSR_PR) {
+ #ifdef EXIT_DEBUG
+@@ -881,9 +934,7 @@ program_interrupt:
+   break;
+  default:
+  {
+-  struct kvmppc_book3s_shadow_vcpu *svcpu = svcpu_get(vcpu);
+-  ulong shadow_srr1 = svcpu->shadow_srr1;
+-  svcpu_put(svcpu);
++  ulong shadow_srr1 = vcpu->arch.shadow_srr1;
+   /* Ugh - bork here! What did we get? */
+   printk(KERN_EMERG "exit_nr=0x%x | pc=0x%lx | msr=0x%lx\n",
+    exit_nr, kvmppc_get_pc(vcpu), shadow_srr1);
+@@ -1058,11 +1109,12 @@ struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
+  if (!vcpu_book3s)
+   goto out;
+ 
++#ifdef CONFIG_KVM_BOOK3S_32
+  vcpu_book3s->shadow_vcpu =
+   kzalloc(sizeof(*vcpu_book3s->shadow_vcpu), GFP_KERNEL);
+  if (!vcpu_book3s->shadow_vcpu)
+   goto free_vcpu;
+-
++#endif
+  vcpu = &vcpu_book3s->vcpu;
+  err = kvm_vcpu_init(vcpu, kvm, id);
+  if (err)
+@@ -1096,8 +1148,10 @@ struct kvm_vcpu *kvmppc_core_vcpu_create(struct kvm *kvm, unsigned int id)
+ uninit_vcpu:
+  kvm_vcpu_uninit(vcpu);
+ free_shadow_vcpu:
++#ifdef CONFIG_KVM_BOOK3S_32
+  kfree(vcpu_book3s->shadow_vcpu);
+ free_vcpu:
++#endif
+  vfree(vcpu_book3s);
+ out:
+  return ERR_PTR(err);
+diff --git a/arch/powerpc/kvm/book3s_rmhandlers.S b/arch/powerpc/kvm/book3s_rmhandlers.S
+index 8f7633e..cd59a3a 100644
+--- a/arch/powerpc/kvm/book3s_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_rmhandlers.S
+@@ -179,11 +179,15 @@ _GLOBAL(kvmppc_entry_trampoline)
+ 
+  li r6, MSR_IR | MSR_DR
+  andc r6, r5, r6 /* Clear DR and IR in MSR value */
++#ifdef CONFIG_PPC_BOOK3S_32
+  /*
+   * Set EE in HOST_MSR so that it's enabled when we get into our
+-  * C exit handler function
++  * C exit handler function.  On 64-bit we delay enabling
++  * interrupts until we have finished transferring stuff
++  * to or from the PACA.
+   */
+  ori r5, r5, MSR_EE
++#endif
+  mtsrr0 r7
+  mtsrr1 r6
+  RFI
+diff --git a/arch/powerpc/kvm/trace.h b/arch/powerpc/kvm/trace.h
+index e326489..a088e9a 100644
+--- a/arch/powerpc/kvm/trace.h
++++ b/arch/powerpc/kvm/trace.h
+@@ -101,17 +101,12 @@ TRACE_EVENT(kvm_exit,
+  ),
+ 
+  TP_fast_assign(
+-#ifdef CONFIG_KVM_BOOK3S_PR
+-  struct kvmppc_book3s_shadow_vcpu *svcpu;
+-#endif
+   __entry->exit_nr = exit_nr;
+   __entry->pc  = kvmppc_get_pc(vcpu);
+   __entry->dar  = kvmppc_get_fault_dar(vcpu);
+   __entry->msr  = vcpu->arch.shared->msr;
+ #ifdef CONFIG_KVM_BOOK3S_PR
+-  svcpu = svcpu_get(vcpu);
+-  __entry->srr1  = svcpu->shadow_srr1;
+-  svcpu_put(svcpu);
++  __entry->srr1  = vcpu->arch.shadow_srr1;
+ #endif
+   __entry->last_inst = vcpu->arch.last_inst;
+  ),
+-- 
+1.7.1

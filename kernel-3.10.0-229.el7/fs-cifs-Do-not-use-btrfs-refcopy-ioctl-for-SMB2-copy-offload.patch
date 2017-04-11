@@ -1,0 +1,80 @@
+From a1a8a06ee75f2e36341e0610bc10d1df5629ef7e Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:29 -0400
+Subject: [fs] cifs: Do not use btrfs refcopy ioctl for SMB2 copy offload
+
+Message-id: <1406549822-10376-37-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86733
+O-Subject: [RHEL7.1 PATCH 36/69] [bz1082049][CIFS] Do not use btrfs refcopy ioctl for SMB2 copy offload
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Steve French <smfrench@gmail.com>
+
+Change cifs.ko to using CIFS_IOCTL_COPYCHUNK instead
+of BTRFS_IOC_CLONE to avoid confusion about whether
+copy-on-write is required or optional for this operation.
+
+SMB2/SMB3 copyoffload had used the BTRFS_IOC_CLONE ioctl since
+they both speed up copy by offloading the copy rather than
+passing many read and write requests back and forth and both have
+identical syntax (passing file handles), but for SMB2/SMB3
+CopyChunk the server is not required to use copy-on-write
+to make a copy of the file (although some do), and Christoph
+has commented that since CopyChunk does not require
+copy-on-write we should not reuse BTRFS_IOC_CLONE.
+
+This patch renames the ioctl to use a cifs specific IOCTL
+CIFS_IOCTL_COPYCHUNK.  This ioctl is particularly important
+for SMB2/SMB3 since large file copy over the network otherwise
+can be very slow, and with this is often more than 100 times
+faster putting less load on server and client.
+
+Note that if a copy syscall is ever introduced, depending on
+its requirements/format it could end up using one of the other
+three methods that CIFS/SMB2/SMB3 can do for copy offload,
+but this method is particularly useful for file copy
+and broadly supported (not just by Samba server).
+
+Signed-off-by: Steve French <smfrench@gmail.com>
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+Reviewed-by: David Disseldorp <ddiss@samba.org>
+(cherry picked from commit f19e84df37bda502a2248d507a9cf2b9e693279e)
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/ioctl.c b/fs/cifs/ioctl.c
+index 409b45e..7749230 100644
+--- a/fs/cifs/ioctl.c
++++ b/fs/cifs/ioctl.c
+@@ -26,13 +26,15 @@
+ #include <linux/mount.h>
+ #include <linux/mm.h>
+ #include <linux/pagemap.h>
+-#include <linux/btrfs.h>
+ #include "cifspdu.h"
+ #include "cifsglob.h"
+ #include "cifsproto.h"
+ #include "cifs_debug.h"
+ #include "cifsfs.h"
+ 
++#define CIFS_IOCTL_MAGIC 0xCF
++#define CIFS_IOC_COPYCHUNK_FILE _IOW(CIFS_IOCTL_MAGIC, 3, int)
++
+ static long cifs_ioctl_clone(unsigned int xid, struct file *dst_file,
+    unsigned long srcfd, u64 off, u64 len, u64 destoff)
+ {
+@@ -213,7 +215,7 @@ long cifs_ioctl(struct file *filep, unsigned int command, unsigned long arg)
+     cifs_dbg(FYI, "set compress flag rc %d\n", rc);
+    }
+    break;
+-  case BTRFS_IOC_CLONE:
++  case CIFS_IOC_COPYCHUNK_FILE:
+    rc = cifs_ioctl_clone(xid, filep, arg, 0, 0, 0);
+    break;
+   default:
+-- 
+1.7.1

@@ -1,0 +1,174 @@
+From ded6f4d38c543b1d2d2acc3296e56160a87aac26 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:41:32 -0400
+Subject: [x86] mcheck, therm_throt: Process package thresholds
+
+Message-id: <1405345303-24468-3-git-send-email-prarit@redhat.com>
+Patchwork-id: 85785
+O-Subject: [RHEL7.1 PATCH BZ 1119306 02/13] x86, mcheck, therm_throt: Process package thresholds
+Bugzilla: 1119306
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119306
+
+commit 25cdce170d28092e8e162f36702be3308973b19d
+Author: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date:   Fri May 17 23:42:01 2013 +0000
+
+    x86, mcheck, therm_throt: Process package thresholds
+
+    Added callback registration for package threshold reports. Also added
+    a callback to check the rate control implemented in callback or not.
+    If there is no rate control implemented, then there is a default rate
+    control similar to core threshold notification by delaying for
+    CHECK_INTERVAL (5 minutes) between reports.
+
+    Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+    Signed-off-by: Zhang Rui <rui.zhang@intel.com>
+
+Cc: Dean Nelson <dnelson@redhat.com>
+Cc: Tony Camuso <tcamuso@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/mce.h b/arch/x86/include/asm/mce.h
+index f23c1d6..cbe6b9e 100644
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@ -226,6 +226,13 @@ void mce_log_therm_throt_event(__u64 status);
+ /* Interrupt Handler for core thermal thresholds */
+ extern int (*platform_thermal_notify)(__u64 msr_val);
+ 
++/* Interrupt Handler for package thermal thresholds */
++extern int (*platform_thermal_package_notify)(__u64 msr_val);
++
++/* Callback support of rate control, return true, if
++ * callback has rate control */
++extern bool (*platform_thermal_package_rate_control)(void);
++
+ #ifdef CONFIG_X86_THERMAL_VECTOR
+ extern void mcheck_intel_therm_init(void);
+ #else
+diff --git a/arch/x86/kernel/cpu/mcheck/therm_throt.c b/arch/x86/kernel/cpu/mcheck/therm_throt.c
+index 10a787b..d921b7e 100644
+--- a/arch/x86/kernel/cpu/mcheck/therm_throt.c
++++ b/arch/x86/kernel/cpu/mcheck/therm_throt.c
+@@ -55,12 +55,24 @@ struct thermal_state {
+  struct _thermal_state package_power_limit;
+  struct _thermal_state core_thresh0;
+  struct _thermal_state core_thresh1;
++ struct _thermal_state pkg_thresh0;
++ struct _thermal_state pkg_thresh1;
+ };
+ 
+ /* Callback to handle core threshold interrupts */
+ int (*platform_thermal_notify)(__u64 msr_val);
+ EXPORT_SYMBOL(platform_thermal_notify);
+ 
++/* Callback to handle core package threshold_interrupts */
++int (*platform_thermal_package_notify)(__u64 msr_val);
++EXPORT_SYMBOL_GPL(platform_thermal_package_notify);
++
++/* Callback support of rate control, return true, if
++ * callback has rate control */
++bool (*platform_thermal_package_rate_control)(void);
++EXPORT_SYMBOL_GPL(platform_thermal_package_rate_control);
++
++
+ static DEFINE_PER_CPU(struct thermal_state, thermal_state);
+ 
+ static atomic_t therm_throt_en = ATOMIC_INIT(0);
+@@ -195,19 +207,25 @@ static int therm_throt_process(bool new_event, int event, int level)
+  return 0;
+ }
+ 
+-static int thresh_event_valid(int event)
++static int thresh_event_valid(int level, int event)
+ {
+  struct _thermal_state *state;
+  unsigned int this_cpu = smp_processor_id();
+  struct thermal_state *pstate = &per_cpu(thermal_state, this_cpu);
+  u64 now = get_jiffies_64();
+ 
+- state = (event == 0) ? &pstate->core_thresh0 : &pstate->core_thresh1;
++ if (level == PACKAGE_LEVEL)
++  state = (event == 0) ? &pstate->pkg_thresh0 :
++      &pstate->pkg_thresh1;
++ else
++  state = (event == 0) ? &pstate->core_thresh0 :
++      &pstate->core_thresh1;
+ 
+  if (time_before64(now, state->next_check))
+   return 0;
+ 
+  state->next_check = now + CHECK_INTERVAL;
++
+  return 1;
+ }
+ 
+@@ -311,6 +329,39 @@ device_initcall(thermal_throttle_init_device);
+ 
+ #endif /* CONFIG_SYSFS */
+ 
++static void notify_package_thresholds(__u64 msr_val)
++{
++ bool notify_thres_0 = false;
++ bool notify_thres_1 = false;
++
++ if (!platform_thermal_package_notify)
++  return;
++
++ /* lower threshold check */
++ if (msr_val & THERM_LOG_THRESHOLD0)
++  notify_thres_0 = true;
++ /* higher threshold check */
++ if (msr_val & THERM_LOG_THRESHOLD1)
++  notify_thres_1 = true;
++
++ if (!notify_thres_0 && !notify_thres_1)
++  return;
++
++ if (platform_thermal_package_rate_control &&
++  platform_thermal_package_rate_control()) {
++  /* Rate control is implemented in callback */
++  platform_thermal_package_notify(msr_val);
++  return;
++ }
++
++ /* lower threshold reached */
++ if (notify_thres_0 && thresh_event_valid(PACKAGE_LEVEL, 0))
++  platform_thermal_package_notify(msr_val);
++ /* higher threshold reached */
++ if (notify_thres_1 && thresh_event_valid(PACKAGE_LEVEL, 1))
++  platform_thermal_package_notify(msr_val);
++}
++
+ static void notify_thresholds(__u64 msr_val)
+ {
+  /* check whether the interrupt handler is defined;
+@@ -320,10 +371,12 @@ static void notify_thresholds(__u64 msr_val)
+   return;
+ 
+  /* lower threshold reached */
+- if ((msr_val & THERM_LOG_THRESHOLD0) && thresh_event_valid(0))
++ if ((msr_val & THERM_LOG_THRESHOLD0) &&
++   thresh_event_valid(CORE_LEVEL, 0))
+   platform_thermal_notify(msr_val);
+  /* higher threshold reached */
+- if ((msr_val & THERM_LOG_THRESHOLD1) && thresh_event_valid(1))
++ if ((msr_val & THERM_LOG_THRESHOLD1) &&
++   thresh_event_valid(CORE_LEVEL, 1))
+   platform_thermal_notify(msr_val);
+ }
+ 
+@@ -349,6 +402,8 @@ static void intel_thermal_interrupt(void)
+ 
+  if (this_cpu_has(X86_FEATURE_PTS)) {
+   rdmsrl(MSR_IA32_PACKAGE_THERM_STATUS, msr_val);
++  /* check violations of package thermal thresholds */
++  notify_package_thresholds(msr_val);
+   therm_throt_process(msr_val & PACKAGE_THERM_STATUS_PROCHOT,
+      THERMAL_THROTTLING_EVENT,
+      PACKAGE_LEVEL);
+-- 
+1.7.1

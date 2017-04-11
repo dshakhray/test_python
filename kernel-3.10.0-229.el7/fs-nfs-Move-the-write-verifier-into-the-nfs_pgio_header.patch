@@ -1,0 +1,99 @@
+From b4189c78b03b020d2739563c4ac2cbc411788bf0 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:53:31 -0400
+Subject: [fs] nfs: Move the write verifier into the nfs_pgio_header
+
+Message-id: <1403798077-28799-13-git-send-email-steved@redhat.com>
+Patchwork-id: 84881
+O-Subject: [RHEL7.1 PATCH 12/78] NFS: Move the write verifier into the nfs_pgio_header
+Bugzilla: 1113248
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Anna Schumaker <Anna.Schumaker@netapp.com>
+
+The header had a pointer to the verifier that was set from the old write
+data struct.  We don't need to keep the pointer around now that we have
+shared structures.
+
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: f79d06f544a797d75cbf5256a5d06c4b3d2759cc
+Bugzilla: 1113248
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/direct.c b/fs/nfs/direct.c
+index 28fdd10..c11015c 100644
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@ -814,12 +814,12 @@ static void nfs_direct_write_completion(struct nfs_pgio_header *hdr)
+    if (dreq->flags == NFS_ODIRECT_RESCHED_WRITES)
+     bit = NFS_IOHDR_NEED_RESCHED;
+    else if (dreq->flags == 0) {
+-    memcpy(&dreq->verf, hdr->verf,
++    memcpy(&dreq->verf, &hdr->verf,
+            sizeof(dreq->verf));
+     bit = NFS_IOHDR_NEED_COMMIT;
+     dreq->flags = NFS_ODIRECT_DO_COMMIT;
+    } else if (dreq->flags == NFS_ODIRECT_DO_COMMIT) {
+-    if (memcmp(&dreq->verf, hdr->verf, sizeof(dreq->verf))) {
++    if (memcmp(&dreq->verf, &hdr->verf, sizeof(dreq->verf))) {
+      dreq->flags = NFS_ODIRECT_RESCHED_WRITES;
+      bit = NFS_IOHDR_NEED_RESCHED;
+     } else
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index a286e83..b0830a3 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -82,7 +82,6 @@ struct nfs_rw_header *nfs_writehdr_alloc(void)
+   INIT_LIST_HEAD(&hdr->rpc_list);
+   spin_lock_init(&hdr->lock);
+   atomic_set(&hdr->refcnt, 0);
+-  hdr->verf = &p->verf;
+  }
+  return p;
+ }
+@@ -644,7 +643,7 @@ static void nfs_write_completion(struct nfs_pgio_header *hdr)
+    goto next;
+   }
+   if (test_bit(NFS_IOHDR_NEED_COMMIT, &hdr->flags)) {
+-   memcpy(&req->wb_verf, &hdr->verf->verifier, sizeof(req->wb_verf));
++   memcpy(&req->wb_verf, &hdr->verf.verifier, sizeof(req->wb_verf));
+    nfs_mark_request_commit(req, hdr->lseg, &cinfo);
+    goto next;
+   }
+@@ -1346,8 +1345,8 @@ static void nfs_writeback_release_common(void *calldata)
+   if (test_bit(NFS_IOHDR_NEED_RESCHED, &hdr->flags))
+    ; /* Do nothing */
+   else if (!test_and_set_bit(NFS_IOHDR_NEED_COMMIT, &hdr->flags))
+-   memcpy(hdr->verf, &data->verf, sizeof(*hdr->verf));
+-  else if (memcmp(hdr->verf, &data->verf, sizeof(*hdr->verf)))
++   memcpy(&hdr->verf, &data->verf, sizeof(hdr->verf));
++  else if (memcmp(&hdr->verf, &data->verf, sizeof(hdr->verf)))
+    set_bit(NFS_IOHDR_NEED_RESCHED, &hdr->flags);
+   spin_unlock(&hdr->lock);
+  }
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index 2d34e0d..965c2aa 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1263,7 +1263,7 @@ struct nfs_pgio_header {
+  struct list_head rpc_list;
+  atomic_t  refcnt;
+  struct nfs_page  *req;
+- struct nfs_writeverf *verf;
++ struct nfs_writeverf verf;  /* Used for writes */
+  struct pnfs_layout_segment *lseg;
+  loff_t   io_start;
+  const struct rpc_call_ops *mds_ops;
+@@ -1297,7 +1297,6 @@ struct nfs_pgio_data {
+ struct nfs_rw_header {
+  struct nfs_pgio_header header;
+  struct nfs_pgio_data rpc_data;
+- struct nfs_writeverf verf;
+ };
+ 
+ struct nfs_mds_commit_info {
+-- 
+1.7.1

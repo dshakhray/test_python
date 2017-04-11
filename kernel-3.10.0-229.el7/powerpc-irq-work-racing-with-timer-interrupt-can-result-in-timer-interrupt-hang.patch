@@ -1,0 +1,86 @@
+From 4baeaa4db43c11b9fc8473f96b562b8d585747e7 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:12:32 -0400
+Subject: [powerpc] irq work racing with timer interrupt can result in timer interrupt hang
+
+Message-id: <1410545655-205645-524-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94472
+O-Subject: [RHEL7 PATCH 523/626] powerpc: irq work racing with timer interrupt can result in timer interrupt hang
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 8050936caf125fbe54111ba5e696b68a360556ba
+Author: Anton Blanchard <anton@samba.org>
+Date:   Fri May 9 17:47:12 2014 +1000
+
+    powerpc: irq work racing with timer interrupt can result in timer interrupt hang
+
+    I am seeing an issue where a CPU running perf eventually hangs.
+    Traces show timer interrupts happening every 4 seconds even
+    when a userspace task is running on the CPU. /proc/timer_list
+    also shows pending hrtimers have not run in over an hour,
+    including the scheduler.
+
+    Looking closer, decrementers_next_tb is getting set to
+    0xffffffffffffffff, and at that point we will never take
+    a timer interrupt again.
+
+    In __timer_interrupt() we set decrementers_next_tb to
+    0xffffffffffffffff and rely on ->event_handler to update it:
+
+            *next_tb = ~(u64)0;
+            if (evt->event_handler)
+                    evt->event_handler(evt);
+
+    In this case ->event_handler is hrtimer_interrupt. This will eventually
+    call back through the clockevents code with the next event to be
+    programmed:
+
+    static int decrementer_set_next_event(unsigned long evt,
+                                          struct clock_event_device *dev)
+    {
+            /* Don't adjust the decrementer if some irq work is pending */
+            if (test_irq_work_pending())
+                    return 0;
+            __get_cpu_var(decrementers_next_tb) = get_tb_or_rtc() + evt;
+
+    If irq work came in between these two points, we will return
+    before updating decrementers_next_tb and we never process a timer
+    interrupt again.
+
+    This looks to have been introduced by 0215f7d8c53f (powerpc: Fix races
+    with irq_work). Fix it by removing the early exit and relying on
+    code later on in the function to force an early decrementer:
+
+           /* We may have raced with new irq work */
+           if (test_irq_work_pending())
+                   set_dec(1);
+
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Cc: stable@vger.kernel.org # 3.14+
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/time.c b/arch/powerpc/kernel/time.c
+index 38efb14..1a898a9 100644
+--- a/arch/powerpc/kernel/time.c
++++ b/arch/powerpc/kernel/time.c
+@@ -812,9 +812,6 @@ static void __init clocksource_init(void)
+ static int decrementer_set_next_event(unsigned long evt,
+           struct clock_event_device *dev)
+ {
+- /* Don't adjust the decrementer if some irq work is pending */
+- if (test_irq_work_pending())
+-  return 0;
+  __get_cpu_var(decrementers_next_tb) = get_tb_or_rtc() + evt;
+  set_dec(evt);
+ 
+-- 
+1.7.1

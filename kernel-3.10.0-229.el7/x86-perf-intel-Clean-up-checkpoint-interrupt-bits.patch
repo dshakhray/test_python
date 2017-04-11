@@ -1,0 +1,114 @@
+From ab9d9aed8a24b166dd47d6ad0a3229a22be88128 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:22:53 -0400
+Subject: [x86] perf/intel: Clean up checkpoint-interrupt bits
+
+Message-id: <1408462094-14194-5-git-send-email-jolsa@redhat.com>
+Patchwork-id: 87994
+O-Subject: [PATCH RHEL7.1 BZ1131394 004/325] perf/x86/intel: Clean up checkpoint-interrupt bits
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 2b9e344df384e595db24ac61ae5f780e9b024878
+Author: Peter Zijlstra <peterz@infradead.org>
+Date: Thu Sep 12 12:53:44 2013 +0200
+
+description
+===========
+Clean up the weird CP interrupt exception code by keeping a CP mask.
+
+Andi suggested this implementation but weirdly didn't actually
+implement it himself, do so now because it removes the conditional in
+the interrupt handler and avoids the assumption its only on cnt2.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/cpu/perf_event.h b/arch/x86/kernel/cpu/perf_event.h
+index 9805279..afcd17e 100644
+--- a/arch/x86/kernel/cpu/perf_event.h
++++ b/arch/x86/kernel/cpu/perf_event.h
+@@ -164,6 +164,11 @@ struct cpu_hw_events {
+  struct perf_guest_switch_msr guest_switch_msrs[X86_PMC_IDX_MAX];
+ 
+  /*
++  * Intel checkpoint mask
++  */
++ u64    intel_cp_status;
++
++ /*
+   * manage shared (per-core, per-cpu) registers
+   * used on Intel NHM/WSM/SNB
+   */
+diff --git a/arch/x86/kernel/cpu/perf_event_intel.c b/arch/x86/kernel/cpu/perf_event_intel.c
+index d71685b..3e032c0 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@ -1183,6 +1183,11 @@ static void intel_pmu_disable_fixed(struct hw_perf_event *hwc)
+  wrmsrl(hwc->config_base, ctrl_val);
+ }
+ 
++static inline bool event_is_checkpointed(struct perf_event *event)
++{
++ return (event->hw.config & HSW_IN_TX_CHECKPOINTED) != 0;
++}
++
+ static void intel_pmu_disable_event(struct perf_event *event)
+ {
+  struct hw_perf_event *hwc = &event->hw;
+@@ -1196,6 +1201,7 @@ static void intel_pmu_disable_event(struct perf_event *event)
+ 
+  cpuc->intel_ctrl_guest_mask &= ~(1ull << hwc->idx);
+  cpuc->intel_ctrl_host_mask &= ~(1ull << hwc->idx);
++ cpuc->intel_cp_status &= ~(1ull << hwc->idx);
+ 
+  /*
+   * must disable before any actual event
+@@ -1270,6 +1276,9 @@ static void intel_pmu_enable_event(struct perf_event *event)
+  if (event->attr.exclude_guest)
+   cpuc->intel_ctrl_host_mask |= (1ull << hwc->idx);
+ 
++ if (unlikely(event_is_checkpointed(event)))
++  cpuc->intel_cp_status |= (1ull << hwc->idx);
++
+  if (unlikely(hwc->config_base == MSR_ARCH_PERFMON_FIXED_CTR_CTRL)) {
+   intel_pmu_enable_fixed(hwc);
+   return;
+@@ -1281,11 +1290,6 @@ static void intel_pmu_enable_event(struct perf_event *event)
+  __x86_pmu_enable_event(hwc, ARCH_PERFMON_EVENTSEL_ENABLE);
+ }
+ 
+-static inline bool event_is_checkpointed(struct perf_event *event)
+-{
+- return (event->hw.config & HSW_IN_TX_CHECKPOINTED) != 0;
+-}
+-
+ /*
+  * Save and restart an expired event. Called by NMI contexts,
+  * so it has to be careful about preempting normal event ops:
+@@ -1384,11 +1388,11 @@ again:
+  }
+ 
+  /*
+-  * To avoid spurious interrupts with perf stat always reset checkpointed
+-  * counters.
++  * Checkpointed counters can lead to 'spurious' PMIs because the
++  * rollback caused by the PMI will have cleared the overflow status
++  * bit. Therefore always force probe these counters.
+   */
+- if (cpuc->events[2] && event_is_checkpointed(cpuc->events[2]))
+-  status |= (1ULL << 2);
++ status |= cpuc->intel_cp_status;
+ 
+  for_each_set_bit(bit, (unsigned long *)&status, X86_PMC_IDX_MAX) {
+   struct perf_event *event = cpuc->events[bit];
+-- 
+1.7.1

@@ -1,0 +1,226 @@
+From ccf744011d0a65ccd0c40c4af0ebd063a465671c Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:36:11 -0400
+Subject: [block] blk-mq: pass in suggested NUMA node to ->alloc_hctx()
+
+Message-id: <1402670238-13916-84-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83858
+O-Subject: [RHEL7.1 PATCH 083/150] blk-mq: pass in suggested NUMA node to ->alloc_hctx()
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit f14bbe77a96bb979dc539d8308ee18a9363a544f
+Author: Jens Axboe <axboe@fb.com>
+Date:   Tue May 27 12:06:53 2014 -0600
+
+    blk-mq: pass in suggested NUMA node to ->alloc_hctx()
+
+    Drivers currently have to figure this out on their own, and they
+    are missing information to do it properly. The ones that did
+    attempt to do it, do it wrong.
+
+    So just pass in the suggested node directly to the alloc
+    function.
+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq-cpumap.c b/block/blk-mq-cpumap.c
+index 5d0f93c..0daacb9 100644
+--- a/block/blk-mq-cpumap.c
++++ b/block/blk-mq-cpumap.c
+@@ -96,3 +96,19 @@ unsigned int *blk_mq_make_queue_map(struct blk_mq_tag_set *set)
+  kfree(map);
+  return NULL;
+ }
++
++/*
++ * We have no quick way of doing reverse lookups. This is only used at
++ * queue init time, so runtime isn't important.
++ */
++int blk_mq_hw_queue_to_node(unsigned int *mq_map, unsigned int index)
++{
++ int i;
++
++ for_each_possible_cpu(i) {
++  if (index == mq_map[i])
++   return cpu_to_node(i);
++ }
++
++ return NUMA_NO_NODE;
++}
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index e8b5f74..30bad93 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1297,10 +1297,10 @@ struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q, const int cpu)
+ EXPORT_SYMBOL(blk_mq_map_queue);
+ 
+ struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *set,
+-         unsigned int hctx_index)
++         unsigned int hctx_index,
++         int node)
+ {
+- return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL,
+-    set->numa_node);
++ return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, node);
+ }
+ EXPORT_SYMBOL(blk_mq_alloc_single_hw_queue);
+ 
+@@ -1752,6 +1752,7 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+  struct blk_mq_hw_ctx **hctxs;
+  struct blk_mq_ctx *ctx;
+  struct request_queue *q;
++ unsigned int *map;
+  int i;
+ 
+  ctx = alloc_percpu(struct blk_mq_ctx);
+@@ -1764,8 +1765,14 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+  if (!hctxs)
+   goto err_percpu;
+ 
++ map = blk_mq_make_queue_map(set);
++ if (!map)
++  goto err_map;
++
+  for (i = 0; i < set->nr_hw_queues; i++) {
+-  hctxs[i] = set->ops->alloc_hctx(set, i);
++  int node = blk_mq_hw_queue_to_node(map, i);
++
++  hctxs[i] = set->ops->alloc_hctx(set, i, node);
+   if (!hctxs[i])
+    goto err_hctxs;
+ 
+@@ -1773,7 +1780,7 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+    goto err_hctxs;
+ 
+   atomic_set(&hctxs[i]->nr_active, 0);
+-  hctxs[i]->numa_node = NUMA_NO_NODE;
++  hctxs[i]->numa_node = node;
+   hctxs[i]->queue_num = i;
+  }
+ 
+@@ -1784,15 +1791,12 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+  if (percpu_counter_init(&q->mq_usage_counter, 0))
+   goto err_map;
+ 
+- q->mq_map = blk_mq_make_queue_map(set);
+- if (!q->mq_map)
+-  goto err_map;
+-
+  setup_timer(&q->timeout, blk_mq_rq_timer, (unsigned long) q);
+  blk_queue_rq_timeout(q, 30000);
+ 
+  q->nr_queues = nr_cpu_ids;
+  q->nr_hw_queues = set->nr_hw_queues;
++ q->mq_map = map;
+ 
+  q->queue_ctx = ctx;
+  q->queue_hw_ctx = hctxs;
+@@ -1844,16 +1848,16 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+ err_flush_rq:
+  kfree(q->flush_rq);
+ err_hw:
+- kfree(q->mq_map);
+-err_map:
+  blk_cleanup_queue(q);
+ err_hctxs:
++ kfree(map);
+  for (i = 0; i < set->nr_hw_queues; i++) {
+   if (!hctxs[i])
+    break;
+   free_cpumask_var(hctxs[i]->cpumask);
+   set->ops->free_hctx(hctxs[i], i);
+  }
++err_map:
+  kfree(hctxs);
+ err_percpu:
+  free_percpu(ctx);
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 491dbd4..ff5e6bf 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -52,6 +52,7 @@ void blk_mq_disable_hotplug(void);
+  */
+ extern unsigned int *blk_mq_make_queue_map(struct blk_mq_tag_set *set);
+ extern int blk_mq_update_queue_map(unsigned int *map, unsigned int nr_queues);
++extern int blk_mq_hw_queue_to_node(unsigned int *map, unsigned int);
+ 
+ /*
+  * Basic implementation of sparser bitmap, allowing the user to spread
+diff --git a/drivers/block/null_blk.c b/drivers/block/null_blk.c
+index 10d295a..a1b82ef 100644
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@ -322,39 +322,10 @@ static int null_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ }
+ 
+ static struct blk_mq_hw_ctx *null_alloc_hctx(struct blk_mq_tag_set *set,
+-  unsigned int hctx_index)
++          unsigned int hctx_index,
++          int node)
+ {
+- int b_size = DIV_ROUND_UP(set->nr_hw_queues, nr_online_nodes);
+- int tip = (set->nr_hw_queues % nr_online_nodes);
+- int node = 0, i, n;
+-
+- /*
+-  * Split submit queues evenly wrt to the number of nodes. If uneven,
+-  * fill the first buckets with one extra, until the rest is filled with
+-  * no extra.
+-  */
+- for (i = 0, n = 1; i < hctx_index; i++, n++) {
+-  if (n % b_size == 0) {
+-   n = 0;
+-   node++;
+-
+-   tip--;
+-   if (!tip)
+-    b_size = set->nr_hw_queues / nr_online_nodes;
+-  }
+- }
+-
+- /*
+-  * A node might not be online, therefore map the relative node id to the
+-  * real node id.
+-  */
+- for_each_online_node(n) {
+-  if (!node)
+-   break;
+-  node--;
+- }
+-
+- return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, n);
++ return kzalloc_node(sizeof(struct blk_mq_hw_ctx), GFP_KERNEL, node);
+ }
+ 
+ static void null_free_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_index)
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 4de7eb6..2052fba 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -80,7 +80,7 @@ struct blk_mq_tag_set {
+ typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+ typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+ typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_tag_set *,
+-  unsigned int);
++  unsigned int, int);
+ typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+ typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+@@ -165,7 +165,7 @@ struct request *blk_mq_alloc_reserved_request(struct request_queue *q, int rw, g
+ struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
+ 
+ struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+-struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int);
++struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+ void blk_mq_free_single_hw_queue(struct blk_mq_hw_ctx *, unsigned int);
+ 
+ void blk_mq_end_io(struct request *rq, int error);
+-- 
+1.7.1

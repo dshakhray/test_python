@@ -1,0 +1,141 @@
+From ef3c0fcc431c8393c85ad0b6b36e9a732ff525df Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:24:37 -0400
+Subject: [tools] perf/symbols: Support for Openembedded/Yocto -dbg packages
+
+Message-id: <1408462094-14194-109-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88080
+O-Subject: [PATCH RHEL7.1 BZ1131394 108/325] perf symbols: Support for Openembedded/Yocto -dbg packages
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 9cd00941f8c274e6ca03ed238d96ddb0be474b86
+Author: Ricardo Ribalda Delgado <ricardo.ribalda@gmail.com>
+Date: Wed Sep 18 15:56:14 2013 +0200
+
+description
+===========
+On OpenEmbedded the symbol files are located under a .debug folder on
+the same folder as the binary file.
+
+This patch adds support for such files.
+
+Without this patch on perf top you can see:
+
+no symbols found in /usr/lib/gstreamer-1.0/libtheoraenc.so.1.1.2, maybe
+install a debug package?
+
+84.56%  libtheoraenc.so.1.1.2       [.] 0x000000000000b346
+
+With this patch symbols are shown:
+
+19.06%  libtheoraenc.so.1.1.2       [.] oc_int_frag_satd_thresh_mmxext
+9.76%   libtheoraenc.so.1.1.2       [.] oc_analyze_mb_mode_luma
+5.58%   libtheoraenc.so.1.1.2       [.] oc_qii_state_advance
+4.84%   libtheoraenc.so.1.1.2       [.] oc_enc_tokenize_ac
+...
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index e3c1ff8..6bfc8aa 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -7,19 +7,20 @@
+ char dso__symtab_origin(const struct dso *dso)
+ {
+  static const char origin[] = {
+-  [DSO_BINARY_TYPE__KALLSYMS]  = 'k',
+-  [DSO_BINARY_TYPE__VMLINUX]  = 'v',
+-  [DSO_BINARY_TYPE__JAVA_JIT]  = 'j',
+-  [DSO_BINARY_TYPE__DEBUGLINK]  = 'l',
+-  [DSO_BINARY_TYPE__BUILD_ID_CACHE] = 'B',
+-  [DSO_BINARY_TYPE__FEDORA_DEBUGINFO] = 'f',
+-  [DSO_BINARY_TYPE__UBUNTU_DEBUGINFO] = 'u',
+-  [DSO_BINARY_TYPE__BUILDID_DEBUGINFO] = 'b',
+-  [DSO_BINARY_TYPE__SYSTEM_PATH_DSO] = 'd',
+-  [DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE] = 'K',
+-  [DSO_BINARY_TYPE__GUEST_KALLSYMS] = 'g',
+-  [DSO_BINARY_TYPE__GUEST_KMODULE] = 'G',
+-  [DSO_BINARY_TYPE__GUEST_VMLINUX] = 'V',
++  [DSO_BINARY_TYPE__KALLSYMS]   = 'k',
++  [DSO_BINARY_TYPE__VMLINUX]   = 'v',
++  [DSO_BINARY_TYPE__JAVA_JIT]   = 'j',
++  [DSO_BINARY_TYPE__DEBUGLINK]   = 'l',
++  [DSO_BINARY_TYPE__BUILD_ID_CACHE]  = 'B',
++  [DSO_BINARY_TYPE__FEDORA_DEBUGINFO]  = 'f',
++  [DSO_BINARY_TYPE__UBUNTU_DEBUGINFO]  = 'u',
++  [DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO] = 'o',
++  [DSO_BINARY_TYPE__BUILDID_DEBUGINFO]  = 'b',
++  [DSO_BINARY_TYPE__SYSTEM_PATH_DSO]  = 'd',
++  [DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE]  = 'K',
++  [DSO_BINARY_TYPE__GUEST_KALLSYMS]  = 'g',
++  [DSO_BINARY_TYPE__GUEST_KMODULE]  = 'G',
++  [DSO_BINARY_TYPE__GUEST_VMLINUX]  = 'V',
+  };
+ 
+  if (dso == NULL || dso->symtab_type == DSO_BINARY_TYPE__NOT_FOUND)
+@@ -64,6 +65,28 @@ int dso__binary_type_file(struct dso *dso, enum dso_binary_type type,
+     symbol_conf.symfs, dso->long_name);
+   break;
+ 
++ case DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO:
++ {
++  char *last_slash;
++  size_t len;
++  size_t dir_size;
++
++  last_slash = dso->long_name + dso->long_name_len;
++  while (last_slash != dso->long_name && *last_slash != '/')
++   last_slash--;
++
++  len = scnprintf(file, size, "%s", symbol_conf.symfs);
++  dir_size = last_slash - dso->long_name + 2;
++  if (dir_size > (size - len)) {
++   ret = -1;
++   break;
++  }
++  len += scnprintf(file + len, dir_size, "%s",  dso->long_name);
++  len += scnprintf(file + len , size - len, ".debug%s",
++        last_slash);
++  break;
++ }
++
+  case DSO_BINARY_TYPE__BUILDID_DEBUGINFO:
+   if (!dso->has_build_id) {
+    ret = -1;
+diff --git a/tools/perf/util/dso.h b/tools/perf/util/dso.h
+index b793053..dbd9241 100644
+--- a/tools/perf/util/dso.h
++++ b/tools/perf/util/dso.h
+@@ -23,6 +23,7 @@ enum dso_binary_type {
+  DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE,
+  DSO_BINARY_TYPE__KCORE,
+  DSO_BINARY_TYPE__GUEST_KCORE,
++ DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO,
+  DSO_BINARY_TYPE__NOT_FOUND,
+ };
+ 
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index 7eb0362..cd1dcc4 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -51,6 +51,7 @@ static enum dso_binary_type binary_type_symtab[] = {
+  DSO_BINARY_TYPE__SYSTEM_PATH_DSO,
+  DSO_BINARY_TYPE__GUEST_KMODULE,
+  DSO_BINARY_TYPE__SYSTEM_PATH_KMODULE,
++ DSO_BINARY_TYPE__OPENEMBEDDED_DEBUGINFO,
+  DSO_BINARY_TYPE__NOT_FOUND,
+ };
+ 
+-- 
+1.7.1

@@ -1,0 +1,81 @@
+From 735fd0cc55ddd4a4b2838017d5a7b4e7865cfae0 Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:43 -0400
+Subject: [fs] cifs: fix the race in cifs_writev()
+
+Message-id: <1406549822-10376-51-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86758
+O-Subject: [RHEL7.1 PATCH 50/69] [bz1082049]cifs: fix the race in cifs_writev()
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Al Viro <viro@zeniv.linux.org.uk>
+
+O_APPEND handling there hadn't been completely fixed by Pavel's
+patch; it checks the right value, but it's racy - we can't really
+do that until i_mutex has been taken.
+
+Fix by switching to __generic_file_aio_write() (open-coding
+generic_file_aio_write(), actually) and pulling mutex_lock() above
+inode_size_read().
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 19dfc1f5f2ef03a52aa30c8257c5745edef23f55)
+
+This patch differs slightly to the upstream patch since the 4th argument
+to the function __generic_file_aio_write() was killed by upstream patch
+41fc56d573c35a212688b12b48af8c303f9bb6d2. We have to continue carrying
+this argument since this is still required in RHEL 7.
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index 8389f91..74601b9 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -2579,19 +2579,33 @@ cifs_writev(struct kiocb *iocb, const struct iovec *iov,
+  struct cifsInodeInfo *cinode = CIFS_I(inode);
+  struct TCP_Server_Info *server = tlink_tcon(cfile->tlink)->ses->server;
+  ssize_t rc = -EACCES;
+- loff_t lock_pos = pos;
++ loff_t lock_pos = iocb->ki_pos;
+ 
+- if (file->f_flags & O_APPEND)
+-  lock_pos = i_size_read(inode);
+  /*
+   * We need to hold the sem to be sure nobody modifies lock list
+   * with a brlock that prevents writing.
+   */
+  down_read(&cinode->lock_sem);
++ mutex_lock(&inode->i_mutex);
++ if (file->f_flags & O_APPEND)
++  lock_pos = i_size_read(inode);
+  if (!cifs_find_lock_conflict(cfile, lock_pos, iov_length(iov, nr_segs),
+          server->vals->exclusive_lock_type, NULL,
+-         CIFS_WRITE_OP))
+-  rc = generic_file_aio_write(iocb, iov, nr_segs, pos);
++         CIFS_WRITE_OP)) {
++  rc = __generic_file_aio_write(iocb, iov, nr_segs,
++      &iocb->ki_pos);
++  mutex_unlock(&inode->i_mutex);
++
++  if (rc > 0) {
++   ssize_t err;
++
++   err = generic_write_sync(file, iocb->ki_pos - rc, rc);
++   if (rc < 0)
++    rc = err;
++  }
++ } else {
++  mutex_unlock(&inode->i_mutex);
++ }
+  up_read(&cinode->lock_sem);
+  return rc;
+ }
+-- 
+1.7.1

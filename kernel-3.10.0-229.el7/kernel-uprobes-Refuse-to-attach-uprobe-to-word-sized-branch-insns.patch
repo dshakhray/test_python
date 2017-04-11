@@ -1,0 +1,72 @@
+From ae63a988031b49b14faf8ec69e25301591b22d7e Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Mon, 16 Jun 2014 16:01:45 -0400
+Subject: [kernel] uprobes: Refuse to attach uprobe to "word-sized" branch insns
+
+Message-id: <20140616160145.GA15456@redhat.com>
+Patchwork-id: 84077
+O-Subject: [PATCH RHEL7 BZ 1073627 16/36] uprobes/x86: Refuse to attach uprobe to "word-sized" branch insns
+Bugzilla: 1073627
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Denys Vlasenko <dvlasenk@redhat.com>
+
+RHBZ: 1073627
+
+All branch insns on x86 can be prefixed with the operand-size
+override prefix, 0x66. It was only ever useful for performing
+jumps to 32-bit offsets in 16-bit code segments.
+
+In 32-bit code, such instructions are useless since
+they cause IP truncation to 16 bits, and in case of call insns,
+they save only 16 bits of return address and misalign
+the stack pointer as a "bonus".
+
+In 64-bit code, such instructions are treated differently by Intel
+and AMD CPUs: Intel ignores the prefix altogether,
+AMD treats them the same as in 32-bit mode.
+
+Before this patch, the emulation code would execute
+the instructions as if they have no 0x66 prefix.
+
+With this patch, we refuse to attach uprobes to such insns.
+
+Signed-off-by: Denys Vlasenko <dvlasenk@redhat.com>
+Acked-by: Jim Keniston <jkenisto@us.ibm.com>
+Acked-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+(cherry picked from commit 250bbd12c2fe1221ec96d8087d63e982d4f2180a)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index ace2291..3cf24a2 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -583,6 +583,7 @@ static struct uprobe_xol_ops branch_xol_ops = {
+ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
+ {
+  u8 opc1 = OPCODE1(insn);
++ int i;
+ 
+  /* has the side-effect of processing the entire instruction */
+  insn_get_length(insn);
+@@ -612,6 +613,16 @@ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
+    return -ENOSYS;
+  }
+ 
++ /*
++  * 16-bit overrides such as CALLW (66 e8 nn nn) are not supported.
++  * Intel and AMD behavior differ in 64-bit mode: Intel ignores 66 prefix.
++  * No one uses these insns, reject any branch insns with such prefix.
++  */
++ for (i = 0; i < insn->prefixes.nbytes; i++) {
++  if (insn->prefixes.bytes[i] == 0x66)
++   return -ENOTSUPP;
++ }
++
+  auprobe->branch.opc1 = opc1;
+  auprobe->branch.ilen = insn->length;
+  auprobe->branch.offs = insn->immediate.value;
+-- 
+1.7.1

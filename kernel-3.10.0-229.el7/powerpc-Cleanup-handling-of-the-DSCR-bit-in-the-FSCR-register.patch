@@ -1,0 +1,106 @@
+From 4f28aea906d0d0eca7f711be4f84c82611936a6d Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:02 -0400
+Subject: [powerpc] Cleanup handling of the DSCR bit in the FSCR register
+
+Message-id: <1410545655-205645-74-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94093
+O-Subject: [RHEL7 PATCH 073/626] powerpc: Cleanup handling of the DSCR bit in the FSCR register
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit bc683a7e51c5c838bc74316125bebec92af74f12
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Mon Aug 26 13:55:57 2013 +1000
+
+    powerpc: Cleanup handling of the DSCR bit in the FSCR register
+
+    As suggested by paulus we can simplify the Data Stream Control Register
+    (DSCR) Facility Status and Control Register (FSCR) handling.
+
+    Firstly, we simplify the asm by using a rldimi.
+
+    Secondly, we now use the FSCR only to control the DSCR facility, rather
+    than both the FSCR and HFSCR.  Users will see no functional change from
+    this but will get a minor speedup as they will trap into the kernel only
+    once (rather than twice) when they first touch the DSCR.  Also, this
+    changes removes a bunch of ugly FTR_SECTION code.
+
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index fe60ec4..f962e11 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -578,34 +578,15 @@ BEGIN_FTR_SECTION
+  ld r7,DSCR_DEFAULT@toc(2)
+  ld r0,THREAD_DSCR(r4)
+  cmpwi r6,0
+- li r8, FSCR_DSCR
+  bne 1f
+  ld r0,0(r7)
+- b 3f
+ 1:
+-  BEGIN_FTR_SECTION_NESTED(70)
+- mfspr r6, SPRN_FSCR
+- or r6, r6, r8
+- mtspr SPRN_FSCR, r6
+-    BEGIN_FTR_SECTION_NESTED(69)
+- mfspr r6, SPRN_HFSCR
+- or r6, r6, r8
+- mtspr SPRN_HFSCR, r6
+-    END_FTR_SECTION_NESTED(CPU_FTR_HVMODE, CPU_FTR_HVMODE, 69)
+- b 4f
+-  END_FTR_SECTION_NESTED(CPU_FTR_ARCH_207S, CPU_FTR_ARCH_207S, 70)
+-3:
+-  BEGIN_FTR_SECTION_NESTED(70)
+- mfspr r6, SPRN_FSCR
+- andc r6, r6, r8
+- mtspr SPRN_FSCR, r6
+-    BEGIN_FTR_SECTION_NESTED(69)
+- mfspr r6, SPRN_HFSCR
+- andc r6, r6, r8
+- mtspr SPRN_HFSCR, r6
+-    END_FTR_SECTION_NESTED(CPU_FTR_HVMODE, CPU_FTR_HVMODE, 69)
+-  END_FTR_SECTION_NESTED(CPU_FTR_ARCH_207S, CPU_FTR_ARCH_207S, 70)
+-4: cmpd r0,r25
++BEGIN_FTR_SECTION_NESTED(70)
++ mfspr r8, SPRN_FSCR
++ rldimi r8, r6, FSCR_DSCR_LG, (63 - FSCR_DSCR_LG)
++ mtspr SPRN_FSCR, r8
++END_FTR_SECTION_NESTED(CPU_FTR_ARCH_207S, CPU_FTR_ARCH_207S, 70)
++ cmpd r0,r25
+  beq 2f
+  mtspr SPRN_DSCR,r0
+ 2:
+diff --git a/arch/powerpc/kernel/traps.c b/arch/powerpc/kernel/traps.c
+index 2bdaffa..b2a8277 100644
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@ -1324,13 +1324,10 @@ void facility_unavailable_exception(struct pt_regs *regs)
+  if (status == FSCR_DSCR_LG) {
+   /* User is acessing the DSCR.  Set the inherit bit and allow
+    * the user to set it directly in future by setting via the
+-   * H/FSCR DSCR bit.
++   * FSCR DSCR bit.  We always leave HFSCR DSCR set.
+    */
+   current->thread.dscr_inherit = 1;
+-  if (hv)
+-   mtspr(SPRN_HFSCR, value | HFSCR_DSCR);
+-  else
+-   mtspr(SPRN_FSCR,  value | FSCR_DSCR);
++  mtspr(SPRN_FSCR, value | FSCR_DSCR);
+   return;
+  }
+ 
+-- 
+1.7.1

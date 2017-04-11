@@ -1,0 +1,1260 @@
+From 72d36b62ff5193c772ca3a9a025f8643bb4eaf72 Mon Sep 17 00:00:00 2001
+From: Nikolay Aleksandrov <nikolay@redhat.com>
+Date: Mon, 1 Sep 2014 13:32:56 -0400
+Subject: [crypto] qat: Intel(R) QAT transport code
+
+Message-id: <1409578401-26943-5-git-send-email-nikolay@redhat.com>
+Patchwork-id: 90081
+O-Subject: [RHEL7.1 PATCH BZ 1091130 04/29] crypto: qat - Intel(R) QAT transport code
+Bugzilla: 1091130
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Herbert Xu <herbert.xu@redhat.com>
+
+From: Tadeusz Struk <tadeusz.struk@intel.com>
+
+This patch adds a code that implements communication channel between the
+driver and the firmware.
+
+Acked-by: John Griffin <john.griffin@intel.com>
+Reviewed-by: Bruce W. Allan <bruce.w.allan@intel.com>
+Signed-off-by: Tadeusz Struk <tadeusz.struk@intel.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit a672a9dc872ec4eea91bd331f6d55aee4ac48d4f)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/crypto/qat/qat_common/adf_transport.c b/drivers/crypto/qat/qat_common/adf_transport.c
+new file mode 100644
+index 0000000..b213010
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_transport.c
+@@ -0,0 +1,565 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#include <linux/delay.h>
++#include "adf_accel_devices.h"
++#include "adf_transport_internal.h"
++#include "adf_transport_access_macros.h"
++#include "adf_cfg.h"
++#include "adf_common_drv.h"
++
++static inline uint32_t adf_modulo(uint32_t data, uint32_t shift)
++{
++ uint32_t div = data >> shift;
++ uint32_t mult = div << shift;
++ return data - mult;
++}
++
++static inline int adf_check_ring_alignment(uint64_t addr, uint64_t size)
++{
++ if (((size - 1) & addr) != 0)
++  return -EFAULT;
++ return 0;
++}
++
++static int adf_verify_ring_size(uint32_t msg_size, uint32_t msg_num)
++{
++ int i = ADF_MIN_RING_SIZE;
++ for (; i <= ADF_MAX_RING_SIZE; i++)
++  if ((msg_size * msg_num) == ADF_SIZE_TO_RING_SIZE_IN_BYTES(i))
++   return i;
++
++ return ADF_DEFAULT_RING_SIZE;
++}
++
++static int adf_reserve_ring(struct adf_etr_bank_data *bank, uint32_t ring)
++{
++ spin_lock(&bank->lock);
++ if (bank->ring_mask & (1 << ring)) {
++  spin_unlock(&bank->lock);
++  return -EFAULT;
++ }
++ bank->ring_mask |= (1 << ring);
++ spin_unlock(&bank->lock);
++ return 0;
++}
++
++static void adf_unreserve_ring(struct adf_etr_bank_data *bank, uint32_t ring)
++{
++ spin_lock(&bank->lock);
++ bank->ring_mask &= ~(1 << ring);
++ spin_unlock(&bank->lock);
++}
++
++static void adf_enable_ring_irq(struct adf_etr_bank_data *bank, uint32_t ring)
++{
++ spin_lock_bh(&bank->lock);
++ bank->irq_mask |= (1 << ring);
++ spin_unlock_bh(&bank->lock);
++ WRITE_CSR_INT_COL_EN(bank->csr_addr, bank->bank_number, bank->irq_mask);
++ WRITE_CSR_INT_COL_CTL(bank->csr_addr, bank->bank_number,
++         bank->irq_coalesc_timer);
++}
++
++static void adf_disable_ring_irq(struct adf_etr_bank_data *bank, uint32_t ring)
++{
++ spin_lock_bh(&bank->lock);
++ bank->irq_mask &= ~(1 << ring);
++ spin_unlock_bh(&bank->lock);
++ WRITE_CSR_INT_COL_EN(bank->csr_addr, bank->bank_number, bank->irq_mask);
++}
++
++int adf_send_message(struct adf_etr_ring_data *ring, uint32_t *msg)
++{
++ if (atomic_add_return(1, ring->inflights) >
++     ADF_MAX_INFLIGHTS(ring->ring_size, ring->msg_size)) {
++  atomic_dec(ring->inflights);
++  return -EAGAIN;
++ }
++ spin_lock_bh(&ring->lock);
++ memcpy(ring->base_addr + ring->tail, msg,
++        ADF_MSG_SIZE_TO_BYTES(ring->msg_size));
++
++ ring->tail = adf_modulo(ring->tail +
++    ADF_MSG_SIZE_TO_BYTES(ring->msg_size),
++    ADF_RING_SIZE_MODULO(ring->ring_size));
++ WRITE_CSR_RING_TAIL(ring->bank->csr_addr, ring->bank->bank_number,
++       ring->ring_number, ring->tail);
++ spin_unlock_bh(&ring->lock);
++ return 0;
++}
++
++static int adf_handle_response(struct adf_etr_ring_data *ring)
++{
++ uint32_t msg_counter = 0;
++ uint32_t *msg = (uint32_t *)(ring->base_addr + ring->head);
++
++ while (*msg != ADF_RING_EMPTY_SIG) {
++  ring->callback((uint32_t *)msg);
++  *msg = ADF_RING_EMPTY_SIG;
++  ring->head = adf_modulo(ring->head +
++     ADF_MSG_SIZE_TO_BYTES(ring->msg_size),
++     ADF_RING_SIZE_MODULO(ring->ring_size));
++  msg_counter++;
++  msg = (uint32_t *)(ring->base_addr + ring->head);
++ }
++ if (msg_counter > 0) {
++  WRITE_CSR_RING_HEAD(ring->bank->csr_addr,
++        ring->bank->bank_number,
++        ring->ring_number, ring->head);
++  atomic_sub(msg_counter, ring->inflights);
++ }
++ return 0;
++}
++
++static void adf_configure_tx_ring(struct adf_etr_ring_data *ring)
++{
++ uint32_t ring_config = BUILD_RING_CONFIG(ring->ring_size);
++
++ WRITE_CSR_RING_CONFIG(ring->bank->csr_addr, ring->bank->bank_number,
++         ring->ring_number, ring_config);
++}
++
++static void adf_configure_rx_ring(struct adf_etr_ring_data *ring)
++{
++ uint32_t ring_config =
++   BUILD_RESP_RING_CONFIG(ring->ring_size,
++            ADF_RING_NEAR_WATERMARK_512,
++            ADF_RING_NEAR_WATERMARK_0);
++
++ WRITE_CSR_RING_CONFIG(ring->bank->csr_addr, ring->bank->bank_number,
++         ring->ring_number, ring_config);
++}
++
++static int adf_init_ring(struct adf_etr_ring_data *ring)
++{
++ struct adf_etr_bank_data *bank = ring->bank;
++ struct adf_accel_dev *accel_dev = bank->accel_dev;
++ struct adf_hw_device_data *hw_data = accel_dev->hw_device;
++ uint64_t ring_base;
++ uint32_t ring_size_bytes =
++   ADF_SIZE_TO_RING_SIZE_IN_BYTES(ring->ring_size);
++
++ ring_size_bytes = ADF_RING_SIZE_BYTES_MIN(ring_size_bytes);
++ ring->base_addr = dma_alloc_coherent(&GET_DEV(accel_dev),
++          ring_size_bytes, &ring->dma_addr,
++          GFP_KERNEL);
++ if (!ring->base_addr)
++  return -ENOMEM;
++
++ memset(ring->base_addr, 0x7F, ring_size_bytes);
++ /* The base_addr has to be aligned to the size of the buffer */
++ if (adf_check_ring_alignment(ring->dma_addr, ring_size_bytes)) {
++  pr_err("QAT: Ring address not aligned\n");
++  dma_free_coherent(&GET_DEV(accel_dev), ring_size_bytes,
++      ring->base_addr, ring->dma_addr);
++  return -EFAULT;
++ }
++
++ if (hw_data->tx_rings_mask & (1 << ring->ring_number))
++  adf_configure_tx_ring(ring);
++
++ else
++  adf_configure_rx_ring(ring);
++
++ ring_base = BUILD_RING_BASE_ADDR(ring->dma_addr, ring->ring_size);
++ WRITE_CSR_RING_BASE(ring->bank->csr_addr, ring->bank->bank_number,
++       ring->ring_number, ring_base);
++ spin_lock_init(&ring->lock);
++ return 0;
++}
++
++static void adf_cleanup_ring(struct adf_etr_ring_data *ring)
++{
++ uint32_t ring_size_bytes =
++   ADF_SIZE_TO_RING_SIZE_IN_BYTES(ring->ring_size);
++ ring_size_bytes = ADF_RING_SIZE_BYTES_MIN(ring_size_bytes);
++
++ if (ring->base_addr) {
++  memset(ring->base_addr, 0x7F, ring_size_bytes);
++  dma_free_coherent(&GET_DEV(ring->bank->accel_dev),
++      ring_size_bytes, ring->base_addr,
++      ring->dma_addr);
++ }
++}
++
++int adf_create_ring(struct adf_accel_dev *accel_dev, const char *section,
++      uint32_t bank_num, uint32_t num_msgs,
++      uint32_t msg_size, const char *ring_name,
++      adf_callback_fn callback, int poll_mode,
++      struct adf_etr_ring_data **ring_ptr)
++{
++ struct adf_etr_data *transport_data = accel_dev->transport;
++ struct adf_etr_bank_data *bank;
++ struct adf_etr_ring_data *ring;
++ char val[ADF_CFG_MAX_VAL_LEN_IN_BYTES];
++ uint32_t ring_num;
++ int ret;
++
++ if (bank_num >= GET_MAX_BANKS(accel_dev)) {
++  pr_err("QAT: Invalid bank number\n");
++  return -EFAULT;
++ }
++ if (msg_size > ADF_MSG_SIZE_TO_BYTES(ADF_MAX_MSG_SIZE)) {
++  pr_err("QAT: Invalid msg size\n");
++  return -EFAULT;
++ }
++ if (ADF_MAX_INFLIGHTS(adf_verify_ring_size(msg_size, num_msgs),
++         ADF_BYTES_TO_MSG_SIZE(msg_size)) < 2) {
++  pr_err("QAT: Invalid ring size for given msg size\n");
++  return -EFAULT;
++ }
++ if (adf_cfg_get_param_value(accel_dev, section, ring_name, val)) {
++  pr_err("QAT: Section %s, no such entry : %s\n",
++         section, ring_name);
++  return -EFAULT;
++ }
++ if (kstrtouint(val, 10, &ring_num)) {
++  pr_err("QAT: Can't get ring number\n");
++  return -EFAULT;
++ }
++
++ bank = &transport_data->banks[bank_num];
++ if (adf_reserve_ring(bank, ring_num)) {
++  pr_err("QAT: Ring %d, %s already exists.\n",
++         ring_num, ring_name);
++  return -EFAULT;
++ }
++ ring = &bank->rings[ring_num];
++ ring->ring_number = ring_num;
++ ring->bank = bank;
++ ring->callback = callback;
++ ring->msg_size = ADF_BYTES_TO_MSG_SIZE(msg_size);
++ ring->ring_size = adf_verify_ring_size(msg_size, num_msgs);
++ ring->head = 0;
++ ring->tail = 0;
++ atomic_set(ring->inflights, 0);
++ ret = adf_init_ring(ring);
++ if (ret)
++  goto err;
++
++ /* Enable HW arbitration for the given ring */
++ accel_dev->hw_device->hw_arb_ring_enable(ring);
++
++ if (adf_ring_debugfs_add(ring, ring_name)) {
++  pr_err("QAT: Couldn't add ring debugfs entry\n");
++  ret = -EFAULT;
++  goto err;
++ }
++
++ /* Enable interrupts if needed */
++ if (callback && (!poll_mode))
++  adf_enable_ring_irq(bank, ring->ring_number);
++ *ring_ptr = ring;
++ return 0;
++err:
++ adf_cleanup_ring(ring);
++ adf_unreserve_ring(bank, ring_num);
++ accel_dev->hw_device->hw_arb_ring_disable(ring);
++ return ret;
++}
++
++void adf_remove_ring(struct adf_etr_ring_data *ring)
++{
++ struct adf_etr_bank_data *bank = ring->bank;
++ struct adf_accel_dev *accel_dev = bank->accel_dev;
++
++ /* Disable interrupts for the given ring */
++ adf_disable_ring_irq(bank, ring->ring_number);
++
++ /* Clear PCI config space */
++ WRITE_CSR_RING_CONFIG(bank->csr_addr, bank->bank_number,
++         ring->ring_number, 0);
++ WRITE_CSR_RING_BASE(bank->csr_addr, bank->bank_number,
++       ring->ring_number, 0);
++ adf_ring_debugfs_rm(ring);
++ adf_unreserve_ring(bank, ring->ring_number);
++ /* Disable HW arbitration for the given ring */
++ accel_dev->hw_device->hw_arb_ring_disable(ring);
++ adf_cleanup_ring(ring);
++}
++
++static void adf_ring_response_handler(struct adf_etr_bank_data *bank)
++{
++ uint32_t empty_rings, i;
++
++ empty_rings = READ_CSR_E_STAT(bank->csr_addr, bank->bank_number);
++ empty_rings = ~empty_rings & bank->irq_mask;
++
++ for (i = 0; i < ADF_ETR_MAX_RINGS_PER_BANK; ++i) {
++  if (empty_rings & (1 << i))
++   adf_handle_response(&bank->rings[i]);
++ }
++}
++
++/**
++ * adf_response_handler() - Bottom half handler response handler
++ * @bank_addr:  Address of a ring bank for with the BH was scheduled.
++ *
++ * Function is the bottom half handler for the response from acceleration
++ * device. There is one handler for every ring bank. Function checks all
++ * communication rings in the bank.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: void
++ */
++void adf_response_handler(unsigned long bank_addr)
++{
++ struct adf_etr_bank_data *bank = (void *)bank_addr;
++
++ /* Handle all the responses nad reenable IRQs */
++ adf_ring_response_handler(bank);
++ WRITE_CSR_INT_FLAG_AND_COL(bank->csr_addr, bank->bank_number,
++       bank->irq_mask);
++}
++EXPORT_SYMBOL_GPL(adf_response_handler);
++
++static inline int adf_get_cfg_int(struct adf_accel_dev *accel_dev,
++      const char *section, const char *format,
++      uint32_t key, uint32_t *value)
++{
++ char key_buf[ADF_CFG_MAX_KEY_LEN_IN_BYTES];
++ char val_buf[ADF_CFG_MAX_VAL_LEN_IN_BYTES];
++
++ snprintf(key_buf, ADF_CFG_MAX_KEY_LEN_IN_BYTES, format, key);
++
++ if (adf_cfg_get_param_value(accel_dev, section, key_buf, val_buf))
++  return -EFAULT;
++
++ if (kstrtouint(val_buf, 10, value))
++  return -EFAULT;
++ return 0;
++}
++
++static void adf_enable_coalesc(struct adf_etr_bank_data *bank,
++          const char *section, uint32_t bank_num_in_accel)
++{
++ if (adf_get_cfg_int(bank->accel_dev, section,
++       ADF_ETRMGR_COALESCE_TIMER_FORMAT,
++       bank_num_in_accel, &bank->irq_coalesc_timer))
++  bank->irq_coalesc_timer = ADF_COALESCING_DEF_TIME;
++
++ if (ADF_COALESCING_MAX_TIME < bank->irq_coalesc_timer ||
++     ADF_COALESCING_MIN_TIME > bank->irq_coalesc_timer)
++  bank->irq_coalesc_timer = ADF_COALESCING_DEF_TIME;
++}
++
++static int adf_init_bank(struct adf_accel_dev *accel_dev,
++    struct adf_etr_bank_data *bank,
++    uint32_t bank_num, void __iomem *csr_addr)
++{
++ struct adf_hw_device_data *hw_data = accel_dev->hw_device;
++ struct adf_etr_ring_data *ring;
++ struct adf_etr_ring_data *tx_ring;
++ uint32_t i, coalesc_enabled;
++
++ memset(bank, 0, sizeof(*bank));
++ bank->bank_number = bank_num;
++ bank->csr_addr = csr_addr;
++ bank->accel_dev = accel_dev;
++ spin_lock_init(&bank->lock);
++
++ /* Enable IRQ coalescing always. This will allow to use
++  * the optimised flag and coalesc register.
++  * If it is disabled in the config file just use min time value */
++ if (adf_get_cfg_int(accel_dev, "Accelerator0",
++       ADF_ETRMGR_COALESCING_ENABLED_FORMAT,
++       bank_num, &coalesc_enabled) && coalesc_enabled)
++  adf_enable_coalesc(bank, "Accelerator0", bank_num);
++ else
++  bank->irq_coalesc_timer = ADF_COALESCING_MIN_TIME;
++
++ for (i = 0; i < ADF_ETR_MAX_RINGS_PER_BANK; i++) {
++  WRITE_CSR_RING_CONFIG(csr_addr, bank_num, i, 0);
++  WRITE_CSR_RING_BASE(csr_addr, bank_num, i, 0);
++  ring = &bank->rings[i];
++  if (hw_data->tx_rings_mask & (1 << i)) {
++   ring->inflights = kzalloc_node(sizeof(atomic_t),
++             GFP_KERNEL,
++             accel_dev->numa_node);
++   if (!ring->inflights)
++    goto err;
++  } else {
++   if (i < hw_data->tx_rx_gap) {
++    pr_err("QAT: Invalid tx rings mask config\n");
++    goto err;
++   }
++   tx_ring = &bank->rings[i - hw_data->tx_rx_gap];
++   ring->inflights = tx_ring->inflights;
++  }
++ }
++ if (adf_bank_debugfs_add(bank)) {
++  pr_err("QAT: Failed to add bank debugfs entry\n");
++  goto err;
++ }
++
++ WRITE_CSR_INT_SRCSEL(csr_addr, bank_num);
++ return 0;
++err:
++ for (i = 0; i < ADF_ETR_MAX_RINGS_PER_BANK; i++) {
++  ring = &bank->rings[i];
++  if (hw_data->tx_rings_mask & (1 << i) && ring->inflights)
++   kfree(ring->inflights);
++ }
++ return -ENOMEM;
++}
++
++/**
++ * adf_init_etr_data() - Initialize transport rings for acceleration device
++ * @accel_dev:  Pointer to acceleration device.
++ *
++ * Function is the initializes the communications channels (rings) to the
++ * acceleration device accel_dev.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: 0 on success, error code othewise.
++ */
++int adf_init_etr_data(struct adf_accel_dev *accel_dev)
++{
++ struct adf_etr_data *etr_data;
++ struct adf_hw_device_data *hw_data = accel_dev->hw_device;
++ void __iomem *csr_addr;
++ uint32_t size;
++ uint32_t num_banks = 0;
++ int i, ret;
++
++ etr_data = kzalloc_node(sizeof(*etr_data), GFP_KERNEL,
++    accel_dev->numa_node);
++ if (!etr_data)
++  return -ENOMEM;
++
++ num_banks = GET_MAX_BANKS(accel_dev);
++ size = num_banks * sizeof(struct adf_etr_bank_data);
++ etr_data->banks = kzalloc_node(size, GFP_KERNEL, accel_dev->numa_node);
++ if (!etr_data->banks) {
++  ret = -ENOMEM;
++  goto err_bank;
++ }
++
++ accel_dev->transport = etr_data;
++ i = hw_data->get_etr_bar_id(hw_data);
++ csr_addr = accel_dev->accel_pci_dev.pci_bars[i].virt_addr;
++
++ /* accel_dev->debugfs_dir should always be non-NULL here */
++ etr_data->debug = debugfs_create_dir("transport",
++          accel_dev->debugfs_dir);
++ if (!etr_data->debug) {
++  pr_err("QAT: Unable to create transport debugfs entry\n");
++  ret = -ENOENT;
++  goto err_bank_debug;
++ }
++
++ for (i = 0; i < num_banks; i++) {
++  ret = adf_init_bank(accel_dev, &etr_data->banks[i], i,
++        csr_addr);
++  if (ret)
++   goto err_bank_all;
++ }
++
++ return 0;
++
++err_bank_all:
++ debugfs_remove(etr_data->debug);
++err_bank_debug:
++ kfree(etr_data->banks);
++err_bank:
++ kfree(etr_data);
++ accel_dev->transport = NULL;
++ return ret;
++}
++EXPORT_SYMBOL_GPL(adf_init_etr_data);
++
++static void cleanup_bank(struct adf_etr_bank_data *bank)
++{
++ uint32_t i;
++
++ for (i = 0; i < ADF_ETR_MAX_RINGS_PER_BANK; i++) {
++  struct adf_accel_dev *accel_dev = bank->accel_dev;
++  struct adf_hw_device_data *hw_data = accel_dev->hw_device;
++  struct adf_etr_ring_data *ring = &bank->rings[i];
++
++  if (bank->ring_mask & (1 << i))
++   adf_cleanup_ring(ring);
++
++  if (hw_data->tx_rings_mask & (1 << i))
++   kfree(ring->inflights);
++ }
++ adf_bank_debugfs_rm(bank);
++ memset(bank, 0, sizeof(*bank));
++}
++
++static void adf_cleanup_etr_handles(struct adf_accel_dev *accel_dev)
++{
++ struct adf_etr_data *etr_data = accel_dev->transport;
++ uint32_t i, num_banks = GET_MAX_BANKS(accel_dev);
++
++ for (i = 0; i < num_banks; i++)
++  cleanup_bank(&etr_data->banks[i]);
++}
++
++/**
++ * adf_cleanup_etr_data() - Clear transport rings for acceleration device
++ * @accel_dev:  Pointer to acceleration device.
++ *
++ * Function is the clears the communications channels (rings) of the
++ * acceleration device accel_dev.
++ * To be used by QAT device specific drivers.
++ *
++ * Return: void
++ */
++void adf_cleanup_etr_data(struct adf_accel_dev *accel_dev)
++{
++ struct adf_etr_data *etr_data = accel_dev->transport;
++
++ if (etr_data) {
++  adf_cleanup_etr_handles(accel_dev);
++  debugfs_remove(etr_data->debug);
++  kfree(etr_data->banks);
++  kfree(etr_data);
++  accel_dev->transport = NULL;
++ }
++}
++EXPORT_SYMBOL_GPL(adf_cleanup_etr_data);
+diff --git a/drivers/crypto/qat/qat_common/adf_transport.h b/drivers/crypto/qat/qat_common/adf_transport.h
+new file mode 100644
+index 0000000..386485b
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_transport.h
+@@ -0,0 +1,63 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#ifndef ADF_TRANSPORT_H
++#define ADF_TRANSPORT_H
++
++#include "adf_accel_devices.h"
++
++struct adf_etr_ring_data;
++
++typedef void (*adf_callback_fn)(void *resp_msg);
++
++int adf_create_ring(struct adf_accel_dev *accel_dev, const char *section,
++      uint32_t bank_num, uint32_t num_mgs, uint32_t msg_size,
++      const char *ring_name, adf_callback_fn callback,
++      int poll_mode, struct adf_etr_ring_data **ring_ptr);
++
++int adf_send_message(struct adf_etr_ring_data *ring, uint32_t *msg);
++void adf_remove_ring(struct adf_etr_ring_data *ring);
++#endif
+diff --git a/drivers/crypto/qat/qat_common/adf_transport_access_macros.h b/drivers/crypto/qat/qat_common/adf_transport_access_macros.h
+new file mode 100644
+index 0000000..91d88d6
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_transport_access_macros.h
+@@ -0,0 +1,160 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#ifndef ADF_TRANSPORT_ACCESS_MACROS_H
++#define ADF_TRANSPORT_ACCESS_MACROS_H
++
++#include "adf_accel_devices.h"
++#define ADF_BANK_INT_SRC_SEL_MASK_0 0x4444444CUL
++#define ADF_BANK_INT_SRC_SEL_MASK_X 0x44444444UL
++#define ADF_RING_CSR_RING_CONFIG 0x000
++#define ADF_RING_CSR_RING_LBASE 0x040
++#define ADF_RING_CSR_RING_UBASE 0x080
++#define ADF_RING_CSR_RING_HEAD 0x0C0
++#define ADF_RING_CSR_RING_TAIL 0x100
++#define ADF_RING_CSR_E_STAT 0x14C
++#define ADF_RING_CSR_INT_SRCSEL 0x174
++#define ADF_RING_CSR_INT_SRCSEL_2 0x178
++#define ADF_RING_CSR_INT_COL_EN 0x17C
++#define ADF_RING_CSR_INT_COL_CTL 0x180
++#define ADF_RING_CSR_INT_FLAG_AND_COL 0x184
++#define ADF_RING_CSR_INT_COL_CTL_ENABLE 0x80000000
++#define ADF_RING_BUNDLE_SIZE 0x1000
++#define ADF_RING_CONFIG_NEAR_FULL_WM 0x0A
++#define ADF_RING_CONFIG_NEAR_EMPTY_WM 0x05
++#define ADF_COALESCING_MIN_TIME 0x1FF
++#define ADF_COALESCING_MAX_TIME 0xFFFFF
++#define ADF_COALESCING_DEF_TIME 0x27FF
++#define ADF_RING_NEAR_WATERMARK_512 0x08
++#define ADF_RING_NEAR_WATERMARK_0 0x00
++#define ADF_RING_EMPTY_SIG 0x7F7F7F7F
++
++/* Valid internal ring size values */
++#define ADF_RING_SIZE_128 0x01
++#define ADF_RING_SIZE_256 0x02
++#define ADF_RING_SIZE_512 0x03
++#define ADF_RING_SIZE_4K 0x06
++#define ADF_RING_SIZE_16K 0x08
++#define ADF_RING_SIZE_4M 0x10
++#define ADF_MIN_RING_SIZE ADF_RING_SIZE_128
++#define ADF_MAX_RING_SIZE ADF_RING_SIZE_4M
++#define ADF_DEFAULT_RING_SIZE ADF_RING_SIZE_16K
++
++/* Valid internal msg size values internal */
++#define ADF_MSG_SIZE_32 0x01
++#define ADF_MSG_SIZE_64 0x02
++#define ADF_MSG_SIZE_128 0x04
++#define ADF_MIN_MSG_SIZE ADF_MSG_SIZE_32
++#define ADF_MAX_MSG_SIZE ADF_MSG_SIZE_128
++
++/* Size to bytes conversion macros for ring and msg values */
++#define ADF_MSG_SIZE_TO_BYTES(SIZE) (SIZE << 5)
++#define ADF_BYTES_TO_MSG_SIZE(SIZE) (SIZE >> 5)
++#define ADF_SIZE_TO_RING_SIZE_IN_BYTES(SIZE) ((1 << (SIZE - 1)) << 7)
++#define ADF_RING_SIZE_IN_BYTES_TO_SIZE(SIZE) ((1 << (SIZE - 1)) >> 7)
++
++/* Minimum ring bufer size for memory allocation */
++#define ADF_RING_SIZE_BYTES_MIN(SIZE) ((SIZE < ADF_RING_SIZE_4K) ? \
++    ADF_RING_SIZE_4K : SIZE)
++#define ADF_RING_SIZE_MODULO(SIZE) (SIZE + 0x6)
++#define ADF_MAX_INFLIGHTS(RING_SIZE, MSG_SIZE) \
++ ((((1 << (RING_SIZE - 1)) << 4) >> MSG_SIZE) - 1)
++#define BUILD_RING_CONFIG(size) \
++ ((ADF_RING_NEAR_WATERMARK_0 << ADF_RING_CONFIG_NEAR_FULL_WM) \
++ | (ADF_RING_NEAR_WATERMARK_0 << ADF_RING_CONFIG_NEAR_EMPTY_WM) \
++ | size)
++#define BUILD_RESP_RING_CONFIG(size, watermark_nf, watermark_ne) \
++ ((watermark_nf << ADF_RING_CONFIG_NEAR_FULL_WM) \
++ | (watermark_ne << ADF_RING_CONFIG_NEAR_EMPTY_WM) \
++ | size)
++#define BUILD_RING_BASE_ADDR(addr, size) \
++ ((addr >> 6) & (0xFFFFFFFFFFFFFFFFULL << size))
++#define READ_CSR_RING_HEAD(csr_base_addr, bank, ring) \
++ ADF_CSR_RD(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++   ADF_RING_CSR_RING_HEAD + (ring << 2))
++#define READ_CSR_RING_TAIL(csr_base_addr, bank, ring) \
++ ADF_CSR_RD(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++   ADF_RING_CSR_RING_TAIL + (ring << 2))
++#define READ_CSR_E_STAT(csr_base_addr, bank) \
++ ADF_CSR_RD(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++   ADF_RING_CSR_E_STAT)
++#define WRITE_CSR_RING_CONFIG(csr_base_addr, bank, ring, value) \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++  ADF_RING_CSR_RING_CONFIG + (ring << 2), value)
++#define WRITE_CSR_RING_BASE(csr_base_addr, bank, ring, value) \
++do { \
++ uint32_t l_base = 0, u_base = 0; \
++ l_base = (uint32_t)(value & 0xFFFFFFFF); \
++ u_base = (uint32_t)((value & 0xFFFFFFFF00000000ULL) >> 32); \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++  ADF_RING_CSR_RING_LBASE + (ring << 2), l_base); \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++  ADF_RING_CSR_RING_UBASE + (ring << 2), u_base); \
++} while (0)
++#define WRITE_CSR_RING_HEAD(csr_base_addr, bank, ring, value) \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++  ADF_RING_CSR_RING_HEAD + (ring << 2), value)
++#define WRITE_CSR_RING_TAIL(csr_base_addr, bank, ring, value) \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++  ADF_RING_CSR_RING_TAIL + (ring << 2), value)
++#define WRITE_CSR_INT_SRCSEL(csr_base_addr, bank) \
++do { \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++ ADF_RING_CSR_INT_SRCSEL, ADF_BANK_INT_SRC_SEL_MASK_0); \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++ ADF_RING_CSR_INT_SRCSEL_2, ADF_BANK_INT_SRC_SEL_MASK_X); \
++} while (0)
++#define WRITE_CSR_INT_COL_EN(csr_base_addr, bank, value) \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++   ADF_RING_CSR_INT_COL_EN, value)
++#define WRITE_CSR_INT_COL_CTL(csr_base_addr, bank, value) \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++   ADF_RING_CSR_INT_COL_CTL, \
++   ADF_RING_CSR_INT_COL_CTL_ENABLE | value)
++#define WRITE_CSR_INT_FLAG_AND_COL(csr_base_addr, bank, value) \
++ ADF_CSR_WR(csr_base_addr, (ADF_RING_BUNDLE_SIZE * bank) + \
++   ADF_RING_CSR_INT_FLAG_AND_COL, value)
++#endif
+diff --git a/drivers/crypto/qat/qat_common/adf_transport_debug.c b/drivers/crypto/qat/qat_common/adf_transport_debug.c
+new file mode 100644
+index 0000000..d83a581
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_transport_debug.c
+@@ -0,0 +1,301 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/seq_file.h>
++#include "adf_accel_devices.h"
++#include "adf_transport_internal.h"
++#include "adf_transport_access_macros.h"
++
++static DEFINE_MUTEX(ring_read_lock);
++static DEFINE_MUTEX(bank_read_lock);
++
++static void *adf_ring_start(struct seq_file *sfile, loff_t *pos)
++{
++ struct adf_etr_ring_data *ring = sfile->private;
++ mutex_lock(&ring_read_lock);
++ if (*pos == 0)
++  return SEQ_START_TOKEN;
++
++ if (*pos >= (ADF_SIZE_TO_RING_SIZE_IN_BYTES(ring->ring_size) /
++       ADF_MSG_SIZE_TO_BYTES(ring->msg_size)))
++  return NULL;
++
++ return ring->base_addr +
++  (ADF_MSG_SIZE_TO_BYTES(ring->msg_size) * (*pos)++);
++}
++
++static void *adf_ring_next(struct seq_file *sfile, void *v, loff_t *pos)
++{
++ struct adf_etr_ring_data *ring = sfile->private;
++
++ if (*pos >= (ADF_SIZE_TO_RING_SIZE_IN_BYTES(ring->ring_size) /
++       ADF_MSG_SIZE_TO_BYTES(ring->msg_size)))
++  return NULL;
++
++ return ring->base_addr +
++  (ADF_MSG_SIZE_TO_BYTES(ring->msg_size) * (*pos)++);
++}
++
++static int adf_ring_show(struct seq_file *sfile, void *v)
++{
++ struct adf_etr_ring_data *ring = sfile->private;
++ struct adf_etr_bank_data *bank = ring->bank;
++ uint32_t *msg = v;
++ void __iomem *csr = ring->bank->csr_addr;
++ int i, x;
++
++ if (v == SEQ_START_TOKEN) {
++  int head, tail, empty;
++
++  head = READ_CSR_RING_HEAD(csr, bank->bank_number,
++       ring->ring_number);
++  tail = READ_CSR_RING_TAIL(csr, bank->bank_number,
++       ring->ring_number);
++  empty = READ_CSR_E_STAT(csr, bank->bank_number);
++
++  seq_puts(sfile, "------- Ring configuration -------\n");
++  seq_printf(sfile, "ring num %d, bank num %d\n",
++      ring->ring_number, ring->bank->bank_number);
++  seq_printf(sfile, "head %x, tail %x, empty: %d\n",
++      head, tail, (empty & 1 << ring->ring_number)
++      >> ring->ring_number);
++  seq_printf(sfile, "ring size %d, msg size %d\n",
++      ADF_SIZE_TO_RING_SIZE_IN_BYTES(ring->ring_size),
++      ADF_MSG_SIZE_TO_BYTES(ring->msg_size));
++  seq_puts(sfile, "----------- Ring data ------------\n");
++  return 0;
++ }
++ seq_printf(sfile, "%p:", msg);
++ x = 0;
++ i = 0;
++ for (; i < (ADF_MSG_SIZE_TO_BYTES(ring->msg_size) >> 2); i++) {
++  seq_printf(sfile, " %08X", *(msg + i));
++  if ((ADF_MSG_SIZE_TO_BYTES(ring->msg_size) >> 2) != i + 1 &&
++      (++x == 8)) {
++   seq_printf(sfile, "\n%p:", msg + i + 1);
++   x = 0;
++  }
++ }
++ seq_puts(sfile, "\n");
++ return 0;
++}
++
++static void adf_ring_stop(struct seq_file *sfile, void *v)
++{
++ mutex_unlock(&ring_read_lock);
++}
++
++static const struct seq_operations adf_ring_sops = {
++ .start = adf_ring_start,
++ .next = adf_ring_next,
++ .stop = adf_ring_stop,
++ .show = adf_ring_show
++};
++
++static int adf_ring_open(struct inode *inode, struct file *file)
++{
++ int ret = seq_open(file, &adf_ring_sops);
++
++ if (!ret) {
++  struct seq_file *seq_f = file->private_data;
++  seq_f->private = inode->i_private;
++ }
++ return ret;
++}
++
++static const struct file_operations adf_ring_debug_fops = {
++ .open = adf_ring_open,
++ .read = seq_read,
++ .llseek = seq_lseek,
++ .release = seq_release
++};
++
++int adf_ring_debugfs_add(struct adf_etr_ring_data *ring, const char *name)
++{
++ struct adf_etr_ring_debug_entry *ring_debug;
++ char entry_name[8];
++
++ ring_debug = kzalloc(sizeof(*ring_debug), GFP_KERNEL);
++ if (!ring_debug)
++  return -ENOMEM;
++
++ strlcpy(ring_debug->ring_name, name, sizeof(ring_debug->ring_name));
++ snprintf(entry_name, sizeof(entry_name), "ring_%02d",
++   ring->ring_number);
++
++ ring_debug->debug = debugfs_create_file(entry_name, S_IRUSR,
++      ring->bank->bank_debug_dir,
++      ring, &adf_ring_debug_fops);
++ if (!ring_debug->debug) {
++  pr_err("QAT: Failed to create ring debug entry.\n");
++  kfree(ring_debug);
++  return -EFAULT;
++ }
++ ring->ring_debug = ring_debug;
++ return 0;
++}
++
++void adf_ring_debugfs_rm(struct adf_etr_ring_data *ring)
++{
++ if (ring->ring_debug) {
++  debugfs_remove(ring->ring_debug->debug);
++  kfree(ring->ring_debug);
++  ring->ring_debug = NULL;
++ }
++}
++
++static void *adf_bank_start(struct seq_file *sfile, loff_t *pos)
++{
++ mutex_lock(&bank_read_lock);
++ if (*pos == 0)
++  return SEQ_START_TOKEN;
++
++ if (*pos >= ADF_ETR_MAX_RINGS_PER_BANK)
++  return NULL;
++
++ return pos;
++}
++
++static void *adf_bank_next(struct seq_file *sfile, void *v, loff_t *pos)
++{
++ if (++(*pos) >= ADF_ETR_MAX_RINGS_PER_BANK)
++  return NULL;
++
++ return pos;
++}
++
++static int adf_bank_show(struct seq_file *sfile, void *v)
++{
++ struct adf_etr_bank_data *bank = sfile->private;
++
++ if (v == SEQ_START_TOKEN) {
++  seq_printf(sfile, "------- Bank %d configuration -------\n",
++      bank->bank_number);
++ } else {
++  int ring_id = *((int *)v) - 1;
++  struct adf_etr_ring_data *ring = &bank->rings[ring_id];
++  void __iomem *csr = bank->csr_addr;
++  int head, tail, empty;
++
++  if (!(bank->ring_mask & 1 << ring_id))
++   return 0;
++
++  head = READ_CSR_RING_HEAD(csr, bank->bank_number,
++       ring->ring_number);
++  tail = READ_CSR_RING_TAIL(csr, bank->bank_number,
++       ring->ring_number);
++  empty = READ_CSR_E_STAT(csr, bank->bank_number);
++
++  seq_printf(sfile,
++      "ring num %02d, head %04x, tail %04x, empty: %d\n",
++      ring->ring_number, head, tail,
++      (empty & 1 << ring->ring_number) >>
++      ring->ring_number);
++ }
++ return 0;
++}
++
++static void adf_bank_stop(struct seq_file *sfile, void *v)
++{
++ mutex_unlock(&bank_read_lock);
++}
++
++static const struct seq_operations adf_bank_sops = {
++ .start = adf_bank_start,
++ .next = adf_bank_next,
++ .stop = adf_bank_stop,
++ .show = adf_bank_show
++};
++
++static int adf_bank_open(struct inode *inode, struct file *file)
++{
++ int ret = seq_open(file, &adf_bank_sops);
++
++ if (!ret) {
++  struct seq_file *seq_f = file->private_data;
++  seq_f->private = inode->i_private;
++ }
++ return ret;
++}
++
++static const struct file_operations adf_bank_debug_fops = {
++ .open = adf_bank_open,
++ .read = seq_read,
++ .llseek = seq_lseek,
++ .release = seq_release
++};
++
++int adf_bank_debugfs_add(struct adf_etr_bank_data *bank)
++{
++ struct adf_accel_dev *accel_dev = bank->accel_dev;
++ struct dentry *parent = accel_dev->transport->debug;
++ char name[8];
++
++ snprintf(name, sizeof(name), "bank_%02d", bank->bank_number);
++ bank->bank_debug_dir = debugfs_create_dir(name, parent);
++ if (!bank->bank_debug_dir) {
++  pr_err("QAT: Failed to create bank debug dir.\n");
++  return -EFAULT;
++ }
++
++ bank->bank_debug_cfg = debugfs_create_file("config", S_IRUSR,
++         bank->bank_debug_dir, bank,
++         &adf_bank_debug_fops);
++ if (!bank->bank_debug_cfg) {
++  pr_err("QAT: Failed to create bank debug entry.\n");
++  debugfs_remove(bank->bank_debug_dir);
++  return -EFAULT;
++ }
++ return 0;
++}
++
++void adf_bank_debugfs_rm(struct adf_etr_bank_data *bank)
++{
++ debugfs_remove(bank->bank_debug_cfg);
++ debugfs_remove(bank->bank_debug_dir);
++}
+diff --git a/drivers/crypto/qat/qat_common/adf_transport_internal.h b/drivers/crypto/qat/qat_common/adf_transport_internal.h
+new file mode 100644
+index 0000000..4eb8969
+--- /dev/null
++++ b/drivers/crypto/qat/qat_common/adf_transport_internal.h
+@@ -0,0 +1,115 @@
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++  Copyright(c) 2014 Intel Corporation.
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  Contact Information:
++  qat-linux@intel.com
++
++  BSD LICENSE
++  Copyright(c) 2014 Intel Corporation.
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++#ifndef ADF_TRANSPORT_INTRN_H
++#define ADF_TRANSPORT_INTRN_H
++
++#include <linux/interrupt.h>
++#include <linux/atomic.h>
++#include <linux/spinlock_types.h>
++#include "adf_transport.h"
++
++struct adf_etr_ring_debug_entry {
++ char ring_name[ADF_CFG_MAX_KEY_LEN_IN_BYTES];
++ struct dentry *debug;
++};
++
++struct adf_etr_ring_data {
++ void *base_addr;
++ atomic_t *inflights;
++ spinlock_t lock; /* protects ring data struct */
++ adf_callback_fn callback;
++ struct adf_etr_bank_data *bank;
++ dma_addr_t dma_addr;
++ uint16_t head;
++ uint16_t tail;
++ uint8_t ring_number;
++ uint8_t ring_size;
++ uint8_t msg_size;
++ uint8_t reserved;
++ struct adf_etr_ring_debug_entry *ring_debug;
++} __packed;
++
++struct adf_etr_bank_data {
++ struct adf_etr_ring_data rings[ADF_ETR_MAX_RINGS_PER_BANK];
++ struct tasklet_struct resp_hanlder;
++ void __iomem *csr_addr;
++ struct adf_accel_dev *accel_dev;
++ uint32_t irq_coalesc_timer;
++ uint16_t ring_mask;
++ uint16_t irq_mask;
++ spinlock_t lock; /* protects bank data struct */
++ struct dentry *bank_debug_dir;
++ struct dentry *bank_debug_cfg;
++ uint32_t bank_number;
++} __packed;
++
++struct adf_etr_data {
++ struct adf_etr_bank_data *banks;
++ struct dentry *debug;
++};
++
++void adf_response_handler(unsigned long bank_addr);
++#ifdef CONFIG_DEBUG_FS
++#include <linux/debugfs.h>
++int adf_bank_debugfs_add(struct adf_etr_bank_data *bank);
++void adf_bank_debugfs_rm(struct adf_etr_bank_data *bank);
++int adf_ring_debugfs_add(struct adf_etr_ring_data *ring, const char *name);
++void adf_ring_debugfs_rm(struct adf_etr_ring_data *ring);
++#else
++static inline int adf_bank_debugfs_add(struct adf_etr_bank_data *bank)
++{
++ return 0;
++}
++#define adf_bank_debugfs_rm(bank) do {} while (0)
++static inline int adf_ring_debugfs_add(struct adf_etr_ring_data *ring,
++           const char *name)
++{
++ return 0;
++}
++#define adf_ring_debugfs_rm(ring) do {} while (0)
++#endif
++#endif
+-- 
+1.7.1

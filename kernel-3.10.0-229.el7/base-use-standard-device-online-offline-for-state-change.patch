@@ -1,0 +1,268 @@
+From d04f19c72153dea76c46c0d2fb159f2599d9d0a7 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:05:11 -0400
+Subject: [base] use standard device online/offline for state change
+
+Message-id: <20140710010511.22146.22722.stgit@gir.stowe>
+Patchwork-id: 85606
+O-Subject: [RHEL7.1 PATCH 067/105] drivers: base: use standard device online/offline for state change
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: fa2be40fe7c0aa3b7accbf6dfa9ef0976e191d4c
+
+commit fa2be40fe7c0aa3b7accbf6dfa9ef0976e191d4c
+Author: Seth Jennings <sjenning@linux.vnet.ibm.com>
+Date:   Tue Aug 20 16:05:05 2013 -0500
+
+    drivers: base: use standard device online/offline for state change
+
+    There are two ways to set the online/offline state for a memory block:
+    echo 0|1 > online and echo online|online_kernel|online_movable|offline >
+    state.
+
+    The state attribute can online a memory block with extra data, the
+    "online type", where the online attribute uses a default online type of
+    ONLINE_KEEP, same as echo online > state.
+
+    Currently there is a state_mutex that provides consistency between the
+    memory block state and the underlying memory.
+
+    The problem is that this code does a lot of things that the common
+    device layer can do for us, such as the serialization of the
+    online/offline handlers using the device lock, setting the dev->offline
+    field, and calling kobject_uevent().
+
+    This patch refactors the online/offline code to allow the common
+    device_[online|offline] functions to be used.  The result is a simpler
+    and more common code path for the two state setting mechanisms.  It also
+    removes the state_mutex from the struct memory_block as the memory block
+    device lock provides the state consistency.
+
+    No functional change is intended by this patch.
+
+    Signed-off-by: Seth Jennings <sjenning@linux.vnet.ibm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/base/memory.c b/drivers/base/memory.c
+index 8cae776..6084869 100644
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@ -16,7 +16,6 @@
+ #include <linux/capability.h>
+ #include <linux/device.h>
+ #include <linux/memory.h>
+-#include <linux/kobject.h>
+ #include <linux/memory_hotplug.h>
+ #include <linux/mm.h>
+ #include <linux/mutex.h>
+@@ -263,9 +262,8 @@ memory_block_action(unsigned long phys_index, unsigned long action, int online_t
+  return ret;
+ }
+ 
+-static int __memory_block_change_state(struct memory_block *mem,
+-  unsigned long to_state, unsigned long from_state_req,
+-  int online_type)
++static int memory_block_change_state(struct memory_block *mem,
++  unsigned long to_state, unsigned long from_state_req)
+ {
+  int ret = 0;
+ 
+@@ -275,105 +273,91 @@ static int __memory_block_change_state(struct memory_block *mem,
+  if (to_state == MEM_OFFLINE)
+   mem->state = MEM_GOING_OFFLINE;
+ 
+- ret = memory_block_action(mem->start_section_nr, to_state, online_type);
++ ret = memory_block_action(mem->start_section_nr, to_state,
++    mem->online_type);
++
+  mem->state = ret ? from_state_req : to_state;
++
+  return ret;
+ }
+ 
++/* The device lock serializes operations on memory_subsys_[online|offline] */
+ static int memory_subsys_online(struct device *dev)
+ {
+  struct memory_block *mem = container_of(dev, struct memory_block, dev);
+  int ret;
+ 
+- mutex_lock(&mem->state_mutex);
++ if (mem->state == MEM_ONLINE)
++  return 0;
+ 
+- ret = mem->state == MEM_ONLINE ? 0 :
+-  __memory_block_change_state(mem, MEM_ONLINE, MEM_OFFLINE,
+-         ONLINE_KEEP);
++ /*
++  * If we are called from store_mem_state(), online_type will be
++  * set >= 0 Otherwise we were called from the device online
++  * attribute and need to set the online_type.
++  */
++ if (mem->online_type < 0)
++  mem->online_type = ONLINE_KEEP;
++
++ ret = memory_block_change_state(mem, MEM_ONLINE, MEM_OFFLINE);
++
++ /* clear online_type */
++ mem->online_type = -1;
+ 
+- mutex_unlock(&mem->state_mutex);
+  return ret;
+ }
+ 
+ static int memory_subsys_offline(struct device *dev)
+ {
+  struct memory_block *mem = container_of(dev, struct memory_block, dev);
+- int ret;
+ 
+- mutex_lock(&mem->state_mutex);
+-
+- ret = mem->state == MEM_OFFLINE ? 0 :
+-  __memory_block_change_state(mem, MEM_OFFLINE, MEM_ONLINE, -1);
+-
+- mutex_unlock(&mem->state_mutex);
+- return ret;
+-}
++ if (mem->state == MEM_OFFLINE)
++  return 0;
+ 
+-static int __memory_block_change_state_uevent(struct memory_block *mem,
+-  unsigned long to_state, unsigned long from_state_req,
+-  int online_type)
+-{
+- int ret = __memory_block_change_state(mem, to_state, from_state_req,
+-           online_type);
+- if (!ret) {
+-  switch (mem->state) {
+-  case MEM_OFFLINE:
+-   kobject_uevent(&mem->dev.kobj, KOBJ_OFFLINE);
+-   break;
+-  case MEM_ONLINE:
+-   kobject_uevent(&mem->dev.kobj, KOBJ_ONLINE);
+-   break;
+-  default:
+-   break;
+-  }
+- }
+- return ret;
++ return memory_block_change_state(mem, MEM_OFFLINE, MEM_ONLINE);
+ }
+ 
+-static int memory_block_change_state(struct memory_block *mem,
+-  unsigned long to_state, unsigned long from_state_req,
+-  int online_type)
+-{
+- int ret;
+-
+- mutex_lock(&mem->state_mutex);
+- ret = __memory_block_change_state_uevent(mem, to_state, from_state_req,
+-       online_type);
+- mutex_unlock(&mem->state_mutex);
+-
+- return ret;
+-}
+ static ssize_t
+ store_mem_state(struct device *dev,
+   struct device_attribute *attr, const char *buf, size_t count)
+ {
+  struct memory_block *mem;
+- bool offline;
+- int ret = -EINVAL;
++ int ret, online_type;
+ 
+  mem = container_of(dev, struct memory_block, dev);
+ 
+  lock_device_hotplug();
+ 
+- if (!strncmp(buf, "online_kernel", min_t(int, count, 13))) {
+-  offline = false;
+-  ret = memory_block_change_state(mem, MEM_ONLINE,
+-      MEM_OFFLINE, ONLINE_KERNEL);
+- } else if (!strncmp(buf, "online_movable", min_t(int, count, 14))) {
+-  offline = false;
+-  ret = memory_block_change_state(mem, MEM_ONLINE,
+-      MEM_OFFLINE, ONLINE_MOVABLE);
+- } else if (!strncmp(buf, "online", min_t(int, count, 6))) {
+-  offline = false;
+-  ret = memory_block_change_state(mem, MEM_ONLINE,
+-      MEM_OFFLINE, ONLINE_KEEP);
+- } else if(!strncmp(buf, "offline", min_t(int, count, 7))) {
+-  offline = true;
+-  ret = memory_block_change_state(mem, MEM_OFFLINE,
+-      MEM_ONLINE, -1);
++ if (!strncmp(buf, "online_kernel", min_t(int, count, 13)))
++  online_type = ONLINE_KERNEL;
++ else if (!strncmp(buf, "online_movable", min_t(int, count, 14)))
++  online_type = ONLINE_MOVABLE;
++ else if (!strncmp(buf, "online", min_t(int, count, 6)))
++  online_type = ONLINE_KEEP;
++ else if (!strncmp(buf, "offline", min_t(int, count, 7)))
++  online_type = -1;
++ else
++  return -EINVAL;
++
++ switch (online_type) {
++ case ONLINE_KERNEL:
++ case ONLINE_MOVABLE:
++ case ONLINE_KEEP:
++  /*
++   * mem->online_type is not protected so there can be a
++   * race here.  However, when racing online, the first
++   * will succeed and the second will just return as the
++   * block will already be online.  The online type
++   * could be either one, but that is expected.
++   */
++  mem->online_type = online_type;
++  ret = device_online(&mem->dev);
++  break;
++ case -1:
++  ret = device_offline(&mem->dev);
++  break;
++ default:
++  ret = -EINVAL; /* should never happen */
+  }
+- if (!ret)
+-  dev->offline = offline;
+ 
+  unlock_device_hotplug();
+ 
+@@ -594,7 +578,6 @@ static int init_memory_block(struct memory_block **memory,
+  mem->end_section_nr = mem->start_section_nr + sections_per_block - 1;
+  mem->state = state;
+  mem->section_count++;
+- mutex_init(&mem->state_mutex);
+  start_pfn = section_nr_to_pfn(mem->start_section_nr);
+  mem->phys_device = arch_get_memory_phys_device(start_pfn);
+ 
+diff --git a/include/linux/memory.h b/include/linux/memory.h
+index 4c89fb0..9a6bbf7 100644
+--- a/include/linux/memory.h
++++ b/include/linux/memory.h
+@@ -25,16 +25,9 @@
+ struct memory_block {
+  unsigned long start_section_nr;
+  unsigned long end_section_nr;
+- unsigned long state;
+- int section_count;
+-
+- /*
+-  * This serializes all state change requests.  It isn't
+-  * held during creation because the control files are
+-  * created long after the critical areas during
+-  * initialization.
+-  */
+- struct mutex state_mutex;
++ unsigned long state;  /* serialized by the dev->lock */
++ int section_count;  /* serialized by mem_sysfs_mutex */
++ int online_type;  /* for passing data to online routine */
+  int phys_device;  /* to which fru does this belong? */
+  void *hw;   /* optional pointer to fw/hw data */
+  int (*phys_callback)(struct memory_block *);
+-- 
+1.7.1

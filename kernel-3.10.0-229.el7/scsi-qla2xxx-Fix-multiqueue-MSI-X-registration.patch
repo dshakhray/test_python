@@ -1,0 +1,106 @@
+From 7c3869015bd1e719876d8eacb37db106eb00b499 Mon Sep 17 00:00:00 2001
+From: Chad Dupuis <cdupuis@redhat.com>
+Date: Mon, 18 Aug 2014 19:56:11 -0400
+Subject: [scsi] qla2xxx: Fix multiqueue MSI-X registration
+
+Message-id: <1408391817-6389-24-git-send-email-cdupuis@redhat.com>
+Patchwork-id: 87954
+O-Subject: [PATCH RHEL 7.1 e-stor 23/69] qla2xxx: Fix multiqueue MSI-X registration.
+Bugzilla: 1089346
+RH-Acked-by: Rob Evers <revers@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Chad Dupuis <chad.dupuis@qlogic.com>
+
+scsi commit id f324777ea88bab2522602671e46fc0851d7d5e35
+
+This fixes requesting of the MSI-X vectors for the base response queue.
+The iteration in the for loop in qla24xx_enable_msix() was incorrect.
+We should only iterate of the first two MSI-X vectors and not the total
+number of MSI-X vectors that have given to the driver for this device
+from pci_enable_msix() in this function.
+
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Chad Dupuis <chad.dupuis@qlogic.com>
+Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index a802626..e423e98 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -2832,6 +2832,7 @@ static int
+ qla24xx_enable_msix(struct qla_hw_data *ha, struct rsp_que *rsp)
+ {
+ #define MIN_MSIX_COUNT 2
++#define ATIO_VECTOR 2
+  int i, ret;
+  struct msix_entry *entries;
+  struct qla_msix_entry *qentry;
+@@ -2888,34 +2889,47 @@ msix_failed:
+  }
+ 
+  /* Enable MSI-X vectors for the base queue */
+- for (i = 0; i < ha->msix_count; i++) {
++ for (i = 0; i < 2; i++) {
+   qentry = &ha->msix_entries[i];
+-  if (QLA_TGT_MODE_ENABLED() && IS_ATIO_MSIX_CAPABLE(ha)) {
+-   ret = request_irq(qentry->vector,
+-    qla83xx_msix_entries[i].handler,
+-    0, qla83xx_msix_entries[i].name, rsp);
+-  } else if (IS_P3P_TYPE(ha)) {
++  if (IS_P3P_TYPE(ha))
+    ret = request_irq(qentry->vector,
+     qla82xx_msix_entries[i].handler,
+     0, qla82xx_msix_entries[i].name, rsp);
+-  } else {
++  else
+    ret = request_irq(qentry->vector,
+     msix_entries[i].handler,
+     0, msix_entries[i].name, rsp);
+-  }
+-  if (ret) {
+-   ql_log(ql_log_fatal, vha, 0x00cb,
+-       "MSI-X: unable to register handler -- %x/%d.\n",
+-       qentry->vector, ret);
+-   qla24xx_disable_msix(ha);
+-   ha->mqenable = 0;
+-   goto msix_out;
+-  }
++  if (ret)
++   goto msix_register_fail;
+   qentry->have_irq = 1;
+   qentry->rsp = rsp;
+   rsp->msix = qentry;
+  }
+ 
++ /*
++  * If target mode is enable, also request the vector for the ATIO
++  * queue.
++  */
++ if (QLA_TGT_MODE_ENABLED() && IS_ATIO_MSIX_CAPABLE(ha)) {
++  qentry = &ha->msix_entries[ATIO_VECTOR];
++  ret = request_irq(qentry->vector,
++   qla83xx_msix_entries[ATIO_VECTOR].handler,
++   0, qla83xx_msix_entries[ATIO_VECTOR].name, rsp);
++  qentry->have_irq = 1;
++  qentry->rsp = rsp;
++  rsp->msix = qentry;
++ }
++
++msix_register_fail:
++ if (ret) {
++  ql_log(ql_log_fatal, vha, 0x00cb,
++      "MSI-X: unable to register handler -- %x/%d.\n",
++      qentry->vector, ret);
++  qla24xx_disable_msix(ha);
++  ha->mqenable = 0;
++  goto msix_out;
++ }
++
+  /* Enable MSI-X vector for response queue update for queue 0 */
+  if (IS_QLA83XX(ha)) {
+   if (ha->msixbase && ha->mqiobase &&
+-- 
+1.7.1

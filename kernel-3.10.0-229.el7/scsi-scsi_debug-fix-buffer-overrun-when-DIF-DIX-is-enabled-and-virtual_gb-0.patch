@@ -1,0 +1,127 @@
+From 05018af3b1eb4cd7448e96d01a51be7ddc715248 Mon Sep 17 00:00:00 2001
+From: Ewan Milne <emilne@redhat.com>
+Date: Wed, 20 Aug 2014 18:59:23 -0400
+Subject: [scsi] scsi_debug: fix buffer overrun when DIF/DIX is enabled and virtual_gb > 0
+
+Message-id: <1408561176-18133-45-git-send-email-emilne@redhat.com>
+Patchwork-id: 88461
+O-Subject: [RHEL7.1 PATCH e-stor 44/57] [SCSI] scsi_debug: fix buffer overrun when DIF/DIX is enabled and virtual_gb > 0
+Bugzilla: 1132100
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: "Ewan D. Milne" <emilne@redhat.com>
+
+upstream commit 14faa944b6fa4c77a6f386806c33ce2c3c77b3a4
+
+Tested by Ewan D. Milne and Barry Donahue with a combination
+of manual and automated testing.  No issues seen.
+
+upstream commit 14faa944b6fa4c77a6f386806c33ce2c3c77b3a4
+Author: Akinobu Mita <akinobu.mita@gmail.com>
+Date:   Wed Sep 18 21:27:24 2013 +0900
+
+    [SCSI] scsi_debug: fix buffer overrun when DIF/DIX is enabled and virtual_gb > 0
+
+    If the module parameter virtual_gb is greater than 0, the READ command
+    may request the blocks which exceed actual ramdisk storage (fake_storep).
+    prot_verify_read() should treat those blocks as wrap around the end of
+    fake_storep.  But it actually causes fake_storep and dif_storep buffer
+    overruns.
+
+    This fixes these buffer overruns.  In order to simplify the fix,
+    this also introduces fake_store() and dif_store() which return
+    corresponding wrap around addresses.
+
+    Signed-off-by: Akinobu Mita <akinobu.mita@gmail.com>
+    Acked-by: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+
+Signed-off-by: Ewan D. Milne <emilne@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/scsi_debug.c b/drivers/scsi/scsi_debug.c
+index 01c0ffa..f640b6b 100644
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@ -293,6 +293,20 @@ static unsigned char ctrl_m_pg[] = {0xa, 10, 2, 0, 0, 0, 0, 0,
+ static unsigned char iec_m_pg[] = {0x1c, 0xa, 0x08, 0, 0, 0, 0, 0,
+               0, 0, 0x0, 0x0};
+ 
++static void *fake_store(unsigned long long lba)
++{
++ lba = do_div(lba, sdebug_store_sectors);
++
++ return fake_storep + lba * scsi_debug_sector_size;
++}
++
++static struct sd_dif_tuple *dif_store(sector_t sector)
++{
++ sector = do_div(sector, sdebug_store_sectors);
++
++ return dif_storep + sector;
++}
++
+ static int sdebug_add_adapter(void);
+ static void sdebug_remove_adapter(void);
+ 
+@@ -1782,24 +1796,19 @@ static int prot_verify_read(struct scsi_cmnd *SCpnt, sector_t start_sec,
+  struct scatterlist *psgl;
+  struct sd_dif_tuple *sdt;
+  sector_t sector;
+- sector_t tmp_sec = start_sec;
+  void *paddr;
++ const void *dif_store_end = dif_storep + sdebug_store_sectors;
+ 
+- start_sec = do_div(tmp_sec, sdebug_store_sectors);
+-
+- sdt = dif_storep + start_sec;
+-
+- for (i = 0 ; i < sectors ; i++) {
++ for (i = 0; i < sectors; i++) {
+   int ret;
+ 
+-  if (sdt[i].app_tag == 0xffff)
+-   continue;
+-
+   sector = start_sec + i;
++  sdt = dif_store(sector);
+ 
+-  ret = dif_verify(&sdt[i],
+-     fake_storep + sector * scsi_debug_sector_size,
+-     sector, ei_lba);
++  if (sdt->app_tag == 0xffff)
++   continue;
++
++  ret = dif_verify(sdt, fake_store(sector), sector, ei_lba);
+   if (ret) {
+    dif_errors++;
+    return ret;
+@@ -1814,16 +1823,19 @@ static int prot_verify_read(struct scsi_cmnd *SCpnt, sector_t start_sec,
+ 
+  scsi_for_each_prot_sg(SCpnt, psgl, scsi_prot_sg_count(SCpnt), i) {
+   int len = min(psgl->length, resid);
++  void *start = dif_store(sector);
++  int rest = 0;
++
++  if (dif_store_end < start + len)
++   rest = start + len - dif_store_end;
+ 
+   paddr = kmap_atomic(sg_page(psgl)) + psgl->offset;
+-  memcpy(paddr, dif_storep + sector, len);
++  memcpy(paddr, start, len - rest);
++
++  if (rest)
++   memcpy(paddr + len - rest, dif_storep, rest);
+ 
+   sector += len / sizeof(*dif_storep);
+-  if (sector >= sdebug_store_sectors) {
+-   /* Force wrap */
+-   tmp_sec = sector;
+-   sector = do_div(tmp_sec, sdebug_store_sectors);
+-  }
+   resid -= len;
+   kunmap_atomic(paddr);
+  }
+-- 
+1.7.1

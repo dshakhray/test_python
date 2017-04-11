@@ -1,0 +1,385 @@
+From bebfb9a3fd2b3f2d327abd885e7a1e58424db99e Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Mon, 16 Jun 2014 12:59:05 -0400
+Subject: [s390] qeth: Accurate ethtool output
+
+Message-id: <1402923545-2928-2-git-send-email-brueckner@redhat.com>
+Patchwork-id: 84039
+O-Subject: [RHEL7.1 PATCH] [s390] qeth: Accurate ethtool output
+Bugzilla: 1088581
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Description
+-----------
+commit 02d5cb5bb20b9d34db20860aad1891cd9b8e81d5
+Author: Eugene Crosser <Eugene.Crosser@ru.ibm.com>
+Date:   Mon Dec 16 09:44:52 2013 +0100
+
+    qeth: Accurate ethtool output
+
+    For OSA devices that support the QUERY_CARD_INFO command, supply
+    accurate data based on the card type, port mode and link speed
+    via the 'ethtool' interface.
+
+    Signed-off-by: Eugene Crosser <Eugene.Crosser@ru.ibm.com>
+    Signed-off-by: Frank Blaschka <frank.blaschka@de.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Bugzilla
+--------
+BZ 1088581
+https://bugzilla.redhat.com/show_bug.cgi?id=1088581
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=02d5cb5bb20b9d34db20860aad1891cd9b8e81d5
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7572070
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index c4f392d..327942f 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -738,6 +738,12 @@ struct qeth_rx {
+  int qdio_err;
+ };
+ 
++struct carrier_info {
++ __u8  card_type;
++ __u16 port_mode;
++ __u32 port_speed;
++};
++
+ #define QETH_NAPI_WEIGHT 128
+ 
+ struct qeth_card {
+@@ -914,6 +920,8 @@ struct qeth_cmd_buffer *qeth_wait_for_buffer(struct qeth_channel *);
+ int qeth_mdio_read(struct net_device *, int, int);
+ int qeth_snmp_command(struct qeth_card *, char __user *);
+ int qeth_query_oat_command(struct qeth_card *, char __user *);
++int qeth_query_card_info(struct qeth_card *card,
++ struct carrier_info *carrier_info);
+ int qeth_send_control_data(struct qeth_card *, int, struct qeth_cmd_buffer *,
+  int (*reply_cb)(struct qeth_card *, struct qeth_reply*, unsigned long),
+  void *reply_param);
+diff --git a/drivers/s390/net/qeth_core_main.c b/drivers/s390/net/qeth_core_main.c
+index f4e4eba..c49e2b0 100644
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -4602,6 +4602,42 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(qeth_query_oat_command);
+ 
++int qeth_query_card_info_cb(struct qeth_card *card,
++   struct qeth_reply *reply, unsigned long data)
++{
++ struct qeth_ipa_cmd *cmd;
++ struct qeth_query_card_info *card_info;
++ struct carrier_info *carrier_info;
++
++ QETH_CARD_TEXT(card, 2, "qcrdincb");
++ carrier_info = (struct carrier_info *)reply->param;
++ cmd = (struct qeth_ipa_cmd *)data;
++ card_info = &cmd->data.setadapterparms.data.card_info;
++ if (cmd->data.setadapterparms.hdr.return_code == 0) {
++  carrier_info->card_type = card_info->card_type;
++  carrier_info->port_mode = card_info->port_mode;
++  carrier_info->port_speed = card_info->port_speed;
++ }
++
++ qeth_default_setadapterparms_cb(card, reply, (unsigned long) cmd);
++ return 0;
++}
++
++int qeth_query_card_info(struct qeth_card *card,
++    struct carrier_info *carrier_info)
++{
++ struct qeth_cmd_buffer *iob;
++
++ QETH_CARD_TEXT(card, 2, "qcrdinfo");
++ if (!qeth_adp_supported(card, IPA_SETADP_QUERY_CARD_INFO))
++  return -EOPNOTSUPP;
++ iob = qeth_get_adapter_cmd(card, IPA_SETADP_QUERY_CARD_INFO,
++  sizeof(struct qeth_ipacmd_setadpparms_hdr));
++ return qeth_send_ipa_cmd(card, iob, qeth_query_card_info_cb,
++     (void *)carrier_info);
++}
++EXPORT_SYMBOL_GPL(qeth_query_card_info);
++
+ static inline int qeth_get_qdio_q_format(struct qeth_card *card)
+ {
+  switch (card->info.type) {
+@@ -5607,11 +5643,65 @@ void qeth_core_get_drvinfo(struct net_device *dev,
+ }
+ EXPORT_SYMBOL_GPL(qeth_core_get_drvinfo);
+ 
++/* Helper function to fill 'advertizing' and 'supported' which are the same. */
++/* Autoneg and full-duplex are supported and advertized uncondionally.      */
++/* Always advertize and support all speeds up to specified, and only one     */
++/* specified port type.            */
++static void qeth_set_ecmd_adv_sup(struct ethtool_cmd *ecmd,
++    int maxspeed, int porttype)
++{
++ int port_sup, port_adv, spd_sup, spd_adv;
++
++ switch (porttype) {
++ case PORT_TP:
++  port_sup = SUPPORTED_TP;
++  port_adv = ADVERTISED_TP;
++  break;
++ case PORT_FIBRE:
++  port_sup = SUPPORTED_FIBRE;
++  port_adv = ADVERTISED_FIBRE;
++  break;
++ default:
++  port_sup = SUPPORTED_TP;
++  port_adv = ADVERTISED_TP;
++  WARN_ON_ONCE(1);
++ }
++
++ /* "Fallthrough" case'es ordered from high to low result in setting  */
++ /* flags cumulatively, starting from the specified speed and down to */
++ /* the lowest possible.           */
++ spd_sup = 0;
++ spd_adv = 0;
++ switch (maxspeed) {
++ case SPEED_10000:
++  spd_sup |= SUPPORTED_10000baseT_Full;
++  spd_adv |= ADVERTISED_10000baseT_Full;
++ case SPEED_1000:
++  spd_sup |= SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full;
++  spd_adv |= ADVERTISED_1000baseT_Half |
++      ADVERTISED_1000baseT_Full;
++ case SPEED_100:
++  spd_sup |= SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full;
++  spd_adv |= ADVERTISED_100baseT_Half | ADVERTISED_100baseT_Full;
++ case SPEED_10:
++  spd_sup |= SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full;
++  spd_adv |= ADVERTISED_10baseT_Half | ADVERTISED_10baseT_Full;
++ break;
++ default:
++  spd_sup = SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full;
++  spd_adv = ADVERTISED_10baseT_Half | ADVERTISED_10baseT_Full;
++  WARN_ON_ONCE(1);
++ }
++ ecmd->advertising = ADVERTISED_Autoneg | port_adv | spd_adv;
++ ecmd->supported = SUPPORTED_Autoneg | port_sup | spd_sup;
++}
++
+ int qeth_core_ethtool_get_settings(struct net_device *netdev,
+      struct ethtool_cmd *ecmd)
+ {
+  struct qeth_card *card = netdev->ml_priv;
+  enum qeth_link_types link_type;
++ struct carrier_info carrier_info;
+ 
+  if ((card->info.type == QETH_CARD_TYPE_IQD) || (card->info.guestlan))
+   link_type = QETH_LINK_TYPE_10GBIT_ETH;
+@@ -5619,80 +5709,92 @@ int qeth_core_ethtool_get_settings(struct net_device *netdev,
+   link_type = card->info.link_type;
+ 
+  ecmd->transceiver = XCVR_INTERNAL;
+- ecmd->supported = SUPPORTED_Autoneg;
+- ecmd->advertising = ADVERTISED_Autoneg;
+  ecmd->duplex = DUPLEX_FULL;
+  ecmd->autoneg = AUTONEG_ENABLE;
+ 
+  switch (link_type) {
+  case QETH_LINK_TYPE_FAST_ETH:
+  case QETH_LINK_TYPE_LANE_ETH100:
+-  ecmd->supported |= SUPPORTED_10baseT_Half |
+-     SUPPORTED_10baseT_Full |
+-     SUPPORTED_100baseT_Half |
+-     SUPPORTED_100baseT_Full |
+-     SUPPORTED_TP;
+-  ecmd->advertising |= ADVERTISED_10baseT_Half |
+-     ADVERTISED_10baseT_Full |
+-     ADVERTISED_100baseT_Half |
+-     ADVERTISED_100baseT_Full |
+-     ADVERTISED_TP;
++  qeth_set_ecmd_adv_sup(ecmd, SPEED_100, PORT_TP);
+   ecmd->speed = SPEED_100;
+   ecmd->port = PORT_TP;
+   break;
+ 
+  case QETH_LINK_TYPE_GBIT_ETH:
+  case QETH_LINK_TYPE_LANE_ETH1000:
+-  ecmd->supported |= SUPPORTED_10baseT_Half |
+-     SUPPORTED_10baseT_Full |
+-     SUPPORTED_100baseT_Half |
+-     SUPPORTED_100baseT_Full |
+-     SUPPORTED_1000baseT_Half |
+-     SUPPORTED_1000baseT_Full |
+-     SUPPORTED_FIBRE;
+-  ecmd->advertising |= ADVERTISED_10baseT_Half |
+-     ADVERTISED_10baseT_Full |
+-     ADVERTISED_100baseT_Half |
+-     ADVERTISED_100baseT_Full |
+-     ADVERTISED_1000baseT_Half |
+-     ADVERTISED_1000baseT_Full |
+-     ADVERTISED_FIBRE;
++  qeth_set_ecmd_adv_sup(ecmd, SPEED_1000, PORT_FIBRE);
+   ecmd->speed = SPEED_1000;
+   ecmd->port = PORT_FIBRE;
+   break;
+ 
+  case QETH_LINK_TYPE_10GBIT_ETH:
+-  ecmd->supported |= SUPPORTED_10baseT_Half |
+-     SUPPORTED_10baseT_Full |
+-     SUPPORTED_100baseT_Half |
+-     SUPPORTED_100baseT_Full |
+-     SUPPORTED_1000baseT_Half |
+-     SUPPORTED_1000baseT_Full |
+-     SUPPORTED_10000baseT_Full |
+-     SUPPORTED_FIBRE;
+-  ecmd->advertising |= ADVERTISED_10baseT_Half |
+-     ADVERTISED_10baseT_Full |
+-     ADVERTISED_100baseT_Half |
+-     ADVERTISED_100baseT_Full |
+-     ADVERTISED_1000baseT_Half |
+-     ADVERTISED_1000baseT_Full |
+-     ADVERTISED_10000baseT_Full |
+-     ADVERTISED_FIBRE;
++  qeth_set_ecmd_adv_sup(ecmd, SPEED_10000, PORT_FIBRE);
+   ecmd->speed = SPEED_10000;
+   ecmd->port = PORT_FIBRE;
+   break;
+ 
+  default:
+-  ecmd->supported |= SUPPORTED_10baseT_Half |
+-     SUPPORTED_10baseT_Full |
+-     SUPPORTED_TP;
+-  ecmd->advertising |= ADVERTISED_10baseT_Half |
+-     ADVERTISED_10baseT_Full |
+-     ADVERTISED_TP;
++  qeth_set_ecmd_adv_sup(ecmd, SPEED_10, PORT_TP);
+   ecmd->speed = SPEED_10;
+   ecmd->port = PORT_TP;
+  }
+ 
++ /* Check if we can obtain more accurate information.  */
++ /* If QUERY_CARD_INFO command is not supported or fails, */
++ /* just return the heuristics that was filled above.  */
++ if (qeth_query_card_info(card, &carrier_info) != 0)
++  return 0;
++
++ netdev_dbg(netdev,
++ "card info: card_type=0x%02x, port_mode=0x%04x, port_speed=0x%08x\n",
++   carrier_info.card_type,
++   carrier_info.port_mode,
++   carrier_info.port_speed);
++
++ /* Update attributes for which we've obtained more authoritative */
++ /* information, leave the rest the way they where filled above.  */
++ switch (carrier_info.card_type) {
++ case CARD_INFO_TYPE_1G_COPPER_A:
++ case CARD_INFO_TYPE_1G_COPPER_B:
++  qeth_set_ecmd_adv_sup(ecmd, SPEED_1000, PORT_TP);
++  ecmd->port = PORT_TP;
++  break;
++ case CARD_INFO_TYPE_1G_FIBRE_A:
++ case CARD_INFO_TYPE_1G_FIBRE_B:
++  qeth_set_ecmd_adv_sup(ecmd, SPEED_1000, PORT_FIBRE);
++  ecmd->port = PORT_FIBRE;
++  break;
++ case CARD_INFO_TYPE_10G_FIBRE_A:
++ case CARD_INFO_TYPE_10G_FIBRE_B:
++  qeth_set_ecmd_adv_sup(ecmd, SPEED_10000, PORT_FIBRE);
++  ecmd->port = PORT_FIBRE;
++  break;
++ }
++
++ switch (carrier_info.port_mode) {
++ case CARD_INFO_PORTM_FULLDUPLEX:
++  ecmd->duplex = DUPLEX_FULL;
++  break;
++ case CARD_INFO_PORTM_HALFDUPLEX:
++  ecmd->duplex = DUPLEX_HALF;
++  break;
++ }
++
++ switch (carrier_info.port_speed) {
++ case CARD_INFO_PORTS_10M:
++  ecmd->speed = SPEED_10;
++  break;
++ case CARD_INFO_PORTS_100M:
++  ecmd->speed = SPEED_100;
++  break;
++ case CARD_INFO_PORTS_1G:
++  ecmd->speed = SPEED_1000;
++  break;
++ case CARD_INFO_PORTS_10G:
++  ecmd->speed = SPEED_10000;
++  break;
++ }
++
+  return 0;
+ }
+ EXPORT_SYMBOL_GPL(qeth_core_ethtool_get_settings);
+diff --git a/drivers/s390/net/qeth_core_mpc.h b/drivers/s390/net/qeth_core_mpc.h
+index 07085d5..0a6e695 100644
+--- a/drivers/s390/net/qeth_core_mpc.h
++++ b/drivers/s390/net/qeth_core_mpc.h
+@@ -274,7 +274,24 @@ enum qeth_ipa_set_access_mode_rc {
+  SET_ACCESS_CTRL_RC_REFLREL_FAILED = 0x0024,
+  SET_ACCESS_CTRL_RC_REFLREL_DEACT_FAILED = 0x0028,
+ };
+-
++enum qeth_card_info_card_type {
++ CARD_INFO_TYPE_1G_COPPER_A = 0x61,
++ CARD_INFO_TYPE_1G_FIBRE_A = 0x71,
++ CARD_INFO_TYPE_10G_FIBRE_A = 0x91,
++ CARD_INFO_TYPE_1G_COPPER_B = 0xb1,
++ CARD_INFO_TYPE_1G_FIBRE_B = 0xa1,
++ CARD_INFO_TYPE_10G_FIBRE_B = 0xc1,
++};
++enum qeth_card_info_port_mode {
++ CARD_INFO_PORTM_HALFDUPLEX = 0x0002,
++ CARD_INFO_PORTM_FULLDUPLEX = 0x0003,
++};
++enum qeth_card_info_port_speed {
++ CARD_INFO_PORTS_10M  = 0x00000005,
++ CARD_INFO_PORTS_100M  = 0x00000006,
++ CARD_INFO_PORTS_1G  = 0x00000007,
++ CARD_INFO_PORTS_10G  = 0x00000008,
++};
+ 
+ /* (SET)DELIP(M) IPA stuff ***************************************************/
+ struct qeth_ipacmd_setdelip4 {
+@@ -404,6 +421,14 @@ struct qeth_qoat_priv {
+  char *buffer;
+ };
+ 
++struct qeth_query_card_info {
++ __u8 card_type;
++ __u8 reserved1;
++ __u16 port_mode;
++ __u32 port_speed;
++ __u32 reserved2;
++};
++
+ struct qeth_ipacmd_setadpparms_hdr {
+  __u32 supp_hw_cmds;
+  __u32 reserved1;
+@@ -424,6 +449,7 @@ struct qeth_ipacmd_setadpparms {
+   struct qeth_snmp_cmd snmp;
+   struct qeth_set_access_ctrl set_access_ctrl;
+   struct qeth_query_oat query_oat;
++  struct qeth_query_card_info card_info;
+   __u32 mode;
+  } data;
+ } __attribute__ ((packed));
+-- 
+1.7.1

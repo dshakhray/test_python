@@ -1,0 +1,199 @@
+From 1e45a6c4ed2dbcfe0838cdb01df0bf15ac0c4463 Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:11 -0400
+Subject: [fs] cifs: Make big endian multiplex ID sequences monotonic on the wire
+
+Message-id: <1406549822-10376-19-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86762
+O-Subject: [RHEL7.1 PATCH 18/69] [bz1082049] cifs: Make big endian multiplex ID sequences monotonic on the wire
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Tim Gardner <tim.gardner@canonical.com>
+
+The multiplex identifier (MID) in the SMB header is only
+ever used by the client, in conjunction with PID, to match responses
+from the server. As such, the endianess of the MID is not important.
+However, When tracing packet sequences on the wire, protocol analyzers
+such as wireshark display MID as little endian. It is much more informative
+for the on-the-wire MID sequences to match debug information emitted by the
+CIFS driver.  Therefore, one should write and read MID in the SMB header
+assuming it is always little endian.
+
+Observed from wireshark during the protocol negotiation
+and session setup:
+
+        Multiplex ID: 256
+        Multiplex ID: 256
+        Multiplex ID: 512
+        Multiplex ID: 512
+        Multiplex ID: 768
+        Multiplex ID: 768
+
+After this patch on-the-wire MID values begin at 1 and increase monotonically.
+
+Introduce get_next_mid64() for the internal consumers that use the full 64 bit
+multiplex identifier.
+
+Introduce the helpers get_mid() and compare_mid() to make the endian
+translation clear.
+
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Tim Gardner <timg@tpi.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 3d378d3fd82a759d59c60d89b4559bf325d7e668)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 3edc1eb..9e92ef6 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -629,11 +629,34 @@ set_credits(struct TCP_Server_Info *server, const int val)
+ }
+ 
+ static inline __u64
+-get_next_mid(struct TCP_Server_Info *server)
++get_next_mid64(struct TCP_Server_Info *server)
+ {
+  return server->ops->get_next_mid(server);
+ }
+ 
++static inline __le16
++get_next_mid(struct TCP_Server_Info *server)
++{
++ __u16 mid = get_next_mid64(server);
++ /*
++  * The value in the SMB header should be little endian for easy
++  * on-the-wire decoding.
++  */
++ return cpu_to_le16(mid);
++}
++
++static inline __u16
++get_mid(const struct smb_hdr *smb)
++{
++ return le16_to_cpu(smb->Mid);
++}
++
++static inline bool
++compare_mid(__u16 mid, const struct smb_hdr *smb)
++{
++ return mid == le16_to_cpu(smb->Mid);
++}
++
+ /*
+  * When the server supports very large reads and writes via POSIX extensions,
+  * we can allow up to 2^24-1, minus the size of a READ/WRITE_AND_X header, not
+diff --git a/fs/cifs/cifspdu.h b/fs/cifs/cifspdu.h
+index ca27cdb..e8bd5f5 100644
+--- a/fs/cifs/cifspdu.h
++++ b/fs/cifs/cifspdu.h
+@@ -428,7 +428,7 @@ struct smb_hdr {
+  __u16 Tid;
+  __le16 Pid;
+  __u16 Uid;
+- __u16 Mid;
++ __le16 Mid;
+  __u8 WordCount;
+ } __attribute__((packed));
+ 
+diff --git a/fs/cifs/misc.c b/fs/cifs/misc.c
+index 949f22a..3b0c62e 100644
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@ -295,7 +295,8 @@ check_smb_hdr(struct smb_hdr *smb)
+  if (smb->Command == SMB_COM_LOCKING_ANDX)
+   return 0;
+ 
+- cifs_dbg(VFS, "Server sent request, not response. mid=%u\n", smb->Mid);
++ cifs_dbg(VFS, "Server sent request, not response. mid=%u\n",
++   get_mid(smb));
+  return 1;
+ }
+ 
+@@ -351,6 +352,7 @@ checkSMB(char *buf, unsigned int total_read)
+  }
+ 
+  if (4 + rfclen != clc_len) {
++  __u16 mid = get_mid(smb);
+   /* check if bcc wrapped around for large read responses */
+   if ((rfclen > 64 * 1024) && (rfclen > clc_len)) {
+    /* check if lengths match mod 64K */
+@@ -358,11 +360,11 @@ checkSMB(char *buf, unsigned int total_read)
+     return 0; /* bcc wrapped */
+   }
+   cifs_dbg(FYI, "Calculated size %u vs length %u mismatch for mid=%u\n",
+-    clc_len, 4 + rfclen, smb->Mid);
++    clc_len, 4 + rfclen, mid);
+ 
+   if (4 + rfclen < clc_len) {
+    cifs_dbg(VFS, "RFC1001 size %u smaller than SMB for mid=%u\n",
+-     rfclen, smb->Mid);
++     rfclen, mid);
+    return -EIO;
+   } else if (rfclen > clc_len + 512) {
+    /*
+@@ -375,7 +377,7 @@ checkSMB(char *buf, unsigned int total_read)
+     * data to 512 bytes.
+     */
+    cifs_dbg(VFS, "RFC1001 size %u more than 512 bytes larger than SMB for mid=%u\n",
+-     rfclen, smb->Mid);
++     rfclen, mid);
+    return -EIO;
+   }
+  }
+diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
+index ba5873d..0222d6b 100644
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@ -67,7 +67,7 @@ send_nt_cancel(struct TCP_Server_Info *server, void *buf,
+  mutex_unlock(&server->srv_mutex);
+ 
+  cifs_dbg(FYI, "issued NT_CANCEL for mid %u, rc = %d\n",
+-   in_buf->Mid, rc);
++   get_mid(in_buf), rc);
+ 
+  return rc;
+ }
+@@ -101,7 +101,7 @@ cifs_find_mid(struct TCP_Server_Info *server, char *buffer)
+ 
+  spin_lock(&GlobalMid_Lock);
+  list_for_each_entry(mid, &server->pending_mid_q, qhead) {
+-  if (mid->mid == buf->Mid &&
++  if (compare_mid(mid->mid, buf) &&
+       mid->mid_state == MID_REQUEST_SUBMITTED &&
+       le16_to_cpu(mid->command) == buf->Command) {
+    spin_unlock(&GlobalMid_Lock);
+diff --git a/fs/cifs/smb2transport.c b/fs/cifs/smb2transport.c
+index 340abca..c523617 100644
+--- a/fs/cifs/smb2transport.c
++++ b/fs/cifs/smb2transport.c
+@@ -466,7 +466,7 @@ smb2_verify_signature(struct smb_rqst *rqst, struct TCP_Server_Info *server)
+ static inline void
+ smb2_seq_num_into_buf(struct TCP_Server_Info *server, struct smb2_hdr *hdr)
+ {
+- hdr->MessageId = get_next_mid(server);
++ hdr->MessageId = get_next_mid64(server);
+ }
+ 
+ static struct mid_q_entry *
+diff --git a/fs/cifs/transport.c b/fs/cifs/transport.c
+index fdc5a58..f722f57 100644
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@ -58,7 +58,7 @@ AllocMidQEntry(const struct smb_hdr *smb_buffer, struct TCP_Server_Info *server)
+   return temp;
+  else {
+   memset(temp, 0, sizeof(struct mid_q_entry));
+-  temp->mid = smb_buffer->Mid; /* always LE */
++  temp->mid = get_mid(smb_buffer);
+   temp->pid = current->pid;
+   temp->command = cpu_to_le16(smb_buffer->Command);
+   cifs_dbg(FYI, "For smb_command %d\n", smb_buffer->Command);
+-- 
+1.7.1

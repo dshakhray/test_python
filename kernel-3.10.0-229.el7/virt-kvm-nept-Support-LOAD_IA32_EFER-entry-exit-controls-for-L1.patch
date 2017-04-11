@@ -1,0 +1,95 @@
+From 3b2b9a1b33a8fbf35535aa83f2599822744554a7 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:37:29 -0400
+Subject: [virt] kvm/nept: Support LOAD_IA32_EFER entry/exit controls for L1
+
+Message-id: <1406040016-3289-55-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86133
+O-Subject: [RHEL7 PATCH v2 054/221] nEPT: Support LOAD_IA32_EFER entry/exit controls for L1
+Bugzilla: 1048496 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Nadav Har'El <nyh@il.ibm.com>
+
+Recent KVM, since http://kerneltrap.org/mailarchive/linux-kvm/2010/5/2/6261577
+switch the EFER MSR when EPT is used and the host and guest have different
+NX bits. So if we add support for nested EPT (L1 guest using EPT to run L2)
+and want to be able to run recent KVM as L1, we need to allow L1 to use this
+EFER switching feature.
+
+To do this EFER switching, KVM uses VM_ENTRY/EXIT_LOAD_IA32_EFER if available,
+and if it isn't, it uses the generic VM_ENTRY/EXIT_MSR_LOAD. This patch adds
+support for the former (the latter is still unsupported).
+
+Nested entry and exit emulation (prepare_vmcs_02 and load_vmcs12_host_state,
+respectively) already handled VM_ENTRY/EXIT_LOAD_IA32_EFER correctly. So all
+that's left to do in this patch is to properly advertise this feature to L1.
+
+Note that vmcs12's VM_ENTRY/EXIT_LOAD_IA32_EFER are emulated by L0, by using
+vmx_set_efer (which itself sets one of several vmcs02 fields), so we always
+support this feature, regardless of whether the host supports it.
+
+Reviewed-by: Orit Wasserman <owasserm@redhat.com>
+Signed-off-by: Nadav Har'El <nyh@il.ibm.com>
+Signed-off-by: Jun Nakajima <jun.nakajima@intel.com>
+Signed-off-by: Xinhao Xu <xinhao.xu@intel.com>
+Signed-off-by: Yang Zhang <yang.z.zhang@Intel.com>
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8049d651e8789b15baaf2a8b888d8919df1152a9)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 2068d70..9e91dc5 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -2198,7 +2198,8 @@ static __init void nested_vmx_setup_ctls_msrs(void)
+ #else
+  nested_vmx_exit_ctls_high = 0;
+ #endif
+- nested_vmx_exit_ctls_high |= VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR;
++ nested_vmx_exit_ctls_high |= (VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR |
++          VM_EXIT_LOAD_IA32_EFER);
+ 
+  /* entry controls */
+  rdmsr(MSR_IA32_VMX_ENTRY_CTLS,
+@@ -2207,8 +2208,8 @@ static __init void nested_vmx_setup_ctls_msrs(void)
+  nested_vmx_entry_ctls_low = VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR;
+  nested_vmx_entry_ctls_high &=
+   VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_IA32E_MODE;
+- nested_vmx_entry_ctls_high |= VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR;
+-
++ nested_vmx_entry_ctls_high |= (VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR |
++           VM_ENTRY_LOAD_IA32_EFER);
+  /* cpu-based controls */
+  rdmsr(MSR_IA32_VMX_PROCBASED_CTLS,
+   nested_vmx_procbased_ctls_low, nested_vmx_procbased_ctls_high);
+@@ -7539,10 +7540,18 @@ static void prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+  vcpu->arch.cr0_guest_owned_bits &= ~vmcs12->cr0_guest_host_mask;
+  vmcs_writel(CR0_GUEST_HOST_MASK, ~vcpu->arch.cr0_guest_owned_bits);
+ 
+- /* Note: IA32_MODE, LOAD_IA32_EFER are modified by vmx_set_efer below */
+- vmcs_write32(VM_EXIT_CONTROLS,
+-  vmcs12->vm_exit_controls | vmcs_config.vmexit_ctrl);
+- vmcs_write32(VM_ENTRY_CONTROLS, vmcs12->vm_entry_controls |
++ /* L2->L1 exit controls are emulated - the hardware exit is to L0 so
++  * we should use its exit controls. Note that VM_EXIT_LOAD_IA32_EFER
++  * bits are further modified by vmx_set_efer() below.
++  */
++ vmcs_write32(VM_EXIT_CONTROLS, vmcs_config.vmexit_ctrl);
++
++ /* vmcs12's VM_ENTRY_LOAD_IA32_EFER and VM_ENTRY_IA32E_MODE are
++  * emulated by vmx_set_efer(), below.
++  */
++ vmcs_write32(VM_ENTRY_CONTROLS,
++  (vmcs12->vm_entry_controls & ~VM_ENTRY_LOAD_IA32_EFER &
++   ~VM_ENTRY_IA32E_MODE) |
+   (vmcs_config.vmentry_ctrl & ~VM_ENTRY_IA32E_MODE));
+ 
+  if (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_PAT)
+-- 
+1.7.1

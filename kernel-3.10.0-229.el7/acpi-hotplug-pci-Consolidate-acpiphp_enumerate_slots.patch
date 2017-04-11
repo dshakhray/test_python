@@ -1,0 +1,156 @@
+From bdea3b047fb219111d6c8e5be14f46b4b2c0dd49 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:00:45 -0400
+Subject: [acpi] hotplug/pci: Consolidate acpiphp_enumerate_slots()
+
+Message-id: <20140710010045.22146.75393.stgit@gir.stowe>
+Patchwork-id: 85563
+O-Subject: [RHEL7.1 PATCH 024/105] ACPI / hotplug / PCI: Consolidate acpiphp_enumerate_slots()
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: 2552002a46cd6a7a262ea1718db33d1a1517008e
+
+commit 2552002a46cd6a7a262ea1718db33d1a1517008e
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Sat Jul 13 23:27:23 2013 +0200
+
+    ACPI / hotplug / PCI: Consolidate acpiphp_enumerate_slots()
+
+    The acpiphp_enumerate_slots() function is now split into two parts,
+    acpiphp_enumerate_slots() proper and init_bridge_misc() which is
+    only called by the former.  If these functions are combined,
+    it is possible to make the code easier to follow and to clean up
+    the error handling (to prevent memory leaks on error from
+    happening in particular), so do that.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index 89145ed..4084e87 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -353,46 +353,6 @@ static int detect_ejectable_slots(acpi_handle handle)
+  return found;
+ }
+ 
+-/* initialize miscellaneous stuff for both root and PCI-to-PCI bridge */
+-static void init_bridge_misc(struct acpiphp_bridge *bridge)
+-{
+- acpi_status status;
+-
+- /* must be added to the list prior to calling register_slot */
+- mutex_lock(&bridge_mutex);
+- list_add(&bridge->list, &bridge_list);
+- mutex_unlock(&bridge_mutex);
+-
+- /* register all slot objects under this bridge */
+- status = acpi_walk_namespace(ACPI_TYPE_DEVICE, bridge->handle, (u32)1,
+-         register_slot, NULL, bridge, NULL);
+- if (ACPI_FAILURE(status)) {
+-  mutex_lock(&bridge_mutex);
+-  list_del(&bridge->list);
+-  mutex_unlock(&bridge_mutex);
+-  return;
+- }
+-
+- /* install notify handler for P2P bridges */
+- if (!pci_is_root_bus(bridge->pci_bus)) {
+-  if ((bridge->flags & BRIDGE_HAS_EJ0) && bridge->func) {
+-   status = acpi_remove_notify_handler(bridge->func->handle,
+-      ACPI_SYSTEM_NOTIFY,
+-      handle_hotplug_event_func);
+-   if (ACPI_FAILURE(status))
+-    pr_err("failed to remove notify handler\n");
+-  }
+-  status = acpi_install_notify_handler(bridge->handle,
+-          ACPI_SYSTEM_NOTIFY,
+-          handle_hotplug_event_bridge,
+-          bridge);
+-
+-  if (ACPI_FAILURE(status)) {
+-   pr_err("failed to register interrupt notify handler\n");
+-  }
+- }
+-}
+-
+ 
+ /* find acpiphp_func from acpiphp_bridge */
+ static struct acpiphp_func *acpiphp_bridge_handle_to_function(acpi_handle handle)
+@@ -1149,8 +1109,9 @@ static void handle_hotplug_event_func(acpi_handle handle, u32 type,
+  */
+ void acpiphp_enumerate_slots(struct pci_bus *bus)
+ {
+- acpi_handle handle;
+  struct acpiphp_bridge *bridge;
++ acpi_handle handle;
++ acpi_status status;
+ 
+  if (acpiphp_disabled)
+   return;
+@@ -1178,14 +1139,51 @@ void acpiphp_enumerate_slots(struct pci_bus *bus)
+   */
+  get_device(&bus->dev);
+ 
+- if (!pci_is_root_bus(bridge->pci_bus) &&
+-     acpi_has_method(bridge->handle, "_EJ0")) {
+-  pr_debug("found ejectable p2p bridge\n");
+-  bridge->flags |= BRIDGE_HAS_EJ0;
+-  bridge->func = acpiphp_bridge_handle_to_function(handle);
++ /* must be added to the list prior to calling register_slot */
++ mutex_lock(&bridge_mutex);
++ list_add(&bridge->list, &bridge_list);
++ mutex_unlock(&bridge_mutex);
++
++ /* register all slot objects under this bridge */
++ status = acpi_walk_namespace(ACPI_TYPE_DEVICE, bridge->handle, 1,
++         register_slot, NULL, bridge, NULL);
++ if (ACPI_FAILURE(status)) {
++  acpi_handle_err(bridge->handle, "failed to register slots\n");
++  goto err;
++ }
++
++ if (pci_is_root_bus(bridge->pci_bus))
++  return;
++
++ /* install notify handler for P2P bridges */
++ status = acpi_install_notify_handler(bridge->handle, ACPI_SYSTEM_NOTIFY,
++          handle_hotplug_event_bridge,
++          bridge);
++ if (ACPI_FAILURE(status)) {
++  acpi_handle_err(bridge->handle,
++    "failed to register notify handler\n");
++  goto err;
++ }
++
++ if (!acpi_has_method(bridge->handle, "_EJ0"))
++  return;
++
++ pr_debug("found ejectable p2p bridge\n");
++ bridge->flags |= BRIDGE_HAS_EJ0;
++ bridge->func = acpiphp_bridge_handle_to_function(bridge->handle);
++ if (bridge->func) {
++  status = acpi_remove_notify_handler(bridge->func->handle,
++          ACPI_SYSTEM_NOTIFY,
++          handle_hotplug_event_func);
++  if (ACPI_FAILURE(status))
++   acpi_handle_err(bridge->func->handle,
++     "failed to remove notify handler\n");
+  }
++ return;
+ 
+- init_bridge_misc(bridge);
++ err:
++ cleanup_bridge(bridge);
++ put_bridge(bridge);
+ }
+ 
+ /* Destroy hotplug slots associated with the PCI bus */
+-- 
+1.7.1

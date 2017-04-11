@@ -1,0 +1,198 @@
+From 5fd022297bb05e67a1b3a75fd370cf4b5da516e1 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:06:08 -0400
+Subject: [virt] kvm/ppc: book3s pr - Use mmu_notifier_retry() in kvmppc_mmu_map_page()
+
+Message-id: <1410545655-205645-140-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94487
+O-Subject: [RHEL7 PATCH 139/626] KVM: PPC: Book3S PR: Use mmu_notifier_retry() in kvmppc_mmu_map_page()
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit d78bca72961ae816181b386ff6b347419dfcd5cf
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:52 2013 +1000
+
+    KVM: PPC: Book3S PR: Use mmu_notifier_retry() in kvmppc_mmu_map_page()
+
+    When the MM code is invalidating a range of pages, it calls the KVM
+    kvm_mmu_notifier_invalidate_range_start() notifier function, which calls
+    kvm_unmap_hva_range(), which arranges to flush all the existing host
+    HPTEs for guest pages.  However, the Linux PTEs for the range being
+    flushed are still valid at that point.  We are not supposed to establish
+    any new references to pages in the range until the ...range_end()
+    notifier gets called.  The PPC-specific KVM code doesn't get any
+    explicit notification of that; instead, we are supposed to use
+    mmu_notifier_retry() to test whether we are or have been inside a
+    range flush notifier pair while we have been getting a page and
+    instantiating a host HPTE for the page.
+
+    This therefore adds a call to mmu_notifier_retry inside
+    kvmppc_mmu_map_page().  This call is inside a region locked with
+    kvm->mmu_lock, which is the same lock that is called by the KVM
+    MMU notifier functions, thus ensuring that no new notification can
+    proceed while we are in the locked region.  Inside this region we
+    also create the host HPTE and link the corresponding hpte_cache
+    structure into the lists used to find it later.  We cannot allocate
+    the hpte_cache structure inside this locked region because that can
+    lead to deadlock, so we allocate it outside the region and free it
+    if we end up not using it.
+
+    This also moves the updates of vcpu3s->hpte_cache_count inside the
+    regions locked with vcpu3s->mmu_lock, and does the increment in
+    kvmppc_mmu_hpte_cache_map() when the pte is added to the cache
+    rather than when it is allocated, in order that the hpte_cache_count
+    is accurate.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index a07bd7e..0ec00f4 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -142,6 +142,7 @@ extern long kvmppc_hv_find_lock_hpte(struct kvm *kvm, gva_t eaddr,
+ 
+ extern void kvmppc_mmu_hpte_cache_map(struct kvm_vcpu *vcpu, struct hpte_cache *pte);
+ extern struct hpte_cache *kvmppc_mmu_hpte_cache_next(struct kvm_vcpu *vcpu);
++extern void kvmppc_mmu_hpte_cache_free(struct hpte_cache *pte);
+ extern void kvmppc_mmu_hpte_destroy(struct kvm_vcpu *vcpu);
+ extern int kvmppc_mmu_hpte_init(struct kvm_vcpu *vcpu);
+ extern void kvmppc_mmu_invalidate_pte(struct kvm_vcpu *vcpu, struct hpte_cache *pte);
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_host.c b/arch/powerpc/kvm/book3s_64_mmu_host.c
+index cc9fb89..307e6e8 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_host.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_host.c
+@@ -93,6 +93,13 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte,
+  int r = 0;
+  int hpsize = MMU_PAGE_4K;
+  bool writable;
++ unsigned long mmu_seq;
++ struct kvm *kvm = vcpu->kvm;
++ struct hpte_cache *cpte;
++
++ /* used to check for invalidations in progress */
++ mmu_seq = kvm->mmu_notifier_seq;
++ smp_rmb();
+ 
+  /* Get host physical address for gpa */
+  hpaddr = kvmppc_gfn_to_pfn(vcpu, orig_pte->raddr >> PAGE_SHIFT,
+@@ -143,6 +150,14 @@ int kvmppc_mmu_map_page(struct kvm_vcpu *vcpu, struct kvmppc_pte *orig_pte,
+ 
+  hash = hpt_hash(vpn, mmu_psize_defs[hpsize].shift, MMU_SEGSIZE_256M);
+ 
++ cpte = kvmppc_mmu_hpte_cache_next(vcpu);
++
++ spin_lock(&kvm->mmu_lock);
++ if (!cpte || mmu_notifier_retry(kvm, mmu_seq)) {
++  r = -EAGAIN;
++  goto out_unlock;
++ }
++
+ map_again:
+  hpteg = ((hash & htab_hash_mask) * HPTES_PER_GROUP);
+ 
+@@ -150,7 +165,7 @@ map_again:
+  if (attempt > 1)
+   if (ppc_md.hpte_remove(hpteg) < 0) {
+    r = -1;
+-   goto out;
++   goto out_unlock;
+   }
+ 
+  ret = ppc_md.hpte_insert(hpteg, vpn, hpaddr, rflags, vflags,
+@@ -163,8 +178,6 @@ map_again:
+   attempt++;
+   goto map_again;
+  } else {
+-  struct hpte_cache *pte = kvmppc_mmu_hpte_cache_next(vcpu);
+-
+   trace_kvm_book3s_64_mmu_map(rflags, hpteg,
+          vpn, hpaddr, orig_pte);
+ 
+@@ -175,15 +188,21 @@ map_again:
+    hpteg = ((hash & htab_hash_mask) * HPTES_PER_GROUP);
+   }
+ 
+-  pte->slot = hpteg + (ret & 7);
+-  pte->host_vpn = vpn;
+-  pte->pte = *orig_pte;
+-  pte->pfn = hpaddr >> PAGE_SHIFT;
+-  pte->pagesize = hpsize;
++  cpte->slot = hpteg + (ret & 7);
++  cpte->host_vpn = vpn;
++  cpte->pte = *orig_pte;
++  cpte->pfn = hpaddr >> PAGE_SHIFT;
++  cpte->pagesize = hpsize;
+ 
+-  kvmppc_mmu_hpte_cache_map(vcpu, pte);
++  kvmppc_mmu_hpte_cache_map(vcpu, cpte);
++  cpte = NULL;
+  }
++
++out_unlock:
++ spin_unlock(&kvm->mmu_lock);
+  kvm_release_pfn_clean(hpaddr >> PAGE_SHIFT);
++ if (cpte)
++  kvmppc_mmu_hpte_cache_free(cpte);
+ 
+ out:
+  return r;
+diff --git a/arch/powerpc/kvm/book3s_mmu_hpte.c b/arch/powerpc/kvm/book3s_mmu_hpte.c
+index d2d280b..6b79bfc 100644
+--- a/arch/powerpc/kvm/book3s_mmu_hpte.c
++++ b/arch/powerpc/kvm/book3s_mmu_hpte.c
+@@ -98,6 +98,8 @@ void kvmppc_mmu_hpte_cache_map(struct kvm_vcpu *vcpu, struct hpte_cache *pte)
+       &vcpu3s->hpte_hash_vpte_64k[index]);
+ #endif
+ 
++ vcpu3s->hpte_cache_count++;
++
+  spin_unlock(&vcpu3s->mmu_lock);
+ }
+ 
+@@ -131,10 +133,10 @@ static void invalidate_pte(struct kvm_vcpu *vcpu, struct hpte_cache *pte)
+ #ifdef CONFIG_PPC_BOOK3S_64
+  hlist_del_init_rcu(&pte->list_vpte_64k);
+ #endif
++ vcpu3s->hpte_cache_count--;
+ 
+  spin_unlock(&vcpu3s->mmu_lock);
+ 
+- vcpu3s->hpte_cache_count--;
+  call_rcu(&pte->rcu_head, free_pte_rcu);
+ }
+ 
+@@ -331,15 +333,19 @@ struct hpte_cache *kvmppc_mmu_hpte_cache_next(struct kvm_vcpu *vcpu)
+  struct kvmppc_vcpu_book3s *vcpu3s = to_book3s(vcpu);
+  struct hpte_cache *pte;
+ 
+- pte = kmem_cache_zalloc(hpte_cache, GFP_KERNEL);
+- vcpu3s->hpte_cache_count++;
+-
+  if (vcpu3s->hpte_cache_count == HPTEG_CACHE_NUM)
+   kvmppc_mmu_pte_flush_all(vcpu);
+ 
++ pte = kmem_cache_zalloc(hpte_cache, GFP_KERNEL);
++
+  return pte;
+ }
+ 
++void kvmppc_mmu_hpte_cache_free(struct hpte_cache *pte)
++{
++ kmem_cache_free(hpte_cache, pte);
++}
++
+ void kvmppc_mmu_hpte_destroy(struct kvm_vcpu *vcpu)
+ {
+  kvmppc_mmu_pte_flush(vcpu, 0, 0);
+-- 
+1.7.1

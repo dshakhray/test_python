@@ -1,0 +1,94 @@
+From f77e51e088fa209073100b45fff5247d7c82eea6 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:23:09 -0400
+Subject: [tools] perf: Add unlikely() to the ring-buffer code
+
+Message-id: <1408462094-14194-21-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88007
+O-Subject: [PATCH RHEL7.1 BZ1131394 020/325] perf: Add unlikely() to the ring-buffer code
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit c72b42a3dde487132da80202756c101b371b2add
+Author: Peter Zijlstra <peterz@infradead.org>
+Date: Thu Oct 31 17:20:25 2013 +0100
+
+description
+===========
+Add unlikely() annotations to 'slow' paths:
+
+When having a sampling event but no output buffer; you have bigger
+issues -- also the bail is still faster than actually doing the work.
+
+When having a sampling event but a control page only buffer, you have
+bigger issues -- again the bail is still faster than actually doing
+work.
+
+Optimize for the case where you're not loosing events -- again, not
+doing the work is still faster but make sure that when you have to
+actually do work its as fast as possible.
+
+The typical watermark is 1/2 the buffer size, so most events will not
+take this path.
+
+Shrinks perf_output_begin() by 16 bytes on x86_64-defconfig.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 6929c58..383cde4 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -121,17 +121,17 @@ int perf_output_begin(struct perf_output_handle *handle,
+   event = event->parent;
+ 
+  rb = rcu_dereference(event->rb);
+- if (!rb)
++ if (unlikely(!rb))
+   goto out;
+ 
+- handle->rb = rb;
+- handle->event = event;
+-
+- if (!rb->nr_pages)
++ if (unlikely(!rb->nr_pages))
+   goto out;
+ 
++ handle->rb    = rb;
++ handle->event = event;
++
+  have_lost = local_read(&rb->lost);
+- if (have_lost) {
++ if (unlikely(have_lost)) {
+   lost_event.header.size = sizeof(lost_event);
+   perf_event_header__init_id(&lost_event.header, &sample_data,
+         event);
+@@ -157,7 +157,7 @@ int perf_output_begin(struct perf_output_handle *handle,
+   head += size;
+  } while (local_cmpxchg(&rb->head, offset, head) != offset);
+ 
+- if (head - local_read(&rb->wakeup) > rb->watermark)
++ if (unlikely(head - local_read(&rb->wakeup) > rb->watermark))
+   local_add(rb->watermark, &rb->wakeup);
+ 
+  handle->page = offset >> (PAGE_SHIFT + page_order(rb));
+@@ -167,7 +167,7 @@ int perf_output_begin(struct perf_output_handle *handle,
+  handle->addr += handle->size;
+  handle->size = (PAGE_SIZE << page_order(rb)) - handle->size;
+ 
+- if (have_lost) {
++ if (unlikely(have_lost)) {
+   lost_event.header.type = PERF_RECORD_LOST;
+   lost_event.header.misc = 0;
+   lost_event.id          = event->id;
+-- 
+1.7.1

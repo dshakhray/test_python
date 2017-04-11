@@ -1,0 +1,144 @@
+From 7c9db5d22943c43bb94f10472f4376992212db65 Mon Sep 17 00:00:00 2001
+From: Rob Evers <revers@redhat.com>
+Date: Wed, 25 Jun 2014 14:11:38 -0400
+Subject: [scsi] be2iscsi: Fix TCP parameters while connection offloading
+
+Message-id: <1403705504-27660-5-git-send-email-revers@redhat.com>
+Patchwork-id: 84804
+O-Subject: [RHEL7.1 e-stor PATCH 04/10] scsi: be2iscsi: Fix TCP parameters while connection offloading.
+Bugzilla: 1088576
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Tomas Henzl <thenzl@redhat.com>
+RH-Acked-by: Maurizio Lombardi <mlombard@redhat.com>
+
+From: John Soni Jose <sony.john-n@emulex.com>
+
+http://www.spinics.net/lists/linux-scsi/msg74145.html
+
+ SKH-R adapter, TCP Window Size/Scale parameters are passed
+ in TCP Connection Offload Mbx Command.
+
+Signed-off-by: Minh Tran <minhduc.tran@emulex.com>
+Signed-off-by: John Soni Jose <sony.john-n@emulex.com>
+Signed-off-by: Jayamohan Kallickal <jayamohan.kallickal@emulex.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/be2iscsi/be_cmds.h b/drivers/scsi/be2iscsi/be_cmds.h
+index cd4410f..cc7405c 100644
+--- a/drivers/scsi/be2iscsi/be_cmds.h
++++ b/drivers/scsi/be2iscsi/be_cmds.h
+@@ -71,6 +71,7 @@ struct be_mcc_wrb {
+ #define BEISCSI_FW_MBX_TIMEOUT 100
+ 
+ /* MBOX Command VER */
++#define MBX_CMD_VER1 0x01
+ #define MBX_CMD_VER2 0x02
+ 
+ struct be_mcc_compl {
+@@ -1013,6 +1014,26 @@ struct tcp_connect_and_offload_in {
+  u8 rsvd0[3];
+ } __packed;
+ 
++struct tcp_connect_and_offload_in_v1 {
++ struct be_cmd_req_hdr hdr;
++ struct ip_addr_format ip_address;
++ u16 tcp_port;
++ u16 cid;
++ u16 cq_id;
++ u16 defq_id;
++ struct phys_addr dataout_template_pa;
++ u16 hdr_ring_id;
++ u16 data_ring_id;
++ u8 do_offload;
++ u8 ifd_state;
++ u8 rsvd0[2];
++ u16 tcp_window_size;
++ u8 tcp_window_scale_count;
++ u8 rsvd1;
++ u32 tcp_mss:24;
++ u8 rsvd2;
++} __packed;
++
+ struct tcp_connect_and_offload_out {
+  struct be_cmd_resp_hdr hdr;
+  u32 connection_handle;
+diff --git a/drivers/scsi/be2iscsi/be_iscsi.c b/drivers/scsi/be2iscsi/be_iscsi.c
+index 74fc9e5..ea7b44d 100644
+--- a/drivers/scsi/be2iscsi/be_iscsi.c
++++ b/drivers/scsi/be2iscsi/be_iscsi.c
+@@ -1108,7 +1108,7 @@ static int beiscsi_open_conn(struct iscsi_endpoint *ep,
+  struct beiscsi_hba *phba = beiscsi_ep->phba;
+  struct tcp_connect_and_offload_out *ptcpcnct_out;
+  struct be_dma_mem nonemb_cmd;
+- unsigned int tag;
++ unsigned int tag, req_memsize;
+  int ret = -ENOMEM;
+ 
+  beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+@@ -1129,8 +1129,14 @@ static int beiscsi_open_conn(struct iscsi_endpoint *ep,
+          (beiscsi_ep->ep_cid)] = ep;
+ 
+  beiscsi_ep->cid_vld = 0;
++
++ if (is_chip_be2_be3r(phba))
++  req_memsize = sizeof(struct tcp_connect_and_offload_in);
++ else
++  req_memsize = sizeof(struct tcp_connect_and_offload_in_v1);
++
+  nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
+-    sizeof(struct tcp_connect_and_offload_in),
++    req_memsize,
+     &nonemb_cmd.dma);
+  if (nonemb_cmd.va == NULL) {
+ 
+@@ -1141,7 +1147,7 @@ static int beiscsi_open_conn(struct iscsi_endpoint *ep,
+   beiscsi_free_ep(beiscsi_ep);
+   return -ENOMEM;
+  }
+- nonemb_cmd.size = sizeof(struct tcp_connect_and_offload_in);
++ nonemb_cmd.size = req_memsize;
+  memset(nonemb_cmd.va, 0, nonemb_cmd.size);
+  tag = mgmt_open_connection(phba, dst_addr, beiscsi_ep, &nonemb_cmd);
+  if (tag <= 0) {
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.c b/drivers/scsi/be2iscsi/be_mgmt.c
+index 52a36fb..6045aa7 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@ -712,7 +712,7 @@ int mgmt_open_connection(struct beiscsi_hba *phba,
+  struct sockaddr_in6 *daddr_in6 = (struct sockaddr_in6 *)dst_addr;
+  struct be_ctrl_info *ctrl = &phba->ctrl;
+  struct be_mcc_wrb *wrb;
+- struct tcp_connect_and_offload_in *req;
++ struct tcp_connect_and_offload_in_v1 *req;
+  unsigned short def_hdr_id;
+  unsigned short def_data_id;
+  struct phys_addr template_address = { 0, 0 };
+@@ -745,10 +745,10 @@ int mgmt_open_connection(struct beiscsi_hba *phba,
+  memset(req, 0, sizeof(*req));
+  wrb->tag0 |= tag;
+ 
+- be_wrb_hdr_prepare(wrb, sizeof(*req), false, 1);
++ be_wrb_hdr_prepare(wrb, nonemb_cmd->size, false, 1);
+  be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI,
+       OPCODE_COMMON_ISCSI_TCP_CONNECT_AND_OFFLOAD,
+-      sizeof(*req));
++      nonemb_cmd->size);
+  if (dst_addr->sa_family == PF_INET) {
+   __be32 s_addr = daddr_in->sin_addr.s_addr;
+   req->ip_address.ip_type = BE2_IPV4;
+@@ -794,6 +794,13 @@ int mgmt_open_connection(struct beiscsi_hba *phba,
+  sge->pa_hi = cpu_to_le32(upper_32_bits(nonemb_cmd->dma));
+  sge->pa_lo = cpu_to_le32(nonemb_cmd->dma & 0xFFFFFFFF);
+  sge->len = cpu_to_le32(nonemb_cmd->size);
++
++ if (!is_chip_be2_be3r(phba)) {
++  req->hdr.version = MBX_CMD_VER1;
++  req->tcp_window_size = 0;
++  req->tcp_window_scale_count = 2;
++ }
++
+  be_mcc_notify(phba);
+  spin_unlock(&ctrl->mbox_lock);
+  return tag;
+-- 
+1.7.1

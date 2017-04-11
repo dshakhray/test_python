@@ -1,0 +1,92 @@
+From 656337fd2318226a2767f2267ef9d711aa4ceebe Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:36:24 -0400
+Subject: [block] blk-mq: blk_mq_tag_to_rq should handle flush request
+
+Message-id: <1402670238-13916-97-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83907
+O-Subject: [RHEL7.1 PATCH 096/150] blk-mq: blk_mq_tag_to_rq should handle flush request
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit 2230237500821aedfcf2bba2a79d9cbca389233c
+Author: Shaohua Li <shli@kernel.org>
+Date:   Fri May 30 08:06:42 2014 -0600
+
+    blk-mq: blk_mq_tag_to_rq should handle flush request
+
+    flush request is special, which borrows the tag from the parent
+    request. Hence blk_mq_tag_to_rq needs special handling to return
+    the flush request from the tag.
+
+    Signed-off-by: Shaohua Li <shli@fusionio.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 8ebc6fd..adf85a2 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -223,8 +223,10 @@ static void flush_end_io(struct request *flush_rq, int error)
+  struct request *rq, *n;
+  unsigned long flags = 0;
+ 
+- if (q->mq_ops)
++ if (q->mq_ops) {
+   spin_lock_irqsave(&q->mq_flush_lock, flags);
++  q->flush_rq->cmd_flags = 0;
++ }
+ 
+  running = &q->flush_queue[q->flush_running_idx];
+  BUG_ON(q->flush_pending_idx == q->flush_running_idx);
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 6160128..21f952a 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -541,9 +541,15 @@ void blk_mq_kick_requeue_list(struct request_queue *q)
+ }
+ EXPORT_SYMBOL(blk_mq_kick_requeue_list);
+ 
+-struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag)
++struct request *blk_mq_tag_to_rq(struct blk_mq_hw_ctx *hctx, unsigned int tag)
+ {
+- return tags->rqs[tag];
++ struct request_queue *q = hctx->queue;
++
++ if ((q->flush_rq->cmd_flags & REQ_FLUSH_SEQ) &&
++     q->flush_rq->tag == tag)
++  return q->flush_rq;
++
++ return hctx->tags->rqs[tag];
+ }
+ EXPORT_SYMBOL(blk_mq_tag_to_rq);
+ 
+@@ -572,7 +578,7 @@ static void blk_mq_timeout_check(void *__data, unsigned long *free_tags)
+   if (tag >= hctx->tags->nr_tags)
+    break;
+ 
+-  rq = blk_mq_tag_to_rq(hctx->tags, tag++);
++  rq = blk_mq_tag_to_rq(hctx, tag++);
+   if (rq->q != hctx->queue)
+    continue;
+   if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index fc1f58c..b79b9ec 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -154,7 +154,7 @@ void blk_mq_free_request(struct request *rq);
+ bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
+ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
+   gfp_t gfp, bool reserved);
+-struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag);
++struct request *blk_mq_tag_to_rq(struct blk_mq_hw_ctx *hctx, unsigned int tag);
+ 
+ struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+ struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+-- 
+1.7.1

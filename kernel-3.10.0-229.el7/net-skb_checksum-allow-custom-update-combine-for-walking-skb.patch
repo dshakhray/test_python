@@ -1,0 +1,159 @@
+From 0d440c19f5fb2c2cc06175238e76d08249129afc Mon Sep 17 00:00:00 2001
+From: Daniel Borkmann <dborkman@redhat.com>
+Date: Thu, 16 Jan 2014 15:19:49 -0500
+Subject: [net] skb_checksum: allow custom update/combine for walking skb
+
+Message-id: <e138ecd45391b61e9b201de08b3393499610b753.1389878943.git.dborkman@redhat.com>
+Patchwork-id: 74356
+O-Subject: [RHEL7 PATCH net 09/11] net: skb_checksum: allow custom update/combine for walking skb
+Bugzilla: 1054215
+RH-Acked-by: Florian Westphal <fwestpha@redhat.com>
+RH-Acked-by: Thomas Graf <tgraf@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1054215
+Upstream Status: 2817a336d4d533fb8b68719723cd60ea7dd7c09e
+Brew: http://brewweb.devel.redhat.com/brew/taskinfo?taskID=6885774
+Tested: verified by QA in their IPVS lab and on beaker for basic tests
+
+Minor conflict as we don't have Joe's batch of 'extern' cleanups.
+
+Upstream Commit:
+commit 2817a336d4d533fb8b68719723cd60ea7dd7c09e
+Author: Daniel Borkmann <dborkman@redhat.com>
+Date:   Wed Oct 30 11:50:51 2013 +0100
+
+    net: skb_checksum: allow custom update/combine for walking skb
+
+    Currently, skb_checksum walks over 1) linearized, 2) frags[], and
+    3) frag_list data and calculats the one's complement, a 32 bit
+    result suitable for feeding into itself or csum_tcpudp_magic(),
+    but unsuitable for SCTP as we're calculating CRC32c there.
+
+    Hence, in order to not re-implement the very same function in
+    SCTP (and maybe other protocols) over and over again, use an
+    update() + combine() callback internally to allow for walking
+    over the skb with different algorithms.
+
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 39c4045..d00a482 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -2451,9 +2451,19 @@ extern int        skb_shift(struct sk_buff *tgt, struct sk_buff *skb,
+      int shiftlen);
+ extern void        skb_scrub_packet(struct sk_buff *skb);
+ unsigned int skb_gso_transport_seglen(const struct sk_buff *skb);
+-
+ extern struct sk_buff *skb_segment(struct sk_buff *skb,
+        netdev_features_t features);
++
++struct skb_checksum_ops {
++ __wsum (*update)(const void *mem, int len, __wsum wsum);
++ __wsum (*combine)(__wsum csum, __wsum csum2, int offset, int len);
++};
++
++__wsum __skb_checksum(const struct sk_buff *skb, int offset, int len,
++        __wsum csum, const struct skb_checksum_ops *ops);
++__wsum skb_checksum(const struct sk_buff *skb, int offset, int len,
++      __wsum csum);
++
+ static inline void *skb_header_pointer(const struct sk_buff *skb, int offset,
+            int len, void *buffer)
+ {
+diff --git a/include/net/checksum.h b/include/net/checksum.h
+index 600d1d7..5ad4557 100644
+--- a/include/net/checksum.h
++++ b/include/net/checksum.h
+@@ -79,6 +79,12 @@ csum_block_add(__wsum csum, __wsum csum2, int offset)
+ }
+ 
+ static inline __wsum
++csum_block_add_ext(__wsum csum, __wsum csum2, int offset, int len)
++{
++ return csum_block_add(csum, csum2, offset);
++}
++
++static inline __wsum
+ csum_block_sub(__wsum csum, __wsum csum2, int offset)
+ {
+  u32 sum = (__force u32)csum2;
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 3897870..d4b48aa 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1926,9 +1926,8 @@ fault:
+ EXPORT_SYMBOL(skb_store_bits);
+ 
+ /* Checksum skb data. */
+-
+-__wsum skb_checksum(const struct sk_buff *skb, int offset,
+-     int len, __wsum csum)
++__wsum __skb_checksum(const struct sk_buff *skb, int offset, int len,
++        __wsum csum, const struct skb_checksum_ops *ops)
+ {
+  int start = skb_headlen(skb);
+  int i, copy = start - offset;
+@@ -1939,7 +1938,7 @@ __wsum skb_checksum(const struct sk_buff *skb, int offset,
+  if (copy > 0) {
+   if (copy > len)
+    copy = len;
+-  csum = csum_partial(skb->data + offset, copy, csum);
++  csum = ops->update(skb->data + offset, copy, csum);
+   if ((len -= copy) == 0)
+    return csum;
+   offset += copy;
+@@ -1960,10 +1959,10 @@ __wsum skb_checksum(const struct sk_buff *skb, int offset,
+    if (copy > len)
+     copy = len;
+    vaddr = kmap_atomic(skb_frag_page(frag));
+-   csum2 = csum_partial(vaddr + frag->page_offset +
+-          offset - start, copy, 0);
++   csum2 = ops->update(vaddr + frag->page_offset +
++         offset - start, copy, 0);
+    kunmap_atomic(vaddr);
+-   csum = csum_block_add(csum, csum2, pos);
++   csum = ops->combine(csum, csum2, pos, copy);
+    if (!(len -= copy))
+     return csum;
+    offset += copy;
+@@ -1982,9 +1981,9 @@ __wsum skb_checksum(const struct sk_buff *skb, int offset,
+    __wsum csum2;
+    if (copy > len)
+     copy = len;
+-   csum2 = skb_checksum(frag_iter, offset - start,
+-          copy, 0);
+-   csum = csum_block_add(csum, csum2, pos);
++   csum2 = __skb_checksum(frag_iter, offset - start,
++            copy, 0, ops);
++   csum = ops->combine(csum, csum2, pos, copy);
+    if ((len -= copy) == 0)
+     return csum;
+    offset += copy;
+@@ -1996,6 +1995,18 @@ __wsum skb_checksum(const struct sk_buff *skb, int offset,
+ 
+  return csum;
+ }
++EXPORT_SYMBOL(__skb_checksum);
++
++__wsum skb_checksum(const struct sk_buff *skb, int offset,
++      int len, __wsum csum)
++{
++ const struct skb_checksum_ops ops = {
++  .update  = csum_partial,
++  .combine = csum_block_add_ext,
++ };
++
++ return __skb_checksum(skb, offset, len, csum, &ops);
++}
+ EXPORT_SYMBOL(skb_checksum);
+ 
+ /* Both of above in one bottle. */
+-- 
+1.7.1

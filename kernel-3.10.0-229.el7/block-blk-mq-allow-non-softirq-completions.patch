@@ -1,0 +1,81 @@
+From 5d37121a37ba08b05bc3aa0f91b23167c97d1955 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:36:12 -0400
+Subject: [block] blk-mq: allow non-softirq completions
+
+Message-id: <1402670238-13916-85-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83824
+O-Subject: [RHEL7.1 PATCH 084/150] blk-mq: allow non-softirq completions
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit 95f096849932fe5eaa7bfec887530cf556744a76
+Author: Jens Axboe <axboe@fb.com>
+Date:   Tue May 27 17:46:48 2014 -0600
+
+    blk-mq: allow non-softirq completions
+
+    Right now we export two ways of completing a request:
+
+    1) blk_mq_complete_request(). This uses an IPI (if needed) and
+       completes through q->softirq_done_fn(). It also works with
+       timeouts.
+
+    2) blk_mq_end_io(). This completes inline, and ignores any timeout
+       state of the request.
+
+    Let blk_mq_complete_request() handle non-softirq_done_fn completions
+    as well, by just completing inline. If a driver has enough completion
+    ports to place completions correctly, it need not define a
+    mq_ops->complete() and we can avoid an indirect function call by
+    doing the completion inline.
+
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 30bad93..010b878 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -434,10 +434,16 @@ void __blk_mq_complete_request(struct request *rq)
+  **/
+ void blk_mq_complete_request(struct request *rq)
+ {
+- if (unlikely(blk_should_fake_timeout(rq->q)))
++ struct request_queue *q = rq->q;
++
++ if (unlikely(blk_should_fake_timeout(q)))
+   return;
+- if (!blk_mark_rq_complete(rq))
+-  __blk_mq_complete_request(rq);
++ if (!blk_mark_rq_complete(rq)) {
++  if (q->softirq_done_fn)
++   __blk_mq_complete_request(rq);
++  else
++   blk_mq_end_io(rq, rq->errors);
++ }
+ }
+ EXPORT_SYMBOL(blk_mq_complete_request);
+ 
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 2052fba..87ce51b 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -173,6 +173,10 @@ void __blk_mq_end_io(struct request *rq, int error);
+ 
+ void blk_mq_requeue_request(struct request *rq);
+ 
++/*
++ * Complete request through potential IPI for right placement. Driver must
++ * have defined a mq_ops->complete() hook for this.
++ */
+ void blk_mq_complete_request(struct request *rq);
+ 
+ void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+-- 
+1.7.1

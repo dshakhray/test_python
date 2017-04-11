@@ -1,0 +1,90 @@
+From 266d3b44e3c38909a239f511e0ed4d4737bf03ee Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:13:45 -0400
+Subject: [powerpc] perf: Clear MMCR2 when enabling PMU
+
+Message-id: <1410545655-205645-597-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94484
+O-Subject: [RHEL7 PATCH 596/626] powerpc/perf: Clear MMCR2 when enabling PMU
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit b50a6c584bb47b370f84bfd746770c0bbe7129b7
+Author: Joel Stanley <joel@jms.id.au>
+Date:   Tue Jul 8 16:08:22 2014 +0930
+
+    powerpc/perf: Clear MMCR2 when enabling PMU
+
+    On POWER8 when switching to a KVM guest we set bits in MMCR2 to freeze
+    the PMU counters. Aside from on boot they are then never reset,
+    resulting in stuck perf counters for any user in the guest or host.
+
+    We now set MMCR2 to 0 whenever enabling the PMU, which provides a sane
+    state for perf to use the PMU counters under either the guest or the
+    host.
+
+    This was manifesting as a bug with ppc64_cpu --frequency:
+
+        $ sudo ppc64_cpu --frequency
+        WARNING: couldn't run on cpu 0
+        WARNING: couldn't run on cpu 8
+          ...
+        WARNING: couldn't run on cpu 144
+        WARNING: couldn't run on cpu 152
+        min:    18446744073.710 GHz (cpu -1)
+        max:    0.000 GHz (cpu -1)
+        avg:    0.000 GHz
+
+    The command uses a perf counter to measure CPU cycles over a fixed
+    amount of time, in order to approximate the frequency of the machine.
+    The counters were returning zero once a guest was started, regardless of
+    weather it was still running or had been shut down.
+
+    By dumping the value of MMCR2, it was observed that once a guest is
+    running MMCR2 is set to 1s - which stops counters from running:
+
+        $ sudo sh -c 'echo p > /proc/sysrq-trigger'
+        CPU: 0 PMU registers, ppmu = POWER8 n_counters = 6
+        PMC1:  5b635e38 PMC2: 00000000 PMC3: 00000000 PMC4: 00000000
+        PMC5:  1bf5a646 PMC6: 5793d378 PMC7: deadbeef PMC8: deadbeef
+        MMCR0: 0000000080000000 MMCR1: 000000001e000000 MMCRA: 0000040000000000
+        MMCR2: fffffffffffffc00 EBBHR: 0000000000000000
+        EBBRR: 0000000000000000 BESCR: 0000000000000000
+        SIAR:  00000000000a51cc SDAR:  c00000000fc40000 SIER:  0000000001000000
+
+    This is done unconditionally in book3s_hv_interrupts.S upon entering the
+    guest, and the original value is only save/restored if the host has
+    indicated it was using the PMU. This is okay, however the user of the
+    PMU needs to ensure that it is in a defined state when it starts using
+    it.
+
+    Fixes: e05b9b9e5c10 ("powerpc/perf: Power8 PMU support")
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Joel Stanley <joel@jms.id.au>
+    Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/perf/core-book3s.c b/arch/powerpc/perf/core-book3s.c
+index a2ff1bd..bae697c 100644
+--- a/arch/powerpc/perf/core-book3s.c
++++ b/arch/powerpc/perf/core-book3s.c
+@@ -1300,6 +1300,9 @@ static void power_pmu_enable(struct pmu *pmu)
+ 
+  write_mmcr0(cpuhw, mmcr0);
+ 
++ if (ppmu->flags & PPMU_ARCH_207S)
++  mtspr(SPRN_MMCR2, 0);
++
+  /*
+   * Enable instruction sampling if necessary
+   */
+-- 
+1.7.1

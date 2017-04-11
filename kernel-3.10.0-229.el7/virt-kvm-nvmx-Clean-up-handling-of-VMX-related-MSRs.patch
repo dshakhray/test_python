@@ -1,0 +1,176 @@
+From 362f1ee3bbf07dd544cdccfa8da7e924c3f7de63 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:38:45 -0400
+Subject: [virt] kvm/nvmx: Clean up handling of VMX-related MSRs
+
+Message-id: <1406040016-3289-131-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86209
+O-Subject: [RHEL7 PATCH v2 130/221] KVM: nVMX: Clean up handling of VMX-related MSRs
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jan Kiszka <jan.kiszka@siemens.com>
+
+This simplifies the code and also stops issuing warning about writing to
+unhandled MSRs when VMX is disabled or the Feature Control MSR is
+locked - we do handle them all according to the spec.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit cae501397a25dc1e88375925c5e93a264d4a55ba)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/uapi/asm/msr-index.h b/arch/x86/include/uapi/asm/msr-index.h
+index 37813b5..2e4a42d 100644
+--- a/arch/x86/include/uapi/asm/msr-index.h
++++ b/arch/x86/include/uapi/asm/msr-index.h
+@@ -527,6 +527,7 @@
+ #define MSR_IA32_VMX_TRUE_PROCBASED_CTLS 0x0000048e
+ #define MSR_IA32_VMX_TRUE_EXIT_CTLS      0x0000048f
+ #define MSR_IA32_VMX_TRUE_ENTRY_CTLS     0x00000490
++#define MSR_IA32_VMX_VMFUNC             0x00000491
+ 
+ /* VMX_BASIC bits and bitmasks */
+ #define VMX_BASIC_VMCS_SIZE_SHIFT 32
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index aa5fe61..fe4b2d0 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -2361,32 +2361,10 @@ static inline u64 vmx_control_msr(u32 low, u32 high)
+  return low | ((u64)high << 32);
+ }
+ 
+-/*
+- * If we allow our guest to use VMX instructions (i.e., nested VMX), we should
+- * also let it use VMX-specific MSRs.
+- * vmx_get_vmx_msr() and vmx_set_vmx_msr() return 1 when we handled a
+- * VMX-specific MSR, or 0 when we haven't (and the caller should handle it
+- * like all other MSRs).
+- */
++/* Returns 0 on success, non-0 otherwise. */
+ static int vmx_get_vmx_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 *pdata)
+ {
+- if (!nested_vmx_allowed(vcpu) && msr_index >= MSR_IA32_VMX_BASIC &&
+-       msr_index <= MSR_IA32_VMX_TRUE_ENTRY_CTLS) {
+-  /*
+-   * According to the spec, processors which do not support VMX
+-   * should throw a #GP(0) when VMX capability MSRs are read.
+-   */
+-  kvm_queue_exception_e(vcpu, GP_VECTOR, 0);
+-  return 1;
+- }
+-
+  switch (msr_index) {
+- case MSR_IA32_FEATURE_CONTROL:
+-  if (nested_vmx_allowed(vcpu)) {
+-   *pdata = to_vmx(vcpu)->nested.msr_ia32_feature_control;
+-   break;
+-  }
+-  return 0;
+  case MSR_IA32_VMX_BASIC:
+   /*
+    * This MSR reports some information about VMX support. We
+@@ -2453,38 +2431,9 @@ static int vmx_get_vmx_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 *pdata)
+   *pdata = nested_vmx_ept_caps;
+   break;
+  default:
+-  return 0;
+- }
+-
+- return 1;
+-}
+-
+-static void vmx_leave_nested(struct kvm_vcpu *vcpu);
+-
+-static int vmx_set_vmx_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+-{
+- u32 msr_index = msr_info->index;
+- u64 data = msr_info->data;
+- bool host_initialized = msr_info->host_initiated;
+-
+- if (!nested_vmx_allowed(vcpu))
+-  return 0;
+-
+- if (msr_index == MSR_IA32_FEATURE_CONTROL) {
+-  if (!host_initialized &&
+-    to_vmx(vcpu)->nested.msr_ia32_feature_control
+-    & FEATURE_CONTROL_LOCKED)
+-   return 0;
+-  to_vmx(vcpu)->nested.msr_ia32_feature_control = data;
+-  if (host_initialized && data == 0)
+-   vmx_leave_nested(vcpu);
+   return 1;
+  }
+ 
+- /*
+-  * No need to treat VMX capability MSRs specially: If we don't handle
+-  * them, handle_wrmsr will #GP(0), which is correct (they are readonly)
+-  */
+  return 0;
+ }
+ 
+@@ -2530,13 +2479,20 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 *pdata)
+  case MSR_IA32_SYSENTER_ESP:
+   data = vmcs_readl(GUEST_SYSENTER_ESP);
+   break;
++ case MSR_IA32_FEATURE_CONTROL:
++  if (!nested_vmx_allowed(vcpu))
++   return 1;
++  data = to_vmx(vcpu)->nested.msr_ia32_feature_control;
++  break;
++ case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
++  if (!nested_vmx_allowed(vcpu))
++   return 1;
++  return vmx_get_vmx_msr(vcpu, msr_index, pdata);
+  case MSR_TSC_AUX:
+   if (!to_vmx(vcpu)->rdtscp_enabled)
+    return 1;
+   /* Otherwise falls through */
+  default:
+-  if (vmx_get_vmx_msr(vcpu, msr_index, pdata))
+-   return 0;
+   msr = find_msr_entry(to_vmx(vcpu), msr_index);
+   if (msr) {
+    data = msr->data;
+@@ -2549,6 +2505,8 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 *pdata)
+  return 0;
+ }
+ 
++static void vmx_leave_nested(struct kvm_vcpu *vcpu);
++
+ /*
+  * Writes msr value into into the appropriate "register".
+  * Returns 0 on success, non-0 otherwise.
+@@ -2603,6 +2561,17 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+  case MSR_IA32_TSC_ADJUST:
+   ret = kvm_set_msr_common(vcpu, msr_info);
+   break;
++ case MSR_IA32_FEATURE_CONTROL:
++  if (!nested_vmx_allowed(vcpu) ||
++      (to_vmx(vcpu)->nested.msr_ia32_feature_control &
++       FEATURE_CONTROL_LOCKED && !msr_info->host_initiated))
++   return 1;
++  vmx->nested.msr_ia32_feature_control = data;
++  if (msr_info->host_initiated && data == 0)
++   vmx_leave_nested(vcpu);
++  break;
++ case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
++  return 1; /* they are read-only */
+  case MSR_TSC_AUX:
+   if (!vmx->rdtscp_enabled)
+    return 1;
+@@ -2611,8 +2580,6 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+    return 1;
+   /* Otherwise falls through */
+  default:
+-  if (vmx_set_vmx_msr(vcpu, msr_info))
+-   break;
+   msr = find_msr_entry(vmx, msr_index);
+   if (msr) {
+    msr->data = data;
+-- 
+1.7.1

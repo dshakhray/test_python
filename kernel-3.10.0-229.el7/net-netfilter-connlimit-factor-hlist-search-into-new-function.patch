@@ -1,0 +1,127 @@
+From 2fef31f5c1d8af51177d05ec7749b965b6b30965 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Thu, 24 Jul 2014 12:29:02 -0400
+Subject: [net] netfilter: connlimit: factor hlist search into new function
+
+Message-id: <1406204949-17382-2-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 86620
+O-Subject: [PATCH 1/8] [RHEL7.1 net] netfilter: connlimit: factor hlist search into new function
+Bugzilla: 1052282
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+BZ: 1052282
+
+commit 15cfd52895751e8f36b48b8ad33f1d68b59611e2
+Author: Florian Westphal <fw@strlen.de>
+Date:   Fri Mar 7 14:37:09 2014 +0100
+
+    netfilter: connlimit: factor hlist search into new function
+
+    Simplifies followup patch that introduces separate locks for each of
+    the hash slots.
+
+    Reviewed-by: Jesper Dangaard Brouer <brouer@redhat.com>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/net/netfilter/xt_connlimit.c b/net/netfilter/xt_connlimit.c
+index c40b269..6988818 100644
+--- a/net/netfilter/xt_connlimit.c
++++ b/net/netfilter/xt_connlimit.c
+@@ -92,30 +92,24 @@ same_source_net(const union nf_inet_addr *addr,
+  }
+ }
+ 
+-static int count_them(struct net *net,
+-        struct xt_connlimit_data *data,
+-        const struct nf_conntrack_tuple *tuple,
+-        const union nf_inet_addr *addr,
+-        const union nf_inet_addr *mask,
+-        u_int8_t family)
++static int count_hlist(struct net *net,
++         struct hlist_head *head,
++         const struct nf_conntrack_tuple *tuple,
++         const union nf_inet_addr *addr,
++         const union nf_inet_addr *mask,
++         u_int8_t family)
+ {
+  const struct nf_conntrack_tuple_hash *found;
+  struct xt_connlimit_conn *conn;
+  struct hlist_node *n;
+  struct nf_conn *found_ct;
+- struct hlist_head *hash;
+  bool addit = true;
+  int matches = 0;
+ 
+- if (family == NFPROTO_IPV6)
+-  hash = &data->iphash[connlimit_iphash6(addr, mask)];
+- else
+-  hash = &data->iphash[connlimit_iphash(addr->ip & mask->ip)];
+-
+  rcu_read_lock();
+ 
+  /* check the saved connections */
+- hlist_for_each_entry_safe(conn, n, hash, node) {
++ hlist_for_each_entry_safe(conn, n, head, node) {
+   found    = nf_conntrack_find_get(net, NF_CT_DEFAULT_ZONE,
+        &conn->tuple);
+   found_ct = NULL;
+@@ -166,13 +160,38 @@ static int count_them(struct net *net,
+    return -ENOMEM;
+   conn->tuple = *tuple;
+   conn->addr = *addr;
+-  hlist_add_head(&conn->node, hash);
++  hlist_add_head(&conn->node, head);
+   ++matches;
+  }
+ 
+  return matches;
+ }
+ 
++static int count_them(struct net *net,
++        struct xt_connlimit_data *data,
++        const struct nf_conntrack_tuple *tuple,
++        const union nf_inet_addr *addr,
++        const union nf_inet_addr *mask,
++        u_int8_t family)
++{
++ struct hlist_head *hhead;
++ int count;
++ u32 hash;
++
++ if (family == NFPROTO_IPV6)
++  hash = connlimit_iphash6(addr, mask);
++ else
++  hash = connlimit_iphash(addr->ip & mask->ip);
++
++ hhead = &data->iphash[hash];
++
++ spin_lock_bh(&data->lock);
++ count = count_hlist(net, hhead, tuple, addr, mask, family);
++ spin_unlock_bh(&data->lock);
++
++ return count;
++}
++
+ static bool
+ connlimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
+ {
+@@ -202,10 +221,8 @@ connlimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
+      iph->daddr : iph->saddr;
+  }
+ 
+- spin_lock_bh(&info->data->lock);
+  connections = count_them(net, info->data, tuple_ptr, &addr,
+                           &info->mask, par->family);
+- spin_unlock_bh(&info->data->lock);
+ 
+  if (connections < 0)
+   /* kmalloc failed, drop it entirely */
+-- 
+1.7.1

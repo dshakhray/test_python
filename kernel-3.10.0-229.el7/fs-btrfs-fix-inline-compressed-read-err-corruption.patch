@@ -1,0 +1,89 @@
+From f74b2271c884e8dbeb72870dce86e77941dc6397 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:03:15 -0400
+Subject: [fs] btrfs: fix inline compressed read err corruption
+
+Message-id: <1407179109-13714-309-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87221
+O-Subject: [RHEL7.1 PATCH 308/422] btrfs: fix inline compressed read err corruption
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Zach Brown <zab@redhat.com>
+
+commit 166ae5a418756dacd2e8883c6f562c2d0ce2db2d
+Author: Zach Brown <zab@redhat.com>
+Date:   Fri May 9 17:15:10 2014 -0400
+
+    btrfs: fix inline compressed read err corruption
+
+    uncompress_inline() is dropping the error from btrfs_decompress() after
+    testing it and zeroing the page that was supposed to hold decompressed
+    data.  This can silently turn compressed inline data in to zeros if
+    decompression fails due to corrupt compressed data or memory allocation
+    failure.
+
+    I verified this by manually forcing the error from btrfs_decompress()
+    for a silly named copy of od:
+
+     if (!strcmp(current->comm, "failod"))
+      ret = -ENOMEM;
+
+      # od -x /mnt/btrfs/dir/80 | head -1
+      0000000 3031 3038 310a 2d30 6f70 6e69 0a74 3031
+      # echo 3 > /proc/sys/vm/drop_caches
+      # cp $(which od) /tmp/failod
+      # /tmp/failod -x /mnt/btrfs/dir/80 | head -1
+      0000000 0000 0000 0000 0000 0000 0000 0000 0000
+
+    The fix is to pass the error to its caller.  Which still has a BUG_ON().
+    So we fix that too.
+
+    There seems to be no reason for the zeroing of the page on the error
+    from btrfs_decompress() but not from the allocation error a few lines
+    above.  So the page zeroing is removed.
+
+    Signed-off-by: Zach Brown <zab@redhat.com>
+    Reviewed-by: David Sterba <dsterba@suse.cz>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 12d6f94..f340e8d 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -6098,16 +6098,8 @@ static noinline int uncompress_inline(struct btrfs_path *path,
+  max_size = min_t(unsigned long, PAGE_CACHE_SIZE, max_size);
+  ret = btrfs_decompress(compress_type, tmp, page,
+           extent_offset, inline_size, max_size);
+- if (ret) {
+-  char *kaddr = kmap_atomic(page);
+-  unsigned long copy_size = min_t(u64,
+-      PAGE_CACHE_SIZE - pg_offset,
+-      max_size - extent_offset);
+-  memset(kaddr + pg_offset, 0, copy_size);
+-  kunmap_atomic(kaddr);
+- }
+  kfree(tmp);
+- return 0;
++ return ret;
+ }
+ 
+ /*
+@@ -6308,7 +6300,10 @@ next:
+     ret = uncompress_inline(path, inode, page,
+        pg_offset,
+        extent_offset, item);
+-    BUG_ON(ret); /* -ENOMEM */
++    if (ret) {
++     err = ret;
++     goto out;
++    }
+    } else {
+     map = kmap(page);
+     read_extent_buffer(leaf, map + pg_offset, ptr,
+-- 
+1.7.1

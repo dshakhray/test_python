@@ -1,0 +1,98 @@
+From 28646659e25a486a365263658759bb1ed533c780 Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Mon, 16 Jun 2014 16:01:20 -0400
+Subject: [kernel] uprobes: move the UPROBE_FIX_{RIP,IP,CALL} code at the end of pre/post hooks
+
+Message-id: <20140616160120.GA15407@redhat.com>
+Patchwork-id: 84069
+O-Subject: [PATCH RHEL7 BZ 1073627 05/36] uprobes/x86: move the UPROBE_FIX_{RIP,IP,CALL} code at the end of pre/post hooks
+Bugzilla: 1073627
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+RHBZ: 1073627
+
+No functional changes. Preparation to simplify the review of the next
+change. Just reorder the code in arch_uprobe_pre/post_xol() functions
+so that UPROBE_FIX_{RIP_*,IP,CALL} logic goes to the end.
+
+Also change arch_uprobe_pre_xol() to use utask instead of autask, to
+make the code more symmetrical with arch_uprobe_post_xol().
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Reviewed-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+Acked-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+(cherry picked from commit 34e7317d6ae8f6111ac449444f22e14f4a14ebfd)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index c52c30f..3bb4198 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -474,19 +474,18 @@ int arch_uprobe_analyze_insn(struct arch_uprobe *auprobe, struct mm_struct *mm,
+  */
+ int arch_uprobe_pre_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+ {
+- struct arch_uprobe_task *autask;
++ struct uprobe_task *utask = current->utask;
+ 
+- autask = &current->utask->autask;
+- autask->saved_trap_nr = current->thread.trap_nr;
++ regs->ip = utask->xol_vaddr;
++ utask->autask.saved_trap_nr = current->thread.trap_nr;
+  current->thread.trap_nr = UPROBE_TRAP_NR;
+- regs->ip = current->utask->xol_vaddr;
+- pre_xol_rip_insn(auprobe, regs, autask);
+ 
+- autask->saved_tf = !!(regs->flags & X86_EFLAGS_TF);
++ utask->autask.saved_tf = !!(regs->flags & X86_EFLAGS_TF);
+  regs->flags |= X86_EFLAGS_TF;
+  if (test_tsk_thread_flag(current, TIF_BLOCKSTEP))
+   set_task_blockstep(current, false);
+ 
++ pre_xol_rip_insn(auprobe, regs, &utask->autask);
+  return 0;
+ }
+ 
+@@ -560,22 +559,13 @@ bool arch_uprobe_xol_was_trapped(struct task_struct *t)
+  */
+ int arch_uprobe_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+ {
+- struct uprobe_task *utask;
++ struct uprobe_task *utask = current->utask;
+  long correction;
+  int result = 0;
+ 
+  WARN_ON_ONCE(current->thread.trap_nr != UPROBE_TRAP_NR);
+ 
+- utask = current->utask;
+  current->thread.trap_nr = utask->autask.saved_trap_nr;
+- correction = (long)(utask->vaddr - utask->xol_vaddr);
+- handle_riprel_post_xol(auprobe, regs, &correction);
+- if (auprobe->fixups & UPROBE_FIX_IP)
+-  regs->ip += correction;
+-
+- if (auprobe->fixups & UPROBE_FIX_CALL)
+-  result = adjust_ret_addr(regs->sp, correction);
+-
+  /*
+   * arch_uprobe_pre_xol() doesn't save the state of TIF_BLOCKSTEP
+   * so we can get an extra SIGTRAP if we do not clear TF. We need
+@@ -586,6 +576,14 @@ int arch_uprobe_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs)
+  else if (!(auprobe->fixups & UPROBE_FIX_SETF))
+   regs->flags &= ~X86_EFLAGS_TF;
+ 
++ correction = (long)(utask->vaddr - utask->xol_vaddr);
++ handle_riprel_post_xol(auprobe, regs, &correction);
++ if (auprobe->fixups & UPROBE_FIX_IP)
++  regs->ip += correction;
++
++ if (auprobe->fixups & UPROBE_FIX_CALL)
++  result = adjust_ret_addr(regs->sp, correction);
++
+  return result;
+ }
+ 
+-- 
+1.7.1

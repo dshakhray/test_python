@@ -1,0 +1,151 @@
+From 674766d7be396bed13a59b5d15bffd6ce459a0a9 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sweil@redhat.com>
+Date: Thu, 28 Aug 2014 16:22:01 -0400
+Subject: [block] rbd: use rwsem to protect header updates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Message-id: <1409243210-7988-15-git-send-email-sweil@redhat.com>
+Patchwork-id: 89719
+O-Subject: [PATCH 014/303] rbd: use rwsem to protect header updates
+Bugzilla: 1122174
+RH-Acked-by: Ilya Dryomov <ilya.dryomov@inktank.com>
+RH-Acked-by: Ã¤Â¸Â¥Ã¦Â­Â£ <zyan@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Alex Elder <elder@inktank.com>
+
+Updating an image header needs to be protected to ensure it's
+done consistently.  However distinct headers can be updated
+concurrently without a problem.  Instead of using the global
+control lock to serialize headder updates, just rely on the header
+semaphore.  (It's already used, this just moves it out to cover
+a broader section of the code.)
+
+That leaves the control mutex protecting only the creation of rbd
+clients, so rename it.
+
+This resolves:
+    http://tracker.ceph.com/issues/5222
+
+Signed-off-by: Alex Elder <elder@inktank.com>
+Reviewed-by: Josh Durgin <josh.durgin@inktank.com>
+(cherry picked from commit cfbf6377b696d88461eef6966bef9e6184111183)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index e98ea72..b85668b 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -372,7 +372,7 @@ enum rbd_dev_flags {
+  RBD_DEV_FLAG_REMOVING, /* this mapping is being removed */
+ };
+ 
+-static DEFINE_MUTEX(ctl_mutex);   /* Serialize open/close/setup/teardown */
++static DEFINE_MUTEX(client_mutex); /* Serialize client creation */
+ 
+ static LIST_HEAD(rbd_dev_list);    /* devices */
+ static DEFINE_SPINLOCK(rbd_dev_list_lock);
+@@ -516,7 +516,7 @@ static const struct block_device_operations rbd_bd_ops = {
+ 
+ /*
+  * Initialize an rbd client instance.  Success or not, this function
+- * consumes ceph_opts.  Caller holds ctl_mutex.
++ * consumes ceph_opts.  Caller holds client_mutex.
+  */
+ static struct rbd_client *rbd_client_create(struct ceph_options *ceph_opts)
+ {
+@@ -673,13 +673,13 @@ static struct rbd_client *rbd_get_client(struct ceph_options *ceph_opts)
+ {
+  struct rbd_client *rbdc;
+ 
+- mutex_lock_nested(&ctl_mutex, SINGLE_DEPTH_NESTING);
++ mutex_lock_nested(&client_mutex, SINGLE_DEPTH_NESTING);
+  rbdc = rbd_client_find(ceph_opts);
+  if (rbdc) /* using an existing client */
+   ceph_destroy_options(ceph_opts);
+  else
+   rbdc = rbd_client_create(ceph_opts);
+- mutex_unlock(&ctl_mutex);
++ mutex_unlock(&client_mutex);
+ 
+  return rbdc;
+ }
+@@ -833,7 +833,6 @@ static int rbd_header_from_disk(struct rbd_device *rbd_dev,
+ 
+  /* We won't fail any more, fill in the header */
+ 
+- down_write(&rbd_dev->header_rwsem);
+  if (first_time) {
+   header->object_prefix = object_prefix;
+   header->obj_order = ondisk->options.order;
+@@ -862,8 +861,6 @@ static int rbd_header_from_disk(struct rbd_device *rbd_dev,
+   if (rbd_dev->mapping.size != header->image_size)
+    rbd_dev->mapping.size = header->image_size;
+ 
+- up_write(&rbd_dev->header_rwsem);
+-
+  return 0;
+ out_2big:
+  ret = -EIO;
+@@ -3333,7 +3330,7 @@ static int rbd_dev_refresh(struct rbd_device *rbd_dev)
+  int ret;
+ 
+  rbd_assert(rbd_image_format_valid(rbd_dev->image_format));
+- mutex_lock_nested(&ctl_mutex, SINGLE_DEPTH_NESTING);
++ down_write(&rbd_dev->header_rwsem);
+  mapping_size = rbd_dev->mapping.size;
+  if (rbd_dev->image_format == 1)
+   ret = rbd_dev_v1_header_info(rbd_dev);
+@@ -3343,7 +3340,8 @@ static int rbd_dev_refresh(struct rbd_device *rbd_dev)
+  /* If it's a mapped snapshot, validate its EXISTS flag */
+ 
+  rbd_exists_validate(rbd_dev);
+- mutex_unlock(&ctl_mutex);
++ up_write(&rbd_dev->header_rwsem);
++
+  if (mapping_size != rbd_dev->mapping.size) {
+   sector_t size;
+ 
+@@ -4272,16 +4270,14 @@ static int rbd_dev_v2_header_info(struct rbd_device *rbd_dev)
+  bool first_time = rbd_dev->header.object_prefix == NULL;
+  int ret;
+ 
+- down_write(&rbd_dev->header_rwsem);
+-
+  ret = rbd_dev_v2_image_size(rbd_dev);
+  if (ret)
+-  goto out;
++  return ret;
+ 
+  if (first_time) {
+   ret = rbd_dev_v2_header_onetime(rbd_dev);
+   if (ret)
+-   goto out;
++   return ret;
+  }
+ 
+  /*
+@@ -4296,7 +4292,7 @@ static int rbd_dev_v2_header_info(struct rbd_device *rbd_dev)
+ 
+   ret = rbd_dev_v2_parent_info(rbd_dev);
+   if (ret)
+-   goto out;
++   return ret;
+ 
+   /*
+    * Print a warning if this is the initial probe and
+@@ -4317,8 +4313,6 @@ static int rbd_dev_v2_header_info(struct rbd_device *rbd_dev)
+ 
+  ret = rbd_dev_v2_snap_context(rbd_dev);
+  dout("rbd_dev_v2_snap_context returned %d\n", ret);
+-out:
+- up_write(&rbd_dev->header_rwsem);
+ 
+  return ret;
+ }
+-- 
+1.7.1

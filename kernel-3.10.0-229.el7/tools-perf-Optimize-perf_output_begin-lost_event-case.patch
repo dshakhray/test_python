@@ -1,0 +1,79 @@
+From abcdb6c1bb948d0985661745a7915408bef48306 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:23:11 -0400
+Subject: [tools] perf: Optimize perf_output_begin() -- lost_event case
+
+Message-id: <1408462094-14194-23-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88011
+O-Subject: [PATCH RHEL7.1 BZ1131394 022/325] perf: Optimize perf_output_begin() -- lost_event case
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit d20a973f46ed83e0d7d24f6c512064133038e193
+Author: Peter Zijlstra <peterz@infradead.org>
+Date: Thu Oct 31 17:29:29 2013 +0100
+
+description
+===========
+Avoid touching the lost_event and sample_data cachelines twince. Its
+not like we end up doing less work, but it might help to keep all
+accesses to these cachelines in one place.
+
+Due to code shuffle, this looses 4 bytes on x86_64-defconfig.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 6ed16ec..e4d70f3 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -106,7 +106,6 @@ int perf_output_begin(struct perf_output_handle *handle,
+  struct ring_buffer *rb;
+  unsigned long tail, offset, head;
+  int have_lost;
+- struct perf_sample_data sample_data;
+  struct {
+   struct perf_event_header header;
+   u64    id;
+@@ -132,10 +131,9 @@ int perf_output_begin(struct perf_output_handle *handle,
+ 
+  have_lost = local_read(&rb->lost);
+  if (unlikely(have_lost)) {
+-  lost_event.header.size = sizeof(lost_event);
+-  perf_event_header__init_id(&lost_event.header, &sample_data,
+-        event);
+-  size += lost_event.header.size;
++  size += sizeof(lost_event);
++  if (event->attr.sample_id_all)
++   size += event->id_header_size;
+  }
+ 
+  perf_output_get_handle(handle);
+@@ -169,11 +167,16 @@ int perf_output_begin(struct perf_output_handle *handle,
+  handle->size = (PAGE_SIZE << page_order(rb)) - handle->size;
+ 
+  if (unlikely(have_lost)) {
++  struct perf_sample_data sample_data;
++
++  lost_event.header.size = sizeof(lost_event);
+   lost_event.header.type = PERF_RECORD_LOST;
+   lost_event.header.misc = 0;
+   lost_event.id          = event->id;
+   lost_event.lost        = local_xchg(&rb->lost, 0);
+ 
++  perf_event_header__init_id(&lost_event.header,
++        &sample_data, event);
+   perf_output_put(handle, lost_event);
+   perf_event__output_id_sample(event, handle, &sample_data);
+  }
+-- 
+1.7.1

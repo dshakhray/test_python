@@ -1,0 +1,86 @@
+From c58afe8c4360ba1acd2243b8c7908ff93bf2f91c Mon Sep 17 00:00:00 2001
+From: Stefan Assmann <sassmann@redhat.com>
+Date: Tue, 26 Aug 2014 14:12:00 -0400
+Subject: [ethernet] igb: fix race conditions on queuing skb for HW time stamp
+
+Message-id: <1409062359-13063-43-git-send-email-sassmann@redhat.com>
+Patchwork-id: 89154
+O-Subject: [RHEL7.1 PATCH 42/81] igb: fix race conditions on queuing skb for HW time stamp
+Bugzilla: 1091121
+RH-Acked-by: Nikolay Aleksandrov <nikolay@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jakub Kicinski <kubakici@wp.pl>
+
+igb has a single set of TX time stamping resources per NIC.
+Use a simple bit lock to avoid race conditions and leaking skbs
+when multiple TX rings try to claim time stamping.
+
+Signed-off-by: Jakub Kicinski <kubakici@wp.pl>
+Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Stefan Assmann <sassmann@redhat.com>
+(cherry picked from commit ed4420a3b412b09cc60d6e3d662428b7e6c36e90)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/igb/igb.h b/drivers/net/ethernet/intel/igb/igb.h
+index e0a4472..3c44387 100644
+--- a/drivers/net/ethernet/intel/igb/igb.h
++++ b/drivers/net/ethernet/intel/igb/igb.h
+@@ -490,7 +490,8 @@ struct igb_adapter {
+ enum e1000_state_t {
+  __IGB_TESTING,
+  __IGB_RESETTING,
+- __IGB_DOWN
++ __IGB_DOWN,
++ __IGB_PTP_TX_IN_PROGRESS,
+ };
+ 
+ enum igb_boards {
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index 37fe594..f1f4cf4 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -4983,7 +4983,8 @@ netdev_tx_t igb_xmit_frame_ring(struct sk_buff *skb,
+  if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)) {
+   struct igb_adapter *adapter = netdev_priv(tx_ring->netdev);
+ 
+-  if (!(adapter->ptp_tx_skb)) {
++  if (!test_and_set_bit_lock(__IGB_PTP_TX_IN_PROGRESS,
++        &adapter->state)) {
+    skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+    tx_flags |= IGB_TX_FLAGS_TSTAMP;
+ 
+diff --git a/drivers/net/ethernet/intel/igb/igb_ptp.c b/drivers/net/ethernet/intel/igb/igb_ptp.c
+index da55fbb..2cca8fd 100644
+--- a/drivers/net/ethernet/intel/igb/igb_ptp.c
++++ b/drivers/net/ethernet/intel/igb/igb_ptp.c
+@@ -387,6 +387,7 @@ static void igb_ptp_tx_work(struct work_struct *work)
+        IGB_PTP_TX_TIMEOUT)) {
+   dev_kfree_skb_any(adapter->ptp_tx_skb);
+   adapter->ptp_tx_skb = NULL;
++  clear_bit_unlock(__IGB_PTP_TX_IN_PROGRESS, &adapter->state);
+   adapter->tx_hwtstamp_timeouts++;
+   dev_warn(&adapter->pdev->dev, "clearing Tx timestamp hang");
+   return;
+@@ -480,6 +481,7 @@ static void igb_ptp_tx_hwtstamp(struct igb_adapter *adapter)
+  skb_tstamp_tx(adapter->ptp_tx_skb, &shhwtstamps);
+  dev_kfree_skb_any(adapter->ptp_tx_skb);
+  adapter->ptp_tx_skb = NULL;
++ clear_bit_unlock(__IGB_PTP_TX_IN_PROGRESS, &adapter->state);
+ }
+ 
+ /**
+@@ -857,6 +859,7 @@ void igb_ptp_stop(struct igb_adapter *adapter)
+  if (adapter->ptp_tx_skb) {
+   dev_kfree_skb_any(adapter->ptp_tx_skb);
+   adapter->ptp_tx_skb = NULL;
++  clear_bit_unlock(__IGB_PTP_TX_IN_PROGRESS, &adapter->state);
+  }
+ 
+  if (adapter->ptp_clock) {
+-- 
+1.7.1

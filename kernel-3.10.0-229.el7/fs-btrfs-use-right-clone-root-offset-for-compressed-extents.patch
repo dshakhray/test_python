@@ -1,0 +1,102 @@
+From b7005b4a311c77af8e28a4a9f1fdc14f52ab17f5 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:00:47 -0400
+Subject: [fs] btrfs: use right clone root offset for compressed extents
+
+Message-id: <1407179109-13714-161-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87105
+O-Subject: [RHEL7.1 PATCH 160/422] Btrfs: use right clone root offset for compressed extents
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Filipe David Borba Manana <fdmanana@gmail.com>
+
+commit 93de4ba86480a9e0d1062cb1d535fa97fb81af48
+Author: Filipe David Borba Manana <fdmanana@gmail.com>
+Date:   Sat Feb 15 15:53:16 2014 +0000
+
+    Btrfs: use right clone root offset for compressed extents
+
+    For non compressed extents, iterate_extent_inodes() gives us offsets
+    that take into account the data offset from the file extent items, while
+    for compressed extents it doesn't. Therefore we have to adjust them before
+    placing them in a send clone instruction. Not doing this adjustment leads to
+    the receiving end requesting for a wrong a file range to the clone ioctl,
+    which results in different file content from the one in the original send
+    root.
+
+    Issue reproducible with the following excerpt from the test I made for
+    xfstests:
+
+      _scratch_mkfs
+      _scratch_mount "-o compress-force=lzo"
+
+      $XFS_IO_PROG -f -c "truncate 118811" $SCRATCH_MNT/foo
+      $XFS_IO_PROG -c "pwrite -S 0x0d -b 39987 92267 39987" $SCRATCH_MNT/foo
+
+      $BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+
+      $XFS_IO_PROG -c "pwrite -S 0x3e -b 80000 200000 80000" $SCRATCH_MNT/foo
+      $BTRFS_UTIL_PROG filesystem sync $SCRATCH_MNT
+      $XFS_IO_PROG -c "pwrite -S 0xdc -b 10000 250000 10000" $SCRATCH_MNT/foo
+      $XFS_IO_PROG -c "pwrite -S 0xff -b 10000 300000 10000" $SCRATCH_MNT/foo
+
+      # will be used for incremental send to be able to issue clone operations
+      $BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/clones_snap
+
+      $BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap2
+
+      $FSSUM_PROG -A -f -w $tmp/1.fssum $SCRATCH_MNT/mysnap1
+      $FSSUM_PROG -A -f -w $tmp/2.fssum -x $SCRATCH_MNT/mysnap2/mysnap1 \
+          -x $SCRATCH_MNT/mysnap2/clones_snap $SCRATCH_MNT/mysnap2
+      $FSSUM_PROG -A -f -w $tmp/clones.fssum $SCRATCH_MNT/clones_snap \
+          -x $SCRATCH_MNT/clones_snap/mysnap1 -x $SCRATCH_MNT/clones_snap/mysnap2
+
+      $BTRFS_UTIL_PROG send $SCRATCH_MNT/mysnap1 -f $tmp/1.snap
+      $BTRFS_UTIL_PROG send $SCRATCH_MNT/clones_snap -f $tmp/clones.snap
+      $BTRFS_UTIL_PROG send -p $SCRATCH_MNT/mysnap1 \
+          -c $SCRATCH_MNT/clones_snap $SCRATCH_MNT/mysnap2 -f $tmp/2.snap
+
+      _scratch_unmount
+      _scratch_mkfs
+      _scratch_mount
+
+      $BTRFS_UTIL_PROG receive $SCRATCH_MNT -f $tmp/1.snap
+      $FSSUM_PROG -r $tmp/1.fssum $SCRATCH_MNT/mysnap1 2>> $seqres.full
+
+      $BTRFS_UTIL_PROG receive $SCRATCH_MNT -f $tmp/clones.snap
+      $FSSUM_PROG -r $tmp/clones.fssum $SCRATCH_MNT/clones_snap 2>> $seqres.full
+
+      $BTRFS_UTIL_PROG receive $SCRATCH_MNT -f $tmp/2.snap
+      $FSSUM_PROG -r $tmp/2.fssum $SCRATCH_MNT/mysnap2 2>> $seqres.full
+
+    Signed-off-by: Filipe David Borba Manana <fdmanana@gmail.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index 9c8d1a3..9dde971 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -1332,6 +1332,16 @@ verbose_printk(KERN_DEBUG "btrfs: find_extent_clone: data_offset=%llu, "
+  }
+ 
+  if (cur_clone_root) {
++  if (compressed != BTRFS_COMPRESS_NONE) {
++   /*
++    * Offsets given by iterate_extent_inodes() are relative
++    * to the start of the extent, we need to add logical
++    * offset from the file extent item.
++    * (See why at backref.c:check_extent_in_eb())
++    */
++   cur_clone_root->offset += btrfs_file_extent_offset(eb,
++            fi);
++  }
+   *found = cur_clone_root;
+   ret = 0;
+  } else {
+-- 
+1.7.1

@@ -1,0 +1,80 @@
+From 79f409bd4133dafd2df9a078a5ab4e1e6f88d63d Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Wed, 18 Jun 2014 20:04:24 -0400
+Subject: [block] blk-mq: bitmap tag, fix races in bt_get() function
+
+Message-id: <1403121864-7956-8-git-send-email-snitzer@redhat.com>
+Patchwork-id: 84268
+O-Subject: [RHEL7.1 PATCH 158/150] blk-mq: bitmap tag: fix races in bt_get() function
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit 86fb5c56cfa26de5e91c9a50e2767a695dff366e
+Author: Alexander Gordeev <agordeev@redhat.com>
+Date:   Tue Jun 17 22:37:23 2014 +0200
+
+    blk-mq: bitmap tag: fix races in bt_get() function
+
+    This update fixes few issues in bt_get() function:
+
+    - list_empty(&wait.task_list) check is not protected;
+
+    - was_empty check is always true which results in *every* thread
+      entering the loop resets bt_wait_state::wait_cnt counter rather
+      than every bt->wake_cnt'th thread;
+
+    - 'bt_wait_state::wait_cnt' counter update is redundant, since
+      it also gets reset in bt_clear_tag() function;
+
+    Cc: Christoph Hellwig <hch@infradead.org>
+    Cc: Ming Lei <tom.leiming@gmail.com>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 08fc671..c1b9242 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -248,18 +248,12 @@ static int bt_get(struct blk_mq_alloc_data *data,
+ 
+  bs = bt_wait_ptr(bt, hctx);
+  do {
+-  bool was_empty;
+-
+-  was_empty = list_empty(&wait.task_list);
+   prepare_to_wait(&bs->wait, &wait, TASK_UNINTERRUPTIBLE);
+ 
+   tag = __bt_get(hctx, bt, last_tag);
+   if (tag != -1)
+    break;
+ 
+-  if (was_empty)
+-   atomic_set(&bs->wait_cnt, bt->wake_cnt);
+-
+   blk_mq_put_ctx(data->ctx);
+ 
+   io_schedule();
+@@ -519,10 +513,13 @@ static int bt_alloc(struct blk_mq_bitmap_tags *bt, unsigned int depth,
+   return -ENOMEM;
+  }
+ 
+- for (i = 0; i < BT_WAIT_QUEUES; i++)
++ bt_update_count(bt, depth);
++
++ for (i = 0; i < BT_WAIT_QUEUES; i++) {
+   init_waitqueue_head(&bt->bs[i].wait);
++  atomic_set(&bt->bs[i].wait_cnt, bt->wake_cnt);
++ }
+ 
+- bt_update_count(bt, depth);
+  return 0;
+ }
+ 
+-- 
+1.7.1

@@ -1,0 +1,119 @@
+From e88c6cec1940dd1680652b9423fa152954339c11 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Wed, 16 Jul 2014 20:42:21 -0400
+Subject: [md] dm-thin: cleanup noflush_work to use a proper completion
+
+Message-id: <1405543364-20901-18-git-send-email-snitzer@redhat.com>
+Patchwork-id: 85899
+O-Subject: [RHEL7.1 PATCH 17/40] dm thin: cleanup noflush_work to use a proper completion
+Bugzilla: 1117872
+RH-Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1117872
+
+Upstream commit e7a3e871d8954c636b6cd2db7c7ece7ffe405986
+Author: Joe Thornber <ejt@redhat.com>
+Date:   Tue May 13 16:14:14 2014 -0400
+
+    dm thin: cleanup noflush_work to use a proper completion
+
+    Factor out a pool_work interface that noflush_work makes use of to wait
+    for and complete work items (in terms of a proper completion struct).
+    Allows discontinuing the use of a custom completion in terms of atomic_t
+    and wait_event.
+
+    Signed-off-by: Joe Thornber <ejt@redhat.com>
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index 5d0558e..6cc0cf0 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -1614,47 +1614,63 @@ static void do_no_space_timeout(struct work_struct *ws)
+ 
+ /*----------------------------------------------------------------*/
+ 
+-struct noflush_work {
++struct pool_work {
+  struct work_struct worker;
+- struct thin_c *tc;
++ struct completion complete;
++};
++
++static struct pool_work *to_pool_work(struct work_struct *ws)
++{
++ return container_of(ws, struct pool_work, worker);
++}
++
++static void pool_work_complete(struct pool_work *pw)
++{
++ complete(&pw->complete);
++}
+ 
+- atomic_t complete;
+- wait_queue_head_t wait;
++static void pool_work_wait(struct pool_work *pw, struct pool *pool,
++      void (*fn)(struct work_struct *))
++{
++ INIT_WORK_ONSTACK(&pw->worker, fn);
++ init_completion(&pw->complete);
++ queue_work(pool->wq, &pw->worker);
++ wait_for_completion(&pw->complete);
++}
++
++/*----------------------------------------------------------------*/
++
++struct noflush_work {
++ struct pool_work pw;
++ struct thin_c *tc;
+ };
+ 
+-static void complete_noflush_work(struct noflush_work *w)
++static struct noflush_work *to_noflush(struct work_struct *ws)
+ {
+- atomic_set(&w->complete, 1);
+- wake_up(&w->wait);
++ return container_of(to_pool_work(ws), struct noflush_work, pw);
+ }
+ 
+ static void do_noflush_start(struct work_struct *ws)
+ {
+- struct noflush_work *w = container_of(ws, struct noflush_work, worker);
++ struct noflush_work *w = to_noflush(ws);
+  w->tc->requeue_mode = true;
+  requeue_io(w->tc);
+- complete_noflush_work(w);
++ pool_work_complete(&w->pw);
+ }
+ 
+ static void do_noflush_stop(struct work_struct *ws)
+ {
+- struct noflush_work *w = container_of(ws, struct noflush_work, worker);
++ struct noflush_work *w = to_noflush(ws);
+  w->tc->requeue_mode = false;
+- complete_noflush_work(w);
++ pool_work_complete(&w->pw);
+ }
+ 
+ static void noflush_work(struct thin_c *tc, void (*fn)(struct work_struct *))
+ {
+  struct noflush_work w;
+ 
+- INIT_WORK_ONSTACK(&w.worker, fn);
+  w.tc = tc;
+- atomic_set(&w.complete, 0);
+- init_waitqueue_head(&w.wait);
+-
+- queue_work(tc->pool->wq, &w.worker);
+-
+- wait_event(w.wait, atomic_read(&w.complete));
++ pool_work_wait(&w.pw, tc->pool, fn);
+ }
+ 
+ /*----------------------------------------------------------------*/
+-- 
+1.7.1

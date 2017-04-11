@@ -1,0 +1,385 @@
+From 3964b34512e796faed3c651102ed3ab71dce3c27 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:37:01 -0400
+Subject: [scsi] Revert: reintroduce scsi_driver.init_command
+
+Message-id: <1402670238-13916-134-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83869
+O-Subject: [RHEL7.1 PATCH 133/150] Temporarily revert "[scsi] reintroduce scsi_driver.init_command"
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+
+This _temporarily_ reverts the changes from rhel7.git commit
+ae374ac34354784bafcf8b384152aee181c53e80
+
+We took these changes before it went upstream, so it is getting in the
+way.  Reverting this commit allows all the latest upstream scsi changes
+that follow to apply cleanly -- once all are applied these
+scsi_driver.init_command changes are reintroduced (using the now
+upstream commit a1b73fc19).
+
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 6e60838..10d1cec 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -496,16 +496,6 @@ void scsi_requeue_run_queue(struct work_struct *work)
+  scsi_run_queue(q);
+ }
+ 
+-static void scsi_uninit_command(struct scsi_cmnd *cmd)
+-{
+- if (cmd->request->cmd_type == REQ_TYPE_FS) {
+-  struct scsi_driver *drv = scsi_cmd_to_driver(cmd);
+-
+-  if (drv->uninit_command)
+-   drv->uninit_command(cmd);
+- }
+-}
+-
+ /*
+  * Function: scsi_requeue_command()
+  *
+@@ -538,8 +528,6 @@ static void scsi_requeue_command(struct request_queue *q, struct scsi_cmnd *cmd)
+   */
+  get_device(&sdev->sdev_gendev);
+ 
+- scsi_uninit_command(cmd);
+-
+  spin_lock_irqsave(q->queue_lock, flags);
+  scsi_unprep_request(req);
+  blk_requeue_request(q, req);
+@@ -1183,7 +1171,15 @@ static struct scsi_cmnd *scsi_get_cmd_from_req(struct scsi_device *sdev,
+ 
+ int scsi_setup_blk_pc_cmnd(struct scsi_device *sdev, struct request *req)
+ {
+- struct scsi_cmnd *cmd = req->special;
++ struct scsi_cmnd *cmd;
++ int ret = scsi_prep_state_check(sdev, req);
++
++ if (ret != BLKPREP_OK)
++  return ret;
++
++ cmd = scsi_get_cmd_from_req(sdev, req);
++ if (unlikely(!cmd))
++  return BLKPREP_DEFER;
+ 
+  /*
+   * BLOCK_PC requests may transfer data, in which case they must
+@@ -1227,11 +1223,15 @@ EXPORT_SYMBOL(scsi_setup_blk_pc_cmnd);
+  */
+ int scsi_setup_fs_cmnd(struct scsi_device *sdev, struct request *req)
+ {
+- struct scsi_cmnd *cmd = req->special;
++ struct scsi_cmnd *cmd;
++ int ret = scsi_prep_state_check(sdev, req);
++
++ if (ret != BLKPREP_OK)
++  return ret;
+ 
+  if (unlikely(sdev->scsi_dh_data && sdev->scsi_dh_data->scsi_dh
+     && sdev->scsi_dh_data->scsi_dh->prep_fn)) {
+-  int ret = sdev->scsi_dh_data->scsi_dh->prep_fn(sdev, req);
++  ret = sdev->scsi_dh_data->scsi_dh->prep_fn(sdev, req);
+   if (ret != BLKPREP_OK)
+    return ret;
+  }
+@@ -1241,13 +1241,16 @@ int scsi_setup_fs_cmnd(struct scsi_device *sdev, struct request *req)
+   */
+  BUG_ON(!req->nr_phys_segments);
+ 
++ cmd = scsi_get_cmd_from_req(sdev, req);
++ if (unlikely(!cmd))
++  return BLKPREP_DEFER;
++
+  memset(cmd->cmnd, 0, BLK_MAX_CDB);
+  return scsi_init_io(cmd, GFP_ATOMIC);
+ }
+ EXPORT_SYMBOL(scsi_setup_fs_cmnd);
+ 
+-static int
+-scsi_prep_state_check(struct scsi_device *sdev, struct request *req)
++int scsi_prep_state_check(struct scsi_device *sdev, struct request *req)
+ {
+  int ret = BLKPREP_OK;
+ 
+@@ -1299,9 +1302,9 @@ scsi_prep_state_check(struct scsi_device *sdev, struct request *req)
+  }
+  return ret;
+ }
++EXPORT_SYMBOL(scsi_prep_state_check);
+ 
+-static int
+-scsi_prep_return(struct request_queue *q, struct request *req, int ret)
++int scsi_prep_return(struct request_queue *q, struct request *req, int ret)
+ {
+  struct scsi_device *sdev = q->queuedata;
+ 
+@@ -1331,33 +1334,18 @@ scsi_prep_return(struct request_queue *q, struct request *req, int ret)
+ 
+  return ret;
+ }
++EXPORT_SYMBOL(scsi_prep_return);
+ 
+-static int scsi_prep_fn(struct request_queue *q, struct request *req)
++int scsi_prep_fn(struct request_queue *q, struct request *req)
+ {
+  struct scsi_device *sdev = q->queuedata;
+- struct scsi_cmnd *cmd;
+- int ret;
+-
+- ret = scsi_prep_state_check(sdev, req);
+- if (ret != BLKPREP_OK)
+-  goto out;
++ int ret = BLKPREP_KILL;
+ 
+- cmd = scsi_get_cmd_from_req(sdev, req);
+- if (unlikely(!cmd)) {
+-  ret = BLKPREP_DEFER;
+-  goto out;
+- }
+-
+- if (req->cmd_type == REQ_TYPE_FS)
+-  ret = scsi_cmd_to_driver(cmd)->init_command(cmd);
+- else if (req->cmd_type == REQ_TYPE_BLOCK_PC)
++ if (req->cmd_type == REQ_TYPE_BLOCK_PC)
+   ret = scsi_setup_blk_pc_cmnd(sdev, req);
+- else
+-  ret = BLKPREP_KILL;
+-
+-out:
+  return scsi_prep_return(q, req, ret);
+ }
++EXPORT_SYMBOL(scsi_prep_fn);
+ 
+ /*
+  * scsi_dev_queue_ready: if we can send requests to sdev, return 1 else
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index f7a23e4..1b18d7d 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -108,8 +108,6 @@ static void sd_shutdown(struct device *);
+ static int sd_suspend(struct device *);
+ static int sd_resume(struct device *);
+ static void sd_rescan(struct device *);
+-static int sd_init_command(struct scsi_cmnd *SCpnt);
+-static void sd_uninit_command(struct scsi_cmnd *SCpnt);
+ static int sd_done(struct scsi_cmnd *);
+ static int sd_eh_action(struct scsi_cmnd *, int);
+ static void sd_read_capacity(struct scsi_disk *sdkp, unsigned char *buffer);
+@@ -503,8 +501,6 @@ static struct scsi_driver sd_template = {
+   .pm  = &sd_pm_ops,
+  },
+  .rescan   = sd_rescan,
+- .init_command  = sd_init_command,
+- .uninit_command  = sd_uninit_command,
+  .done   = sd_done,
+  .eh_action  = sd_eh_action,
+ };
+@@ -830,9 +826,9 @@ static int scsi_setup_flush_cmnd(struct scsi_device *sdp, struct request *rq)
+  return scsi_setup_blk_pc_cmnd(sdp, rq);
+ }
+ 
+-static void sd_uninit_command(struct scsi_cmnd *SCpnt)
++static void sd_unprep_fn(struct request_queue *q, struct request *rq)
+ {
+- struct request *rq = SCpnt->request;
++ struct scsi_cmnd *SCpnt = rq->special;
+ 
+  if (rq->cmd_flags & REQ_DISCARD) {
+   free_page((unsigned long)rq->buffer);
+@@ -845,10 +841,18 @@ static void sd_uninit_command(struct scsi_cmnd *SCpnt)
+  }
+ }
+ 
+-static int sd_init_command(struct scsi_cmnd *SCpnt)
++/**
++ * sd_prep_fn - build a scsi (read or write) command from
++ * information in the request structure.
++ * @SCpnt: pointer to mid-level's per scsi command structure that
++ * contains request and into which the scsi command is written
++ *
++ * Returns 1 if successful and 0 if error (or cannot be done now).
++ **/
++static int sd_prep_fn(struct request_queue *q, struct request *rq)
+ {
+- struct request *rq = SCpnt->request;
+- struct scsi_device *sdp = SCpnt->device;
++ struct scsi_cmnd *SCpnt;
++ struct scsi_device *sdp = q->queuedata;
+  struct gendisk *disk = rq->rq_disk;
+  struct scsi_disk *sdkp;
+  sector_t block = blk_rq_pos(rq);
+@@ -870,6 +874,12 @@ static int sd_init_command(struct scsi_cmnd *SCpnt)
+  } else if (rq->cmd_flags & REQ_FLUSH) {
+   ret = scsi_setup_flush_cmnd(sdp, rq);
+   goto out;
++ } else if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
++  ret = scsi_setup_blk_pc_cmnd(sdp, rq);
++  goto out;
++ } else if (rq->cmd_type != REQ_TYPE_FS) {
++  ret = BLKPREP_KILL;
++  goto out;
+  }
+  ret = scsi_setup_fs_cmnd(sdp, rq);
+  if (ret != BLKPREP_OK)
+@@ -881,10 +891,11 @@ static int sd_init_command(struct scsi_cmnd *SCpnt)
+   * is used for a killable error condition */
+  ret = BLKPREP_KILL;
+ 
+- SCSI_LOG_HLQUEUE(1,
+-  scmd_printk(KERN_INFO, SCpnt,
+-   "%s: block=%llu, count=%d\n",
+-   __func__, (unsigned long long)block, this_count));
++ SCSI_LOG_HLQUEUE(1, scmd_printk(KERN_INFO, SCpnt,
++     "sd_prep_fn: block=%llu, "
++     "count=%d\n",
++     (unsigned long long)block,
++     this_count));
+ 
+  if (!sdp || !scsi_device_online(sdp) ||
+      block + blk_rq_sectors(rq) > get_capacity(disk)) {
+@@ -1104,7 +1115,7 @@ static int sd_init_command(struct scsi_cmnd *SCpnt)
+   */
+  ret = BLKPREP_OK;
+  out:
+- return ret;
++ return scsi_prep_return(q, rq, ret);
+ }
+ 
+ /**
+@@ -1622,8 +1633,6 @@ static int sd_done(struct scsi_cmnd *SCpnt)
+  unsigned char op = SCpnt->cmnd[0];
+  unsigned char unmap = SCpnt->cmnd[1] & 8;
+ 
+- sd_uninit_command(SCpnt);
+-
+  if (req->cmd_flags & REQ_DISCARD || req->cmd_flags & REQ_WRITE_SAME) {
+   if (!result) {
+    good_bytes = blk_rq_bytes(req);
+@@ -2830,6 +2839,9 @@ static void sd_probe_async(void *data, async_cookie_t cookie)
+ 
+  sd_revalidate_disk(gd);
+ 
++ blk_queue_prep_rq(sdp->request_queue, sd_prep_fn);
++ blk_queue_unprep_rq(sdp->request_queue, sd_unprep_fn);
++
+  gd->driverfs_dev = &sdp->sdev_gendev;
+  gd->flags = GENHD_FL_EXT_DEVT;
+  if (sdp->removable) {
+@@ -2974,6 +2986,8 @@ static int sd_remove(struct device *dev)
+  scsi_autopm_get_device(sdkp->device);
+ 
+  async_synchronize_full_domain(&scsi_sd_probe_domain);
++ blk_queue_prep_rq(sdkp->device->request_queue, scsi_prep_fn);
++ blk_queue_unprep_rq(sdkp->device->request_queue, NULL);
+  device_del(&sdkp->dev);
+  del_gendisk(sdkp->disk);
+  sd_shutdown(dev);
+diff --git a/drivers/scsi/sr.c b/drivers/scsi/sr.c
+index 64b7361..119d67f 100644
+--- a/drivers/scsi/sr.c
++++ b/drivers/scsi/sr.c
+@@ -79,7 +79,6 @@ MODULE_ALIAS_SCSI_DEVICE(TYPE_WORM);
+ static DEFINE_MUTEX(sr_mutex);
+ static int sr_probe(struct device *);
+ static int sr_remove(struct device *);
+-static int sr_init_command(struct scsi_cmnd *SCpnt);
+ static int sr_done(struct scsi_cmnd *);
+ static int sr_runtime_suspend(struct device *dev);
+ 
+@@ -95,7 +94,6 @@ static struct scsi_driver sr_template = {
+   .remove  = sr_remove,
+   .pm  = &sr_pm_ops,
+  },
+- .init_command  = sr_init_command,
+  .done   = sr_done,
+ };
+ 
+@@ -385,14 +383,21 @@ static int sr_done(struct scsi_cmnd *SCpnt)
+  return good_bytes;
+ }
+ 
+-static int sr_init_command(struct scsi_cmnd *SCpnt)
++static int sr_prep_fn(struct request_queue *q, struct request *rq)
+ {
+  int block = 0, this_count, s_size;
+  struct scsi_cd *cd;
+- struct request *rq = SCpnt->request;
+- struct scsi_device *sdp = SCpnt->device;
++ struct scsi_cmnd *SCpnt;
++ struct scsi_device *sdp = q->queuedata;
+  int ret;
+ 
++ if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
++  ret = scsi_setup_blk_pc_cmnd(sdp, rq);
++  goto out;
++ } else if (rq->cmd_type != REQ_TYPE_FS) {
++  ret = BLKPREP_KILL;
++  goto out;
++ }
+  ret = scsi_setup_fs_cmnd(sdp, rq);
+  if (ret != BLKPREP_OK)
+   goto out;
+@@ -517,7 +522,7 @@ static int sr_init_command(struct scsi_cmnd *SCpnt)
+   */
+  ret = BLKPREP_OK;
+  out:
+- return ret;
++ return scsi_prep_return(q, rq, ret);
+ }
+ 
+ static int sr_block_open(struct block_device *bdev, fmode_t mode)
+@@ -730,6 +735,7 @@ static int sr_probe(struct device *dev)
+ 
+  /* FIXME: need to handle a get_capabilities failure properly ?? */
+  get_capabilities(cd);
++ blk_queue_prep_rq(sdev->request_queue, sr_prep_fn);
+  sr_vendor_init(cd);
+ 
+  disk->driverfs_dev = &sdev->sdev_gendev;
+@@ -998,6 +1004,7 @@ static int sr_remove(struct device *dev)
+ 
+  scsi_autopm_get_device(cd->device);
+ 
++ blk_queue_prep_rq(cd->device->request_queue, scsi_prep_fn);
+  del_gendisk(cd->disk);
+ 
+  mutex_lock(&sr_ref_mutex);
+diff --git a/include/scsi/scsi_driver.h b/include/scsi/scsi_driver.h
+index 6faae6a..c88952e 100644
+--- a/include/scsi/scsi_driver.h
++++ b/include/scsi/scsi_driver.h
+@@ -7,14 +7,14 @@ struct module;
+ struct scsi_cmnd;
+ struct scsi_device;
+ struct request;
++struct request_queue;
++
+ 
+ struct scsi_driver {
+  struct module  *owner;
+  struct device_driver gendrv;
+ 
+  void (*rescan)(struct device *);
+- int (*init_command)(struct scsi_cmnd *);
+- void (*uninit_command)(struct scsi_cmnd *);
+  int (*done)(struct scsi_cmnd *);
+  int (*eh_action)(struct scsi_cmnd *, int);
+ 
+@@ -35,5 +35,8 @@ extern int scsi_register_interface(struct class_interface *);
+ 
+ int scsi_setup_blk_pc_cmnd(struct scsi_device *sdev, struct request *req);
+ int scsi_setup_fs_cmnd(struct scsi_device *sdev, struct request *req);
++int scsi_prep_state_check(struct scsi_device *sdev, struct request *req);
++int scsi_prep_return(struct request_queue *q, struct request *req, int ret);
++int scsi_prep_fn(struct request_queue *, struct request *);
+ 
+ #endif /* _SCSI_SCSI_DRIVER_H */
+-- 
+1.7.1

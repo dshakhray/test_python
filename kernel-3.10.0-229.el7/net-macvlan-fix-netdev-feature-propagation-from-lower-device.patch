@@ -1,0 +1,100 @@
+From 21da55a0ccd37b4974b12d67bd603834ad6dcc93 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fwestpha@redhat.com>
+Date: Mon, 13 Jan 2014 17:01:34 -0500
+Subject: [net] macvlan: fix netdev feature propagation from lower device
+
+Message-id: <1389632494-4857-3-git-send-email-fwestpha@redhat.com>
+Patchwork-id: 73991
+O-Subject: [PATCH 2/2 RHEL7 net] macvlan: fix netdev feature propagation from lower device
+Bugzilla: 928644
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Jiri Pirko <jpirko@redhat.com>
+RH-Acked-by: Thomas Graf <tgraf@redhat.com>
+RH-Acked-by: Jesper Brouer <jbrouer@redhat.com>
+RH-Acked-by: Daniel Borkmann <dborkman@redhat.com>
+
+BZ: 928644
+Upstream: 797f87f83b60685ff8a13fa0572d2f10393c50d3
+Build info: https://brewweb.devel.redhat.com/taskinfo?taskID=6841901
+Tested: vlan-on-top-of-macvlan doesn't oops, ethtool -K $lowerdev feat removes
+feature from macvlan interface too
+
+no macvlan l2 hw acceleration in rhel7 driver -> dropped part handling it.
+
+commit 797f87f83b60685ff8a13fa0572d2f10393c50d3
+Author: Florian Westphal <fw@strlen.de>
+Date:   Thu Dec 26 12:17:00 2013 +0100
+
+    macvlan: fix netdev feature propagation from lower device
+
+    There are inconsistencies wrt. feature propagation/inheritance between
+    macvlan and the underlying interface.
+
+    When a feature is turned off on the real device before a macvlan is
+    created on top, these will remain enabled on the macvlan device, whereas
+    turning off the feature on the lower device after macvlan creation the
+    kernel will propagate the changes to the macvlan.
+
+    The second issue is that, when propagating changes from underlying device
+    to the macvlan interface, macvlan can erronously lose its NETIF_F_LLTX flag,
+    as features are anded with the underlying device.
+
+    However, LLTX should be kept since it has no dependencies on physical
+    hardware (LLTX is set on macvlan creation regardless of the lower
+    device properties, see 8ffab51b3dfc54876f145f15b351c41f3f703195
+    (macvlan: lockless tx path).
+
+    The LLTX flag is now forced regardless of user settings in absence of
+    layer2 hw acceleration (a6cc0cfa72e0b6d9f2c8fd858aa,
+    net: Add layer 2 hardware acceleration operations for macvlan devices).
+
+    Use netdev_increment_features to rebuild the feature set on capability
+    changes on either the lower device or on the macvlan interface.
+
+    As pointed out by Ben Hutchings, use netdev_update_features on
+    NETDEV_FEAT_CHANGE event (it calls macvlan_fix_features/netdev_features_change
+    if needed).
+
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Florian Westphal <fwestpha@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/macvlan.c b/drivers/net/macvlan.c
+index 424ef91..cd8c567 100644
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@ -642,8 +642,17 @@ static netdev_features_t macvlan_fix_features(struct net_device *dev,
+            netdev_features_t features)
+ {
+  struct macvlan_dev *vlan = netdev_priv(dev);
++ netdev_features_t mask;
+ 
+- return features & (vlan->set_features | ~MACVLAN_FEATURES);
++ features |= NETIF_F_ALL_FOR_ALL;
++ features &= (vlan->set_features | ~MACVLAN_FEATURES);
++ mask = features;
++
++ features = netdev_increment_features(vlan->lowerdev->features,
++          features,
++          mask);
++ features |= NETIF_F_LLTX;
++ return features;
+ }
+ 
+ static const struct ethtool_ops macvlan_ethtool_ops = {
+@@ -959,9 +968,8 @@ static int macvlan_device_event(struct notifier_block *unused,
+   break;
+  case NETDEV_FEAT_CHANGE:
+   list_for_each_entry(vlan, &port->vlans, list) {
+-   vlan->dev->features = dev->features & MACVLAN_FEATURES;
+    vlan->dev->gso_max_size = dev->gso_max_size;
+-   netdev_features_change(vlan->dev);
++   netdev_update_features(vlan->dev);
+   }
+   break;
+  case NETDEV_UNREGISTER:
+-- 
+1.7.1

@@ -1,0 +1,121 @@
+From abd2728870c8614cd62ff8150280a0930913d89c Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:50:38 -0400
+Subject: [tools] lib/traceevent: Get rid of malloc_or_die() in find_event()
+
+Message-id: <1408953210-26343-151-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88853
+O-Subject: [PATCH RHEL7.1 BZ1133083 150/322] tools lib traceevent: Get rid of malloc_or_die() in find_event()
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 605b8fda958a578e0a50ed1df3cac5a12f1fe8dc
+Author: Namhyung Kim <namhyung@kernel.org>
+Date: Thu Dec 12 16:36:08 2013 +0900
+
+description
+===========
+Make it return pevent_errno to distinguish malloc allocation failure.
+Since it'll be returned to user later, add more error code.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/lib/traceevent/event-parse.h b/tools/lib/traceevent/event-parse.h
+index 6e23f19..abdfd3c 100644
+--- a/tools/lib/traceevent/event-parse.h
++++ b/tools/lib/traceevent/event-parse.h
+@@ -356,7 +356,9 @@ enum pevent_flag {
+  _PE(READ_FORMAT_FAILED, "failed to read event format"),        \
+  _PE(READ_PRINT_FAILED, "failed to read event print fmt"),        \
+  _PE(OLD_FTRACE_ARG_FAILED,"failed to allocate field name for ftrace"),\
+- _PE(INVALID_ARG_TYPE, "invalid argument type")
++ _PE(INVALID_ARG_TYPE, "invalid argument type"),        \
++ _PE(INVALID_EVENT_NAME, "invalid event name"),         \
++ _PE(EVENT_NOT_FOUND, "No event found")
+ 
+ #undef _PE
+ #define _PE(__code, __str) PEVENT_ERRNO__ ## __code
+diff --git a/tools/lib/traceevent/parse-filter.c b/tools/lib/traceevent/parse-filter.c
+index 246ee81..a0ab040 100644
+--- a/tools/lib/traceevent/parse-filter.c
++++ b/tools/lib/traceevent/parse-filter.c
+@@ -287,7 +287,7 @@ static int event_match(struct event_format *event,
+   !regexec(ereg, event->name, 0, NULL, 0);
+ }
+ 
+-static int
++static enum pevent_errno
+ find_event(struct pevent *pevent, struct event_list **events,
+     char *sys_name, char *event_name)
+ {
+@@ -306,23 +306,31 @@ find_event(struct pevent *pevent, struct event_list **events,
+   sys_name = NULL;
+  }
+ 
+- reg = malloc_or_die(strlen(event_name) + 3);
++ reg = malloc(strlen(event_name) + 3);
++ if (reg == NULL)
++  return PEVENT_ERRNO__MEM_ALLOC_FAILED;
++
+  sprintf(reg, "^%s$", event_name);
+ 
+  ret = regcomp(&ereg, reg, REG_ICASE|REG_NOSUB);
+  free(reg);
+ 
+  if (ret)
+-  return -1;
++  return PEVENT_ERRNO__INVALID_EVENT_NAME;
+ 
+  if (sys_name) {
+-  reg = malloc_or_die(strlen(sys_name) + 3);
++  reg = malloc(strlen(sys_name) + 3);
++  if (reg == NULL) {
++   regfree(&ereg);
++   return PEVENT_ERRNO__MEM_ALLOC_FAILED;
++  }
++
+   sprintf(reg, "^%s$", sys_name);
+   ret = regcomp(&sreg, reg, REG_ICASE|REG_NOSUB);
+   free(reg);
+   if (ret) {
+    regfree(&ereg);
+-   return -1;
++   return PEVENT_ERRNO__INVALID_EVENT_NAME;
+   }
+  }
+ 
+@@ -342,9 +350,9 @@ find_event(struct pevent *pevent, struct event_list **events,
+   regfree(&sreg);
+ 
+  if (!match)
+-  return -1;
++  return PEVENT_ERRNO__EVENT_NOT_FOUND;
+  if (fail)
+-  return -2;
++  return PEVENT_ERRNO__MEM_ALLOC_FAILED;
+ 
+  return 0;
+ }
+@@ -1312,7 +1320,10 @@ int pevent_filter_add_filter_str(struct event_filter *filter,
+   /* Find this event */
+   ret = find_event(pevent, &events, strim(sys_name), strim(event_name));
+   if (ret < 0) {
+-   if (event_name)
++   if (ret == PEVENT_ERRNO__MEM_ALLOC_FAILED)
++    show_error(error_str,
++        "Memory allocation failure");
++   else if (event_name)
+     show_error(error_str,
+         "No event found under '%s.%s'",
+         sys_name, event_name);
+-- 
+1.7.1

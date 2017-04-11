@@ -1,0 +1,116 @@
+From 8fff3665e4817d9c46b3aa2284a070c95471e76a Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Thu, 28 Aug 2014 15:32:33 -0400
+Subject: [block] scsi_ioctl: verify return pointer from blk_get_request
+
+Message-id: <x494mwwzl2m.fsf@segfault.boston.devel.redhat.com>
+Patchwork-id: 89536
+O-Subject: [RHEL7 patch] block,scsi: verify return pointer from blk_get_request
+Bugzilla: 1104324
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Mike Snitzer <snitzer@redhat.com>
+
+This is a straight-forward backport of the following commit (in Jens'
+linux-block tree, for-3.18/core branch) to address a null pointer
+dereference during device removal (easily triggered with a DVD drive
+in the bug).  Testing has been done by Stratus, who verified that the
+oops no longer occurs on a patched kernel.
+
+This fixes bug 1104324.
+
+  commit eb571eeade2598635f813b3284d02c13a380301e
+  Author: Joe Lawrence <joe.lawrence@stratus.com>
+  Date:   Wed Jul 2 15:35:16 2014 -0400
+
+    block,scsi: verify return pointer from blk_get_request
+
+    The blk-core dead queue checks introduce an error scenario to
+    blk_get_request that returns NULL if the request queue has been
+    shutdown. This affects the behavior for __GFP_WAIT callers, who should
+    verify the return value before dereferencing.
+
+    Signed-off-by: Joe Lawrence <joe.lawrence@stratus.com>
+    Acked-by: Jiri Kosina <jkosina@suse.cz> [for pktdvd]
+    Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/scsi_ioctl.c b/block/scsi_ioctl.c
+index ce3bacd..6fd524e 100644
+--- a/block/scsi_ioctl.c
++++ b/block/scsi_ioctl.c
+@@ -458,6 +458,10 @@ int sg_scsi_ioctl(struct request_queue *q, struct gendisk *disk, fmode_t mode,
+  }
+ 
+  rq = blk_get_request(q, in_len ? WRITE : READ, __GFP_WAIT);
++ if (!rq) {
++  err = -ENODEV;
++  goto error_free_buffer;
++ }
+ 
+  cmdlen = COMMAND_SIZE(opcode);
+ 
+@@ -530,8 +534,9 @@ out:
+  }
+  
+ error:
+- kfree(buffer);
+  blk_put_request(rq);
++error_free_buffer:
++ kfree(buffer);
+  return err;
+ }
+ EXPORT_SYMBOL_GPL(sg_scsi_ioctl);
+@@ -544,6 +549,8 @@ static int __blk_send_generic(struct request_queue *q, struct gendisk *bd_disk,
+  int err;
+ 
+  rq = blk_get_request(q, WRITE, __GFP_WAIT);
++ if (!rq)
++  return -ENODEV;
+  blk_rq_set_block_pc(rq);
+  rq->timeout = BLK_DEFAULT_SG_TIMEOUT;
+  rq->cmd[0] = cmd;
+diff --git a/drivers/block/paride/pd.c b/drivers/block/paride/pd.c
+index 19ad8f0..856178a 100644
+--- a/drivers/block/paride/pd.c
++++ b/drivers/block/paride/pd.c
+@@ -722,6 +722,8 @@ static int pd_special_command(struct pd_unit *disk,
+  int err = 0;
+ 
+  rq = blk_get_request(disk->gd->queue, READ, __GFP_WAIT);
++ if (!rq)
++  return -ENODEV;
+ 
+  rq->cmd_type = REQ_TYPE_SPECIAL;
+  rq->special = func;
+diff --git a/drivers/block/pktcdvd.c b/drivers/block/pktcdvd.c
+index caddb5d..097a8d8 100644
+--- a/drivers/block/pktcdvd.c
++++ b/drivers/block/pktcdvd.c
+@@ -712,6 +712,8 @@ static int pkt_generic_packet(struct pktcdvd_device *pd, struct packet_command *
+ 
+  rq = blk_get_request(q, (cgc->data_direction == CGC_DATA_WRITE) ?
+         WRITE : READ, __GFP_WAIT);
++ if (!rq)
++  return -ENODEV;
+  blk_rq_set_block_pc(rq);
+ 
+  if (cgc->buflen) {
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index 907bd22..9617977 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -1950,6 +1950,8 @@ static void scsi_eh_lock_door(struct scsi_device *sdev)
+   * request becomes available
+   */
+  req = blk_get_request(sdev->request_queue, READ, GFP_KERNEL);
++ if (!req)
++  return;
+ 
+  blk_rq_set_block_pc(req);
+ 
+-- 
+1.7.1

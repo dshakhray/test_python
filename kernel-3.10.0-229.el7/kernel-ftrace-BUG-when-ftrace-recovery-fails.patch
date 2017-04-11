@@ -1,0 +1,92 @@
+From 230edbd7bc92adc33d9526be4e85e46a1954b310 Mon Sep 17 00:00:00 2001
+From: Josh Poimboeuf <jpoimboe@redhat.com>
+Date: Thu, 4 Sep 2014 18:54:25 -0400
+Subject: [kernel] ftrace: BUG when ftrace recovery fails
+
+Message-id: <decedc22e6da8c383585d80ece43cce5326cd3da.1409856554.git.jpoimboe@redhat.com>
+Patchwork-id: 91241
+O-Subject: [RHEL7.1 PATCH 06/23] ftrace/x86: BUG when ftrace recovery fails
+Bugzilla: 1113829
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1113829
+
+commit 7f11f5ecf4ae09815dc2de267c5e04d1de01d862
+Author: Petr Mladek <pmladek@suse.cz>
+Date:   Mon Feb 24 17:12:22 2014 +0100
+
+    ftrace/x86: BUG when ftrace recovery fails
+
+    Ftrace modifies function calls using Int3 breakpoints on x86.
+    The breakpoints are handled only when the patching is in progress.
+    If something goes wrong, there is a recovery code that removes
+    the breakpoints. If this fails, the system might get silently
+    rebooted when a remaining break is not handled or an invalid
+    instruction is proceed.
+
+    We should BUG() when the breakpoint could not be removed. Otherwise,
+    the system silently crashes when the function finishes the Int3
+    handler is disabled.
+
+    Note that we need to modify remove_breakpoint() to return non-zero
+    value only when there is an error. The return value was ignored before,
+    so it does not cause any troubles.
+
+    Link: http://lkml.kernel.org/r/1393258342-29978-4-git-send-email-pmladek@suse.cz
+
+    Signed-off-by: Petr Mladek <pmladek@suse.cz>
+    Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/ftrace.c b/arch/x86/kernel/ftrace.c
+index 8cabf63..e2b6ef5 100644
+--- a/arch/x86/kernel/ftrace.c
++++ b/arch/x86/kernel/ftrace.c
+@@ -425,7 +425,7 @@ static int remove_breakpoint(struct dyn_ftrace *rec)
+ 
+  /* If this does not have a breakpoint, we are done */
+  if (ins[0] != brk)
+-  return -1;
++  return 0;
+ 
+  nop = ftrace_nop_replace();
+ 
+@@ -625,7 +625,12 @@ void ftrace_replace_code(int enable)
+  printk(KERN_WARNING "Failed on %s (%d):\n", report, count);
+  for_ftrace_rec_iter(iter) {
+   rec = ftrace_rec_iter_record(iter);
+-  remove_breakpoint(rec);
++  /*
++   * Breakpoints are handled only when this function is in
++   * progress. The system could not work with them.
++   */
++  if (remove_breakpoint(rec))
++   BUG();
+  }
+  run_sync();
+ }
+@@ -649,12 +654,19 @@ ftrace_modify_code(unsigned long ip, unsigned const char *old_code,
+  run_sync();
+ 
+  ret = ftrace_write(ip, new_code, 1);
++ /*
++  * The breakpoint is handled only when this function is in progress.
++  * The system could not work if we could not remove it.
++  */
++ BUG_ON(ret);
+  out:
+  run_sync();
+  return ret;
+ 
+  fail_update:
+- ftrace_write(ip, old_code, 1);
++ /* Also here the system could not work with the breakpoint */
++ if (ftrace_write(ip, old_code, 1))
++  BUG();
+  goto out;
+ }
+ 
+-- 
+1.7.1

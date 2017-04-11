@@ -1,0 +1,183 @@
+From 683531c6c744913991c72fc04b078d329881dfb5 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:07:59 -0400
+Subject: [acpi] hotplug: Simplify device ejection routines
+
+Message-id: <20140710010758.22146.16061.stgit@gir.stowe>
+Patchwork-id: 85633
+O-Subject: [RHEL7.1 PATCH 094/105] ACPI / hotplug: Simplify device ejection routines
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: 5add99cfef416487d32b4b7075fe1a409f3a5e82
+
+commit 5add99cfef416487d32b4b7075fe1a409f3a5e82
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Thu Nov 7 01:41:39 2013 +0100
+
+    ACPI / hotplug: Simplify device ejection routines
+
+    Simplify handle_root_bridge_removal() and acpi_eject_store() by
+    getting rid of struct acpi_eject_event and passing device objects
+    directly to async routines executed via acpi_os_hotplug_execute().
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Acked-by: Toshi Kani <toshi.kani@hp.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/pci_root.c b/drivers/acpi/pci_root.c
+index c0a7498..8600ebf 100644
+--- a/drivers/acpi/pci_root.c
++++ b/drivers/acpi/pci_root.c
+@@ -646,27 +646,11 @@ static void handle_root_bridge_insertion(acpi_handle handle)
+ static void handle_root_bridge_removal(struct acpi_device *device)
+ {
+  acpi_status status;
+- struct acpi_eject_event *ej_event;
+-
+- ej_event = kmalloc(sizeof(*ej_event), GFP_KERNEL);
+- if (!ej_event) {
+-  /* Inform firmware the hot-remove operation has error */
+-  (void) acpi_evaluate_hotplug_ost(device->handle,
+-     ACPI_NOTIFY_EJECT_REQUEST,
+-     ACPI_OST_SC_NON_SPECIFIC_FAILURE,
+-     NULL);
+-  return;
+- }
+-
+- ej_event->device = device;
+- ej_event->event = ACPI_NOTIFY_EJECT_REQUEST;
+ 
+  get_device(&device->dev);
+- status = acpi_os_hotplug_execute(acpi_bus_hot_remove_device, ej_event);
+- if (ACPI_FAILURE(status)) {
++ status = acpi_os_hotplug_execute(acpi_bus_hot_remove_device, device);
++ if (ACPI_FAILURE(status))
+   put_device(&device->dev);
+-  kfree(ej_event);
+- }
+ }
+ 
+ static void _handle_hotplug_event_root(struct work_struct *work)
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index d9a694b..3bba7bf 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -441,18 +441,8 @@ static void acpi_hotplug_notify_cb(acpi_handle handle, u32 type, void *data)
+        NULL);
+ }
+ 
+-/**
+- * acpi_bus_hot_remove_device: hot-remove a device and its children
+- * @context: struct acpi_eject_event pointer (freed in this func)
+- *
+- * Hot-remove a device and its children. This function frees up the
+- * memory space passed by arg context, so that the caller may call
+- * this function asynchronously through acpi_os_hotplug_execute().
+- */
+-void acpi_bus_hot_remove_device(void *context)
++void __acpi_bus_hot_remove_device(struct acpi_device *device, u32 ost_src)
+ {
+- struct acpi_eject_event *ej_event = context;
+- struct acpi_device *device = ej_event->device;
+  acpi_handle handle = device->handle;
+  int error;
+ 
+@@ -461,13 +451,21 @@ void acpi_bus_hot_remove_device(void *context)
+ 
+  error = acpi_scan_hot_remove(device);
+  if (error && handle)
+-  acpi_evaluate_hotplug_ost(handle, ej_event->event,
++  acpi_evaluate_hotplug_ost(handle, ost_src,
+        ACPI_OST_SC_NON_SPECIFIC_FAILURE,
+        NULL);
+ 
+  mutex_unlock(&acpi_scan_lock);
+  unlock_device_hotplug();
+- kfree(context);
++}
++
++/**
++ * acpi_bus_hot_remove_device: Hot-remove a device and its children.
++ * @context: Address of the ACPI device object to hot-remove.
++ */
++void acpi_bus_hot_remove_device(void *context)
++{
++ __acpi_bus_hot_remove_device(context, ACPI_NOTIFY_EJECT_REQUEST);
+ }
+ EXPORT_SYMBOL(acpi_bus_hot_remove_device);
+ 
+@@ -497,15 +495,18 @@ static ssize_t power_state_show(struct device *dev,
+ 
+ static DEVICE_ATTR(power_state, 0444, power_state_show, NULL);
+ 
++static void acpi_eject_store_work(void *context)
++{
++ __acpi_bus_hot_remove_device(context, ACPI_OST_EC_OSPM_EJECT);
++}
++
+ static ssize_t
+ acpi_eject_store(struct device *d, struct device_attribute *attr,
+   const char *buf, size_t count)
+ {
+  struct acpi_device *acpi_device = to_acpi_device(d);
+- struct acpi_eject_event *ej_event;
+  acpi_object_type not_used;
+  acpi_status status;
+- int ret;
+ 
+  if (!count || buf[0] != '1')
+   return -EINVAL;
+@@ -518,28 +519,17 @@ acpi_eject_store(struct device *d, struct device_attribute *attr,
+  if (ACPI_FAILURE(status) || !acpi_device->flags.ejectable)
+   return -ENODEV;
+ 
+- ej_event = kmalloc(sizeof(*ej_event), GFP_KERNEL);
+- if (!ej_event) {
+-  ret = -ENOMEM;
+-  goto err_out;
+- }
+  acpi_evaluate_hotplug_ost(acpi_device->handle, ACPI_OST_EC_OSPM_EJECT,
+       ACPI_OST_SC_EJECT_IN_PROGRESS, NULL);
+- ej_event->device = acpi_device;
+- ej_event->event = ACPI_OST_EC_OSPM_EJECT;
+  get_device(&acpi_device->dev);
+- status = acpi_os_hotplug_execute(acpi_bus_hot_remove_device, ej_event);
++ status = acpi_os_hotplug_execute(acpi_eject_store_work, acpi_device);
+  if (ACPI_SUCCESS(status))
+   return count;
+ 
+  put_device(&acpi_device->dev);
+- kfree(ej_event);
+- ret = status == AE_NO_MEMORY ? -ENOMEM : -EAGAIN;
+-
+- err_out:
+  acpi_evaluate_hotplug_ost(acpi_device->handle, ACPI_OST_EC_OSPM_EJECT,
+       ACPI_OST_SC_NON_SPECIFIC_FAILURE, NULL);
+- return ret;
++ return status == AE_NO_MEMORY ? -ENOMEM : -EAGAIN;
+ }
+ 
+ static DEVICE_ATTR(eject, 0200, NULL, acpi_eject_store);
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index f1a0cd5..b05cd9e 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -340,11 +340,6 @@ struct acpi_bus_event {
+  u32 data;
+ };
+ 
+-struct acpi_eject_event {
+- struct acpi_device *device;
+- u32  event;
+-};
+-
+ struct acpi_hp_work {
+  struct work_struct work;
+  acpi_handle handle;
+-- 
+1.7.1

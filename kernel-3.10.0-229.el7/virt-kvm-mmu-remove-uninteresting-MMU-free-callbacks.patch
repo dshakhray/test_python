@@ -1,0 +1,121 @@
+From b1d0a5bbe9ffc851745e2586074eb68af40b7234 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:38:07 -0400
+Subject: [virt] kvm/mmu: remove uninteresting MMU "free" callbacks
+
+Message-id: <1406040016-3289-93-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86171
+O-Subject: [RHEL7 PATCH v2 092/221] KVM: mmu: remove uninteresting MMU "free" callbacks
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+The free MMU callback has been a wrapper for mmu_free_roots since mmu_free_roots
+itself was introduced (commit 17ac10a, [PATCH] KVM: MU: Special treatment
+for shadow pae root pages, 2007-01-05), and has always been the same for all
+MMU cases.  Remove the indirection as it is useless.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+(cherry picked from commit 206260941fd4b6f25f28ecf4e267b2f9a0ba72d7)
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 9ef93f1..a880156 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -261,7 +261,6 @@ struct kvm_mmu {
+      bool prefault);
+  void (*inject_page_fault)(struct kvm_vcpu *vcpu,
+       struct x86_exception *fault);
+- void (*free)(struct kvm_vcpu *vcpu);
+  gpa_t (*gva_to_gpa)(struct kvm_vcpu *vcpu, gva_t gva, u32 access,
+        struct x86_exception *exception);
+  gpa_t (*translate_gpa)(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access);
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 3f249c4..ce7410d 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3433,18 +3433,12 @@ out_unlock:
+  return 0;
+ }
+ 
+-static void nonpaging_free(struct kvm_vcpu *vcpu)
+-{
+- mmu_free_roots(vcpu);
+-}
+-
+ static int nonpaging_init_context(struct kvm_vcpu *vcpu,
+       struct kvm_mmu *context)
+ {
+  context->new_cr3 = nonpaging_new_cr3;
+  context->page_fault = nonpaging_page_fault;
+  context->gva_to_gpa = nonpaging_gva_to_gpa;
+- context->free = nonpaging_free;
+  context->sync_page = nonpaging_sync_page;
+  context->invlpg = nonpaging_invlpg;
+  context->update_pte = nonpaging_update_pte;
+@@ -3480,11 +3474,6 @@ static void inject_page_fault(struct kvm_vcpu *vcpu,
+  vcpu->arch.mmu.inject_page_fault(vcpu, fault);
+ }
+ 
+-static void paging_free(struct kvm_vcpu *vcpu)
+-{
+- nonpaging_free(vcpu);
+-}
+-
+ static bool sync_mmio_spte(struct kvm *kvm, u64 *sptep, gfn_t gfn,
+       unsigned access, int *nr_present)
+ {
+@@ -3692,7 +3681,6 @@ static int paging64_init_context_common(struct kvm_vcpu *vcpu,
+  context->sync_page = paging64_sync_page;
+  context->invlpg = paging64_invlpg;
+  context->update_pte = paging64_update_pte;
+- context->free = paging_free;
+  context->shadow_root_level = level;
+  context->root_hpa = INVALID_PAGE;
+  context->direct_map = false;
+@@ -3718,7 +3706,6 @@ static int paging32_init_context(struct kvm_vcpu *vcpu,
+  context->new_cr3 = paging_new_cr3;
+  context->page_fault = paging32_page_fault;
+  context->gva_to_gpa = paging32_gva_to_gpa;
+- context->free = paging_free;
+  context->sync_page = paging32_sync_page;
+  context->invlpg = paging32_invlpg;
+  context->update_pte = paging32_update_pte;
+@@ -3741,7 +3728,6 @@ static int init_kvm_tdp_mmu(struct kvm_vcpu *vcpu)
+  context->base_role.word = 0;
+  context->new_cr3 = nonpaging_new_cr3;
+  context->page_fault = tdp_page_fault;
+- context->free = nonpaging_free;
+  context->sync_page = nonpaging_sync_page;
+  context->invlpg = nonpaging_invlpg;
+  context->update_pte = nonpaging_update_pte;
+@@ -3821,7 +3807,6 @@ int kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *context,
+  context->sync_page = ept_sync_page;
+  context->invlpg = ept_invlpg;
+  context->update_pte = ept_update_pte;
+- context->free = paging_free;
+  context->root_level = context->shadow_root_level;
+  context->root_hpa = INVALID_PAGE;
+  context->direct_map = false;
+@@ -3899,9 +3884,10 @@ static int init_kvm_mmu(struct kvm_vcpu *vcpu)
+ static void destroy_kvm_mmu(struct kvm_vcpu *vcpu)
+ {
+  ASSERT(vcpu);
+- if (VALID_PAGE(vcpu->arch.mmu.root_hpa))
+-  /* mmu.free() should set root_hpa = INVALID_PAGE */
+-  vcpu->arch.mmu.free(vcpu);
++ if (VALID_PAGE(vcpu->arch.mmu.root_hpa)) {
++  mmu_free_roots(vcpu);
++  WARN_ON(VALID_PAGE(vcpu->arch.mmu.root_hpa));
++ }
+ }
+ 
+ int kvm_mmu_reset_context(struct kvm_vcpu *vcpu)
+-- 
+1.7.1

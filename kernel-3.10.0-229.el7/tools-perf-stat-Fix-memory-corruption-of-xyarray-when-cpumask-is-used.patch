@@ -1,0 +1,74 @@
+From b927ff7f173b1a5e40f9ef7133b772dac37805b4 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:53:00 -0400
+Subject: [tools] perf/stat: Fix memory corruption of xyarray when cpumask is used
+
+Message-id: <1408953210-26343-293-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88940
+O-Subject: [PATCH RHEL7.1 BZ1133083 292/322] perf stat: Fix memory corruption of xyarray when cpumask is used
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 8ad9219e08af12a5652892e273336dbd31b25b03
+Author: Stephane Eranian <eranian@google.com>
+Date: Fri Jan 17 16:34:06 2014 +0100
+
+description
+===========
+This patch fixes a memory corruption problem with the xyarray when the
+evsel fds get closed at the end of the run_perf_stat() call.
+
+It could be triggered with:
+
+ # perf stat -a -e power/energy-cores/ ls
+
+When cpumask are used by events (.e.g, RAPL or uncores) then the evsel
+fds are allocated based on the actual number of CPUs monitored. That
+number can be smaller than the total number of CPUs on the system.
+
+The problem arises at the end by perf stat closes the fds twice. When
+fds are closed, their entry in the xyarray are set to -1.
+
+The first close() on the evsel is made from __run_perf_stat() and it
+uses the actual number of CPUS for the event which is how the xyarray
+was allocated for.
+
+The second is from perf_evlist_close() but that one is on the total
+number of CPUs in the system, so it assume the xyarray was allocated to
+cover it. However it was not, and some writes corrupt memory.
+
+The fix is in perf_evlist_close() is to first try with the evsel->cpus
+if present, if not use the evlist->cpus. That fixes the problem.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index 40bd2c0..59ef280 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -1003,9 +1003,12 @@ void perf_evlist__close(struct perf_evlist *evlist)
+  struct perf_evsel *evsel;
+  int ncpus = cpu_map__nr(evlist->cpus);
+  int nthreads = thread_map__nr(evlist->threads);
++ int n;
+ 
+- evlist__for_each_reverse(evlist, evsel)
+-  perf_evsel__close(evsel, ncpus, nthreads);
++ evlist__for_each_reverse(evlist, evsel) {
++  n = evsel->cpus ? evsel->cpus->nr : ncpus;
++  perf_evsel__close(evsel, n, nthreads);
++ }
+ }
+ 
+ int perf_evlist__open(struct perf_evlist *evlist)
+-- 
+1.7.1

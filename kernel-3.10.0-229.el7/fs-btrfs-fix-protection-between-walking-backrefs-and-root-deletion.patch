@@ -1,0 +1,76 @@
+From 98a611df1b2648a4959c833dfa8d98de84b647d4 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:00:22 -0400
+Subject: [fs] btrfs: fix protection between walking backrefs and root deletion
+
+Message-id: <1407179109-13714-136-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87094
+O-Subject: [RHEL7.1 PATCH 135/422] Btrfs: fix protection between walking backrefs and root deletion
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+
+commit 538f72cdf03cad1c21c551ea542c8ce7d9fa2d81
+Author: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+Date:   Thu Jan 23 13:47:48 2014 +0800
+
+    Btrfs: fix protection between walking backrefs and root deletion
+
+    There is a race condition between resolving indirect ref and root deletion,
+    and we should gurantee that root can not be destroyed to avoid accessing
+    broken tree here.
+
+    Here we fix it by holding @subvol_srcu, and we will release it as soon
+    as we have held root node lock.
+
+    Signed-off-by: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/backref.c b/fs/btrfs/backref.c
+index 1538496..10ae570 100644
+--- a/fs/btrfs/backref.c
++++ b/fs/btrfs/backref.c
+@@ -301,23 +301,34 @@ static int __resolve_indirect_ref(struct btrfs_fs_info *fs_info,
+  int ret = 0;
+  int root_level;
+  int level = ref->level;
++ int index;
+ 
+  root_key.objectid = ref->root_id;
+  root_key.type = BTRFS_ROOT_ITEM_KEY;
+  root_key.offset = (u64)-1;
++
++ index = srcu_read_lock(&fs_info->subvol_srcu);
++
+  root = btrfs_read_fs_root_no_name(fs_info, &root_key);
+  if (IS_ERR(root)) {
++  srcu_read_unlock(&fs_info->subvol_srcu, index);
+   ret = PTR_ERR(root);
+   goto out;
+  }
+ 
+  root_level = btrfs_old_root_level(root, time_seq);
+ 
+- if (root_level + 1 == level)
++ if (root_level + 1 == level) {
++  srcu_read_unlock(&fs_info->subvol_srcu, index);
+   goto out;
++ }
+ 
+  path->lowest_level = level;
+  ret = btrfs_search_old_slot(root, &ref->key_for_search, path, time_seq);
++
++ /* root node has been locked, we can release @subvol_srcu safely here */
++ srcu_read_unlock(&fs_info->subvol_srcu, index);
++
+  pr_debug("search slot in root %llu (level %d, ref count %d) returned "
+    "%d for key (%llu %u %llu)\n",
+    ref->root_id, level, ref->count, ret,
+-- 
+1.7.1

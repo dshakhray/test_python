@@ -1,0 +1,174 @@
+From e95a72f31e25f90bbf22966953b8c3145d47d6ef Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:23:33 -0400
+Subject: [cpufreq] move call to __find_governor() to cpufreq_init_policy()
+
+Message-id: <1409235879-1283-120-git-send-email-prarit@redhat.com>
+Patchwork-id: 89503
+O-Subject: [RHEL7.1 PATCH BZ 1134639 119/185] cpufreq: move call to __find_governor() to cpufreq_init_policy()
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit 6e2c89d16d987e6e11c531b039a42d3f5f1d7c32
+Author: viresh kumar <viresh.kumar@linaro.org>
+Date:   Tue Mar 4 11:43:59 2014 +0800
+
+    cpufreq: move call to __find_governor() to cpufreq_init_policy()
+
+    We call __find_governor() during the addition of the first CPU of
+    each policy from __cpufreq_add_dev() to find the last governor used
+    for this CPU before it was hot-removed.
+
+    After that we call cpufreq_parse_governor() in cpufreq_init_policy(),
+    either with this governor, or with the default governor. Right after
+    that policy->governor is set to NULL.
+
+    While that code is not functionally problematic, the structure of it
+    is suboptimal, because some of the code required in cpufreq_init_policy()
+    is being executed by its caller, __cpufreq_add_dev(). So, it would make
+    more sense to get all of it together in a single place to make code more
+    readable.
+
+    Accordingly, move the code needed for policy initialization to
+    cpufreq_init_policy() and initialize policy->governor to NULL at the
+    beginning.
+
+    In order to clean up the code a bit more, some of the #ifdefs for
+    CONFIG_HOTPLUG_CPU are dropped too.
+
+    Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+    [rjw: Changelog]
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index ec90cc1..d951f1c 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -42,10 +42,8 @@ static DEFINE_RWLOCK(cpufreq_driver_lock);
+ DEFINE_MUTEX(cpufreq_governor_lock);
+ static LIST_HEAD(cpufreq_policy_list);
+ 
+-#ifdef CONFIG_HOTPLUG_CPU
+ /* This one keeps track of the previously set governor of a removed CPU */
+ static DEFINE_PER_CPU(char[CPUFREQ_NAME_LEN], cpufreq_cpu_governor);
+-#endif
+ 
+ static inline bool has_target(void)
+ {
+@@ -879,12 +877,25 @@ err_out_kobj_put:
+ 
+ static void cpufreq_init_policy(struct cpufreq_policy *policy)
+ {
++ struct cpufreq_governor *gov = NULL;
+  struct cpufreq_policy new_policy;
+  int ret = 0;
+ 
+  memcpy(&new_policy, policy, sizeof(struct cpufreq_policy));
+- /* assure that the starting sequence is run in cpufreq_set_policy */
+- policy->governor = NULL;
++
++ /* Update governor of new_policy to the governor used before hotplug */
++ gov = __find_governor(per_cpu(cpufreq_cpu_governor, policy->cpu));
++ if (gov)
++  pr_debug("Restoring governor %s for cpu %d\n",
++    policy->governor->name, policy->cpu);
++ else
++  gov = CPUFREQ_DEFAULT_GOVERNOR;
++
++ new_policy.governor = gov;
++
++ /* Use the default policy if its valid. */
++ if (cpufreq_driver->setpolicy)
++  cpufreq_parse_governor(gov->name, &new_policy.policy, NULL);
+ 
+  /* set default policy */
+  ret = cpufreq_set_policy(policy, &new_policy);
+@@ -943,6 +954,8 @@ static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
+ 
+  read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ 
++ policy->governor = NULL;
++
+  return policy;
+ }
+ 
+@@ -1030,7 +1043,6 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
+  unsigned long flags;
+ #ifdef CONFIG_HOTPLUG_CPU
+  struct cpufreq_policy *tpolicy;
+- struct cpufreq_governor *gov;
+ #endif
+ 
+  if (cpu_is_offline(cpu))
+@@ -1088,7 +1100,6 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
+  else
+   policy->cpu = cpu;
+ 
+- policy->governor = CPUFREQ_DEFAULT_GOVERNOR;
+  cpumask_copy(policy->cpus, cpumask_of(cpu));
+ 
+  init_completion(&policy->kobj_unregister);
+@@ -1174,15 +1185,6 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
+  blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+          CPUFREQ_START, policy);
+ 
+-#ifdef CONFIG_HOTPLUG_CPU
+- gov = __find_governor(per_cpu(cpufreq_cpu_governor, cpu));
+- if (gov) {
+-  policy->governor = gov;
+-  pr_debug("Restoring governor %s for cpu %d\n",
+-         policy->governor->name, cpu);
+- }
+-#endif
+-
+  if (!frozen) {
+   ret = cpufreq_add_dev_interface(policy, dev);
+   if (ret)
+@@ -1306,11 +1308,9 @@ static int __cpufreq_remove_dev_prepare(struct device *dev,
+   }
+  }
+ 
+-#ifdef CONFIG_HOTPLUG_CPU
+  if (!cpufreq_driver->setpolicy)
+   strncpy(per_cpu(cpufreq_cpu_governor, cpu),
+    policy->governor->name, CPUFREQ_NAME_LEN);
+-#endif
+ 
+  down_read(&policy->rwsem);
+  cpus = cpumask_weight(policy->cpus);
+@@ -1948,9 +1948,7 @@ EXPORT_SYMBOL_GPL(cpufreq_register_governor);
+ 
+ void cpufreq_unregister_governor(struct cpufreq_governor *governor)
+ {
+-#ifdef CONFIG_HOTPLUG_CPU
+  int cpu;
+-#endif
+ 
+  if (!governor)
+   return;
+@@ -1958,14 +1956,12 @@ void cpufreq_unregister_governor(struct cpufreq_governor *governor)
+  if (cpufreq_disabled())
+   return;
+ 
+-#ifdef CONFIG_HOTPLUG_CPU
+  for_each_present_cpu(cpu) {
+   if (cpu_online(cpu))
+    continue;
+   if (!strcmp(per_cpu(cpufreq_cpu_governor, cpu), governor->name))
+    strcpy(per_cpu(cpufreq_cpu_governor, cpu), "\0");
+  }
+-#endif
+ 
+  mutex_lock(&cpufreq_governor_mutex);
+  list_del(&governor->governor_list);
+-- 
+1.7.1

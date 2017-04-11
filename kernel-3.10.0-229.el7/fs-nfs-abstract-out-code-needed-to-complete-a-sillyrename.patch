@@ -1,0 +1,100 @@
+From 05483a6e8a90b83beef8718b3fa1a211be6ae2c4 Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@redhat.com>
+Date: Mon, 21 Apr 2014 12:25:06 -0400
+Subject: [fs] nfs: abstract out code needed to complete a sillyrename
+
+Message-id: <1398083110-3724-2-git-send-email-jlayton@redhat.com>
+Patchwork-id: 78982
+O-Subject: [RHEL7.1 PATCH 1/5] [BZ#919347] nfs: abstract out code needed to complete a sillyrename
+Bugzilla: 919347
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+The async rename code is currently "polluted" with some parts that are
+really just for sillyrenames. Add a new "complete" operation vector to
+the nfs_renamedata to separate out the stuff that just needs to be done
+for a sillyrename.
+
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Tested-by: Anna Schumaker <Anna.Schumaker@netapp.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=919347
+Upstream commit: 96f9d8c0740264c5e2975361389ff2c21f2c5a4d
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/unlink.c b/fs/nfs/unlink.c
+index 11d7894..3e6798c 100644
+--- a/fs/nfs/unlink.c
++++ b/fs/nfs/unlink.c
+@@ -353,8 +353,8 @@ static void nfs_async_rename_done(struct rpc_task *task, void *calldata)
+   return;
+  }
+ 
+- if (task->tk_status != 0)
+-  nfs_cancel_async_unlink(old_dentry);
++ if (data->complete)
++  data->complete(task, data);
+ }
+ 
+ /**
+@@ -401,7 +401,8 @@ static const struct rpc_call_ops nfs_rename_ops = {
+  */
+ static struct rpc_task *
+ nfs_async_rename(struct inode *old_dir, struct inode *new_dir,
+-   struct dentry *old_dentry, struct dentry *new_dentry)
++   struct dentry *old_dentry, struct dentry *new_dentry,
++   void (*complete)(struct rpc_task *, struct nfs_renamedata *))
+ {
+  struct nfs_renamedata *data;
+  struct rpc_message msg = { };
+@@ -438,6 +439,7 @@ nfs_async_rename(struct inode *old_dir, struct inode *new_dir,
+  data->new_dentry = dget(new_dentry);
+  nfs_fattr_init(&data->old_fattr);
+  nfs_fattr_init(&data->new_fattr);
++ data->complete = complete;
+ 
+  /* set up nfs_renameargs */
+  data->args.old_dir = NFS_FH(old_dir);
+@@ -456,6 +458,17 @@ nfs_async_rename(struct inode *old_dir, struct inode *new_dir,
+  return rpc_run_task(&task_setup_data);
+ }
+ 
++/*
++ * Perform tasks needed when a sillyrename is done such as cancelling the
++ * queued async unlink if it failed.
++ */
++static void
++nfs_complete_sillyrename(struct rpc_task *task, struct nfs_renamedata *data)
++{
++ if (task->tk_status != 0)
++  nfs_cancel_async_unlink(data->old_dentry);
++}
++
+ #define SILLYNAME_PREFIX ".nfs"
+ #define SILLYNAME_PREFIX_LEN ((unsigned)sizeof(SILLYNAME_PREFIX) - 1)
+ #define SILLYNAME_FILEID_LEN ((unsigned)sizeof(u64) << 1)
+@@ -548,7 +561,8 @@ nfs_sillyrename(struct inode *dir, struct dentry *dentry)
+  }
+ 
+  /* run the rename task, undo unlink if it fails */
+- task = nfs_async_rename(dir, dir, dentry, sdentry);
++ task = nfs_async_rename(dir, dir, dentry, sdentry,
++     nfs_complete_sillyrename);
+  if (IS_ERR(task)) {
+   error = -EBUSY;
+   nfs_cancel_async_unlink(dentry);
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index b2fb167..0534184 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1397,6 +1397,7 @@ struct nfs_renamedata {
+  struct inode  *new_dir;
+  struct dentry  *new_dentry;
+  struct nfs_fattr new_fattr;
++ void (*complete)(struct rpc_task *, struct nfs_renamedata *);
+ };
+ 
+ struct nfs_access_entry;
+-- 
+1.7.1

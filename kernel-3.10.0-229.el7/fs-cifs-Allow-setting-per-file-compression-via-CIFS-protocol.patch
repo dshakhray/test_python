@@ -1,0 +1,199 @@
+From 9ca26a565f43730eea495ef1de26496fa491ac2f Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:16:15 -0400
+Subject: [fs] cifs: Allow setting per-file compression via CIFS protocol
+
+Message-id: <1406549822-10376-23-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86745
+O-Subject: [RHEL7.1 PATCH 22/69] [bz1082049] Allow setting per-file compression via CIFS protocol
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+From: Steve French <smfrench@gmail.com>
+
+An earlier patch allowed setting the per-file compression flag
+
+"chattr +c filename"
+
+on an smb2 or smb3 mount, and also allowed lsattr to return
+whether a file on a cifs, or smb2/smb3 mount was compressed.
+
+This patch extends the ability to set the per-file
+compression flag to the cifs protocol, which uses a somewhat
+different IOCTL mechanism than SMB2, although the payload
+(the flags stored in the compression_state) are the same.
+
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit c7f508a99bf229963915e79a603e0618d1d2ba76)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/cifspdu.h b/fs/cifs/cifspdu.h
+index e8bd5f5..8d2389d 100644
+--- a/fs/cifs/cifspdu.h
++++ b/fs/cifs/cifspdu.h
+@@ -1352,6 +1352,35 @@ typedef struct smb_com_transaction_ioctl_req {
+  __u8 Data[1];
+ } __attribute__((packed)) TRANSACT_IOCTL_REQ;
+ 
++typedef struct smb_com_transaction_compr_ioctl_req {
++ struct smb_hdr hdr; /* wct = 23 */
++ __u8 MaxSetupCount;
++ __u16 Reserved;
++ __le32 TotalParameterCount;
++ __le32 TotalDataCount;
++ __le32 MaxParameterCount;
++ __le32 MaxDataCount;
++ __le32 ParameterCount;
++ __le32 ParameterOffset;
++ __le32 DataCount;
++ __le32 DataOffset;
++ __u8 SetupCount; /* four setup words follow subcommand */
++ /* SNIA spec incorrectly included spurious pad here */
++ __le16 SubCommand; /* 2 = IOCTL/FSCTL */
++ __le32 FunctionCode;
++ __u16 Fid;
++ __u8 IsFsctl;  /* 1 = File System Control 0 = device control (IOCTL) */
++ __u8 IsRootFlag; /* 1 = apply command to root of share (must be DFS) */
++ __le16 ByteCount;
++ __u8 Pad[3];
++ __le16 compression_state;  /* See below for valid flags */
++} __attribute__((packed)) TRANSACT_COMPR_IOCTL_REQ;
++
++/* compression state flags */
++#define COMPRESSION_FORMAT_NONE  0x0000
++#define COMPRESSION_FORMAT_DEFAULT 0x0001
++#define COMPRESSION_FORMAT_LZNT1 0x0002
++
+ typedef struct smb_com_transaction_ioctl_rsp {
+  struct smb_hdr hdr; /* wct = 19 */
+  __u8 Reserved[3];
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index f60d23c..51e3f2b 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -363,6 +363,8 @@ extern int CIFSSMBUnixQuerySymLink(const unsigned int xid,
+ extern int CIFSSMBQuerySymLink(const unsigned int xid, struct cifs_tcon *tcon,
+           __u16 fid, char **symlinkinfo,
+           const struct nls_table *nls_codepage);
++extern int CIFSSMB_set_compression(const unsigned int xid,
++       struct cifs_tcon *tcon, __u16 fid);
+ extern int CIFSSMBOpen(const unsigned int xid, struct cifs_tcon *tcon,
+    const char *fileName, const int disposition,
+    const int access_flags, const int omode,
+diff --git a/fs/cifs/cifssmb.c b/fs/cifs/cifssmb.c
+index f08efaa..dea7f0e 100644
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@ -3194,6 +3194,60 @@ qreparse_out:
+  return rc;
+ }
+ 
++int
++CIFSSMB_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
++      __u16 fid)
++{
++ int rc = 0;
++ int bytes_returned;
++ struct smb_com_transaction_compr_ioctl_req *pSMB;
++ struct smb_com_transaction_ioctl_rsp *pSMBr;
++
++ cifs_dbg(FYI, "Set compression for %u\n", fid);
++ rc = smb_init(SMB_COM_NT_TRANSACT, 23, tcon, (void **) &pSMB,
++        (void **) &pSMBr);
++ if (rc)
++  return rc;
++
++ pSMB->compression_state = cpu_to_le16(COMPRESSION_FORMAT_DEFAULT);
++
++ pSMB->TotalParameterCount = 0;
++ pSMB->TotalDataCount = __constant_cpu_to_le32(2);
++ pSMB->MaxParameterCount = 0;
++ pSMB->MaxDataCount = 0;
++ pSMB->MaxSetupCount = 4;
++ pSMB->Reserved = 0;
++ pSMB->ParameterOffset = 0;
++ pSMB->DataCount = __constant_cpu_to_le32(2);
++ pSMB->DataOffset =
++  cpu_to_le32(offsetof(struct smb_com_transaction_compr_ioctl_req,
++    compression_state) - 4);  /* 84 */
++ pSMB->SetupCount = 4;
++ pSMB->SubCommand = __constant_cpu_to_le16(NT_TRANSACT_IOCTL);
++ pSMB->ParameterCount = 0;
++ pSMB->FunctionCode = __constant_cpu_to_le32(FSCTL_SET_COMPRESSION);
++ pSMB->IsFsctl = 1; /* FSCTL */
++ pSMB->IsRootFlag = 0;
++ pSMB->Fid = fid; /* file handle always le */
++ /* 3 byte pad, followed by 2 byte compress state */
++ pSMB->ByteCount = __constant_cpu_to_le16(5);
++ inc_rfc1001_len(pSMB, 5);
++
++ rc = SendReceive(xid, tcon->ses, (struct smb_hdr *) pSMB,
++    (struct smb_hdr *) pSMBr, &bytes_returned, 0);
++ if (rc)
++  cifs_dbg(FYI, "Send error in SetCompression = %d\n", rc);
++
++ cifs_buf_release(pSMB);
++
++ /*
++  * Note: On -EAGAIN error only caller can retry on handle based calls
++  * since file handle passed in no longer valid.
++  */
++ return rc;
++}
++
++
+ #ifdef CONFIG_CIFS_POSIX
+ 
+ /*Convert an Access Control Entry from wire format to local POSIX xattr format*/
+diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
+index 0222d6b..1a4b868 100644
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@ -817,6 +817,13 @@ out:
+ }
+ 
+ static int
++cifs_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
++     struct cifsFileInfo *cfile)
++{
++ return CIFSSMB_set_compression(xid, tcon, cfile->fid.netfid);
++}
++
++static int
+ cifs_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
+        const char *path, struct cifs_sb_info *cifs_sb,
+        struct cifs_fid *fid, __u16 search_flags,
+@@ -1007,6 +1014,7 @@ struct smb_version_operations smb1_operations = {
+  .set_path_size = CIFSSMBSetEOF,
+  .set_file_size = CIFSSMBSetFileSize,
+  .set_file_info = smb_set_file_info,
++ .set_compression = cifs_set_compression,
+  .echo = CIFSSMBEcho,
+  .mkdir = CIFSSMBMkDir,
+  .mkdir_setinfo = cifs_mkdir_setinfo,
+diff --git a/fs/cifs/smb2pdu.h b/fs/cifs/smb2pdu.h
+index 7e44f18..6183b1b 100644
+--- a/fs/cifs/smb2pdu.h
++++ b/fs/cifs/smb2pdu.h
+@@ -570,12 +570,9 @@ struct network_interface_info_ioctl_rsp {
+ #define NO_FILE_ID 0xFFFFFFFFFFFFFFFFULL /* general ioctls to srv not to file */
+ 
+ struct compress_ioctl {
+- __le16 CompressionState;
++ __le16 CompressionState; /* See cifspdu.h for possible flag values */
+ } __packed;
+ 
+-#define COMPRESSION_FORMAT_NONE  0x0000
+-#define COMPRESSION_FORMAT_DEFAULT 0x0001
+-#define COMPRESSION_FORMAT_LZNT1 0x0002
+ struct smb2_ioctl_req {
+  struct smb2_hdr hdr;
+  __le16 StructureSize; /* Must be 57 */
+-- 
+1.7.1

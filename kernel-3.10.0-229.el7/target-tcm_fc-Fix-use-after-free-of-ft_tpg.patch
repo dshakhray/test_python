@@ -1,0 +1,56 @@
+From 1542493e8d929aeb6bea324d96d29256ade35ea0 Mon Sep 17 00:00:00 2001
+From: Andy Grover <agrover@redhat.com>
+Date: Tue, 15 Apr 2014 21:48:10 -0400
+Subject: [target] tcm_fc: Fix use-after-free of ft_tpg
+
+Message-id: <1397598490-4417-1-git-send-email-agrover@redhat.com>
+Patchwork-id: 78946
+O-Subject: [RHEL7.1 PATCH e-stor] target/tcm_fc: Fix use-after-free of ft_tpg
+Bugzilla: 1071340
+RH-Acked-by: Rob Evers <revers@redhat.com>
+RH-Acked-by: Maurizio Lombardi <mlombard@redhat.com>
+
+accepted into maintainer repo (nab/target-pending.git) as 2c42be2d
+
+ft_del_tpg checks tpg->tport is set before unlinking the tpg from the
+tport when the tpg is being removed. Set this pointer in ft_tport_create,
+or the unlinking won't happen in ft_del_tpg and tport->tpg will reference
+a deleted object.
+
+This patch sets tpg->tport in ft_tport_create, because that's what
+ft_del_tpg checks, and is the only way to get back to the tport to
+clear tport->tpg.
+
+The bug was occuring when:
+
+- lport created, tport (our per-lport, per-provider context) is
+  allocated.
+  tport->tpg = NULL
+- tpg created
+- a PRLI is received. ft_tport_create is called, tpg is found and
+  tport->tpg is set
+- tpg removed. ft_tpg is freed in ft_del_tpg. Since tpg->tport was not
+  set, tport->tpg is not cleared and points at freed memory
+- Future calls to ft_tport_create return tport via first conditional,
+  instead of searching for new tpg by calling ft_lport_find_tpg.
+  tport->tpg is still invalid, and will access freed memory.
+
+Cc: stable@vger.kernel.org # 3.0+
+Signed-off-by: Andy Grover <agrover@redhat.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/target/tcm_fc/tfc_sess.c b/drivers/target/tcm_fc/tfc_sess.c
+index 4859505..639fdb3 100644
+--- a/drivers/target/tcm_fc/tfc_sess.c
++++ b/drivers/target/tcm_fc/tfc_sess.c
+@@ -68,6 +68,7 @@ static struct ft_tport *ft_tport_create(struct fc_lport *lport)
+ 
+  if (tport) {
+   tport->tpg = tpg;
++  tpg->tport = tport;
+   return tport;
+  }
+ 
+-- 
+1.7.1

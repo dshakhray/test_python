@@ -1,0 +1,130 @@
+From f4dd9542ae134641fd6f225f0dcbc2b684cd0fad Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:33:21 -0400
+Subject: [fs] nfs: Use correct locking when updating nfs4_state in nfs4_close_done
+
+Message-id: <1403796815-28580-16-git-send-email-steved@redhat.com>
+Patchwork-id: 84849
+O-Subject: [RHEL7.1 PATCH 15/29] NFSv4: Use correct locking when updating nfs4_state in nfs4_close_done
+Bugzilla: 1111170
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+The stateid and state->flags should be updated atomically under
+protection of the state->seqlock.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upsteam Id: 226056c5c312b3dac16ff6d4f40208f95c070b6a
+Bugzilla: 1111170
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 020c26f..dea381f 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -1150,6 +1150,38 @@ static bool nfs_need_update_open_stateid(struct nfs4_state *state,
+  return false;
+ }
+ 
++static void nfs_clear_open_stateid_locked(struct nfs4_state *state,
++  nfs4_stateid *stateid, fmode_t fmode)
++{
++ clear_bit(NFS_O_RDWR_STATE, &state->flags);
++ switch (fmode & (FMODE_READ|FMODE_WRITE)) {
++ case FMODE_WRITE:
++  clear_bit(NFS_O_RDONLY_STATE, &state->flags);
++  break;
++ case FMODE_READ:
++  clear_bit(NFS_O_WRONLY_STATE, &state->flags);
++  break;
++ case 0:
++  clear_bit(NFS_O_RDONLY_STATE, &state->flags);
++  clear_bit(NFS_O_WRONLY_STATE, &state->flags);
++  clear_bit(NFS_OPEN_STATE, &state->flags);
++ }
++ if (stateid == NULL)
++  return;
++ if (!nfs_need_update_open_stateid(state, stateid))
++  return;
++ if (test_bit(NFS_DELEGATED_STATE, &state->flags) == 0)
++  nfs4_stateid_copy(&state->stateid, stateid);
++ nfs4_stateid_copy(&state->open_stateid, stateid);
++}
++
++static void nfs_clear_open_stateid(struct nfs4_state *state, nfs4_stateid *stateid, fmode_t fmode)
++{
++ write_seqlock(&state->seqlock);
++ nfs_clear_open_stateid_locked(state, stateid, fmode);
++ write_sequnlock(&state->seqlock);
++}
++
+ static void nfs_set_open_stateid_locked(struct nfs4_state *state, nfs4_stateid *stateid, fmode_t fmode)
+ {
+  switch (fmode) {
+@@ -1169,13 +1201,6 @@ static void nfs_set_open_stateid_locked(struct nfs4_state *state, nfs4_stateid *
+  nfs4_stateid_copy(&state->open_stateid, stateid);
+ }
+ 
+-static void nfs_set_open_stateid(struct nfs4_state *state, nfs4_stateid *stateid, fmode_t fmode)
+-{
+- write_seqlock(&state->seqlock);
+- nfs_set_open_stateid_locked(state, stateid, fmode);
+- write_sequnlock(&state->seqlock);
+-}
+-
+ static void __update_open_stateid(struct nfs4_state *state, nfs4_stateid *open_stateid, const nfs4_stateid *deleg_stateid, fmode_t fmode)
+ {
+  /*
+@@ -2493,26 +2518,6 @@ static void nfs4_free_closedata(void *data)
+  kfree(calldata);
+ }
+ 
+-static void nfs4_close_clear_stateid_flags(struct nfs4_state *state,
+-  fmode_t fmode)
+-{
+- spin_lock(&state->owner->so_lock);
+- clear_bit(NFS_O_RDWR_STATE, &state->flags);
+- switch (fmode & (FMODE_READ|FMODE_WRITE)) {
+- case FMODE_WRITE:
+-  clear_bit(NFS_O_RDONLY_STATE, &state->flags);
+-  break;
+- case FMODE_READ:
+-  clear_bit(NFS_O_WRONLY_STATE, &state->flags);
+-  break;
+- case 0:
+-  clear_bit(NFS_O_RDONLY_STATE, &state->flags);
+-  clear_bit(NFS_O_WRONLY_STATE, &state->flags);
+-  clear_bit(NFS_OPEN_STATE, &state->flags);
+- }
+- spin_unlock(&state->owner->so_lock);
+-}
+-
+ static void nfs4_close_done(struct rpc_task *task, void *data)
+ {
+  struct nfs4_closedata *calldata = data;
+@@ -2531,9 +2536,9 @@ static void nfs4_close_done(struct rpc_task *task, void *data)
+    if (calldata->roc)
+     pnfs_roc_set_barrier(state->inode,
+            calldata->roc_barrier);
+-   nfs_set_open_stateid(state, &calldata->res.stateid, 0);
++   nfs_clear_open_stateid(state, &calldata->res.stateid, 0);
+    renew_lease(server, calldata->timestamp);
+-   break;
++   goto out_release;
+   case -NFS4ERR_ADMIN_REVOKED:
+   case -NFS4ERR_STALE_STATEID:
+   case -NFS4ERR_OLD_STATEID:
+@@ -2547,7 +2552,7 @@ static void nfs4_close_done(struct rpc_task *task, void *data)
+     goto out_release;
+    }
+  }
+- nfs4_close_clear_stateid_flags(state, calldata->arg.fmode);
++ nfs_clear_open_stateid(state, NULL, calldata->arg.fmode);
+ out_release:
+  nfs_release_seqid(calldata->arg.seqid);
+  nfs_refresh_inode(calldata->inode, calldata->res.fattr);
+-- 
+1.7.1

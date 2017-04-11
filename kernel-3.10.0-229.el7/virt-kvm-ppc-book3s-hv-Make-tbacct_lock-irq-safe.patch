@@ -1,0 +1,166 @@
+From 3ca8a1237741c29d80edcdb71ac55b12b903e244 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:17 -0400
+Subject: [virt] kvm/ppc: book3s hv - Make tbacct_lock irq-safe
+
+Message-id: <1410545655-205645-329-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94589
+O-Subject: [RHEL7 PATCH 328/626] KVM: PPC: Book3S HV: Make tbacct_lock irq-safe
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit bf3d32e1156c36c88b75960fd2e5457d5d75620b
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Sat Nov 16 17:46:04 2013 +1100
+
+    KVM: PPC: Book3S HV: Make tbacct_lock irq-safe
+
+    Lockdep reported that there is a potential for deadlock because
+    vcpu->arch.tbacct_lock is not irq-safe, and is sometimes taken inside
+    the rq_lock (run-queue lock) in the scheduler, which is taken within
+    interrupts.  The lockdep splat looks like:
+
+    ======================================================
+    [ INFO: HARDIRQ-safe -> HARDIRQ-unsafe lock order detected ]
+    3.12.0-rc5-kvm+ #8 Not tainted
+    ------------------------------------------------------
+    qemu-system-ppc/4803 [HC0[0]:SC0[0]:HE0:SE1] is trying to acquire:
+    (&(&vcpu->arch.tbacct_lock)->rlock){+.+...}, at: [<c0000000000947ac>] .kvmppc_core_vcpu_put_hv+0x2c/0xa0
+
+    and this task is already holding:
+    (&rq->lock){-.-.-.}, at: [<c000000000ac16c0>] .__schedule+0x180/0xaa0
+    which would create a new lock dependency:
+    (&rq->lock){-.-.-.} -> (&(&vcpu->arch.tbacct_lock)->rlock){+.+...}
+
+    but this new dependency connects a HARDIRQ-irq-safe lock:
+    (&rq->lock){-.-.-.}
+    ... which became HARDIRQ-irq-safe at:
+     [<c00000000013797c>] .lock_acquire+0xbc/0x190
+     [<c000000000ac3c74>] ._raw_spin_lock+0x34/0x60
+     [<c0000000000f8564>] .scheduler_tick+0x54/0x180
+     [<c0000000000c2610>] .update_process_times+0x70/0xa0
+     [<c00000000012cdfc>] .tick_periodic+0x3c/0xe0
+     [<c00000000012cec8>] .tick_handle_periodic+0x28/0xb0
+     [<c00000000001ef40>] .timer_interrupt+0x120/0x2e0
+     [<c000000000002868>] decrementer_common+0x168/0x180
+     [<c0000000001c7ca4>] .get_page_from_freelist+0x924/0xc10
+     [<c0000000001c8e00>] .__alloc_pages_nodemask+0x200/0xba0
+     [<c0000000001c9eb8>] .alloc_pages_exact_nid+0x68/0x110
+     [<c000000000f4c3ec>] .page_cgroup_init+0x1e0/0x270
+     [<c000000000f24480>] .start_kernel+0x3e0/0x4e4
+     [<c000000000009d30>] .start_here_common+0x20/0x70
+
+    to a HARDIRQ-irq-unsafe lock:
+    (&(&vcpu->arch.tbacct_lock)->rlock){+.+...}
+    ... which became HARDIRQ-irq-unsafe at:
+    ...  [<c00000000013797c>] .lock_acquire+0xbc/0x190
+     [<c000000000ac3c74>] ._raw_spin_lock+0x34/0x60
+     [<c0000000000946ac>] .kvmppc_core_vcpu_load_hv+0x2c/0x100
+     [<c00000000008394c>] .kvmppc_core_vcpu_load+0x2c/0x40
+     [<c000000000081000>] .kvm_arch_vcpu_load+0x10/0x30
+     [<c00000000007afd4>] .vcpu_load+0x64/0xd0
+     [<c00000000007b0f8>] .kvm_vcpu_ioctl+0x68/0x730
+     [<c00000000025530c>] .do_vfs_ioctl+0x4dc/0x7a0
+     [<c000000000255694>] .SyS_ioctl+0xc4/0xe0
+     [<c000000000009ee4>] syscall_exit+0x0/0x98
+
+    Some users have reported this deadlock occurring in practice, though
+    the reports have been primarily on 3.10.x-based kernels.
+
+    This fixes the problem by making tbacct_lock be irq-safe.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index c590f31..23055a0 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -131,8 +131,9 @@ static void kvmppc_fast_vcpu_kick_hv(struct kvm_vcpu *vcpu)
+ static void kvmppc_core_vcpu_load_hv(struct kvm_vcpu *vcpu, int cpu)
+ {
+  struct kvmppc_vcore *vc = vcpu->arch.vcore;
++ unsigned long flags;
+ 
+- spin_lock(&vcpu->arch.tbacct_lock);
++ spin_lock_irqsave(&vcpu->arch.tbacct_lock, flags);
+  if (vc->runner == vcpu && vc->vcore_state != VCORE_INACTIVE &&
+      vc->preempt_tb != TB_NIL) {
+   vc->stolen_tb += mftb() - vc->preempt_tb;
+@@ -143,19 +144,20 @@ static void kvmppc_core_vcpu_load_hv(struct kvm_vcpu *vcpu, int cpu)
+   vcpu->arch.busy_stolen += mftb() - vcpu->arch.busy_preempt;
+   vcpu->arch.busy_preempt = TB_NIL;
+  }
+- spin_unlock(&vcpu->arch.tbacct_lock);
++ spin_unlock_irqrestore(&vcpu->arch.tbacct_lock, flags);
+ }
+ 
+ static void kvmppc_core_vcpu_put_hv(struct kvm_vcpu *vcpu)
+ {
+  struct kvmppc_vcore *vc = vcpu->arch.vcore;
++ unsigned long flags;
+ 
+- spin_lock(&vcpu->arch.tbacct_lock);
++ spin_lock_irqsave(&vcpu->arch.tbacct_lock, flags);
+  if (vc->runner == vcpu && vc->vcore_state != VCORE_INACTIVE)
+   vc->preempt_tb = mftb();
+  if (vcpu->arch.state == KVMPPC_VCPU_BUSY_IN_HOST)
+   vcpu->arch.busy_preempt = mftb();
+- spin_unlock(&vcpu->arch.tbacct_lock);
++ spin_unlock_irqrestore(&vcpu->arch.tbacct_lock, flags);
+ }
+ 
+ static void kvmppc_set_msr_hv(struct kvm_vcpu *vcpu, u64 msr)
+@@ -486,11 +488,11 @@ static u64 vcore_stolen_time(struct kvmppc_vcore *vc, u64 now)
+   */
+  if (vc->vcore_state != VCORE_INACTIVE &&
+      vc->runner->arch.run_task != current) {
+-  spin_lock(&vc->runner->arch.tbacct_lock);
++  spin_lock_irq(&vc->runner->arch.tbacct_lock);
+   p = vc->stolen_tb;
+   if (vc->preempt_tb != TB_NIL)
+    p += now - vc->preempt_tb;
+-  spin_unlock(&vc->runner->arch.tbacct_lock);
++  spin_unlock_irq(&vc->runner->arch.tbacct_lock);
+  } else {
+   p = vc->stolen_tb;
+  }
+@@ -512,10 +514,10 @@ static void kvmppc_create_dtl_entry(struct kvm_vcpu *vcpu,
+  core_stolen = vcore_stolen_time(vc, now);
+  stolen = core_stolen - vcpu->arch.stolen_logged;
+  vcpu->arch.stolen_logged = core_stolen;
+- spin_lock(&vcpu->arch.tbacct_lock);
++ spin_lock_irq(&vcpu->arch.tbacct_lock);
+  stolen += vcpu->arch.busy_stolen;
+  vcpu->arch.busy_stolen = 0;
+- spin_unlock(&vcpu->arch.tbacct_lock);
++ spin_unlock_irq(&vcpu->arch.tbacct_lock);
+  if (!dt || !vpa)
+   return;
+  memset(dt, 0, sizeof(struct dtl_entry));
+@@ -1113,13 +1115,13 @@ static void kvmppc_remove_runnable(struct kvmppc_vcore *vc,
+ 
+  if (vcpu->arch.state != KVMPPC_VCPU_RUNNABLE)
+   return;
+- spin_lock(&vcpu->arch.tbacct_lock);
++ spin_lock_irq(&vcpu->arch.tbacct_lock);
+  now = mftb();
+  vcpu->arch.busy_stolen += vcore_stolen_time(vc, now) -
+   vcpu->arch.stolen_logged;
+  vcpu->arch.busy_preempt = now;
+  vcpu->arch.state = KVMPPC_VCPU_BUSY_IN_HOST;
+- spin_unlock(&vcpu->arch.tbacct_lock);
++ spin_unlock_irq(&vcpu->arch.tbacct_lock);
+  --vc->n_runnable;
+  list_del(&vcpu->arch.run_list);
+ }
+-- 
+1.7.1

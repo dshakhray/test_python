@@ -1,0 +1,128 @@
+From 416ab03cb664f201b5b0358e998154fb965f0a9f Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:39:01 -0400
+Subject: [x86] xsave: Support eager-only xsave features, add MPX support
+
+Message-id: <1406040016-3289-147-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86225
+O-Subject: [RHEL7 PATCH v2 146/221] x86, xsave: Support eager-only xsave features, add MPX support
+Bugzilla: 1076194 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Qiaowei Ren <qiaowei.ren@intel.com>
+
+Some features, like Intel MPX, work only if the kernel uses eagerfpu
+model.  So we should force eagerfpu on unless the user has explicitly
+disabled it.
+
+Add definitions for Intel MPX and add it to the supported list.
+
+[ hpa: renamed XSTATE_FLEXIBLE to XSTATE_LAZY and added comments ]
+
+Signed-off-by: Qiaowei Ren <qiaowei.ren@intel.com>
+Link: http://lkml.kernel.org/r/9E0BE1322F2F2246BD820DA9FC397ADE014A6115@SHSMSX102.ccr.corp.intel.com
+Signed-off-by: H. Peter Anvin <hpa@linux.intel.com>
+(cherry picked from commit e7d820a5e549b3eb6c3f9467507566565646a669)
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 0ee9c84..a55c6d2 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -374,6 +374,26 @@ struct ymmh_struct {
+  u32 ymmh_space[64];
+ };
+ 
++struct lwp_struct {
++ u64 lwpcb_addr;
++ u32 flags;
++ u32 buf_head_offset;
++ u64 buf_base;
++ u32 buf_size;
++ u32 filters;
++ u64 saved_event_record[4];
++ u32 event_counter[16];
++};
++
++struct bndregs_struct {
++ u64 bndregs[8];
++} __packed;
++
++struct bndcsr_struct {
++ u64 cfg_reg_u;
++ u64 status_reg;
++} __packed;
++
+ struct xsave_hdr_struct {
+  u64 xstate_bv;
+  u64 reserved1[2];
+@@ -384,6 +404,9 @@ struct xsave_struct {
+  struct i387_fxsave_struct i387;
+  struct xsave_hdr_struct xsave_hdr;
+  struct ymmh_struct ymmh;
++ struct lwp_struct lwp;
++ struct bndregs_struct bndregs;
++ struct bndcsr_struct bndcsr;
+  /* new processor state extensions will go here */
+ } __attribute__ ((packed, aligned (64)));
+ 
+diff --git a/arch/x86/include/asm/xsave.h b/arch/x86/include/asm/xsave.h
+index b9e4932..dcd047b 100644
+--- a/arch/x86/include/asm/xsave.h
++++ b/arch/x86/include/asm/xsave.h
+@@ -9,6 +9,8 @@
+ #define XSTATE_FP 0x1
+ #define XSTATE_SSE 0x2
+ #define XSTATE_YMM 0x4
++#define XSTATE_BNDREGS 0x8
++#define XSTATE_BNDCSR 0x10
+ 
+ #define XSTATE_FPSSE (XSTATE_FP | XSTATE_SSE)
+ /* Bit 63 of XCR0 is reserved for future expansion */
+@@ -22,10 +24,14 @@
+ #define XSAVE_YMM_SIZE     256
+ #define XSAVE_YMM_OFFSET    (XSAVE_HDR_SIZE + XSAVE_HDR_OFFSET)
+ 
+-/*
+- * These are the features that the OS can handle currently.
+- */
+-#define XCNTXT_MASK (XSTATE_FP | XSTATE_SSE | XSTATE_YMM)
++/* Supported features which support lazy state saving */
++#define XSTATE_LAZY (XSTATE_FP | XSTATE_SSE | XSTATE_YMM)
++
++/* Supported features which require eager state saving */
++#define XSTATE_EAGER (XSTATE_BNDREGS | XSTATE_BNDCSR)
++
++/* All currently supported features */
++#define XCNTXT_MASK (XSTATE_LAZY | XSTATE_EAGER)
+ 
+ #ifdef CONFIG_X86_64
+ #define REX_PREFIX "0x48, "
+diff --git a/arch/x86/kernel/xsave.c b/arch/x86/kernel/xsave.c
+index 8063c9d..64bfa44 100644
+--- a/arch/x86/kernel/xsave.c
++++ b/arch/x86/kernel/xsave.c
+@@ -563,6 +563,16 @@ static void __init xstate_enable_boot_cpu(void)
+  if (cpu_has_xsaveopt && eagerfpu != DISABLE)
+   eagerfpu = ENABLE;
+ 
++ if (pcntxt_mask & XSTATE_EAGER) {
++  if (eagerfpu == DISABLE) {
++   pr_err("eagerfpu not present, disabling some xstate features: 0x%llx\n",
++     pcntxt_mask & XSTATE_EAGER);
++   pcntxt_mask &= ~XSTATE_EAGER;
++  } else {
++   eagerfpu = ENABLE;
++  }
++ }
++
+  pr_info("enabled xstate_bv 0x%llx, cntxt size 0x%x\n",
+   pcntxt_mask, xstate_size);
+ }
+-- 
+1.7.1

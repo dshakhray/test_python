@@ -1,0 +1,393 @@
+From 7a70145d4ed4c958fc2c6b23c14149f6dd8226c0 Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Mon, 16 Jun 2014 12:55:53 -0400
+Subject: [s390] sclp: Determine HSA size dynamically for zfcpdump
+
+Message-id: <1402923362-2331-3-git-send-email-brueckner@redhat.com>
+Patchwork-id: 84027
+O-Subject: [RHEL7.1 PATCH 02/11] [s390] s390/sclp: Determine HSA size dynamically for zfcpdump
+Bugzilla: 1107730
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Description
+-----------
+commit e657d8fe2faf49ed5d35e2325bd0f1712b8058cd
+Author: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+Date:   Wed Nov 13 10:38:27 2013 +0100
+
+    s390/sclp: Determine HSA size dynamically for zfcpdump
+
+    Currently we have hardcoded the HSA size to 32 MiB. With this patch the
+    HSA size is determined dynamically via SCLP in early.c.
+
+    Reviewed-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+    Signed-off-by: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+    Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+Bugzilla
+--------
+BZ 1107730
+https://bugzilla.redhat.com/show_bug.cgi?id=1107730
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=e657d8fe2faf49ed5d35e2325bd0f1712b8058cd
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7572070
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/s390/include/asm/sclp.h b/arch/s390/include/asm/sclp.h
+index 0845158..d8455be 100644
+--- a/arch/s390/include/asm/sclp.h
++++ b/arch/s390/include/asm/sclp.h
+@@ -58,5 +58,7 @@ bool sclp_has_vt220(void);
+ int sclp_pci_configure(u32 fid);
+ int sclp_pci_deconfigure(u32 fid);
+ int memcpy_hsa(void *dest, unsigned long src, size_t count, int mode);
++void sclp_hsa_size_detect(void);
++unsigned long sclp_get_hsa_size(void);
+ 
+ #endif /* _ASM_S390_SCLP_H */
+diff --git a/arch/s390/include/asm/setup.h b/arch/s390/include/asm/setup.h
+index 59880db..28cda86 100644
+--- a/arch/s390/include/asm/setup.h
++++ b/arch/s390/include/asm/setup.h
+@@ -114,9 +114,6 @@ extern unsigned int s390_user_mode;
+ #define MACHINE_HAS_RRBM (S390_lowcore.machine_flags & MACHINE_FLAG_RRBM)
+ #endif /* CONFIG_64BIT */
+ 
+-#define ZFCPDUMP_HSA_SIZE (32UL<<20)
+-#define ZFCPDUMP_HSA_SIZE_MAX (64UL<<20)
+-
+ /*
+  * Console mode. Override with conmode=
+  */
+diff --git a/arch/s390/kernel/crash_dump.c b/arch/s390/kernel/crash_dump.c
+index c84f33d..46f967a 100644
+--- a/arch/s390/kernel/crash_dump.c
++++ b/arch/s390/kernel/crash_dump.c
+@@ -72,7 +72,7 @@ static void *elfcorehdr_newmem;
+ /*
+  * Copy one page from zfcpdump "oldmem"
+  *
+- * For pages below ZFCPDUMP_HSA_SIZE memory from the HSA is copied. Otherwise
++ * For pages below HSA size memory from the HSA is copied. Otherwise
+  * real memory copy is used.
+  */
+ static ssize_t copy_oldmem_page_zfcpdump(char *buf, size_t csize,
+@@ -80,7 +80,7 @@ static ssize_t copy_oldmem_page_zfcpdump(char *buf, size_t csize,
+ {
+  int rc;
+ 
+- if (src < ZFCPDUMP_HSA_SIZE) {
++ if (src < sclp_get_hsa_size()) {
+   rc = memcpy_hsa(buf, src, csize, userbuf);
+  } else {
+   if (userbuf)
+@@ -165,18 +165,19 @@ static int remap_oldmem_pfn_range_kdump(struct vm_area_struct *vma,
+ /*
+  * Remap "oldmem" for zfcpdump
+  *
+- * We only map available memory above ZFCPDUMP_HSA_SIZE. Memory below
+- * ZFCPDUMP_HSA_SIZE is read on demand using the copy_oldmem_page() function.
++ * We only map available memory above HSA size. Memory below HSA size
++ * is read on demand using the copy_oldmem_page() function.
+  */
+ static int remap_oldmem_pfn_range_zfcpdump(struct vm_area_struct *vma,
+         unsigned long from,
+         unsigned long pfn,
+         unsigned long size, pgprot_t prot)
+ {
++ unsigned long hsa_end = sclp_get_hsa_size();
+  unsigned long size_hsa;
+ 
+- if (pfn < ZFCPDUMP_HSA_SIZE >> PAGE_SHIFT) {
+-  size_hsa = min(size, ZFCPDUMP_HSA_SIZE - (pfn << PAGE_SHIFT));
++ if (pfn < hsa_end >> PAGE_SHIFT) {
++  size_hsa = min(size, hsa_end - (pfn << PAGE_SHIFT));
+   if (size == size_hsa)
+    return 0;
+   size -= size_hsa;
+@@ -215,9 +216,9 @@ int copy_from_oldmem(void *dest, void *src, size_t count)
+     return rc;
+   }
+  } else {
+-  if ((unsigned long) src < ZFCPDUMP_HSA_SIZE) {
+-   copied = min(count,
+-         ZFCPDUMP_HSA_SIZE - (unsigned long) src);
++  unsigned long hsa_end = sclp_get_hsa_size();
++  if ((unsigned long) src < hsa_end) {
++   copied = min(count, hsa_end - (unsigned long) src);
+    rc = memcpy_hsa(dest, (unsigned long) src, copied, 0);
+    if (rc)
+     return rc;
+@@ -557,6 +558,9 @@ int elfcorehdr_alloc(unsigned long long *addr, unsigned long long *size)
+  /* If elfcorehdr= has been passed via cmdline, we use that one */
+  if (elfcorehdr_addr != ELFCORE_ADDR_MAX)
+   return 0;
++ /* If we cannot get HSA size for zfcpdump return error */
++ if (ipl_info.type == IPL_TYPE_FCP_DUMP && !sclp_get_hsa_size())
++  return -ENODEV;
+  mem_chunk_cnt = get_mem_chunk_cnt();
+ 
+  alloc_size = 0x1000 + get_cpu_cnt() * 0x300 +
+diff --git a/arch/s390/kernel/early.c b/arch/s390/kernel/early.c
+index dc8770d..67928f0 100644
+--- a/arch/s390/kernel/early.c
++++ b/arch/s390/kernel/early.c
+@@ -482,6 +482,7 @@ void __init startup_init(void)
+  detect_machine_facilities();
+  setup_topology();
+  sclp_facilities_detect();
++ sclp_hsa_size_detect();
+ #ifdef CONFIG_DYNAMIC_FTRACE
+  S390_lowcore.ftrace_func = (unsigned long)ftrace_caller;
+ #endif
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index 271ce0d..77adf32 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -506,8 +506,9 @@ static void __init setup_memory_end(void)
+ 
+ 
+ #ifdef CONFIG_ZFCPDUMP
+- if (ipl_info.type == IPL_TYPE_FCP_DUMP && !OLDMEM_BASE) {
+-  memory_end = ZFCPDUMP_HSA_SIZE;
++ if (ipl_info.type == IPL_TYPE_FCP_DUMP &&
++     !OLDMEM_BASE && sclp_get_hsa_size()) {
++  memory_end = sclp_get_hsa_size();
+   memory_end_set = 1;
+  }
+ #endif
+@@ -621,7 +622,7 @@ static unsigned long __init find_crash_base(unsigned long crash_size,
+   crash_base = (chunk->addr + chunk->size) - crash_size;
+   if (crash_base < crash_size)
+    continue;
+-  if (crash_base < ZFCPDUMP_HSA_SIZE_MAX)
++  if (crash_base < sclp_get_hsa_size())
+    continue;
+   if (crash_base < (unsigned long) INITRD_START + INITRD_SIZE)
+    continue;
+diff --git a/drivers/s390/char/Makefile b/drivers/s390/char/Makefile
+index 17821a0..b69ab17 100644
+--- a/drivers/s390/char/Makefile
++++ b/drivers/s390/char/Makefile
+@@ -3,7 +3,8 @@
+ #
+ 
+ obj-y += ctrlchar.o keyboard.o defkeymap.o sclp.o sclp_rw.o sclp_quiesce.o \
+-  sclp_cmd.o sclp_config.o sclp_cpi_sys.o sclp_ocf.o sclp_ctl.o
++  sclp_cmd.o sclp_config.o sclp_cpi_sys.o sclp_ocf.o sclp_ctl.o \
++  sclp_early.o
+ 
+ obj-$(CONFIG_TN3270) += raw3270.o
+ obj-$(CONFIG_TN3270_CONSOLE) += con3270.o
+diff --git a/drivers/s390/char/sclp.h b/drivers/s390/char/sclp.h
+index 40d1406..9cb8076 100644
+--- a/drivers/s390/char/sclp.h
++++ b/drivers/s390/char/sclp.h
+@@ -172,6 +172,7 @@ int sclp_deactivate(void);
+ int sclp_reactivate(void);
+ int sclp_service_call(sclp_cmdw_t command, void *sccb);
+ int sclp_sync_request(sclp_cmdw_t command, void *sccb);
++int __init sclp_cmd_sync_early(sclp_cmdw_t cmd, void *sccb);
+ 
+ int sclp_sdias_init(void);
+ void sclp_sdias_exit(void);
+diff --git a/drivers/s390/char/sclp_cmd.c b/drivers/s390/char/sclp_cmd.c
+index ae2ca21..4136dba 100644
+--- a/drivers/s390/char/sclp_cmd.c
++++ b/drivers/s390/char/sclp_cmd.c
+@@ -59,7 +59,7 @@ static u8 sclp_fac84;
+ static unsigned long long rzm;
+ static unsigned long long rnmax;
+ 
+-static int __init sclp_cmd_sync_early(sclp_cmdw_t cmd, void *sccb)
++int __init sclp_cmd_sync_early(sclp_cmdw_t cmd, void *sccb)
+ {
+  int rc;
+ 
+diff --git a/drivers/s390/char/sclp_early.c b/drivers/s390/char/sclp_early.c
+new file mode 100644
+index 0000000..7751129
+--- /dev/null
++++ b/drivers/s390/char/sclp_early.c
+@@ -0,0 +1,111 @@
++/*
++ * SCLP early driver
++ *
++ * Copyright IBM Corp. 2013
++ */
++
++#define KMSG_COMPONENT "sclp_early"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <asm/sclp.h>
++#include <asm/ipl.h>
++#include "sclp_sdias.h"
++#include "sclp.h"
++
++static __initdata char sccb_early[PAGE_SIZE] __aligned(PAGE_SIZE);
++static unsigned long sclp_hsa_size;
++
++static int __init sclp_cmd_early(sclp_cmdw_t cmd, void *sccb)
++{
++ int rc;
++
++ do {
++  rc = sclp_cmd_sync_early(cmd, sccb);
++ } while (rc == -EBUSY);
++
++ if (rc)
++  return -EIO;
++ if (((struct sccb_header *) sccb)->response_code != 0x0020)
++  return -EIO;
++ return 0;
++}
++
++static void __init sccb_init_eq_size(struct sdias_sccb *sccb)
++{
++ memset(sccb, 0, sizeof(*sccb));
++
++ sccb->hdr.length = sizeof(*sccb);
++ sccb->evbuf.hdr.length = sizeof(struct sdias_evbuf);
++ sccb->evbuf.hdr.type = EVTYP_SDIAS;
++ sccb->evbuf.event_qual = SDIAS_EQ_SIZE;
++ sccb->evbuf.data_id = SDIAS_DI_FCP_DUMP;
++ sccb->evbuf.event_id = 4712;
++ sccb->evbuf.dbs = 1;
++}
++
++static int __init sclp_set_event_mask(unsigned long receive_mask,
++          unsigned long send_mask)
++{
++ struct init_sccb *sccb = (void *) &sccb_early;
++
++ memset(sccb, 0, sizeof(*sccb));
++ sccb->header.length = sizeof(*sccb);
++ sccb->mask_length = sizeof(sccb_mask_t);
++ sccb->receive_mask = receive_mask;
++ sccb->send_mask = send_mask;
++ return sclp_cmd_early(SCLP_CMDW_WRITE_EVENT_MASK, sccb);
++}
++
++static long __init sclp_hsa_size_init(void)
++{
++ struct sdias_sccb *sccb = (void *) &sccb_early;
++
++ sccb_init_eq_size(sccb);
++ if (sclp_cmd_early(SCLP_CMDW_WRITE_EVENT_DATA, sccb))
++  return -EIO;
++ if (sccb->evbuf.blk_cnt != 0)
++  return (sccb->evbuf.blk_cnt - 1) * PAGE_SIZE;
++ return 0;
++}
++
++static long __init sclp_hsa_copy_wait(void)
++{
++ struct sccb_header *sccb = (void *) &sccb_early;
++
++ memset(sccb, 0, PAGE_SIZE);
++ sccb->length = PAGE_SIZE;
++ if (sclp_cmd_early(SCLP_CMDW_READ_EVENT_DATA, sccb))
++  return -EIO;
++ return (((struct sdias_sccb *) sccb)->evbuf.blk_cnt - 1) * PAGE_SIZE;
++}
++
++unsigned long sclp_get_hsa_size(void)
++{
++ return sclp_hsa_size;
++}
++
++void __init sclp_hsa_size_detect(void)
++{
++ long size;
++
++ /* First try synchronous interface (LPAR) */
++ if (sclp_set_event_mask(0, 0x40000010))
++  return;
++ size = sclp_hsa_size_init();
++ if (size < 0)
++  return;
++ if (size != 0)
++  goto out;
++ /* Then try asynchronous interface (z/VM) */
++ if (sclp_set_event_mask(0x00000010, 0x40000010))
++  return;
++ size = sclp_hsa_size_init();
++ if (size < 0)
++  return;
++ size = sclp_hsa_copy_wait();
++ if (size < 0)
++  return;
++out:
++ sclp_set_event_mask(0, 0);
++ sclp_hsa_size = size;
++}
+diff --git a/drivers/s390/char/zcore.c b/drivers/s390/char/zcore.c
+index 794820a..e10f66e 100644
+--- a/drivers/s390/char/zcore.c
++++ b/drivers/s390/char/zcore.c
+@@ -330,9 +330,9 @@ static ssize_t zcore_read(struct file *file, char __user *buf, size_t count,
+  mem_offs = 0;
+ 
+  /* Copy from HSA data */
+- if (*ppos < (ZFCPDUMP_HSA_SIZE + HEADER_SIZE)) {
+-  size = min((count - hdr_count), (size_t) (ZFCPDUMP_HSA_SIZE
+-      - mem_start));
++ if (*ppos < sclp_get_hsa_size() + HEADER_SIZE) {
++  size = min((count - hdr_count),
++      (size_t) (sclp_get_hsa_size() - mem_start));
+   rc = memcpy_hsa_user(buf + hdr_count, mem_start, size);
+   if (rc)
+    goto fail;
+@@ -492,7 +492,7 @@ static ssize_t zcore_hsa_read(struct file *filp, char __user *buf,
+  static char str[18];
+ 
+  if (hsa_available)
+-  snprintf(str, sizeof(str), "%lx\n", ZFCPDUMP_HSA_SIZE);
++  snprintf(str, sizeof(str), "%lx\n", sclp_get_hsa_size());
+  else
+   snprintf(str, sizeof(str), "0\n");
+  return simple_read_from_buffer(buf, count, ppos, str, strlen(str));
+@@ -586,17 +586,9 @@ static int __init sys_info_init(enum arch_id arch, unsigned long mem_end)
+ 
+ static int __init check_sdias(void)
+ {
+- int rc, act_hsa_size;
+-
+- rc = sclp_sdias_blk_count();
+- if (rc < 0) {
++ if (!sclp_get_hsa_size()) {
+   TRACE("Could not determine HSA size\n");
+-  return rc;
+- }
+- act_hsa_size = (rc - 1) * PAGE_SIZE;
+- if (act_hsa_size < ZFCPDUMP_HSA_SIZE) {
+-  TRACE("HSA size too small: %i\n", act_hsa_size);
+-  return -EINVAL;
++  return -ENODEV;
+  }
+  return 0;
+ }
+@@ -664,7 +656,7 @@ static int __init zcore_reipl_init(void)
+  ipl_block = (void *) __get_free_page(GFP_KERNEL);
+  if (!ipl_block)
+   return -ENOMEM;
+- if (ipib_info.ipib < ZFCPDUMP_HSA_SIZE)
++ if (ipib_info.ipib < sclp_get_hsa_size())
+   rc = memcpy_hsa_kernel(ipl_block, ipib_info.ipib, PAGE_SIZE);
+  else
+   rc = memcpy_real(ipl_block, (void *) ipib_info.ipib, PAGE_SIZE);
+-- 
+1.7.1

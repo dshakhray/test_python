@@ -1,0 +1,97 @@
+From 236db5b5767d07c82e25fb2ded8ee3410ef36e38 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:12:39 -0400
+Subject: [powerpc] Fix 64 bit builds with binutils 2.24
+
+Message-id: <1410545655-205645-531-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94467
+O-Subject: [RHEL7 PATCH 530/626] powerpc: Fix 64 bit builds with binutils 2.24
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 7998eb3dc700aaf499f93f50b3d77da834ef9e1d
+Author: Guenter Roeck <linux@roeck-us.net>
+Date:   Thu May 15 09:33:42 2014 -0700
+
+    powerpc: Fix 64 bit builds with binutils 2.24
+
+    With binutils 2.24, various 64 bit builds fail with relocation errors
+    such as
+
+    arch/powerpc/kernel/built-in.o: In function `exc_debug_crit_book3e':
+     (.text+0x165ee): relocation truncated to fit: R_PPC64_ADDR16_HI
+     against symbol `interrupt_base_book3e' defined in .text section
+     in arch/powerpc/kernel/built-in.o
+    arch/powerpc/kernel/built-in.o: In function `exc_debug_crit_book3e':
+     (.text+0x16602): relocation truncated to fit: R_PPC64_ADDR16_HI
+     against symbol `interrupt_end_book3e' defined in .text section
+     in arch/powerpc/kernel/built-in.o
+
+    The assembler maintainer says:
+
+     I changed the ABI, something that had to be done but unfortunately
+     happens to break the booke kernel code.  When building up a 64-bit
+     value with lis, ori, shl, oris, ori or similar sequences, you now
+     should use @high and @higha in place of @h and @ha.  @h and @ha
+     (and their associated relocs R_PPC64_ADDR16_HI and R_PPC64_ADDR16_HA)
+     now report overflow if the value is out of 32-bit signed range.
+     ie. @h and @ha assume you're building a 32-bit value. This is needed
+     to report out-of-range -mcmodel=medium toc pointer offsets in @toc@h
+     and @toc@ha expressions, and for consistency I did the same for all
+     other @h and @ha relocs.
+
+    Replacing @h with @high in one strategic location fixes the relocation
+    errors. This has to be done conditionally since the assembler either
+    supports @h or @high but not both.
+
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/Makefile b/arch/powerpc/Makefile
+index 8784119..2378660 100644
+--- a/arch/powerpc/Makefile
++++ b/arch/powerpc/Makefile
+@@ -142,7 +142,9 @@ CFLAGS-$(CONFIG_E6500_CPU) += $(call cc-option,-mcpu=e6500,$(E5500_CPU))
+ 
+ CFLAGS-$(CONFIG_TUNE_CELL) += $(call cc-option,-mtune=cell)
+ 
+-KBUILD_CPPFLAGS += -Iarch/$(ARCH)
++asinstr := $(call as-instr,lis 9$(comma)foo@high,-DHAVE_AS_ATHIGH=1)
++
++KBUILD_CPPFLAGS += -Iarch/$(ARCH) $(asinstr)
+ KBUILD_AFLAGS += -Iarch/$(ARCH) $(AFLAGS-y)
+ KBUILD_CFLAGS += -msoft-float -pipe -Iarch/$(ARCH) $(CFLAGS-y)
+ CPP  = $(CC) -E $(KBUILD_CFLAGS)
+diff --git a/arch/powerpc/include/asm/ppc_asm.h b/arch/powerpc/include/asm/ppc_asm.h
+index 36b3226..fc54d39 100644
+--- a/arch/powerpc/include/asm/ppc_asm.h
++++ b/arch/powerpc/include/asm/ppc_asm.h
+@@ -323,11 +323,16 @@ n:
+  addi reg,reg,(name - 0b)@l;
+ 
+ #ifdef __powerpc64__
++#ifdef HAVE_AS_ATHIGH
++#define __AS_ATHIGH high
++#else
++#define __AS_ATHIGH h
++#endif
+ #define LOAD_REG_IMMEDIATE(reg,expr)  \
+  lis     reg,(expr)@highest;  \
+  ori     reg,reg,(expr)@higher; \
+  rldicr  reg,reg,32,31;  \
+- oris    reg,reg,(expr)@h;  \
++ oris    reg,reg,(expr)@__AS_ATHIGH; \
+  ori     reg,reg,(expr)@l;
+ 
+ #define LOAD_REG_ADDR(reg,name)   \
+-- 
+1.7.1

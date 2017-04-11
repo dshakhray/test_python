@@ -1,0 +1,108 @@
+From 379e2673e9bbb033c7211182eb15805044f47e09 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:53:50 -0400
+Subject: [fs] nfs: page group syncing in read path
+
+Message-id: <1403798077-28799-32-git-send-email-steved@redhat.com>
+Patchwork-id: 84925
+O-Subject: [RHEL7.1 PATCH 31/78] nfs: page group syncing in read path
+Bugzilla: 1113248
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+Operations that modify state for a whole page must be syncronized across
+all requests within a page group. In the read path, this is calling
+unlock_page and SetPageUptodate. Both of these functions should not be
+called until all requests in a page group have reached the point where
+they would call them.
+
+This patch should have no effect yet since all page groups currently
+have one request, but will come into play when pg_test functions are
+modified to split pages into sub-page regions.
+
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 67d0338edd71db9a4f406d8778f7c525d31e9f7f
+Bugzilla: 1113248
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 015fb7b..18ee4e9 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -395,6 +395,8 @@ static void nfs_free_request(struct nfs_page *req)
+ 
+  /* extra debug: make sure no sync bits are still set */
+  WARN_ON_ONCE(test_bit(PG_TEARDOWN, &req->wb_flags));
++ WARN_ON_ONCE(test_bit(PG_UNLOCKPAGE, &req->wb_flags));
++ WARN_ON_ONCE(test_bit(PG_UPTODATE, &req->wb_flags));
+ 
+  /* Release struct file and open context */
+  nfs_clear_request(req);
+diff --git a/fs/nfs/read.c b/fs/nfs/read.c
+index 902ba2c..53d5b83 100644
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@ -105,10 +105,16 @@ static void nfs_readpage_release(struct nfs_page *req)
+ {
+  struct inode *d_inode = req->wb_context->dentry->d_inode;
+ 
+- if (PageUptodate(req->wb_page))
+-  nfs_readpage_to_fscache(d_inode, req->wb_page, 0);
++ dprintk("NFS: read done (%s/%llu %d@%lld)\n", d_inode->i_sb->s_id,
++  (unsigned long long)NFS_FILEID(d_inode), req->wb_bytes,
++  (long long)req_offset(req));
+ 
+- unlock_page(req->wb_page);
++ if (nfs_page_group_sync_on_bit(req, PG_UNLOCKPAGE)) {
++  if (PageUptodate(req->wb_page))
++   nfs_readpage_to_fscache(d_inode, req->wb_page, 0);
++
++  unlock_page(req->wb_page);
++ }
+ 
+  dprintk("NFS: read done (%s/%Lu %d@%Ld)\n",
+    req->wb_context->dentry->d_inode->i_sb->s_id,
+@@ -118,6 +124,12 @@ static void nfs_readpage_release(struct nfs_page *req)
+  nfs_release_request(req);
+ }
+ 
++static void nfs_page_group_set_uptodate(struct nfs_page *req)
++{
++ if (nfs_page_group_sync_on_bit(req, PG_UPTODATE))
++  SetPageUptodate(req->wb_page);
++}
++
+ /* Note io was page aligned */
+ static void nfs_read_completion(struct nfs_pgio_header *hdr)
+ {
+@@ -140,9 +152,9 @@ static void nfs_read_completion(struct nfs_pgio_header *hdr)
+   bytes += req->wb_bytes;
+   if (test_bit(NFS_IOHDR_ERROR, &hdr->flags)) {
+    if (bytes <= hdr->good_bytes)
+-    SetPageUptodate(page);
++    nfs_page_group_set_uptodate(req);
+   } else
+-   SetPageUptodate(page);
++   nfs_page_group_set_uptodate(req);
+   nfs_list_remove_request(req);
+   nfs_readpage_release(req);
+  }
+diff --git a/include/linux/nfs_page.h b/include/linux/nfs_page.h
+index 986c0c2..6385175 100644
+--- a/include/linux/nfs_page.h
++++ b/include/linux/nfs_page.h
+@@ -29,6 +29,8 @@ enum {
+  PG_INODE_REF,  /* extra ref held by inode (head req only) */
+  PG_HEADLOCK,  /* page group lock of wb_head */
+  PG_TEARDOWN,  /* page group sync for destroy */
++ PG_UNLOCKPAGE,  /* page group sync bit in read path */
++ PG_UPTODATE,  /* page group sync bit in read path */
+ };
+ 
+ struct nfs_inode;
+-- 
+1.7.1

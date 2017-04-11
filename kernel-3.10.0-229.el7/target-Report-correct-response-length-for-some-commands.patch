@@ -1,0 +1,156 @@
+From 0201c5721c3a172d5ee2d2a0ee370450cc6b60a4 Mon Sep 17 00:00:00 2001
+From: Andy Grover <agrover@redhat.com>
+Date: Fri, 5 Sep 2014 16:36:23 -0400
+Subject: [target] Report correct response length for some commands
+
+Message-id: <1409934989-29941-26-git-send-email-agrover@redhat.com>
+Patchwork-id: 91487
+O-Subject: [RHEL7.1 PATCH e-stor 25/31] target: Report correct response length for some commands
+Bugzilla: 1129387
+RH-Acked-by: Chris Leech <cleech@redhat.com>
+RH-Acked-by: Rob Evers <revers@redhat.com>
+
+From: Roland Dreier <roland@purestorage.com>
+
+commit 2426bd456a61407388b6e61fc5f98dbcbebc50e2 upstream.
+
+When an initiator sends an allocation length bigger than what its
+command consumes, the target should only return the actual response data
+and set the residual length to the unused part of the allocation length.
+
+Add a helper function that command handlers (INQUIRY, READ CAPACITY,
+etc) can use to do this correctly, and use this code to get the correct
+residual for commands that don't use the full initiator allocation in the
+handlers for READ CAPACITY, READ CAPACITY(16), INQUIRY, MODE SENSE and
+REPORT LUNS.
+
+This addresses a handful of failures as reported by Christophe with
+the Windows Certification Kit:
+
+  http://permalink.gmane.org/gmane.linux.scsi.target.devel/6515
+
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+Tested-by: Christophe Vu-Brugier <cvubrugier@yahoo.fr>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/target/target_core_sbc.c b/drivers/target/target_core_sbc.c
+index a2a8543..055837b 100644
+--- a/drivers/target/target_core_sbc.c
++++ b/drivers/target/target_core_sbc.c
+@@ -63,7 +63,7 @@ sbc_emulate_readcapacity(struct se_cmd *cmd)
+   transport_kunmap_data_sg(cmd);
+  }
+ 
+- target_complete_cmd(cmd, GOOD);
++ target_complete_cmd_with_length(cmd, GOOD, 8);
+  return 0;
+ }
+ 
+@@ -111,7 +111,7 @@ sbc_emulate_readcapacity_16(struct se_cmd *cmd)
+   transport_kunmap_data_sg(cmd);
+  }
+ 
+- target_complete_cmd(cmd, GOOD);
++ target_complete_cmd_with_length(cmd, GOOD, 32);
+  return 0;
+ }
+ 
+diff --git a/drivers/target/target_core_spc.c b/drivers/target/target_core_spc.c
+index 77f9b88..d0c343b 100644
+--- a/drivers/target/target_core_spc.c
++++ b/drivers/target/target_core_spc.c
+@@ -635,6 +635,7 @@ spc_emulate_inquiry(struct se_cmd *cmd)
+  unsigned char buf[SE_INQUIRY_BUF];
+  sense_reason_t ret;
+  int p;
++ int len = 0;
+ 
+  memset(buf, 0, SE_INQUIRY_BUF);
+ 
+@@ -652,6 +653,7 @@ spc_emulate_inquiry(struct se_cmd *cmd)
+   }
+ 
+   ret = spc_emulate_inquiry_std(cmd, buf);
++  len = buf[4] + 5;
+   goto out;
+  }
+ 
+@@ -659,6 +661,7 @@ spc_emulate_inquiry(struct se_cmd *cmd)
+   if (cdb[2] == evpd_handlers[p].page) {
+    buf[1] = cdb[2];
+    ret = evpd_handlers[p].emulate(cmd, buf);
++   len = get_unaligned_be16(&buf[2]) + 4;
+    goto out;
+   }
+  }
+@@ -674,7 +677,7 @@ out:
+  }
+ 
+  if (!ret)
+-  target_complete_cmd(cmd, GOOD);
++  target_complete_cmd_with_length(cmd, GOOD, len);
+  return ret;
+ }
+ 
+@@ -992,7 +995,7 @@ set_length:
+   transport_kunmap_data_sg(cmd);
+  }
+ 
+- target_complete_cmd(cmd, GOOD);
++ target_complete_cmd_with_length(cmd, GOOD, length);
+  return 0;
+ }
+ 
+@@ -1169,7 +1172,7 @@ done:
+  buf[3] = (lun_count & 0xff);
+  transport_kunmap_data_sg(cmd);
+ 
+- target_complete_cmd(cmd, GOOD);
++ target_complete_cmd_with_length(cmd, GOOD, 8 + lun_count * 8);
+  return 0;
+ }
+ EXPORT_SYMBOL(spc_emulate_report_luns);
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 1cc9597..334af7b 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -633,6 +633,23 @@ void target_complete_cmd(struct se_cmd *cmd, u8 scsi_status)
+ }
+ EXPORT_SYMBOL(target_complete_cmd);
+ 
++void target_complete_cmd_with_length(struct se_cmd *cmd, u8 scsi_status, int length)
++{
++ if (scsi_status == SAM_STAT_GOOD && length < cmd->data_length) {
++  if (cmd->se_cmd_flags & SCF_UNDERFLOW_BIT) {
++   cmd->residual_count += cmd->data_length - length;
++  } else {
++   cmd->se_cmd_flags |= SCF_UNDERFLOW_BIT;
++   cmd->residual_count = cmd->data_length - length;
++  }
++
++  cmd->data_length = length;
++ }
++
++ target_complete_cmd(cmd, scsi_status);
++}
++EXPORT_SYMBOL(target_complete_cmd_with_length);
++
+ static void target_add_to_state_list(struct se_cmd *cmd)
+ {
+  struct se_device *dev = cmd->se_dev;
+diff --git a/include/target/target_core_backend.h b/include/target/target_core_backend.h
+index a30ce8a..9026b90 100644
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@ -55,6 +55,7 @@ int transport_subsystem_register(struct se_subsystem_api *);
+ void transport_subsystem_release(struct se_subsystem_api *);
+ 
+ void target_complete_cmd(struct se_cmd *, u8);
++void target_complete_cmd_with_length(struct se_cmd *, u8, int);
+ 
+ sense_reason_t spc_parse_cdb(struct se_cmd *cmd, unsigned int *size);
+ sense_reason_t spc_emulate_report_luns(struct se_cmd *cmd);
+-- 
+1.7.1

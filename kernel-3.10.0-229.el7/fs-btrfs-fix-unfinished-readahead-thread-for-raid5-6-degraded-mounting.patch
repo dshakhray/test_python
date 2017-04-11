@@ -1,0 +1,64 @@
+From 8576994286180d5a0013703a2cd44440644f0382 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:04:36 -0400
+Subject: [fs] btrfs: fix unfinished readahead thread for raid5/6 degraded mounting
+
+Message-id: <1407179109-13714-390-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87334
+O-Subject: [RHEL7.1 PATCH 389/422] Btrfs: fix unfinished readahead thread for raid5/6 degraded mounting
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+
+commit 5fbc7c59fd22c5a6531b40b0759624b680a95e52
+Author: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+Date:   Wed Jun 11 10:55:22 2014 +0800
+
+    Btrfs: fix unfinished readahead thread for raid5/6 degraded mounting
+
+    Steps to reproduce:
+
+     # mkfs.btrfs -f /dev/sd[b-f] -m raid5 -d raid5
+     # mkfs.ext4 /dev/sdc --->corrupt one of btrfs device
+     # mount /dev/sdb /mnt -o degraded
+     # btrfs scrub start -BRd /mnt
+
+    This is because readahead would skip missing device, this is not true
+    for RAID5/6, because REQ_GET_READ_MIRRORS return 1 for RAID5/6 block
+    mapping. If expected data locates in missing device, readahead thread
+    would not call __readahead_hook() which makes event @rc->elems=0
+    wait forever.
+
+    Fix this problem by checking return value of btrfs_map_block(),we
+    can only skip missing device safely if there are several mirrors.
+
+    Signed-off-by: Wang Shilong <wangsl.fnst@cn.fujitsu.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/reada.c b/fs/btrfs/reada.c
+index 30947f9..09230cf 100644
+--- a/fs/btrfs/reada.c
++++ b/fs/btrfs/reada.c
+@@ -428,8 +428,13 @@ static struct reada_extent *reada_find_extent(struct btrfs_root *root,
+    continue;
+   }
+   if (!dev->bdev) {
+-   /* cannot read ahead on missing device */
+-   continue;
++   /*
++    * cannot read ahead on missing device, but for RAID5/6,
++    * REQ_GET_READ_MIRRORS return 1. So don't skip missing
++    * device for such case.
++    */
++   if (nzones > 1)
++    continue;
+   }
+   if (dev_replace_is_ongoing &&
+       dev == fs_info->dev_replace.tgtdev) {
+-- 
+1.7.1

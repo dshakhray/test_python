@@ -1,0 +1,166 @@
+From 2b5f96c46349bd9a11fe96f65a995d96986d8b72 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:51:06 -0400
+Subject: [tools] perf/report: Introduce helpers for processing callchains
+
+Message-id: <1408953210-26343-179-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88851
+O-Subject: [PATCH RHEL7.1 BZ1133083 178/322] perf report: Introduce helpers for processing callchains
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 6dbc8ca97b7737fa9254083df29d06c556b0653c
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date: Wed Dec 18 18:16:18 2013 -0300
+
+description
+===========
+Continuing to try to remove the code duplication introduced with mem and
+branch hist entry code, this time providing prologue and epilogues to
+deal with callchains when processing samples.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 9a20c9e..8424053 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -75,6 +75,24 @@ static int perf_report_config(const char *var, const char *value, void *cb)
+  return perf_default_config(var, value, cb);
+ }
+ 
++static int report__resolve_callchain(struct perf_report *rep, struct symbol **parent,
++         struct perf_evsel *evsel, struct addr_location *al,
++         struct perf_sample *sample, struct machine *machine)
++{
++ if ((sort__has_parent || symbol_conf.use_callchain) && sample->callchain) {
++  return machine__resolve_callchain(machine, evsel, al->thread, sample,
++        parent, al, rep->max_stack);
++ }
++ return 0;
++}
++
++static int hist_entry__append_callchain(struct hist_entry *he, struct perf_sample *sample)
++{
++ if (!symbol_conf.use_callchain)
++  return 0;
++ return callchain_append(he->callchain, &callchain_cursor, sample->period);
++}
++
+ static int perf_report__add_mem_hist_entry(struct perf_tool *tool,
+         struct addr_location *al,
+         struct perf_sample *sample,
+@@ -85,19 +103,13 @@ static int perf_report__add_mem_hist_entry(struct perf_tool *tool,
+  struct perf_report *rep = container_of(tool, struct perf_report, tool);
+  struct symbol *parent = NULL;
+  u8 cpumode = event->header.misc & PERF_RECORD_MISC_CPUMODE_MASK;
+- int err = 0;
+  struct hist_entry *he;
+  struct mem_info *mi, *mx;
+  uint64_t cost;
++ int err = report__resolve_callchain(rep, &parent, evsel, al, sample, machine);
+ 
+- if ((sort__has_parent || symbol_conf.use_callchain) &&
+-     sample->callchain) {
+-  err = machine__resolve_callchain(machine, evsel, al->thread,
+-       sample, &parent, al,
+-       rep->max_stack);
+-  if (err)
+-   return err;
+- }
++ if (err)
++  return err;
+ 
+  mi = machine__resolve_mem(machine, al->thread, sample, cpumode);
+  if (!mi)
+@@ -133,13 +145,7 @@ static int perf_report__add_mem_hist_entry(struct perf_tool *tool,
+ 
+  evsel->hists.stats.total_period += cost;
+  hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
+- err = 0;
+-
+- if (symbol_conf.use_callchain) {
+-  err = callchain_append(he->callchain,
+-           &callchain_cursor,
+-           sample->period);
+- }
++ err = hist_entry__append_callchain(he, sample);
+ out:
+  return err;
+ }
+@@ -152,19 +158,13 @@ static int perf_report__add_branch_hist_entry(struct perf_tool *tool,
+ {
+  struct perf_report *rep = container_of(tool, struct perf_report, tool);
+  struct symbol *parent = NULL;
+- int err = 0;
+  unsigned i;
+  struct hist_entry *he;
+  struct branch_info *bi, *bx;
++ int err = report__resolve_callchain(rep, &parent, evsel, al, sample, machine);
+ 
+- if ((sort__has_parent || symbol_conf.use_callchain)
+-     && sample->callchain) {
+-  err = machine__resolve_callchain(machine, evsel, al->thread,
+-       sample, &parent, al,
+-       rep->max_stack);
+-  if (err)
+-   return err;
+- }
++ if (err)
++  return err;
+ 
+  bi = machine__resolve_bstack(machine, al->thread,
+          sample->branch_stack);
+@@ -216,16 +216,11 @@ static int perf_evsel__add_hist_entry(struct perf_tool *tool,
+ {
+  struct perf_report *rep = container_of(tool, struct perf_report, tool);
+  struct symbol *parent = NULL;
+- int err = 0;
+  struct hist_entry *he;
++ int err = report__resolve_callchain(rep, &parent, evsel, al, sample, machine);
+ 
+- if ((sort__has_parent || symbol_conf.use_callchain) && sample->callchain) {
+-  err = machine__resolve_callchain(machine, evsel, al->thread,
+-       sample, &parent, al,
+-       rep->max_stack);
+-  if (err)
+-   return err;
+- }
++ if (err)
++  return err;
+ 
+  he = __hists__add_entry(&evsel->hists, al, parent, NULL, NULL,
+     sample->period, sample->weight,
+@@ -233,17 +228,14 @@ static int perf_evsel__add_hist_entry(struct perf_tool *tool,
+  if (he == NULL)
+   return -ENOMEM;
+ 
+- if (symbol_conf.use_callchain) {
+-  err = callchain_append(he->callchain,
+-           &callchain_cursor,
+-           sample->period);
+-  if (err)
+-   return err;
+- }
++ err = hist_entry__append_callchain(he, sample);
++ if (err)
++  goto out;
+ 
+  err = hist_entry__inc_addr_samples(he, evsel->idx, al->addr);
+  evsel->hists.stats.total_period += sample->period;
+  hists__inc_nr_events(&evsel->hists, PERF_RECORD_SAMPLE);
++out:
+  return err;
+ }
+ 
+-- 
+1.7.1

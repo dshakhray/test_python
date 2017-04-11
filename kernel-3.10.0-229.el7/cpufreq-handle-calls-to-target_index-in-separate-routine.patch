@@ -1,0 +1,124 @@
+From 6967388a638ace2e00cfa8252e423a0e7a671908 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:24:08 -0400
+Subject: [cpufreq] handle calls to ->target_index() in separate routine
+
+Message-id: <1409235879-1283-155-git-send-email-prarit@redhat.com>
+Patchwork-id: 89519
+O-Subject: [RHEL7.1 PATCH BZ 1134639 154/185] cpufreq: handle calls to ->target_index() in separate routine
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit 8d65775d17941d6d41f5913fc6a99a134c588e01
+Author: Viresh Kumar <viresh.kumar@linaro.org>
+Date:   Wed May 21 14:29:29 2014 +0530
+
+    cpufreq: handle calls to ->target_index() in separate routine
+
+    Handling calls to ->target_index() has got complex over time and might become
+    more complex. So, its better to take target_index() bits out in another routine
+    __target_index() for better code readability. Shouldn't have any functional
+    impact.
+
+    Tested-by: Stephen Warren <swarren@nvidia.com>
+    Reviewed-by: Doug Anderson <dianders@chromium.org>
+    Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 67e32f9..977db09 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1814,12 +1814,43 @@ EXPORT_SYMBOL(cpufreq_unregister_notifier);
+  *                              GOVERNORS                            *
+  *********************************************************************/
+ 
++static int __target_index(struct cpufreq_policy *policy,
++     struct cpufreq_frequency_table *freq_table, int index)
++{
++ struct cpufreq_freqs freqs;
++ int retval = -EINVAL;
++ bool notify;
++
++ notify = !(cpufreq_driver->flags & CPUFREQ_ASYNC_NOTIFICATION);
++
++ if (notify) {
++  freqs.old = policy->cur;
++  freqs.new = freq_table[index].frequency;
++  freqs.flags = 0;
++
++  pr_debug("%s: cpu: %d, oldfreq: %u, new freq: %u\n",
++    __func__, policy->cpu, freqs.old, freqs.new);
++
++  cpufreq_freq_transition_begin(policy, &freqs);
++ }
++
++ retval = cpufreq_driver->target_index(policy, index);
++ if (retval)
++  pr_err("%s: Failed to change cpu frequency: %d\n", __func__,
++         retval);
++
++ if (notify)
++  cpufreq_freq_transition_end(policy, &freqs, retval);
++
++ return retval;
++}
++
+ int __cpufreq_driver_target(struct cpufreq_policy *policy,
+        unsigned int target_freq,
+        unsigned int relation)
+ {
+- int retval = -EINVAL;
+  unsigned int old_target_freq = target_freq;
++ int retval = -EINVAL;
+ 
+  if (cpufreq_disabled())
+   return -ENODEV;
+@@ -1846,8 +1877,6 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
+   retval = cpufreq_driver->target(policy, target_freq, relation);
+  else if (cpufreq_driver->target_index) {
+   struct cpufreq_frequency_table *freq_table;
+-  struct cpufreq_freqs freqs;
+-  bool notify;
+   int index;
+ 
+   freq_table = cpufreq_frequency_get_table(policy->cpu);
+@@ -1868,26 +1897,7 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
+    goto out;
+   }
+ 
+-  notify = !(cpufreq_driver->flags & CPUFREQ_ASYNC_NOTIFICATION);
+-
+-  if (notify) {
+-   freqs.old = policy->cur;
+-   freqs.new = freq_table[index].frequency;
+-   freqs.flags = 0;
+-
+-   pr_debug("%s: cpu: %d, oldfreq: %u, new freq: %u\n",
+-     __func__, policy->cpu, freqs.old, freqs.new);
+-
+-   cpufreq_freq_transition_begin(policy, &freqs);
+-  }
+-
+-  retval = cpufreq_driver->target_index(policy, index);
+-  if (retval)
+-   pr_err("%s: Failed to change cpu frequency: %d\n",
+-          __func__, retval);
+-
+-  if (notify)
+-   cpufreq_freq_transition_end(policy, &freqs, retval);
++  retval = __target_index(policy, freq_table, index);
+  }
+ 
+ out:
+-- 
+1.7.1

@@ -1,0 +1,982 @@
+From d98bf4e5ef22d9c71650ba9c866bdddf283bc3dc Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Thu, 10 Jul 2014 09:08:41 -0400
+Subject: [s390] zcrypt: add support for EP11 coprocessor cards
+
+Message-id: <1404983322-13545-2-git-send-email-brueckner@redhat.com>
+Patchwork-id: 85647
+O-Subject: [RHEL7.1 PATCH 1/2] [s390] s390/zcrypt: add support for EP11 coprocessor cards
+Bugzilla: 1088511
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+
+Description
+-----------
+commit 91f3e3eaba4413e76ce8e12e3ef10525a889142f
+Author: Ingo Tuchscherer <ingo.tuchscherer@de.ibm.com>
+Commit: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+    s390/zcrypt: add support for EP11 coprocessor cards
+
+    This feature extends the generic cryptographic device driver (zcrypt)
+    with a new capability to service EP11 requests for the Crypto Express4S
+    card in EP11 (Enterprise PKCS#11 mode) coprocessor mode.
+
+    Signed-off-by: Ingo Tuchscherer <ingo.tuchscherer@de.ibm.com>
+    Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+Bugzilla
+--------
+BZ 1088511
+https://bugzilla.redhat.com/show_bug.cgi?id=1088511
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version v3.14-rc1
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=91f3e3eaba4413e76ce8e12e3ef10525a889142f
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7667791
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/kmsg/s390/zcrypt b/Documentation/kmsg/s390/zcrypt
+new file mode 100644
+index 0000000..7fb2087
+--- /dev/null
++++ b/Documentation/kmsg/s390/zcrypt
+@@ -0,0 +1,20 @@
++/*?
++ * Text: "Cryptographic device %x failed and was set offline\n"
++ * Severity: Error
++ * Parameter:
++ *   @1: device index
++ * Description:
++ * A cryptographic device failed to process a cryptographic request.
++ * The cryptographic device driver could not correct the error and
++ * set the device offline. The application that issued the
++ * request received an indication that the request has failed.
++ * User action:
++ * Use the lszcrypt command to confirm that the cryptographic
++ * hardware is still configured to your LPAR or z/VM guest virtual
++ * machine. If the device is available to your Linux instance the
++ * command output contains a line that begins with 'card<device index>',
++ * where <device index> is the two-digit decimal number in the message text.
++ * After ensuring that the device is available, use the chzcrypt command to
++ * set it online again.
++ * If the error persists, contact your support organization.
++ */
+diff --git a/arch/s390/include/uapi/asm/zcrypt.h b/arch/s390/include/uapi/asm/zcrypt.h
+index e83fc11..f2b18ea 100644
+--- a/arch/s390/include/uapi/asm/zcrypt.h
++++ b/arch/s390/include/uapi/asm/zcrypt.h
+@@ -154,6 +154,67 @@ struct ica_xcRB {
+  unsigned short priority_window;
+  unsigned int status;
+ } __attribute__((packed));
++
++/**
++ * struct ep11_cprb - EP11 connectivity programming request block
++ * @cprb_len:  CPRB header length [0x0020]
++ * @cprb_ver_id: CPRB version id.   [0x04]
++ * @pad_000:  Alignment pad bytes
++ * @flags:  Admin cmd [0x80] or functional cmd [0x00]
++ * @func_id:  Function id / subtype [0x5434]
++ * @source_id:  Source id [originator id]
++ * @target_id:  Target id [usage/ctrl domain id]
++ * @ret_code:  Return code
++ * @reserved1:  Reserved
++ * @reserved2:  Reserved
++ * @payload_len: Payload length
++ */
++struct ep11_cprb {
++ uint16_t cprb_len;
++ unsigned char cprb_ver_id;
++ unsigned char pad_000[2];
++ unsigned char flags;
++ unsigned char func_id[2];
++ uint32_t source_id;
++ uint32_t target_id;
++ uint32_t ret_code;
++ uint32_t reserved1;
++ uint32_t reserved2;
++ uint32_t payload_len;
++} __attribute__((packed));
++
++/**
++ * struct ep11_target_dev - EP11 target device list
++ * @ap_id: AP device id
++ * @dom_id: Usage domain id
++ */
++struct ep11_target_dev {
++ uint16_t ap_id;
++ uint16_t dom_id;
++};
++
++/**
++ * struct ep11_urb - EP11 user request block
++ * @targets_num: Number of target adapters
++ * @targets:  Addr to target adapter list
++ * @weight:  Level of request priority
++ * @req_no:  Request id/number
++ * @req_len:  Request length
++ * @req:  Addr to request block
++ * @resp_len:  Response length
++ * @resp:  Addr to response block
++ */
++struct ep11_urb {
++ uint16_t  targets_num;
++ uint64_t  targets;
++ uint64_t  weight;
++ uint64_t  req_no;
++ uint64_t  req_len;
++ uint64_t  req;
++ uint64_t  resp_len;
++ uint64_t  resp;
++} __attribute__((packed));
++
+ #define AUTOSELECT ((unsigned int)0xFFFFFFFF)
+ 
+ #define ZCRYPT_IOCTL_MAGIC 'z'
+@@ -183,6 +244,9 @@ struct ica_xcRB {
+  *   ZSECSENDCPRB
+  *     Send an arbitrary CPRB to a crypto card.
+  *
++ *   ZSENDEP11CPRB
++ *     Send an arbitrary EP11 CPRB to an EP11 coprocessor crypto card.
++ *
+  *   Z90STAT_STATUS_MASK
+  *     Return an 64 element array of unsigned chars for the status of
+  *     all devices.
+@@ -256,6 +320,7 @@ struct ica_xcRB {
+ #define ICARSAMODEXPO _IOC(_IOC_READ|_IOC_WRITE, ZCRYPT_IOCTL_MAGIC, 0x05, 0)
+ #define ICARSACRT _IOC(_IOC_READ|_IOC_WRITE, ZCRYPT_IOCTL_MAGIC, 0x06, 0)
+ #define ZSECSENDCPRB _IOC(_IOC_READ|_IOC_WRITE, ZCRYPT_IOCTL_MAGIC, 0x81, 0)
++#define ZSENDEP11CPRB _IOC(_IOC_READ|_IOC_WRITE, ZCRYPT_IOCTL_MAGIC, 0x04, 0)
+ 
+ /* New status calls */
+ #define Z90STAT_TOTALCOUNT _IOR(ZCRYPT_IOCTL_MAGIC, 0x40, int)
+diff --git a/drivers/s390/crypto/ap_bus.c b/drivers/s390/crypto/ap_bus.c
+index e8c2c71..7001f52 100644
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@ -591,7 +591,13 @@ static int ap_init_queue(ap_qid_t qid)
+   if (rc != -ENODEV && rc != -EBUSY)
+    break;
+   if (i < AP_MAX_RESET - 1) {
+-   udelay(5);
++   /* Time we are waiting until we give up (0.7sec * 90).
++    * Since the actual request (in progress) will not
++    * interrupted immediately for the reset command,
++    * we have to be patient. In worst case we have to
++    * wait 60sec + reset time (some msec).
++    */
++   schedule_timeout(AP_RESET_TIMEOUT);
+    status = ap_test_queue(qid, &dummy, &dummy);
+   }
+  }
+@@ -992,6 +998,28 @@ static ssize_t ap_domain_show(struct bus_type *bus, char *buf)
+ 
+ static BUS_ATTR(ap_domain, 0444, ap_domain_show, NULL);
+ 
++static ssize_t ap_control_domain_mask_show(struct bus_type *bus, char *buf)
++{
++ if (ap_configuration != NULL) { /* QCI not supported */
++  if (test_facility(76)) { /* format 1 - 256 bit domain field */
++   return snprintf(buf, PAGE_SIZE,
++    "0x%08x%08x%08x%08x%08x%08x%08x%08x\n",
++   ap_configuration->adm[0], ap_configuration->adm[1],
++   ap_configuration->adm[2], ap_configuration->adm[3],
++   ap_configuration->adm[4], ap_configuration->adm[5],
++   ap_configuration->adm[6], ap_configuration->adm[7]);
++  } else { /* format 0 - 16 bit domain field */
++   return snprintf(buf, PAGE_SIZE, "%08x%08x\n",
++   ap_configuration->adm[0], ap_configuration->adm[1]);
++    }
++ } else {
++  return snprintf(buf, PAGE_SIZE, "not supported\n");
++   }
++}
++
++static BUS_ATTR(ap_control_domain_mask, 0444,
++  ap_control_domain_mask_show, NULL);
++
+ static ssize_t ap_config_time_show(struct bus_type *bus, char *buf)
+ {
+  return snprintf(buf, PAGE_SIZE, "%d\n", ap_config_time);
+@@ -1077,6 +1105,7 @@ static BUS_ATTR(poll_timeout, 0644, poll_timeout_show, poll_timeout_store);
+ 
+ static struct bus_attribute *const ap_bus_attrs[] = {
+  &bus_attr_ap_domain,
++ &bus_attr_ap_control_domain_mask,
+  &bus_attr_config_time,
+  &bus_attr_poll_thread,
+  &bus_attr_ap_interrupts,
+diff --git a/drivers/s390/crypto/ap_bus.h b/drivers/s390/crypto/ap_bus.h
+index 685f6cc..6405ae2 100644
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@ -33,7 +33,7 @@
+ #define AP_DEVICES 64  /* Number of AP devices. */
+ #define AP_DOMAINS 16  /* Number of AP domains. */
+ #define AP_MAX_RESET 90  /* Maximum number of resets. */
+-#define AP_RESET_TIMEOUT (HZ/2) /* Time in ticks for reset timeouts. */
++#define AP_RESET_TIMEOUT (HZ*0.7) /* Time in ticks for reset timeouts. */
+ #define AP_CONFIG_TIME 30 /* Time in seconds between AP bus rescans. */
+ #define AP_POLL_TIME 1  /* Time in ticks between receive polls. */
+ 
+@@ -125,6 +125,8 @@ static inline int ap_test_bit(unsigned int *ptr, unsigned int nr)
+ #define AP_FUNC_CRT4K 2
+ #define AP_FUNC_COPRO 3
+ #define AP_FUNC_ACCEL 4
++#define AP_FUNC_EP11  5
++#define AP_FUNC_APXA  6
+ 
+ /*
+  * AP reset flag states
+diff --git a/drivers/s390/crypto/zcrypt_api.c b/drivers/s390/crypto/zcrypt_api.c
+index 31cfaa5..4b824b1 100644
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@ -44,6 +44,8 @@
+ #include "zcrypt_debug.h"
+ #include "zcrypt_api.h"
+ 
++#include "zcrypt_msgtype6.h"
++
+ /*
+  * Module description.
+  */
+@@ -554,9 +556,9 @@ static long zcrypt_send_cprb(struct ica_xcRB *xcRB)
+  spin_lock_bh(&zcrypt_device_lock);
+  list_for_each_entry(zdev, &zcrypt_device_list, list) {
+   if (!zdev->online || !zdev->ops->send_cprb ||
+-      (xcRB->user_defined != AUTOSELECT &&
+-   AP_QID_DEVICE(zdev->ap_dev->qid) != xcRB->user_defined)
+-      )
++     (zdev->ops->variant == MSGTYPE06_VARIANT_EP11) ||
++     (xcRB->user_defined != AUTOSELECT &&
++      AP_QID_DEVICE(zdev->ap_dev->qid) != xcRB->user_defined))
+    continue;
+   zcrypt_device_get(zdev);
+   get_device(&zdev->ap_dev->device);
+@@ -581,6 +583,90 @@ static long zcrypt_send_cprb(struct ica_xcRB *xcRB)
+  return -ENODEV;
+ }
+ 
++struct ep11_target_dev_list {
++ unsigned short  targets_num;
++ struct ep11_target_dev *targets;
++};
++
++static bool is_desired_ep11dev(unsigned int dev_qid,
++          struct ep11_target_dev_list dev_list)
++{
++ int n;
++
++ for (n = 0; n < dev_list.targets_num; n++, dev_list.targets++) {
++  if ((AP_QID_DEVICE(dev_qid) == dev_list.targets->ap_id) &&
++      (AP_QID_QUEUE(dev_qid) == dev_list.targets->dom_id)) {
++   return true;
++  }
++ }
++ return false;
++}
++
++static long zcrypt_send_ep11_cprb(struct ep11_urb *xcrb)
++{
++ struct zcrypt_device *zdev;
++ bool autoselect = false;
++ int rc;
++ struct ep11_target_dev_list ep11_dev_list = {
++  .targets_num =  0x00,
++  .targets =  NULL,
++ };
++
++ ep11_dev_list.targets_num = (unsigned short) xcrb->targets_num;
++
++ /* empty list indicates autoselect (all available targets) */
++ if (ep11_dev_list.targets_num == 0)
++  autoselect = true;
++ else {
++  ep11_dev_list.targets = kcalloc((unsigned short)
++      xcrb->targets_num,
++      sizeof(struct ep11_target_dev),
++      GFP_KERNEL);
++  if (!ep11_dev_list.targets)
++   return -ENOMEM;
++
++  if (copy_from_user(ep11_dev_list.targets,
++       (struct ep11_target_dev *)xcrb->targets,
++       xcrb->targets_num *
++       sizeof(struct ep11_target_dev)))
++   return -EFAULT;
++ }
++
++ spin_lock_bh(&zcrypt_device_lock);
++ list_for_each_entry(zdev, &zcrypt_device_list, list) {
++  /* check if device is eligible */
++  if (!zdev->online ||
++      zdev->ops->variant != MSGTYPE06_VARIANT_EP11)
++   continue;
++
++  /* check if device is selected as valid target */
++  if (!is_desired_ep11dev(zdev->ap_dev->qid, ep11_dev_list) &&
++      !autoselect)
++   continue;
++
++  zcrypt_device_get(zdev);
++  get_device(&zdev->ap_dev->device);
++  zdev->request_count++;
++  __zcrypt_decrease_preference(zdev);
++  if (try_module_get(zdev->ap_dev->drv->driver.owner)) {
++   spin_unlock_bh(&zcrypt_device_lock);
++   rc = zdev->ops->send_ep11_cprb(zdev, xcrb);
++   spin_lock_bh(&zcrypt_device_lock);
++   module_put(zdev->ap_dev->drv->driver.owner);
++  } else {
++   rc = -EAGAIN;
++    }
++  zdev->request_count--;
++  __zcrypt_increase_preference(zdev);
++  put_device(&zdev->ap_dev->device);
++  zcrypt_device_put(zdev);
++  spin_unlock_bh(&zcrypt_device_lock);
++  return rc;
++ }
++ spin_unlock_bh(&zcrypt_device_lock);
++ return -ENODEV;
++}
++
+ static long zcrypt_rng(char *buffer)
+ {
+  struct zcrypt_device *zdev;
+@@ -784,6 +870,23 @@ static long zcrypt_unlocked_ioctl(struct file *filp, unsigned int cmd,
+    return -EFAULT;
+   return rc;
+  }
++ case ZSENDEP11CPRB: {
++  struct ep11_urb __user *uxcrb = (void __user *)arg;
++  struct ep11_urb xcrb;
++  if (copy_from_user(&xcrb, uxcrb, sizeof(xcrb)))
++   return -EFAULT;
++  do {
++   rc = zcrypt_send_ep11_cprb(&xcrb);
++  } while (rc == -EAGAIN);
++  /* on failure: retry once again after a requested rescan */
++  if ((rc == -ENODEV) && (zcrypt_process_rescan()))
++   do {
++    rc = zcrypt_send_ep11_cprb(&xcrb);
++   } while (rc == -EAGAIN);
++  if (copy_to_user(uxcrb, &xcrb, sizeof(xcrb)))
++   return -EFAULT;
++  return rc;
++ }
+  case Z90STAT_STATUS_MASK: {
+   char status[AP_DEVICES];
+   zcrypt_status_mask(status);
+diff --git a/drivers/s390/crypto/zcrypt_api.h b/drivers/s390/crypto/zcrypt_api.h
+index 8963291..b3d496b 100644
+--- a/drivers/s390/crypto/zcrypt_api.h
++++ b/drivers/s390/crypto/zcrypt_api.h
+@@ -74,6 +74,7 @@ struct ica_z90_status {
+ #define ZCRYPT_CEX2A  6
+ #define ZCRYPT_CEX3C  7
+ #define ZCRYPT_CEX3A  8
++#define ZCRYPT_CEX4        10
+ 
+ /**
+  * Large random numbers are pulled in 4096 byte chunks from the crypto cards
+@@ -89,6 +90,7 @@ struct zcrypt_ops {
+  long (*rsa_modexpo_crt)(struct zcrypt_device *,
+     struct ica_rsa_modexpo_crt *);
+  long (*send_cprb)(struct zcrypt_device *, struct ica_xcRB *);
++ long (*send_ep11_cprb)(struct zcrypt_device *, struct ep11_urb *);
+  long (*rng)(struct zcrypt_device *, char *);
+  struct list_head list;  /* zcrypt ops list. */
+  struct module *owner;
+diff --git a/drivers/s390/crypto/zcrypt_cex4.c b/drivers/s390/crypto/zcrypt_cex4.c
+index ce12263..569f8b1 100644
+--- a/drivers/s390/crypto/zcrypt_cex4.c
++++ b/drivers/s390/crypto/zcrypt_cex4.c
+@@ -30,7 +30,12 @@
+ #define CEX4A_MAX_MESSAGE_SIZE MSGTYPE50_CRB3_MAX_MSG_SIZE
+ #define CEX4C_MAX_MESSAGE_SIZE MSGTYPE06_MAX_MSG_SIZE
+ 
+-#define CEX4_CLEANUP_TIME (15*HZ)
++/* Waiting time for requests to be processed.
++ * Currently there are some types of request which are not deterministic.
++ * But the maximum time limit managed by the stomper code is set to 60sec.
++ * Hence we have to wait at least that time period.
++ */
++#define CEX4_CLEANUP_TIME (61*HZ)
+ 
+ static struct ap_device_id zcrypt_cex4_ids[] = {
+  { AP_DEVICE(AP_DEVICE_TYPE_CEX4)  },
+@@ -101,6 +106,19 @@ static int zcrypt_cex4_probe(struct ap_device *ap_dev)
+    zdev->speed_rating = CEX4C_SPEED_RATING;
+    zdev->ops = zcrypt_msgtype_request(MSGTYPE06_NAME,
+           MSGTYPE06_VARIANT_DEFAULT);
++  } else if (ap_test_bit(&ap_dev->functions, AP_FUNC_EP11)) {
++   zdev = zcrypt_device_alloc(CEX4C_MAX_MESSAGE_SIZE);
++   if (!zdev)
++    return -ENOMEM;
++   zdev->type_string = "CEX4P";
++   zdev->user_space_type = ZCRYPT_CEX4;
++   zdev->min_mod_size = CEX4C_MIN_MOD_SIZE;
++   zdev->max_mod_size = CEX4C_MAX_MOD_SIZE;
++   zdev->max_exp_bit_length = CEX4C_MAX_MOD_SIZE;
++   zdev->short_crt = 0;
++   zdev->speed_rating = CEX4C_SPEED_RATING;
++   zdev->ops = zcrypt_msgtype_request(MSGTYPE06_NAME,
++       MSGTYPE06_VARIANT_EP11);
+   }
+   break;
+  }
+diff --git a/drivers/s390/crypto/zcrypt_error.h b/drivers/s390/crypto/zcrypt_error.h
+index 0079b66..7b23f43 100644
+--- a/drivers/s390/crypto/zcrypt_error.h
++++ b/drivers/s390/crypto/zcrypt_error.h
+@@ -106,15 +106,15 @@ static inline int convert_error(struct zcrypt_device *zdev,
+  //   REP88_ERROR_MESSAGE_TYPE  // '20' CEX2A
+   /*
+    * To sent a message of the wrong type is a bug in the
+-   * device driver. Warn about it, disable the device
++   * device driver. Send error msg, disable the device
+    * and then repeat the request.
+    */
+-  WARN_ON(1);
+   atomic_set(&zcrypt_rescan_req, 1);
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
+   ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%drc%d",
+-          zdev->ap_dev->qid,
+-          zdev->online, ehdr->reply_code);
++   zdev->ap_dev->qid, zdev->online, ehdr->reply_code);
+   return -EAGAIN;
+  case REP82_ERROR_TRANSPORT_FAIL:
+  case REP82_ERROR_MACHINE_FAILURE:
+@@ -122,15 +122,17 @@ static inline int convert_error(struct zcrypt_device *zdev,
+   /* If a card fails disable it and repeat the request. */
+   atomic_set(&zcrypt_rescan_req, 1);
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
+   ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%drc%d",
+-          zdev->ap_dev->qid,
+-          zdev->online, ehdr->reply_code);
++   zdev->ap_dev->qid, zdev->online, ehdr->reply_code);
+   return -EAGAIN;
+  default:
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
+   ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%drc%d",
+-          zdev->ap_dev->qid,
+-          zdev->online, ehdr->reply_code);
++   zdev->ap_dev->qid, zdev->online, ehdr->reply_code);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+ }
+diff --git a/drivers/s390/crypto/zcrypt_msgtype50.c b/drivers/s390/crypto/zcrypt_msgtype50.c
+index 7c522f3..334e282 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype50.c
++++ b/drivers/s390/crypto/zcrypt_msgtype50.c
+@@ -25,6 +25,9 @@
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
+ 
++#define KMSG_COMPONENT "zcrypt"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/init.h>
+@@ -332,6 +335,11 @@ static int convert_type80(struct zcrypt_device *zdev,
+  if (t80h->len < sizeof(*t80h) + outputdatalength) {
+   /* The result is too short, the CEX2A card may not do that.. */
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%drc%d",
++          zdev->ap_dev->qid, zdev->online, t80h->code);
++
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+  if (zdev->user_space_type == ZCRYPT_CEX2A)
+@@ -359,6 +367,10 @@ static int convert_response(struct zcrypt_device *zdev,
+           outputdata, outputdatalength);
+  default: /* Unknown response type, this should NEVER EVER happen */
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%dfail",
++          zdev->ap_dev->qid, zdev->online);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+ }
+diff --git a/drivers/s390/crypto/zcrypt_msgtype6.c b/drivers/s390/crypto/zcrypt_msgtype6.c
+index 7d97fa5..57bfda1 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype6.c
++++ b/drivers/s390/crypto/zcrypt_msgtype6.c
+@@ -25,6 +25,9 @@
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
+ 
++#define KMSG_COMPONENT "zcrypt"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/err.h>
+@@ -50,6 +53,7 @@ struct response_type {
+ };
+ #define PCIXCC_RESPONSE_TYPE_ICA  0
+ #define PCIXCC_RESPONSE_TYPE_XCRB 1
++#define PCIXCC_RESPONSE_TYPE_EP11 2
+ 
+ MODULE_AUTHOR("IBM Corporation");
+ MODULE_DESCRIPTION("Cryptographic Coprocessor (message type 6), " \
+@@ -358,6 +362,91 @@ static int XCRB_msg_to_type6CPRB_msgX(struct zcrypt_device *zdev,
+  return 0;
+ }
+ 
++static int xcrb_msg_to_type6_ep11cprb_msgx(struct zcrypt_device *zdev,
++           struct ap_message *ap_msg,
++           struct ep11_urb *xcRB)
++{
++ unsigned int lfmt;
++
++ static struct type6_hdr static_type6_ep11_hdr = {
++  .type  =  0x06,
++  .rqid  = {0x00, 0x01},
++  .function_code = {0x00, 0x00},
++  .agent_id[0] =  0x58, /* {'X'} */
++  .agent_id[1] =  0x43, /* {'C'} */
++  .offset1 =  0x00000058,
++ };
++
++ struct {
++  struct type6_hdr hdr;
++  struct ep11_cprb cprbx;
++  unsigned char pld_tag; /* fixed value 0x30 */
++  unsigned char pld_lenfmt; /* payload length format */
++ } __packed * msg = ap_msg->message;
++
++ struct pld_hdr {
++  unsigned char func_tag; /* fixed value 0x4 */
++  unsigned char func_len; /* fixed value 0x4 */
++  unsigned int func_val; /* function ID    */
++  unsigned char dom_tag; /* fixed value 0x4 */
++  unsigned char dom_len; /* fixed value 0x4 */
++  unsigned int dom_val; /* domain id    */
++ } __packed * payload_hdr;
++
++ /* length checks */
++ ap_msg->length = sizeof(struct type6_hdr) + xcRB->req_len;
++ if (CEIL4(xcRB->req_len) > MSGTYPE06_MAX_MSG_SIZE -
++       (sizeof(struct type6_hdr)))
++  return -EINVAL;
++
++ if (CEIL4(xcRB->resp_len) > MSGTYPE06_MAX_MSG_SIZE -
++        (sizeof(struct type86_fmt2_msg)))
++  return -EINVAL;
++
++ /* prepare type6 header */
++ msg->hdr = static_type6_ep11_hdr;
++ msg->hdr.ToCardLen1   = xcRB->req_len;
++ msg->hdr.FromCardLen1 = xcRB->resp_len;
++
++ /* Import CPRB data from the ioctl input parameter */
++ if (copy_from_user(&(msg->cprbx.cprb_len),
++      (char *)xcRB->req, xcRB->req_len)) {
++  return -EFAULT;
++ }
++
++ /*
++  The target domain field within the cprb body/payload block will be
++  replaced by the usage domain for non-management commands only.
++  Therefore we check the first bit of the 'flags' parameter for
++  management command indication.
++    0 - non managment command
++    1 - management command
++ */
++ if (!((msg->cprbx.flags & 0x80) == 0x80)) {
++  msg->cprbx.target_id = (unsigned int)
++     AP_QID_QUEUE(zdev->ap_dev->qid);
++
++  if ((msg->pld_lenfmt & 0x80) == 0x80) { /*ext.len.fmt 2 or 3*/
++   switch (msg->pld_lenfmt & 0x03) {
++   case 1:
++    lfmt = 2;
++    break;
++   case 2:
++    lfmt = 3;
++    break;
++   default:
++    return -EINVAL;
++   }
++  } else {
++   lfmt = 1; /* length format #1 */
++    }
++  payload_hdr = (struct pld_hdr *)((&(msg->pld_lenfmt))+lfmt);
++  payload_hdr->dom_val = (unsigned int)
++     AP_QID_QUEUE(zdev->ap_dev->qid);
++ }
++ return 0;
++}
++
+ /**
+  * Copy results from a type 86 ICA reply message back to user space.
+  *
+@@ -377,6 +466,12 @@ struct type86x_reply {
+  char text[0];
+ } __packed;
+ 
++struct type86_ep11_reply {
++ struct type86_hdr hdr;
++ struct type86_fmt2_ext fmt2;
++ struct ep11_cprb cprbx;
++} __packed;
++
+ static int convert_type86_ica(struct zcrypt_device *zdev,
+      struct ap_message *reply,
+      char __user *outputdata,
+@@ -440,6 +535,11 @@ static int convert_type86_ica(struct zcrypt_device *zdev,
+   if (service_rc == 8 && service_rs == 72)
+    return -EINVAL;
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%drc%d",
++          zdev->ap_dev->qid, zdev->online,
++          msg->hdr.reply_code);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+  data = msg->text;
+@@ -503,6 +603,33 @@ static int convert_type86_xcrb(struct zcrypt_device *zdev,
+  return 0;
+ }
+ 
++/**
++ * Copy results from a type 86 EP11 XCRB reply message back to user space.
++ *
++ * @zdev: crypto device pointer
++ * @reply: reply AP message.
++ * @xcRB: pointer to EP11 user request block
++ *
++ * Returns 0 on success or -EINVAL, -EFAULT, -EAGAIN in case of an error.
++ */
++static int convert_type86_ep11_xcrb(struct zcrypt_device *zdev,
++        struct ap_message *reply,
++        struct ep11_urb *xcRB)
++{
++ struct type86_fmt2_msg *msg = reply->message;
++ char *data = reply->message;
++
++ if (xcRB->resp_len < msg->fmt2.count1)
++  return -EINVAL;
++
++ /* Copy response CPRB to user */
++ if (copy_to_user((char *)xcRB->resp,
++    data + msg->fmt2.offset1, msg->fmt2.count1))
++  return -EFAULT;
++ xcRB->resp_len = msg->fmt2.count1;
++ return 0;
++}
++
+ static int convert_type86_rng(struct zcrypt_device *zdev,
+      struct ap_message *reply,
+      char *buffer)
+@@ -551,6 +678,10 @@ static int convert_response_ica(struct zcrypt_device *zdev,
+    * response */
+  default: /* Unknown response type, this should NEVER EVER happen */
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%dfail",
++          zdev->ap_dev->qid, zdev->online);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+ }
+@@ -579,10 +710,40 @@ static int convert_response_xcrb(struct zcrypt_device *zdev,
+  default: /* Unknown response type, this should NEVER EVER happen */
+   xcRB->status = 0x0008044DL; /* HDD_InvalidParm */
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%dfail",
++          zdev->ap_dev->qid, zdev->online);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+ }
+ 
++static int convert_response_ep11_xcrb(struct zcrypt_device *zdev,
++ struct ap_message *reply, struct ep11_urb *xcRB)
++{
++ struct type86_ep11_reply *msg = reply->message;
++
++ /* Response type byte is the second byte in the response. */
++ switch (((unsigned char *)reply->message)[1]) {
++ case TYPE82_RSP_CODE:
++ case TYPE87_RSP_CODE:
++  return convert_error(zdev, reply);
++ case TYPE86_RSP_CODE:
++  if (msg->hdr.reply_code)
++   return convert_error(zdev, reply);
++  if (msg->cprbx.cprb_ver_id == 0x04)
++   return convert_type86_ep11_xcrb(zdev, reply, xcRB);
++ /* Fall through, no break, incorrect cprb version is an unknown resp.*/
++ default: /* Unknown response type, this should NEVER EVER happen */
++  zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%dfail",
++          zdev->ap_dev->qid, zdev->online);
++  return -EAGAIN; /* repeat the request on a different device. */
++ }
++}
++
+ static int convert_response_rng(struct zcrypt_device *zdev,
+      struct ap_message *reply,
+      char *data)
+@@ -602,6 +763,10 @@ static int convert_response_rng(struct zcrypt_device *zdev,
+    * response */
+  default: /* Unknown response type, this should NEVER EVER happen */
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%dfail",
++          zdev->ap_dev->qid, zdev->online);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+ }
+@@ -657,6 +822,51 @@ out:
+  complete(&(resp_type->work));
+ }
+ 
++/**
++ * This function is called from the AP bus code after a crypto request
++ * "msg" has finished with the reply message "reply".
++ * It is called from tasklet context.
++ * @ap_dev: pointer to the AP device
++ * @msg: pointer to the AP message
++ * @reply: pointer to the AP reply message
++ */
++static void zcrypt_msgtype6_receive_ep11(struct ap_device *ap_dev,
++      struct ap_message *msg,
++      struct ap_message *reply)
++{
++ static struct error_hdr error_reply = {
++  .type = TYPE82_RSP_CODE,
++  .reply_code = REP82_ERROR_MACHINE_FAILURE,
++ };
++ struct response_type *resp_type =
++  (struct response_type *)msg->private;
++ struct type86_ep11_reply *t86r;
++ int length;
++
++ /* Copy the reply message to the request message buffer. */
++ if (IS_ERR(reply)) {
++  memcpy(msg->message, &error_reply, sizeof(error_reply));
++  goto out;
++ }
++ t86r = reply->message;
++ if (t86r->hdr.type == TYPE86_RSP_CODE &&
++     t86r->cprbx.cprb_ver_id == 0x04) {
++  switch (resp_type->type) {
++  case PCIXCC_RESPONSE_TYPE_EP11:
++   length = t86r->fmt2.offset1 + t86r->fmt2.count1;
++   length = min(MSGTYPE06_MAX_MSG_SIZE, length);
++   memcpy(msg->message, reply->message, length);
++   break;
++  default:
++   memcpy(msg->message, &error_reply, sizeof(error_reply));
++  }
++ } else {
++  memcpy(msg->message, reply->message, sizeof(error_reply));
++   }
++out:
++ complete(&(resp_type->work));
++}
++
+ static atomic_t zcrypt_step = ATOMIC_INIT(0);
+ 
+ /**
+@@ -782,6 +992,46 @@ out_free:
+ }
+ 
+ /**
++ * The request distributor calls this function if it picked the CEX4P
++ * device to handle a send_ep11_cprb request.
++ * @zdev: pointer to zcrypt_device structure that identifies the
++ *   CEX4P device to the request distributor
++ * @xcRB: pointer to the ep11 user request block
++ */
++static long zcrypt_msgtype6_send_ep11_cprb(struct zcrypt_device *zdev,
++      struct ep11_urb *xcrb)
++{
++ struct ap_message ap_msg;
++ struct response_type resp_type = {
++  .type = PCIXCC_RESPONSE_TYPE_EP11,
++ };
++ int rc;
++
++ ap_init_message(&ap_msg);
++ ap_msg.message = kmalloc(MSGTYPE06_MAX_MSG_SIZE, GFP_KERNEL);
++ if (!ap_msg.message)
++  return -ENOMEM;
++ ap_msg.receive = zcrypt_msgtype6_receive_ep11;
++ ap_msg.psmid = (((unsigned long long) current->pid) << 32) +
++    atomic_inc_return(&zcrypt_step);
++ ap_msg.private = &resp_type;
++ rc = xcrb_msg_to_type6_ep11cprb_msgx(zdev, &ap_msg, xcrb);
++ if (rc)
++  goto out_free;
++ init_completion(&resp_type.work);
++ ap_queue_message(zdev->ap_dev, &ap_msg);
++ rc = wait_for_completion_interruptible(&resp_type.work);
++ if (rc == 0)
++  rc = convert_response_ep11_xcrb(zdev, &ap_msg, xcrb);
++ else /* Signal pending. */
++  ap_cancel_message(zdev->ap_dev, &ap_msg);
++
++out_free:
++ kzfree(ap_msg.message);
++ return rc;
++}
++
++/**
+  * The request distributor calls this function if it picked the PCIXCC/CEX2C
+  * device to generate random data.
+  * @zdev: pointer to zcrypt_device structure that identifies the
+@@ -839,10 +1089,19 @@ static struct zcrypt_ops zcrypt_msgtype6_ops = {
+  .rng = zcrypt_msgtype6_rng,
+ };
+ 
++static struct zcrypt_ops zcrypt_msgtype6_ep11_ops = {
++ .owner = THIS_MODULE,
++ .variant = MSGTYPE06_VARIANT_EP11,
++ .rsa_modexpo = NULL,
++ .rsa_modexpo_crt = NULL,
++ .send_ep11_cprb = zcrypt_msgtype6_send_ep11_cprb,
++};
++
+ int __init zcrypt_msgtype6_init(void)
+ {
+  zcrypt_msgtype_register(&zcrypt_msgtype6_norng_ops);
+  zcrypt_msgtype_register(&zcrypt_msgtype6_ops);
++ zcrypt_msgtype_register(&zcrypt_msgtype6_ep11_ops);
+  return 0;
+ }
+ 
+@@ -850,6 +1109,7 @@ void __exit zcrypt_msgtype6_exit(void)
+ {
+  zcrypt_msgtype_unregister(&zcrypt_msgtype6_norng_ops);
+  zcrypt_msgtype_unregister(&zcrypt_msgtype6_ops);
++ zcrypt_msgtype_unregister(&zcrypt_msgtype6_ep11_ops);
+ }
+ 
+ module_init(zcrypt_msgtype6_init);
+diff --git a/drivers/s390/crypto/zcrypt_msgtype6.h b/drivers/s390/crypto/zcrypt_msgtype6.h
+index 1e500d3..2072475 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype6.h
++++ b/drivers/s390/crypto/zcrypt_msgtype6.h
+@@ -32,6 +32,7 @@
+ #define MSGTYPE06_NAME   "zcrypt_msgtype6"
+ #define MSGTYPE06_VARIANT_DEFAULT 0
+ #define MSGTYPE06_VARIANT_NORNG  1
++#define MSGTYPE06_VARIANT_EP11  2
+ 
+ #define MSGTYPE06_MAX_MSG_SIZE  (12*1024)
+ 
+@@ -99,6 +100,7 @@ struct type86_hdr {
+ } __packed;
+ 
+ #define TYPE86_RSP_CODE 0x86
++#define TYPE87_RSP_CODE 0x87
+ #define TYPE86_FMT2 0x02
+ 
+ struct type86_fmt2_ext {
+diff --git a/drivers/s390/crypto/zcrypt_pcica.c b/drivers/s390/crypto/zcrypt_pcica.c
+index f2b71d8..7a743f4 100644
+--- a/drivers/s390/crypto/zcrypt_pcica.c
++++ b/drivers/s390/crypto/zcrypt_pcica.c
+@@ -24,6 +24,9 @@
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
+ 
++#define KMSG_COMPONENT "zcrypt"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/init.h>
+@@ -199,6 +202,10 @@ static int convert_type84(struct zcrypt_device *zdev,
+  if (t84h->len < sizeof(*t84h) + outputdatalength) {
+   /* The result is too short, the PCICA card may not do that.. */
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%drc%d",
++          zdev->ap_dev->qid, zdev->online, t84h->code);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+  BUG_ON(t84h->len > PCICA_MAX_RESPONSE_SIZE);
+@@ -223,6 +230,10 @@ static int convert_response(struct zcrypt_device *zdev,
+           outputdata, outputdatalength);
+  default: /* Unknown response type, this should NEVER EVER happen */
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%dfail",
++          zdev->ap_dev->qid, zdev->online);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+ }
+diff --git a/drivers/s390/crypto/zcrypt_pcicc.c b/drivers/s390/crypto/zcrypt_pcicc.c
+index 0d90a43..4d14c04 100644
+--- a/drivers/s390/crypto/zcrypt_pcicc.c
++++ b/drivers/s390/crypto/zcrypt_pcicc.c
+@@ -24,6 +24,9 @@
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
+ 
++#define KMSG_COMPONENT "zcrypt"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/gfp.h>
+@@ -372,6 +375,11 @@ static int convert_type86(struct zcrypt_device *zdev,
+   if (service_rc == 8 && service_rs == 72)
+    return -EINVAL;
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%drc%d",
++          zdev->ap_dev->qid, zdev->online,
++          msg->hdr.reply_code);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+  data = msg->text;
+@@ -425,6 +433,10 @@ static int convert_response(struct zcrypt_device *zdev,
+   /* no break, incorrect cprb version is an unknown response */
+  default: /* Unknown response type, this should NEVER EVER happen */
+   zdev->online = 0;
++  pr_err("Cryptographic device %x failed and was set offline\n",
++         zdev->ap_dev->qid);
++  ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%dfail",
++          zdev->ap_dev->qid, zdev->online);
+   return -EAGAIN; /* repeat the request on a different device. */
+  }
+ }
+-- 
+1.7.1

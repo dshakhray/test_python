@@ -1,0 +1,93 @@
+From 85a1da9cdcf778c5e752edf3c437c6786f5c9eba Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:39:20 -0400
+Subject: [virt] kvm/svm: Allow the guest to run with dirty debug registers
+
+Message-id: <1406040016-3289-166-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86244
+O-Subject: [RHEL7 PATCH v2 165/221] KVM: svm: Allow the guest to run with dirty debug registers
+Bugzilla: 1068627 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+When not running in guest-debug mode (i.e. the guest controls the debug
+registers, having to take an exit for each DR access is a waste of time.
+If the guest gets into a state where each context switch causes DR to be
+saved and restored, this can take away as much as 40% of the execution
+time from the guest.
+
+If the guest is running with vcpu->arch.db == vcpu->arch.eff_db, we
+can let it write freely to the debug registers and reload them on the
+next exit.  We still need to exit on the first access, so that the
+KVM_DEBUGREG_WONT_EXIT flag is set in switch_db_regs; after that, further
+accesses to the debug registers will not cause a vmexit.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit facb0139698923dc7b7d15cafbb319219969f4fd)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 75eacbb..8dbf6b4 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -34,6 +34,7 @@
+ #include <asm/perf_event.h>
+ #include <asm/tlbflush.h>
+ #include <asm/desc.h>
++#include <asm/debugreg.h>
+ #include <asm/kvm_para.h>
+ 
+ #include <asm/virtext.h>
+@@ -1683,6 +1684,21 @@ static void svm_set_dr6(struct kvm_vcpu *vcpu, unsigned long value)
+  mark_dirty(svm->vmcb, VMCB_DR);
+ }
+ 
++static void svm_sync_dirty_debug_regs(struct kvm_vcpu *vcpu)
++{
++ struct vcpu_svm *svm = to_svm(vcpu);
++
++ get_debugreg(vcpu->arch.db[0], 0);
++ get_debugreg(vcpu->arch.db[1], 1);
++ get_debugreg(vcpu->arch.db[2], 2);
++ get_debugreg(vcpu->arch.db[3], 3);
++ vcpu->arch.dr6 = svm_get_dr6(vcpu);
++ vcpu->arch.dr7 = svm->vmcb->save.dr7;
++
++ vcpu->arch.switch_db_regs &= ~KVM_DEBUGREG_WONT_EXIT;
++ set_dr_intercepts(svm);
++}
++
+ static void svm_set_dr7(struct kvm_vcpu *vcpu, unsigned long value)
+ {
+  struct vcpu_svm *svm = to_svm(vcpu);
+@@ -2974,6 +2990,17 @@ static int dr_interception(struct vcpu_svm *svm)
+  unsigned long val;
+  int err;
+ 
++ if (svm->vcpu.guest_debug == 0) {
++  /*
++   * No more DR vmexits; force a reload of the debug registers
++   * and reenter on this instruction.  The next vmexit will
++   * retrieve the full state of the debug registers.
++   */
++  clr_dr_intercepts(svm);
++  svm->vcpu.arch.switch_db_regs |= KVM_DEBUGREG_WONT_EXIT;
++  return 1;
++ }
++
+  if (!boot_cpu_has(X86_FEATURE_DECODEASSISTS))
+   return emulate_on_interception(svm);
+ 
+@@ -4300,6 +4327,7 @@ static struct kvm_x86_ops svm_x86_ops = {
+  .get_dr6 = svm_get_dr6,
+  .set_dr6 = svm_set_dr6,
+  .set_dr7 = svm_set_dr7,
++ .sync_dirty_debug_regs = svm_sync_dirty_debug_regs,
+  .cache_reg = svm_cache_reg,
+  .get_rflags = svm_get_rflags,
+  .set_rflags = svm_set_rflags,
+-- 
+1.7.1

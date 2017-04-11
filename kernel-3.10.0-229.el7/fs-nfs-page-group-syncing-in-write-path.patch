@@ -1,0 +1,128 @@
+From 4a1ff4e383a77df33eca093b45da1dccd4953aa2 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:53:51 -0400
+Subject: [fs] nfs: page group syncing in write path
+
+Message-id: <1403798077-28799-33-git-send-email-steved@redhat.com>
+Patchwork-id: 84938
+O-Subject: [RHEL7.1 PATCH 32/78] nfs: page group syncing in write path
+Bugzilla: 1113248
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+Operations that modify state for a whole page must be syncronized across
+all requests within a page group. In the write path, this is calling
+end_page_writeback and removing the head request from an inode.
+Both of these operations should not be called until all requests
+in a page group have reached the point where they would call them.
+
+This patch should have no effect yet since all page groups currently
+have one request, but will come into play when pg_test functions are
+modified to split pages into sub-page regions.
+
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 20633f042fd0907300069714b98aaf607a8b5bf8
+Bugzilla: 1113248
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 18ee4e9..ceb4424 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -397,6 +397,8 @@ static void nfs_free_request(struct nfs_page *req)
+  WARN_ON_ONCE(test_bit(PG_TEARDOWN, &req->wb_flags));
+  WARN_ON_ONCE(test_bit(PG_UNLOCKPAGE, &req->wb_flags));
+  WARN_ON_ONCE(test_bit(PG_UPTODATE, &req->wb_flags));
++ WARN_ON_ONCE(test_bit(PG_WB_END, &req->wb_flags));
++ WARN_ON_ONCE(test_bit(PG_REMOVE, &req->wb_flags));
+ 
+  /* Release struct file and open context */
+  nfs_clear_request(req);
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 56bd0b4..725d1a8 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -201,12 +201,15 @@ static void nfs_set_page_writeback(struct page *page)
+  }
+ }
+ 
+-static void nfs_end_page_writeback(struct page *page)
++static void nfs_end_page_writeback(struct nfs_page *req)
+ {
+- struct inode *inode = page_file_mapping(page)->host;
++ struct inode *inode = page_file_mapping(req->wb_page)->host;
+  struct nfs_server *nfss = NFS_SERVER(inode);
+ 
+- end_page_writeback(page);
++ if (!nfs_page_group_sync_on_bit(req, PG_WB_END))
++  return;
++
++ end_page_writeback(req->wb_page);
+  if (atomic_long_dec_return(&nfss->writeback) < NFS_CONGESTION_OFF_THRESH)
+   clear_bdi_congested(&nfss->backing_dev_info, BLK_RW_ASYNC);
+ }
+@@ -397,15 +400,20 @@ static void nfs_inode_remove_request(struct nfs_page *req)
+ {
+  struct inode *inode = req->wb_context->dentry->d_inode;
+  struct nfs_inode *nfsi = NFS_I(inode);
++ struct nfs_page *head;
+ 
+- spin_lock(&inode->i_lock);
+- if (likely(!PageSwapCache(req->wb_page))) {
+-  set_page_private(req->wb_page, 0);
+-  ClearPagePrivate(req->wb_page);
+-  clear_bit(PG_MAPPED, &req->wb_flags);
++ if (nfs_page_group_sync_on_bit(req, PG_REMOVE)) {
++  head = req->wb_head;
++
++  spin_lock(&inode->i_lock);
++  if (likely(!PageSwapCache(head->wb_page))) {
++   set_page_private(head->wb_page, 0);
++   ClearPagePrivate(head->wb_page);
++   clear_bit(PG_MAPPED, &head->wb_flags);
++  }
++  nfsi->npages--;
++  spin_unlock(&inode->i_lock);
+  }
+- nfsi->npages--;
+- spin_unlock(&inode->i_lock);
+  nfs_release_request(req);
+ }
+ 
+@@ -599,7 +607,7 @@ remove_req:
+   nfs_inode_remove_request(req);
+ next:
+   nfs_unlock_request(req);
+-  nfs_end_page_writeback(req->wb_page);
++  nfs_end_page_writeback(req);
+   do_destroy = !test_bit(NFS_IOHDR_NEED_COMMIT, &hdr->flags);
+   nfs_release_request(req);
+  }
+@@ -966,7 +974,7 @@ static void nfs_redirty_request(struct nfs_page *req)
+ {
+  nfs_mark_request_dirty(req);
+  nfs_unlock_request(req);
+- nfs_end_page_writeback(req->wb_page);
++ nfs_end_page_writeback(req);
+  nfs_release_request(req);
+ }
+ 
+diff --git a/include/linux/nfs_page.h b/include/linux/nfs_page.h
+index 6385175..7d9096d 100644
+--- a/include/linux/nfs_page.h
++++ b/include/linux/nfs_page.h
+@@ -31,6 +31,8 @@ enum {
+  PG_TEARDOWN,  /* page group sync for destroy */
+  PG_UNLOCKPAGE,  /* page group sync bit in read path */
+  PG_UPTODATE,  /* page group sync bit in read path */
++ PG_WB_END,  /* page group sync bit in write path */
++ PG_REMOVE,  /* page group sync bit in write path */
+ };
+ 
+ struct nfs_inode;
+-- 
+1.7.1

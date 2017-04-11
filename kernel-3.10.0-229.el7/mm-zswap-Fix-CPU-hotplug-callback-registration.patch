@@ -1,0 +1,92 @@
+From 5595008bf36eb46459d4b2de3282cdf4954ab221 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:08:10 -0400
+Subject: [mm] zswap: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-34-git-send-email-prarit@redhat.com>
+Patchwork-id: 85755
+O-Subject: [RHEL7.1 PATCH BZ 1119078 33/35] mm, zswap: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit 576378249c8e0a020aafeaa702c834dff81dd596
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:12:40 2014 +0530
+
+    mm, zswap: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the zswap code by using this latter form of callback registration.
+
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Steve Best <sbest@redhat.com>
+Cc: Larry Woodman <lwoodman@redhat.com>
+Cc: Rik van Riel <riel@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/zswap.c b/mm/zswap.c
+index deda2b6..45fd45d 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -344,18 +344,18 @@ static int zswap_cpu_init(void)
+ {
+  unsigned long cpu;
+ 
+- get_online_cpus();
++ cpu_notifier_register_begin();
+  for_each_online_cpu(cpu)
+   if (__zswap_cpu_notifier(CPU_UP_PREPARE, cpu) != NOTIFY_OK)
+    goto cleanup;
+- register_cpu_notifier(&zswap_cpu_notifier_block);
+- put_online_cpus();
++ __register_cpu_notifier(&zswap_cpu_notifier_block);
++ cpu_notifier_register_done();
+  return 0;
+ 
+ cleanup:
+  for_each_online_cpu(cpu)
+   __zswap_cpu_notifier(CPU_UP_CANCELED, cpu);
+- put_online_cpus();
++ cpu_notifier_register_done();
+  return -ENOMEM;
+ }
+ 
+-- 
+1.7.1

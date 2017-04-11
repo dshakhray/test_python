@@ -1,0 +1,133 @@
+From 44ba7ceb10f6041c277da756ed1b595c61769944 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:37:20 -0400
+Subject: [virt] kvm/perf: Support the in_tx/in_tx_cp modifiers in KVM arch perfmon emulation v5
+
+Message-id: <1406040016-3289-46-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86124
+O-Subject: [RHEL7 PATCH v2 045/221] perf, kvm: Support the in_tx/in_tx_cp modifiers in KVM arch perfmon emulation v5
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Andi Kleen <ak@linux.intel.com>
+
+[KVM maintainers:
+The underlying support for this is in perf/core now. So please merge
+this patch into the KVM tree.]
+
+This is not arch perfmon, but older CPUs will just ignore it. This makes
+it possible to do at least some TSX measurements from a KVM guest
+
+v2: Various fixes to address review feedback
+v3: Ignore the bits when no CPUID. No #GP. Force raw events with TSX bits.
+v4: Use reserved bits for #GP
+v5: Remove obsolete argument
+Acked-by: Gleb Natapov <gleb@redhat.com>
+Signed-off-by: Andi Kleen <ak@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 103af0a98788592b76ee69a13948b6b3036d7e18)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index afb54d8..fa32ebb 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -323,6 +323,7 @@ struct kvm_pmu {
+  u64 global_ovf_ctrl;
+  u64 counter_bitmask[2];
+  u64 global_ctrl_mask;
++ u64 reserved_bits;
+  u8 version;
+  struct kvm_pmc gp_counters[INTEL_PMC_MAX_GENERIC];
+  struct kvm_pmc fixed_counters[INTEL_PMC_MAX_FIXED];
+diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
+index c53e797..5c4f631 100644
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -160,7 +160,7 @@ static void stop_counter(struct kvm_pmc *pmc)
+ 
+ static void reprogram_counter(struct kvm_pmc *pmc, u32 type,
+   unsigned config, bool exclude_user, bool exclude_kernel,
+-  bool intr)
++  bool intr, bool in_tx, bool in_tx_cp)
+ {
+  struct perf_event *event;
+  struct perf_event_attr attr = {
+@@ -173,6 +173,10 @@ static void reprogram_counter(struct kvm_pmc *pmc, u32 type,
+   .exclude_kernel = exclude_kernel,
+   .config = config,
+  };
++ if (in_tx)
++  attr.config |= HSW_IN_TX;
++ if (in_tx_cp)
++  attr.config |= HSW_IN_TX_CHECKPOINTED;
+ 
+  attr.sample_period = (-pmc->counter) & pmc_bitmask(pmc);
+ 
+@@ -226,7 +230,9 @@ static void reprogram_gp_counter(struct kvm_pmc *pmc, u64 eventsel)
+ 
+  if (!(eventsel & (ARCH_PERFMON_EVENTSEL_EDGE |
+     ARCH_PERFMON_EVENTSEL_INV |
+-    ARCH_PERFMON_EVENTSEL_CMASK))) {
++    ARCH_PERFMON_EVENTSEL_CMASK |
++    HSW_IN_TX |
++    HSW_IN_TX_CHECKPOINTED))) {
+   config = find_arch_event(&pmc->vcpu->arch.pmu, event_select,
+     unit_mask);
+   if (config != PERF_COUNT_HW_MAX)
+@@ -239,7 +245,9 @@ static void reprogram_gp_counter(struct kvm_pmc *pmc, u64 eventsel)
+  reprogram_counter(pmc, type, config,
+    !(eventsel & ARCH_PERFMON_EVENTSEL_USR),
+    !(eventsel & ARCH_PERFMON_EVENTSEL_OS),
+-   eventsel & ARCH_PERFMON_EVENTSEL_INT);
++   eventsel & ARCH_PERFMON_EVENTSEL_INT,
++   (eventsel & HSW_IN_TX),
++   (eventsel & HSW_IN_TX_CHECKPOINTED));
+ }
+ 
+ static void reprogram_fixed_counter(struct kvm_pmc *pmc, u8 en_pmi, int idx)
+@@ -256,7 +264,7 @@ static void reprogram_fixed_counter(struct kvm_pmc *pmc, u8 en_pmi, int idx)
+    arch_events[fixed_pmc_events[idx]].event_type,
+    !(en & 0x2), /* exclude user */
+    !(en & 0x1), /* exclude kernel */
+-   pmi);
++   pmi, false, false);
+ }
+ 
+ static inline u8 fixed_en_pmi(u64 ctrl, int idx)
+@@ -408,7 +416,7 @@ int kvm_pmu_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+   } else if ((pmc = get_gp_pmc(pmu, index, MSR_P6_EVNTSEL0))) {
+    if (data == pmc->eventsel)
+     return 0;
+-   if (!(data & 0xffffffff00200000ull)) {
++   if (!(data & pmu->reserved_bits)) {
+     reprogram_gp_counter(pmc, data);
+     return 0;
+    }
+@@ -450,6 +458,7 @@ void kvm_pmu_cpuid_update(struct kvm_vcpu *vcpu)
+  pmu->counter_bitmask[KVM_PMC_GP] = 0;
+  pmu->counter_bitmask[KVM_PMC_FIXED] = 0;
+  pmu->version = 0;
++ pmu->reserved_bits = 0xffffffff00200000ull;
+ 
+  entry = kvm_find_cpuid_entry(vcpu, 0xa, 0);
+  if (!entry)
+@@ -478,6 +487,12 @@ void kvm_pmu_cpuid_update(struct kvm_vcpu *vcpu)
+  pmu->global_ctrl = ((1 << pmu->nr_arch_gp_counters) - 1) |
+   (((1ull << pmu->nr_arch_fixed_counters) - 1) << INTEL_PMC_IDX_FIXED);
+  pmu->global_ctrl_mask = ~pmu->global_ctrl;
++
++ entry = kvm_find_cpuid_entry(vcpu, 7, 0);
++ if (entry &&
++     (boot_cpu_has(X86_FEATURE_HLE) || boot_cpu_has(X86_FEATURE_RTM)) &&
++     (entry->ebx & (X86_FEATURE_HLE|X86_FEATURE_RTM)))
++  pmu->reserved_bits ^= HSW_IN_TX|HSW_IN_TX_CHECKPOINTED;
+ }
+ 
+ void kvm_pmu_init(struct kvm_vcpu *vcpu)
+-- 
+1.7.1

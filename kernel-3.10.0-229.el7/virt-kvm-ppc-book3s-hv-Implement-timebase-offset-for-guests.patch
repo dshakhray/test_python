@@ -1,0 +1,238 @@
+From ab4191e6c2fa9448524a7d141e48a42709f74495 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:05:49 -0400
+Subject: [virt] kvm/ppc: book3s hv - Implement timebase offset for guests
+
+Message-id: <1410545655-205645-121-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94246
+O-Subject: [RHEL7 PATCH 120/626] KVM: PPC: Book3S HV: Implement timebase offset for guests
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 93b0f4dc29c5f077a1c97bd1d484147230c3779a
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 6 13:17:46 2013 +1000
+
+    KVM: PPC: Book3S HV: Implement timebase offset for guests
+
+    This allows guests to have a different timebase origin from the host.
+    This is needed for migration, where a guest can migrate from one host
+    to another and the two hosts might have a different timebase origin.
+    However, the timebase seen by the guest must not go backwards, and
+    should go forwards only by a small amount corresponding to the time
+    taken for the migration.
+
+    Therefore this provides a new per-vcpu value accessed via the one_reg
+    interface using the new KVM_REG_PPC_TB_OFFSET identifier.  This value
+    defaults to 0 and is not modified by KVM.  On entering the guest, this
+    value is added onto the timebase, and on exiting the guest, it is
+    subtracted from the timebase.
+
+    This is only supported for recent POWER hardware which has the TBU40
+    (timebase upper 40 bits) register.  Writing to the TBU40 register only
+    alters the upper 40 bits of the timebase, leaving the lower 24 bits
+    unchanged.  This provides a way to modify the timebase for guest
+    migration without disturbing the synchronization of the timebase
+    registers across CPU cores.  The kernel rounds up the value given
+    to a multiple of 2^24.
+
+    Timebase values stored in KVM structures (struct kvm_vcpu, struct
+    kvmppc_vcore, etc.) are stored as host timebase values.  The timebase
+    values in the dispatch trace log need to be guest timebase values,
+    however, since that is read directly by the guest.  This moves the
+    setting of vcpu->arch.dec_expires on guest exit to a point after we
+    have restored the host timebase so that vcpu->arch.dec_expires is a
+    host timebase value.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index e49a81c..5b8830b 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -1823,6 +1823,7 @@ registers, find a list below:
+   PPC   | KVM_REG_PPC_TLB3PS | 32
+   PPC   | KVM_REG_PPC_EPTCFG | 32
+   PPC   | KVM_REG_PPC_ICP_STATE | 64
++  PPC   | KVM_REG_PPC_TB_OFFSET | 64
+   PPC   | KVM_REG_PPC_SPMC1 | 32
+   PPC   | KVM_REG_PPC_SPMC2 | 32
+   PPC   | KVM_REG_PPC_IAMR | 64
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 91b833d..9741bf0 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -294,6 +294,7 @@ struct kvmppc_vcore {
+  u64 stolen_tb;
+  u64 preempt_tb;
+  struct kvm_vcpu *runner;
++ u64 tb_offset;  /* guest timebase - host timebase */
+ };
+ 
+ #define VCORE_ENTRY_COUNT(vc) ((vc)->entry_exit_count & 0xff)
+diff --git a/arch/powerpc/include/asm/reg.h b/arch/powerpc/include/asm/reg.h
+index aa75296..3afa76b 100644
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -249,6 +249,7 @@
+ #define SPRN_TBRU 0x10D /* Time Base Read Upper Register (user, R/O) */
+ #define SPRN_TBWL 0x11C /* Time Base Lower Register (super, R/W) */
+ #define SPRN_TBWU 0x11D /* Time Base Upper Register (super, R/W) */
++#define SPRN_TBU40 0x11E /* Timebase upper 40 bits (hyper, R/W) */
+ #define SPRN_SPURR 0x134 /* Scaled PURR */
+ #define SPRN_HSPRG0 0x130 /* Hypervisor Scratch 0 */
+ #define SPRN_HSPRG1 0x131 /* Hypervisor Scratch 1 */
+diff --git a/arch/powerpc/include/uapi/asm/kvm.h b/arch/powerpc/include/uapi/asm/kvm.h
+index 7ed41c0..a8124fe 100644
+--- a/arch/powerpc/include/uapi/asm/kvm.h
++++ b/arch/powerpc/include/uapi/asm/kvm.h
+@@ -504,6 +504,9 @@ struct kvm_get_htab_header {
+ #define KVM_REG_PPC_TLB3PS (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x9a)
+ #define KVM_REG_PPC_EPTCFG (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x9b)
+ 
++/* Timebase offset */
++#define KVM_REG_PPC_TB_OFFSET (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0x9c)
++
+ /* POWER8 registers */
+ #define KVM_REG_PPC_SPMC1 (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x9d)
+ #define KVM_REG_PPC_SPMC2 (KVM_REG_PPC | KVM_REG_SIZE_U32 | 0x9e)
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 20428f6..d961326 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -517,6 +517,7 @@ int main(void)
+  DEFINE(VCORE_NAP_COUNT, offsetof(struct kvmppc_vcore, nap_count));
+  DEFINE(VCORE_IN_GUEST, offsetof(struct kvmppc_vcore, in_guest));
+  DEFINE(VCORE_NAPPING_THREADS, offsetof(struct kvmppc_vcore, napping_threads));
++ DEFINE(VCORE_TB_OFFSET, offsetof(struct kvmppc_vcore, tb_offset));
+  DEFINE(VCPU_SVCPU, offsetof(struct kvmppc_vcpu_book3s, shadow_vcpu) -
+       offsetof(struct kvmppc_vcpu_book3s, vcpu));
+  DEFINE(VCPU_SLB_E, offsetof(struct kvmppc_slb, orige));
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index cfcee84..dfdd274 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -489,7 +489,7 @@ static void kvmppc_create_dtl_entry(struct kvm_vcpu *vcpu,
+  memset(dt, 0, sizeof(struct dtl_entry));
+  dt->dispatch_reason = 7;
+  dt->processor_id = vc->pcpu + vcpu->arch.ptid;
+- dt->timebase = now;
++ dt->timebase = now + vc->tb_offset;
+  dt->enqueue_to_dispatch_time = stolen;
+  dt->srr0 = kvmppc_get_pc(vcpu);
+  dt->srr1 = vcpu->arch.shregs.msr;
+@@ -793,6 +793,9 @@ int kvmppc_get_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+   val->vpaval.length = vcpu->arch.dtl.len;
+   spin_unlock(&vcpu->arch.vpa_update_lock);
+   break;
++ case KVM_REG_PPC_TB_OFFSET:
++  *val = get_reg_val(id, vcpu->arch.vcore->tb_offset);
++  break;
+  default:
+   r = -EINVAL;
+   break;
+@@ -892,6 +895,11 @@ int kvmppc_set_one_reg(struct kvm_vcpu *vcpu, u64 id, union kvmppc_one_reg *val)
+   len -= len % sizeof(struct dtl_entry);
+   r = set_vpa(vcpu, &vcpu->arch.dtl, addr, len);
+   break;
++ case KVM_REG_PPC_TB_OFFSET:
++  /* round up to multiple of 2^24 */
++  vcpu->arch.vcore->tb_offset =
++   ALIGN(set_reg_val(id, *val), 1UL << 24);
++  break;
+  default:
+   r = -EINVAL;
+   break;
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 2efff8a..bb5b80a 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -347,7 +347,22 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+  bdnz 28b
+  ptesync
+ 
+-22: li r0,1
++ /* Add timebase offset onto timebase */
++22: ld r8,VCORE_TB_OFFSET(r5)
++ cmpdi r8,0
++ beq 37f
++ mftb r6  /* current host timebase */
++ add r8,r8,r6
++ mtspr SPRN_TBU40,r8 /* update upper 40 bits */
++ mftb r7  /* check if lower 24 bits overflowed */
++ clrldi r6,r6,40
++ clrldi r7,r7,40
++ cmpld r7,r6
++ bge 37f
++ addis r8,r8,0x100 /* if so, increment upper 40 bits */
++ mtspr SPRN_TBU40,r8
++
++37: li r0,1
+  stb r0,VCORE_IN_GUEST(r5) /* signal secondaries to continue */
+  b 10f
+ 
+@@ -782,13 +797,6 @@ ext_stash_for_host:
+ ext_interrupt_to_host:
+ 
+ guest_exit_cont:  /* r9 = vcpu, r12 = trap, r13 = paca */
+- /* Save DEC */
+- mfspr r5,SPRN_DEC
+- mftb r6
+- extsw r5,r5
+- add r5,r5,r6
+- std r5,VCPU_DEC_EXPIRES(r9)
+-
+  /* Save more register state  */
+  mfdar r6
+  mfdsisr r7
+@@ -958,7 +966,24 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+  mtspr SPRN_SDR1,r6  /* switch to partition page table */
+  mtspr SPRN_LPID,r7
+  isync
+- li r0,0
++
++ /* Subtract timebase offset from timebase */
++ ld r8,VCORE_TB_OFFSET(r5)
++ cmpdi r8,0
++ beq 17f
++ mftb r6   /* current host timebase */
++ subf r8,r8,r6
++ mtspr SPRN_TBU40,r8  /* update upper 40 bits */
++ mftb r7   /* check if lower 24 bits overflowed */
++ clrldi r6,r6,40
++ clrldi r7,r7,40
++ cmpld r7,r6
++ bge 17f
++ addis r8,r8,0x100  /* if so, increment upper 40 bits */
++ mtspr SPRN_TBU40,r8
++
++ /* Signal secondary CPUs to continue */
++17: li r0,0
+  stb r0,VCORE_IN_GUEST(r5)
+  lis r8,0x7fff  /* MAX_INT@h */
+  mtspr SPRN_HDEC,r8
+@@ -1056,6 +1081,13 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_201)
+ 1: addi r8,r8,16
+  .endr
+ 
++ /* Save DEC */
++ mfspr r5,SPRN_DEC
++ mftb r6
++ extsw r5,r5
++ add r5,r5,r6
++ std r5,VCPU_DEC_EXPIRES(r9)
++
+  /* Save and reset AMR and UAMOR before turning on the MMU */
+ BEGIN_FTR_SECTION
+  mfspr r5,SPRN_AMR
+-- 
+1.7.1

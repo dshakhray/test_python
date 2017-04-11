@@ -1,0 +1,123 @@
+From b89c9f630dc37923663f3ef11d9071b7da2030c5 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:25:59 -0400
+Subject: [tools] perf/annotate: Another fix for annotate_browser__callq()
+
+Message-id: <1408462094-14194-191-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88164
+O-Subject: [PATCH RHEL7.1 BZ1131394 190/325] perf annotate: Another fix for annotate_browser__callq()
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit 1d5077bdd9a10c4297cded139989bb9ee2998a6c
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Mon Oct 14 13:43:44 2013 +0300
+
+description
+===========
+The target address is provided by objdump and is not necessary a memory
+address.  Add a helper to get the correct address.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/ui/browsers/annotate.c b/tools/perf/ui/browsers/annotate.c
+index 57d3a86..f0697a3 100644
+--- a/tools/perf/ui/browsers/annotate.c
++++ b/tools/perf/ui/browsers/annotate.c
+@@ -445,14 +445,17 @@ static bool annotate_browser__callq(struct annotate_browser *browser,
+  struct annotation *notes;
+  struct addr_map_symbol target = {
+   .map = ms->map,
+-  .addr = dl->ops.target.addr,
++  .addr = map__objdump_2mem(ms->map, dl->ops.target.addr),
+  };
+  char title[SYM_TITLE_MAX_SIZE];
+ 
+  if (!ins__is_call(dl->ins))
+   return false;
+ 
+- if (map_groups__find_ams(&target, NULL)) {
++ if (map_groups__find_ams(&target, NULL) ||
++     map__rip_2objdump(target.map, target.map->map_ip(target.map,
++            target.addr)) !=
++     dl->ops.target.addr) {
+   ui_helpline__puts("The called function was not found.");
+   return true;
+  }
+diff --git a/tools/perf/util/map.c b/tools/perf/util/map.c
+index 9dea404..ef5bc91 100644
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@ -252,10 +252,16 @@ size_t map__fprintf_dsoname(struct map *map, FILE *fp)
+  return fprintf(fp, "%s", dsoname);
+ }
+ 
+-/*
++/**
++ * map__rip_2objdump - convert symbol start address to objdump address.
++ * @map: memory map
++ * @rip: symbol start address
++ *
+  * objdump wants/reports absolute IPs for ET_EXEC, and RIPs for ET_DYN.
+  * map->dso->adjust_symbols==1 for ET_EXEC-like cases except ET_REL which is
+  * relative to section start.
++ *
++ * Return: Address suitable for passing to "objdump --start-address="
+  */
+ u64 map__rip_2objdump(struct map *map, u64 rip)
+ {
+@@ -268,6 +274,29 @@ u64 map__rip_2objdump(struct map *map, u64 rip)
+  return map->unmap_ip(map, rip);
+ }
+ 
++/**
++ * map__objdump_2mem - convert objdump address to a memory address.
++ * @map: memory map
++ * @ip: objdump address
++ *
++ * Closely related to map__rip_2objdump(), this function takes an address from
++ * objdump and converts it to a memory address.  Note this assumes that @map
++ * contains the address.  To be sure the result is valid, check it forwards
++ * e.g. map__rip_2objdump(map->map_ip(map, map__objdump_2mem(map, ip))) == ip
++ *
++ * Return: Memory address.
++ */
++u64 map__objdump_2mem(struct map *map, u64 ip)
++{
++ if (!map->dso->adjust_symbols)
++  return map->unmap_ip(map, ip);
++
++ if (map->dso->rel)
++  return map->unmap_ip(map, ip + map->pgoff);
++
++ return ip;
++}
++
+ void map_groups__init(struct map_groups *mg)
+ {
+  int i;
+diff --git a/tools/perf/util/map.h b/tools/perf/util/map.h
+index 0359b4a..e4e259c 100644
+--- a/tools/perf/util/map.h
++++ b/tools/perf/util/map.h
+@@ -84,6 +84,9 @@ static inline u64 identity__map_ip(struct map *map __maybe_unused, u64 ip)
+ /* rip/ip <-> addr suitable for passing to `objdump --start-address=` */
+ u64 map__rip_2objdump(struct map *map, u64 rip);
+ 
++/* objdump address -> memory address */
++u64 map__objdump_2mem(struct map *map, u64 ip);
++
+ struct symbol;
+ 
+ typedef int (*symbol_filter_t)(struct map *map, struct symbol *sym);
+-- 
+1.7.1

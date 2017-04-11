@@ -1,0 +1,145 @@
+From 560b4082e98509cda8edd97c50691c5af234a805 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:22:09 -0400
+Subject: [cpufreq] Split __cpufreq_remove_dev() into two parts
+
+Message-id: <1409235879-1283-36-git-send-email-prarit@redhat.com>
+Patchwork-id: 89369
+O-Subject: [RHEL7.1 PATCH BZ 1134639 035/185] cpufreq: Split __cpufreq_remove_dev() into two parts
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit cedb70afd077b00bff7379042fdbf7eef32606c9
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Sat Sep 7 01:23:09 2013 +0530
+
+    cpufreq: Split __cpufreq_remove_dev() into two parts
+
+    During CPU offline, the cpufreq core invokes __cpufreq_remove_dev()
+    to perform work such as stopping the cpufreq governor, clearing the
+    CPU from the policy structure etc, and finally cleaning up the
+    kobject.
+
+    There are certain subtle issues related to the kobject cleanup, and
+    it would be much easier to deal with them if we separate that part
+    from the rest of the cleanup-work in the CPU offline phase. So split
+    the __cpufreq_remove_dev() function into 2 parts: one that handles
+    the kobject cleanup, and the other that handles the rest of the work.
+
+    Reported-by: Stephen Boyd <sboyd@codeaurora.org>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 4905c29..6ed11d1 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1139,22 +1139,14 @@ static int cpufreq_nominate_new_policy_cpu(struct cpufreq_policy *policy,
+  return cpu_dev->id;
+ }
+ 
+-/**
+- * __cpufreq_remove_dev - remove a CPU device
+- *
+- * Removes the cpufreq interface for a CPU device.
+- * Caller should already have policy_rwsem in write mode for this CPU.
+- * This routine frees the rwsem before returning.
+- */
+-static int __cpufreq_remove_dev(struct device *dev,
+-    struct subsys_interface *sif, bool frozen)
++static int __cpufreq_remove_dev_prepare(struct device *dev,
++     struct subsys_interface *sif,
++     bool frozen)
+ {
+  unsigned int cpu = dev->id, cpus;
+  int new_cpu, ret;
+  unsigned long flags;
+  struct cpufreq_policy *policy;
+- struct kobject *kobj;
+- struct completion *cmp;
+ 
+  pr_debug("%s: unregistering CPU %u\n", __func__, cpu);
+ 
+@@ -1211,6 +1203,33 @@ static int __cpufreq_remove_dev(struct device *dev,
+   }
+  }
+ 
++ return 0;
++}
++
++static int __cpufreq_remove_dev_finish(struct device *dev,
++           struct subsys_interface *sif,
++           bool frozen)
++{
++ unsigned int cpu = dev->id, cpus;
++ int ret;
++ unsigned long flags;
++ struct cpufreq_policy *policy;
++ struct kobject *kobj;
++ struct completion *cmp;
++
++ read_lock_irqsave(&cpufreq_driver_lock, flags);
++ policy = per_cpu(cpufreq_cpu_data, cpu);
++ read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++
++ if (!policy) {
++  pr_debug("%s: No cpu_data found\n", __func__);
++  return -EINVAL;
++ }
++
++ lock_policy_rwsem_read(cpu);
++ cpus = cpumask_weight(policy->cpus);
++ unlock_policy_rwsem_read(cpu);
++
+  /* If cpu is last user of policy, free policy */
+  if (cpus == 1) {
+   if (cpufreq_driver->target) {
+@@ -1276,6 +1295,27 @@ static int __cpufreq_remove_dev(struct device *dev,
+  return 0;
+ }
+ 
++/**
++ * __cpufreq_remove_dev - remove a CPU device
++ *
++ * Removes the cpufreq interface for a CPU device.
++ * Caller should already have policy_rwsem in write mode for this CPU.
++ * This routine frees the rwsem before returning.
++ */
++static inline int __cpufreq_remove_dev(struct device *dev,
++           struct subsys_interface *sif,
++           bool frozen)
++{
++ int ret;
++
++ ret = __cpufreq_remove_dev_prepare(dev, sif, frozen);
++
++ if (!ret)
++  ret = __cpufreq_remove_dev_finish(dev, sif, frozen);
++
++ return ret;
++}
++
+ static int cpufreq_remove_dev(struct device *dev, struct subsys_interface *sif)
+ {
+  unsigned int cpu = dev->id;
+@@ -2008,7 +2048,8 @@ static int cpufreq_cpu_callback(struct notifier_block *nfb,
+    break;
+ 
+   case CPU_DOWN_PREPARE:
+-   __cpufreq_remove_dev(dev, NULL, frozen);
++   __cpufreq_remove_dev_prepare(dev, NULL, frozen);
++   __cpufreq_remove_dev_finish(dev, NULL, frozen);
+    break;
+ 
+   case CPU_DOWN_FAILED:
+-- 
+1.7.1

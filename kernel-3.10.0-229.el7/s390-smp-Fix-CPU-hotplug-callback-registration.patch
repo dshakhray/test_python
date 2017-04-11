@@ -1,0 +1,99 @@
+From 26fbf76b3e995943cceb897ebe51bc0fa759274c Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:07:43 -0400
+Subject: [s390] smp: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-7-git-send-email-prarit@redhat.com>
+Patchwork-id: 85741
+O-Subject: [RHEL7.1 PATCH BZ 1119078 06/35] s390, smp: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit f4edbcd5d1f350b90583c8f3e0e7112b28f65e62
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:05:58 2014 +0530
+
+    s390, smp: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the smp code in s390 by using this latter form of callback registration.
+
+    Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Chao WANG <chaowang@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/s390/kernel/smp.c b/arch/s390/kernel/smp.c
+index 2dd7c59..342991b 100644
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -1064,19 +1064,24 @@ static DEVICE_ATTR(rescan, 0200, NULL, rescan_store);
+ 
+ static int __init s390_smp_init(void)
+ {
+- int cpu, rc;
++ int cpu, rc = 0;
+ 
+- hotcpu_notifier(smp_cpu_notify, 0);
+ #ifdef CONFIG_HOTPLUG_CPU
+  rc = device_create_file(cpu_subsys.dev_root, &dev_attr_rescan);
+  if (rc)
+   return rc;
+ #endif
++ cpu_notifier_register_begin();
+  for_each_present_cpu(cpu) {
+   rc = smp_add_present_cpu(cpu);
+   if (rc)
+-   return rc;
++   goto out;
+  }
+- return 0;
++
++ __hotcpu_notifier(smp_cpu_notify, 0);
++
++out:
++ cpu_notifier_register_done();
++ return rc;
+ }
+ subsys_initcall(s390_smp_init);
+-- 
+1.7.1

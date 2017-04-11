@@ -1,0 +1,80 @@
+From 3919fccd6da5efc7402e8110f23a0cceb0ec4b66 Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:09:43 -0400
+Subject: [virt] kvm/ppc: book3s hv - Fix decrementer timeouts with non-zero TB offset
+
+Message-id: <1410545655-205645-355-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94288
+O-Subject: [RHEL7 PATCH 354/626] KVM: PPC: Book3S HV: Fix decrementer timeouts with non-zero TB offset
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit c5fb80d3b24f6280bd6f608d8f2a02139a0fabaf
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Tue Mar 25 10:47:07 2014 +1100
+
+    KVM: PPC: Book3S HV: Fix decrementer timeouts with non-zero TB offset
+
+    Commit c7699822bc21 ("KVM: PPC: Book3S HV: Make physical thread 0 do
+    the MMU switching") reordered the guest entry/exit code so that most
+    of the guest register save/restore code happened in guest MMU context.
+    A side effect of that is that the timebase still contains the guest
+    timebase value at the point where we compute and use vcpu->arch.dec_expires,
+    and therefore that is now a guest timebase value rather than a host
+    timebase value.  That in turn means that the timeouts computed in
+    kvmppc_set_timer() are wrong if the timebase offset for the guest is
+    non-zero.  The consequence of that is things such as "sleep 1" in a
+    guest after migration may sleep for much longer than they should.
+
+    This fixes the problem by converting between guest and host timebase
+    values as necessary, by adding or subtracting the timebase offset.
+    This also fixes an incorrect comment.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Acked-by: Scott Wood <scottwood@freescale.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 1152d4f..26014f6 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -737,6 +737,10 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
+   * Set the decrementer to the guest decrementer.
+   */
+  ld r8,VCPU_DEC_EXPIRES(r4)
++ /* r8 is a host timebase value here, convert to guest TB */
++ ld r5,HSTATE_KVM_VCORE(r13)
++ ld r6,VCORE_TB_OFFSET(r5)
++ add r8,r8,r6
+  mftb r7
+  subf r3,r7,r8
+  mtspr SPRN_DEC,r3
+@@ -1099,6 +1103,10 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_201)
+  mftb r6
+  extsw r5,r5
+  add r5,r5,r6
++ /* r5 is a guest timebase value here, convert to host TB */
++ ld r3,HSTATE_KVM_VCORE(r13)
++ ld r4,VCORE_TB_OFFSET(r3)
++ subf r5,r4,r5
+  std r5,VCPU_DEC_EXPIRES(r9)
+ 
+ BEGIN_FTR_SECTION
+@@ -1388,7 +1396,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+  ld r8,VCORE_TB_OFFSET(r5)
+  cmpdi r8,0
+  beq 17f
+- mftb r6   /* current host timebase */
++ mftb r6   /* current guest timebase */
+  subf r8,r8,r6
+  mtspr SPRN_TBU40,r8  /* update upper 40 bits */
+  mftb r7   /* check if lower 24 bits overflowed */
+-- 
+1.7.1

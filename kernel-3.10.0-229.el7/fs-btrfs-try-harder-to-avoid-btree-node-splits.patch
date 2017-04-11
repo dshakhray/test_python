@@ -1,0 +1,111 @@
+From 895df91de3a2c8cd13b19be865cc8c32ec269fac Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 18:58:48 -0400
+Subject: [fs] btrfs: try harder to avoid btree node splits
+
+Message-id: <1407179109-13714-42-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87028
+O-Subject: [RHEL7.1 PATCH 041/422] Btrfs: try harder to avoid btree node splits
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Filipe David Borba Manana <fdmanana@gmail.com>
+
+commit 5a4267ca20d4c452a97dace4612f1dfc04147fbd
+Author: Filipe David Borba Manana <fdmanana@gmail.com>
+Date:   Mon Nov 25 03:20:46 2013 +0000
+
+    Btrfs: try harder to avoid btree node splits
+
+    When attempting to move items from our target leaf to its neighbor
+    leaves (right and left), we only need to free data_size - free_space
+    bytes from our leaf in order to add the new item (which has size of
+    data_size bytes). Therefore attempt to move items to the right and
+    left leaves if they have at least data_size - free_space bytes free,
+    instead of data_size bytes free.
+
+    After 5 runs of the following test, I got a smaller number of btree
+    node splits overall:
+
+    sysbench --test=fileio --file-num=512 --file-total-size=5G \
+      --file-test-mode=seqwr --num-threads=512 \
+       --file-block-size=8192 --max-requests=100000 --file-io-mode=sync
+
+    Before this change:
+    * 6171 splits (average of 5 test runs)
+    * 61.508Mb/sec of throughput (average of 5 test runs)
+
+    After this change:
+    * 6036 splits (average of 5 test runs)
+    * 63.533Mb/sec of throughput (average of 5 test runs)
+
+    An ideal test would not just have multiple threads/processes writing
+    to a file (insertion of file extent items) but also do other operations
+    that result in insertion of items with varied sizes, like file/directory
+    creations, creation of links, symlinks, xattrs, etc.
+
+    Signed-off-by: Filipe David Borba Manana <fdmanana@gmail.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/ctree.c b/fs/btrfs/ctree.c
+index 2262980..11f9a18 100644
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -3929,14 +3929,17 @@ static noinline int push_for_double_split(struct btrfs_trans_handle *trans,
+  int progress = 0;
+  int slot;
+  u32 nritems;
++ int space_needed = data_size;
+ 
+  slot = path->slots[0];
++ if (slot < btrfs_header_nritems(path->nodes[0]))
++  space_needed -= btrfs_leaf_free_space(root, path->nodes[0]);
+ 
+  /*
+   * try to push all the items after our slot into the
+   * right leaf
+   */
+- ret = push_leaf_right(trans, root, path, 1, data_size, 0, slot);
++ ret = push_leaf_right(trans, root, path, 1, space_needed, 0, slot);
+  if (ret < 0)
+   return ret;
+ 
+@@ -3956,7 +3959,7 @@ static noinline int push_for_double_split(struct btrfs_trans_handle *trans,
+ 
+  /* try to push all the items before our slot into the next leaf */
+  slot = path->slots[0];
+- ret = push_leaf_left(trans, root, path, 1, data_size, 0, slot);
++ ret = push_leaf_left(trans, root, path, 1, space_needed, 0, slot);
+  if (ret < 0)
+   return ret;
+ 
+@@ -4000,13 +4003,18 @@ static noinline int split_leaf(struct btrfs_trans_handle *trans,
+ 
+  /* first try to make some room by pushing left and right */
+  if (data_size && path->nodes[1]) {
+-  wret = push_leaf_right(trans, root, path, data_size,
+-           data_size, 0, 0);
++  int space_needed = data_size;
++
++  if (slot < btrfs_header_nritems(l))
++   space_needed -= btrfs_leaf_free_space(root, l);
++
++  wret = push_leaf_right(trans, root, path, space_needed,
++           space_needed, 0, 0);
+   if (wret < 0)
+    return wret;
+   if (wret) {
+-   wret = push_leaf_left(trans, root, path, data_size,
+-           data_size, 0, (u32)-1);
++   wret = push_leaf_left(trans, root, path, space_needed,
++           space_needed, 0, (u32)-1);
+    if (wret < 0)
+     return wret;
+   }
+-- 
+1.7.1

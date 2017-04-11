@@ -1,0 +1,100 @@
+From 3867205fc8536f21227b30f8fcf0d61a4e864995 Mon Sep 17 00:00:00 2001
+From: Abhijith Das <adas@redhat.com>
+Date: Fri, 15 Aug 2014 19:56:30 -0400
+Subject: [fs] gfs2: Inline qd_trylock into gfs2_quota_unlock
+
+Message-id: <1408132603-52384-5-git-send-email-adas@redhat.com>
+Patchwork-id: 87810
+O-Subject: [RHEL7.1 PATCH 04/17] GFS2: Inline qd_trylock into gfs2_quota_unlock
+Bugzilla: 1026406
+RH-Acked-by: Robert S Peterson <rpeterso@redhat.com>
+RH-Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+
+The function qd_trylock was not a trylock despite its name and
+can be inlined into gfs2_quota_unlock in order to make the
+code a bit clearer. There should be no functional change as a
+result of this patch.
+
+Resolves: rhbz#1026406
+Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+Cc: Abhijith Das <adas@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index 88f7d28..05e5b38 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -438,29 +438,6 @@ static int qd_fish(struct gfs2_sbd *sdp, struct gfs2_quota_data **qdp)
+  return 0;
+ }
+ 
+-static int qd_trylock(struct gfs2_quota_data *qd)
+-{
+- struct gfs2_sbd *sdp = qd->qd_gl->gl_sbd;
+- int found;
+-
+- spin_lock(&qd_lru_lock);
+- found = qd_check_sync(sdp, qd, NULL);
+- spin_unlock(&qd_lru_lock);
+-
+- if (!found)
+-  return 0;
+-
+- gfs2_assert_warn(sdp, qd->qd_change_sync);
+- if (bh_get(qd)) {
+-  clear_bit(QDF_LOCKED, &qd->qd_flags);
+-  slot_put(qd);
+-  qd_put(qd);
+-  return 0;
+- }
+-
+- return 1;
+-}
+-
+ static void qd_unlock(struct gfs2_quota_data *qd)
+ {
+  gfs2_assert_warn(qd->qd_gl->gl_sbd,
+@@ -1012,9 +989,11 @@ static int need_sync(struct gfs2_quota_data *qd)
+ 
+ void gfs2_quota_unlock(struct gfs2_inode *ip)
+ {
++ struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+  struct gfs2_quota_data *qda[4];
+  unsigned int count = 0;
+  unsigned int x;
++ int found;
+ 
+  if (!test_and_clear_bit(GIF_QD_LOCKED, &ip->i_flags))
+   goto out;
+@@ -1027,9 +1006,25 @@ void gfs2_quota_unlock(struct gfs2_inode *ip)
+   sync = need_sync(qd);
+ 
+   gfs2_glock_dq_uninit(&ip->i_res->rs_qa_qd_ghs[x]);
++  if (!sync)
++   continue;
++
++  spin_lock(&qd_lru_lock);
++  found = qd_check_sync(sdp, qd, NULL);
++  spin_unlock(&qd_lru_lock);
++
++  if (!found)
++   continue;
++
++  gfs2_assert_warn(sdp, qd->qd_change_sync);
++  if (bh_get(qd)) {
++   clear_bit(QDF_LOCKED, &qd->qd_flags);
++   slot_put(qd);
++   qd_put(qd);
++   continue;
++  }
+ 
+-  if (sync && qd_trylock(qd))
+-   qda[count++] = qd;
++  qda[count++] = qd;
+  }
+ 
+  if (count) {
+-- 
+1.7.1

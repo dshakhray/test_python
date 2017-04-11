@@ -1,0 +1,136 @@
+From 48eecb9b7f34c4ed7058de22cfef815c225e2fa5 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:39:22 -0400
+Subject: [virt] kvm/x86: handle missing MPX in nested virtualization
+
+Message-id: <1406040016-3289-168-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86246
+O-Subject: [RHEL7 PATCH v2 167/221] KVM: x86: handle missing MPX in nested virtualization
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+When doing nested virtualization, we may be able to read BNDCFGS but
+still not be allowed to write to GUEST_BNDCFGS in the VMCS.  Guard
+writes to the field with vmx_mpx_supported(), and similarly hide the
+MSR from userspace if the processor does not support the field.
+
+We could work around this with the generic MSR save/load machinery,
+but there is only a limited number of MSR save/load slots and it is
+not really worthwhile to waste one for a scenario that should not
+happen except in the nested virtualization case.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 93c4adc7afedf9b0ec190066d45b6d67db5270da)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index bb07da2..4ca7d97 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -47,7 +47,7 @@ u64 kvm_supported_xcr0(void)
+ {
+  u64 xcr0 = KVM_SUPPORTED_XCR0 & host_xcr0;
+ 
+- if (!kvm_x86_ops->mpx_supported || !kvm_x86_ops->mpx_supported())
++ if (!kvm_x86_ops->mpx_supported())
+   xcr0 &= ~(XSTATE_BNDREGS | XSTATE_BNDCSR);
+ 
+  return xcr0;
+@@ -259,8 +259,7 @@ static inline int __do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
+ #endif
+  unsigned f_rdtscp = kvm_x86_ops->rdtscp_supported() ? F(RDTSCP) : 0;
+  unsigned f_invpcid = kvm_x86_ops->invpcid_supported() ? F(INVPCID) : 0;
+- unsigned f_mpx = kvm_x86_ops->mpx_supported ?
+-    (kvm_x86_ops->mpx_supported() ? F(MPX) : 0) : 0;
++ unsigned f_mpx = kvm_x86_ops->mpx_supported() ? F(MPX) : 0;
+ 
+  /* cpuid 1.edx */
+  const u32 kvm_supported_word0_x86_features =
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 8dbf6b4..86d7015 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -4089,6 +4089,11 @@ static bool svm_invpcid_supported(void)
+  return false;
+ }
+ 
++static bool svm_mpx_supported(void)
++{
++ return false;
++}
++
+ static bool svm_has_wbinvd_exit(void)
+ {
+  return true;
+@@ -4371,6 +4376,7 @@ static struct kvm_x86_ops svm_x86_ops = {
+ 
+  .rdtscp_supported = svm_rdtscp_supported,
+  .invpcid_supported = svm_invpcid_supported,
++ .mpx_supported = svm_mpx_supported,
+ 
+  .set_supported_cpuid = svm_set_supported_cpuid,
+ 
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index c95bea1..1320e0f 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -729,6 +729,7 @@ static unsigned long nested_ept_get_cr3(struct kvm_vcpu *vcpu);
+ static u64 construct_eptp(unsigned long root_hpa);
+ static void kvm_cpu_vmxon(u64 addr);
+ static void kvm_cpu_vmxoff(void);
++static bool vmx_mpx_supported(void);
+ static int vmx_set_tss_addr(struct kvm *kvm, unsigned int addr);
+ static void vmx_set_segment(struct kvm_vcpu *vcpu,
+        struct kvm_segment *var, int seg);
+@@ -2501,6 +2502,8 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 *pdata)
+   data = vmcs_readl(GUEST_SYSENTER_ESP);
+   break;
+  case MSR_IA32_BNDCFGS:
++  if (!vmx_mpx_supported())
++   return 1;
+   data = vmcs_read64(GUEST_BNDCFGS);
+   break;
+  case MSR_IA32_FEATURE_CONTROL:
+@@ -2572,6 +2575,8 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+   vmcs_writel(GUEST_SYSENTER_ESP, data);
+   break;
+  case MSR_IA32_BNDCFGS:
++  if (!vmx_mpx_supported())
++   return 1;
+   vmcs_write64(GUEST_BNDCFGS, data);
+   break;
+  case MSR_IA32_TSC:
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 0f222b7..919bd38 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3940,6 +3940,23 @@ static void kvm_init_msr_list(void)
+  for (i = j = KVM_SAVE_MSRS_BEGIN; i < ARRAY_SIZE(msrs_to_save); i++) {
+   if (rdmsr_safe(msrs_to_save[i], &dummy[0], &dummy[1]) < 0)
+    continue;
++
++  /*
++   * Even MSRs that are valid in the host may not be exposed
++   * to the guests in some cases.  We could work around this
++   * in VMX with the generic MSR save/load machinery, but it
++   * is not really worthwhile since it will really only
++   * happen with nested virtualization.
++   */
++  switch (msrs_to_save[i]) {
++  case MSR_IA32_BNDCFGS:
++   if (!kvm_x86_ops->mpx_supported())
++    continue;
++   break;
++  default:
++   break;
++  }
++
+   if (j < i)
+    msrs_to_save[j] = msrs_to_save[i];
+   j++;
+-- 
+1.7.1

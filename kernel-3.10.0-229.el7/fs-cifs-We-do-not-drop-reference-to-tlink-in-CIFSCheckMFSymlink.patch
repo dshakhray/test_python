@@ -1,0 +1,128 @@
+From ed2d727516414167979e88142542bca74074a6bc Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Tue, 18 Mar 2014 17:30:42 -0400
+Subject: [fs] cifs: We do not drop reference to tlink in CIFSCheckMFSymlink()
+
+Message-id: <1395163848-29977-2-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 78386
+O-Subject: [RHEL7 PATCH 1/7] [bz1077230]cifs: We do not drop reference to tlink in CIFSCheckMFSymlink()
+Bugzilla: 1077230
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Jeff Layton <jlayton@redhat.com>
+
+When we obtain tcon from cifs_sb, we use cifs_sb_tlink() to first obtain
+tlink which also grabs a reference to it. We do not drop this reference
+to tlink once we are done with the call.
+
+The patch fixes this issue by instead passing tcon as a parameter and
+avoids having to obtain a reference to the tlink. A lookup for the tcon
+is already made in the calling functions and this way we avoid having to
+re-run the lookup. This is also consistent with the argument list for
+other similar calls for M-F symlinks.
+
+We should also return an ENOSYS when we do not find a protocol specific
+function to lookup the MF Symlink data.
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+CC: Stable <stable@kernel.org>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 750b8de6c4277d7034061e1da50663aa1b0479e4)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index c0fdd93..6ce1333 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -475,9 +475,10 @@ extern int CIFSGetExtAttr(const unsigned int xid, struct cifs_tcon *tcon,
+    const int netfid, __u64 *pExtAttrBits, __u64 *pMask);
+ extern void cifs_autodisable_serverino(struct cifs_sb_info *cifs_sb);
+ extern bool CIFSCouldBeMFSymlink(const struct cifs_fattr *fattr);
+-extern int CIFSCheckMFSymlink(struct cifs_fattr *fattr,
+-  const unsigned char *path,
+-  struct cifs_sb_info *cifs_sb, unsigned int xid);
++extern int CIFSCheckMFSymlink(unsigned int xid, struct cifs_tcon *tcon,
++         struct cifs_sb_info *cifs_sb,
++         struct cifs_fattr *fattr,
++         const unsigned char *path);
+ extern int mdfour(unsigned char *, unsigned char *, int);
+ extern int E_md4hash(const unsigned char *passwd, unsigned char *p16,
+    const struct nls_table *codepage);
+diff --git a/fs/cifs/inode.c b/fs/cifs/inode.c
+index e3bb647..6bc8c74 100644
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -356,7 +356,8 @@ int cifs_get_inode_info_unix(struct inode **pinode,
+ 
+  /* check for Minshall+French symlinks */
+  if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS) {
+-  int tmprc = CIFSCheckMFSymlink(&fattr, full_path, cifs_sb, xid);
++  int tmprc = CIFSCheckMFSymlink(xid, tcon, cifs_sb, &fattr,
++            full_path);
+   if (tmprc)
+    cifs_dbg(FYI, "CIFSCheckMFSymlink: %d\n", tmprc);
+  }
+@@ -763,7 +764,8 @@ cifs_get_inode_info(struct inode **inode, const char *full_path,
+ 
+  /* check for Minshall+French symlinks */
+  if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS) {
+-  tmprc = CIFSCheckMFSymlink(&fattr, full_path, cifs_sb, xid);
++  tmprc = CIFSCheckMFSymlink(xid, tcon, cifs_sb, &fattr,
++        full_path);
+   if (tmprc)
+    cifs_dbg(FYI, "CIFSCheckMFSymlink: %d\n", tmprc);
+  }
+diff --git a/fs/cifs/link.c b/fs/cifs/link.c
+index 75c3ed4..878c696 100644
+--- a/fs/cifs/link.c
++++ b/fs/cifs/link.c
+@@ -354,34 +354,30 @@ open_query_close_cifs_symlink(const unsigned char *path, char *pbuf,
+ 
+ 
+ int
+-CIFSCheckMFSymlink(struct cifs_fattr *fattr,
+-     const unsigned char *path,
+-     struct cifs_sb_info *cifs_sb, unsigned int xid)
++CIFSCheckMFSymlink(unsigned int xid, struct cifs_tcon *tcon,
++     struct cifs_sb_info *cifs_sb, struct cifs_fattr *fattr,
++     const unsigned char *path)
+ {
+- int rc = 0;
++ int rc;
+  u8 *buf = NULL;
+  unsigned int link_len = 0;
+  unsigned int bytes_read = 0;
+- struct cifs_tcon *ptcon;
+ 
+  if (!CIFSCouldBeMFSymlink(fattr))
+   /* it's not a symlink */
+   return 0;
+ 
+  buf = kmalloc(CIFS_MF_SYMLINK_FILE_SIZE, GFP_KERNEL);
+- if (!buf) {
+-  rc = -ENOMEM;
+-  goto out;
+- }
++ if (!buf)
++  return -ENOMEM;
+ 
+- ptcon = tlink_tcon(cifs_sb_tlink(cifs_sb));
+- if ((ptcon->ses) && (ptcon->ses->server->ops->query_mf_symlink))
+-  rc = ptcon->ses->server->ops->query_mf_symlink(path, buf,
+-       &bytes_read, cifs_sb, xid);
++ if (tcon->ses->server->ops->query_mf_symlink)
++  rc = tcon->ses->server->ops->query_mf_symlink(path, buf,
++      &bytes_read, cifs_sb, xid);
+  else
+-  goto out;
++  rc = -ENOSYS;
+ 
+- if (rc != 0)
++ if (rc)
+   goto out;
+ 
+  if (bytes_read == 0) /* not a symlink */
+-- 
+1.7.1

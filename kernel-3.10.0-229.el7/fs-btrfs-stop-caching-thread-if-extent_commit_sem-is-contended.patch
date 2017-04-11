@@ -1,0 +1,82 @@
+From 54c5676637cb75983a1e283f141ff5d481e57df7 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 18:59:26 -0400
+Subject: [fs] btrfs: stop caching thread if extent_commit_sem is contended
+
+Message-id: <1407179109-13714-80-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87048
+O-Subject: [RHEL7.1 PATCH 079/422] Btrfs: stop caching thread if extent_commit_sem is contended
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Josef Bacik <jbacik@fusionio.com>
+
+commit c9ea7b24ce5863d65efb1134319cede160674d41
+Author: Josef Bacik <jbacik@fusionio.com>
+Date:   Thu Sep 19 10:02:11 2013 -0400
+
+    Btrfs: stop caching thread if extent_commit_sem is contended
+
+    We can starve out the transaction commit with a bunch of caching threads all
+    running at the same time.  This is because we will only drop the
+    extent_commit_sem if we need_resched(), which isn't likely to happen since we
+    will be reading a lot from the disk so have already schedule()'ed plenty.  Alex
+    observed that he could starve out a transaction commit for up to a minute with
+    32 caching threads all running at once.  This will allow us to drop the
+    extent_commit_sem to allow the transaction commit to swap the commit_root out
+    and then all the cachers will start back up. Here is an explanation provided by
+    Igno
+
+    So, just to fill in what happens in this loop:
+
+                                    mutex_unlock(&caching_ctl->mutex);
+                                    cond_resched();
+                                    goto again;
+
+    where 'again:' takes caching_ctl->mutex and fs_info->extent_commit_sem
+    again:
+
+            again:
+                    mutex_lock(&caching_ctl->mutex);
+                    /* need to make sure the commit_root doesn't disappear */
+                    down_read(&fs_info->extent_commit_sem);
+
+    So, if I'm reading the code correct, there can be a fair amount of
+    concurrency here: there may be multiple 'caching kthreads' per filesystem
+    active, while there's one fs_info->extent_commit_sem per filesystem
+    AFAICS.
+
+    So, what happens if there are a lot of CPUs all busy holding the
+    ->extent_commit_sem rwsem read-locked and a writer arrives? They'd all
+    rush to try to release the fs_info->extent_commit_sem, and they'd block in
+    the down_read() because there's a writer waiting.
+
+    So there's a guarantee of forward progress. This should answer akpm's
+    concern I think.
+
+    Thanks,
+
+    Acked-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 1c82bea..3d19dcc 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -442,7 +442,8 @@ next:
+    if (ret)
+     break;
+ 
+-   if (need_resched()) {
++   if (need_resched() ||
++       rwsem_is_contended(&fs_info->extent_commit_sem)) {
+     caching_ctl->progress = last;
+     btrfs_release_path(path);
+     up_read(&fs_info->extent_commit_sem);
+-- 
+1.7.1

@@ -1,0 +1,73 @@
+From b06ca29e8f1c0c1deffe31b991f6bccf7d482753 Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Mon, 16 Jun 2014 16:01:57 -0400
+Subject: [kernel] uprobes: Fix is_64bit_mm() with CONFIG_X86_X32
+
+Message-id: <20140616160157.GA15479@redhat.com>
+Patchwork-id: 84082
+O-Subject: [PATCH RHEL7 BZ 1073627 21/36] uprobes/x86: Fix is_64bit_mm() with CONFIG_X86_X32
+Bugzilla: 1073627
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+RHBZ: 1073627
+
+is_64bit_mm() assumes that mm->context.ia32_compat means the 32-bit
+instruction set, this is not true if the task is TIF_X32.
+
+Change set_personality_ia32() to initialize mm->context.ia32_compat
+by TIF_X32 or TIF_IA32 instead of 1. This allows to fix is_64bit_mm()
+without affecting other users, they all treat ia32_compat as "bool".
+
+TIF_ in ->ia32_compat looks a bit strange, but this is grep-friendly
+and avoids the new define's.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+Acked-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+(cherry picked from commit b24dc8dace74708fd849312722090169c5da97d3)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index f99a242..739ac35 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -398,12 +398,11 @@ void set_personality_ia32(bool x32)
+  set_thread_flag(TIF_ADDR32);
+ 
+  /* Mark the associated mm as containing 32-bit tasks. */
+- if (current->mm)
+-  current->mm->context.ia32_compat = 1;
+-
+  if (x32) {
+   clear_thread_flag(TIF_IA32);
+   set_thread_flag(TIF_X32);
++  if (current->mm)
++   current->mm->context.ia32_compat = TIF_X32;
+   current->personality &= ~READ_IMPLIES_EXEC;
+   /* is_compat_task() uses the presence of the x32
+      syscall bit flag to determine compat status */
+@@ -411,6 +410,8 @@ void set_personality_ia32(bool x32)
+  } else {
+   set_thread_flag(TIF_IA32);
+   clear_thread_flag(TIF_X32);
++  if (current->mm)
++   current->mm->context.ia32_compat = TIF_IA32;
+   current->personality |= force_personality32;
+   /* Prepare the first "return" to user space */
+   current_thread_info()->status |= TS_COMPAT;
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index 892975b..ecbffd1 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -245,7 +245,7 @@ static int uprobe_init_insn(struct arch_uprobe *auprobe, struct insn *insn, bool
+ static inline bool is_64bit_mm(struct mm_struct *mm)
+ {
+  return !config_enabled(CONFIG_IA32_EMULATION) ||
+-  !mm->context.ia32_compat;
++  !(mm->context.ia32_compat == TIF_IA32);
+ }
+ /*
+  * If arch_uprobe->insn doesn't use rip-relative addressing, return
+-- 
+1.7.1

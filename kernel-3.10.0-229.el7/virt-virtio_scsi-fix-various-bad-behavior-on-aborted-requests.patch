@@ -1,0 +1,70 @@
+From 68b14800ef27fa7f620d5df03c9ff774b2ef7310 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Thu, 11 Sep 2014 20:14:55 -0400
+Subject: [virt] virtio_scsi: fix various bad behavior on aborted requests
+
+Message-id: <1410466495-19013-2-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 93784
+O-Subject: [RHEL7 PATCH] virtio-scsi: fix various bad behavior on aborted requests
+Bugzilla: 1098506
+RH-Acked-by: Ewan Milne <emilne@redhat.com>
+RH-Acked-by: Stefan Hajnoczi <stefanha@redhat.com>
+RH-Acked-by: Fam Zheng <famz@redhat.com>
+RH-Acked-by: Jason Wang <jasowang@redhat.com>
+
+Bugzilla: 1098506
+
+Brew build: 7941686
+
+Even though the virtio-scsi spec guarantees that all requests related
+to the TMF will have been completed by the time the TMF itself completes,
+the request queue's callback might not have run yet.  This causes requests
+to be completed more than once, and as a result triggers a variety of
+BUGs or oopses.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8faeb529b2dabb9df691d614dda18910a43d05c9)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/virtio_scsi.c b/drivers/scsi/virtio_scsi.c
+index 22498f0..2b9e987 100644
+--- a/drivers/scsi/virtio_scsi.c
++++ b/drivers/scsi/virtio_scsi.c
+@@ -273,6 +273,16 @@ static void virtscsi_req_done(struct virtqueue *vq)
+  virtscsi_vq_done(vscsi, req_vq, virtscsi_complete_cmd);
+ };
+ 
++static void virtscsi_poll_requests(struct virtio_scsi *vscsi)
++{
++ int i, num_vqs;
++
++ num_vqs = vscsi->num_queues;
++ for (i = 0; i < num_vqs; i++)
++  virtscsi_vq_done(vscsi, &vscsi->req_vqs[i],
++     virtscsi_complete_cmd);
++}
++
+ static void virtscsi_complete_free(struct virtio_scsi *vscsi, void *buf)
+ {
+  struct virtio_scsi_cmd *cmd = buf;
+@@ -602,6 +612,18 @@ static int virtscsi_tmf(struct virtio_scsi *vscsi, struct virtio_scsi_cmd *cmd)
+      cmd->resp.tmf.response == VIRTIO_SCSI_S_FUNCTION_SUCCEEDED)
+   ret = SUCCESS;
+ 
++ /*
++  * The spec guarantees that all requests related to the TMF have
++  * been completed, but the callback might not have run yet if
++  * we're using independent interrupts (e.g. MSI).  Poll the
++  * virtqueues once.
++  *
++  * In the abort case, sc->scsi_done will do nothing, because
++  * the block layer must have detected a timeout and as a result
++  * REQ_ATOM_COMPLETE has been set.
++  */
++ virtscsi_poll_requests(vscsi);
++
+ out:
+  mempool_free(cmd, virtscsi_cmd_pool);
+  return ret;
+-- 
+1.7.1

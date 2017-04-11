@@ -1,0 +1,104 @@
+From dcde031fc52130a6fe5ddab1cdb00098f280f43a Mon Sep 17 00:00:00 2001
+From: Hendrik Brueckner <brueckner@redhat.com>
+Date: Thu, 21 Aug 2014 14:48:49 -0400
+Subject: [s390] con3215: fix hanging console issue
+
+Message-id: <1408632535-642-1-git-send-email-brueckner@redhat.com>
+Patchwork-id: 88680
+O-Subject: [RHEL7.1 PATCH] [s390] s390/3215: fix hanging console issue
+Bugzilla: 1132345
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Description
+-----------
+commit 26d766c60f4ea08cd14f0f3435a6db3d6cc2ae96
+Author: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Date:   Tue Jul 15 17:53:12 2014 +0200
+
+    s390/3215: fix hanging console issue
+
+    The ccw_device_start in raw3215_start_io can fail. raw3215_try_io
+    does not check if the request could be started and removes any
+    pending timer. This can leave the system in a hanging state.
+    Check for pending request after raw3215_start_io and start a
+    timer if necessary.
+
+    Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+Bugzilla
+--------
+BZ 1132345
+https://bugzilla.redhat.com/show_bug.cgi?id=1132345
+
+Upstream status of the patch
+----------------------------
+The patch is upstream as of kernel version
+http://git.kernel.org/?p=linux/kernel/git/torvalds/linux-2.6.git;a=commitdiff;h=26d766c60f4ea08cd14f0f3435a6db3d6cc2ae96
+
+Brew
+----
+https://brewweb.devel.redhat.com/taskinfo?taskID=7869031
+
+Test status
+-----------
+The patch has been tested and fixes the problem.
+The fix has been verified by the IBM test department.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/s390/char/con3215.c b/drivers/s390/char/con3215.c
+index eb5d227..f4e07f8 100644
+--- a/drivers/s390/char/con3215.c
++++ b/drivers/s390/char/con3215.c
+@@ -288,12 +288,16 @@ static void raw3215_timeout(unsigned long __data)
+  unsigned long flags;
+ 
+  spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
+- if (raw->flags & RAW3215_TIMER_RUNS) {
+-  del_timer(&raw->timer);
+-  raw->flags &= ~RAW3215_TIMER_RUNS;
+-  if (!(raw->port.flags & ASYNC_SUSPENDED)) {
+-   raw3215_mk_write_req(raw);
+-   raw3215_start_io(raw);
++ raw->flags &= ~RAW3215_TIMER_RUNS;
++ if (!(raw->port.flags & ASYNC_SUSPENDED)) {
++  raw3215_mk_write_req(raw);
++  raw3215_start_io(raw);
++  if ((raw->queued_read || raw->queued_write) &&
++      !(raw->flags & RAW3215_WORKING) &&
++      !(raw->flags & RAW3215_TIMER_RUNS)) {
++   raw->timer.expires = RAW3215_TIMEOUT + jiffies;
++   add_timer(&raw->timer);
++   raw->flags |= RAW3215_TIMER_RUNS;
+   }
+  }
+  spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+@@ -317,17 +321,15 @@ static inline void raw3215_try_io(struct raw3215_info *raw)
+       (raw->flags & RAW3215_FLUSHING)) {
+    /* execute write requests bigger than minimum size */
+    raw3215_start_io(raw);
+-   if (raw->flags & RAW3215_TIMER_RUNS) {
+-    del_timer(&raw->timer);
+-    raw->flags &= ~RAW3215_TIMER_RUNS;
+-   }
+-  } else if (!(raw->flags & RAW3215_TIMER_RUNS)) {
+-   /* delay small writes */
+-   raw->timer.expires = RAW3215_TIMEOUT + jiffies;
+-   add_timer(&raw->timer);
+-   raw->flags |= RAW3215_TIMER_RUNS;
+   }
+  }
++ if ((raw->queued_read || raw->queued_write) &&
++     !(raw->flags & RAW3215_WORKING) &&
++     !(raw->flags & RAW3215_TIMER_RUNS)) {
++  raw->timer.expires = RAW3215_TIMEOUT + jiffies;
++  add_timer(&raw->timer);
++  raw->flags |= RAW3215_TIMER_RUNS;
++ }
+ }
+ 
+ /*
+-- 
+1.7.1

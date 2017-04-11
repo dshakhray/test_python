@@ -1,0 +1,102 @@
+From 08b3f7a37ff3fedb104c8a0805912aed341c295c Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:06:03 -0400
+Subject: [virt] kvm/ppc: Book3S PR - Correct errors in H_ENTER implementation
+
+Message-id: <1410545655-205645-135-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94149
+O-Subject: [RHEL7 PATCH 134/626] KVM: PPC: Book3S PR: Correct errors in H_ENTER implementation
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 5cd92a9521d35013fff904d3c805323027a33d73
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Sep 20 14:52:47 2013 +1000
+
+    KVM: PPC: Book3S PR: Correct errors in H_ENTER implementation
+
+    The implementation of H_ENTER in PR KVM has some errors:
+
+    * With H_EXACT not set, if the HPTEG is full, we return H_PTEG_FULL
+      as the return value of kvmppc_h_pr_enter, but the caller is expecting
+      one of the EMULATE_* values.  The H_PTEG_FULL needs to go in the
+      guest's R3 instead.
+
+    * With H_EXACT set, if the selected HPTE is already valid, the H_ENTER
+      call should return a H_PTEG_FULL error.
+
+    This fixes these errors and also makes it write only the selected HPTE,
+    not the whole group, since only the selected HPTE has been modified.
+    This also micro-optimizes the calculations involving pte_index and i.
+
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/kvm/book3s_pr_papr.c b/arch/powerpc/kvm/book3s_pr_papr.c
+index da0e0bc..38f1899 100644
+--- a/arch/powerpc/kvm/book3s_pr_papr.c
++++ b/arch/powerpc/kvm/book3s_pr_papr.c
+@@ -21,6 +21,8 @@
+ #include <asm/kvm_ppc.h>
+ #include <asm/kvm_book3s.h>
+ 
++#define HPTE_SIZE 16  /* bytes per HPT entry */
++
+ static unsigned long get_pteg_addr(struct kvm_vcpu *vcpu, long pte_index)
+ {
+  struct kvmppc_vcpu_book3s *vcpu_book3s = to_book3s(vcpu);
+@@ -40,32 +42,39 @@ static int kvmppc_h_pr_enter(struct kvm_vcpu *vcpu)
+  long pte_index = kvmppc_get_gpr(vcpu, 5);
+  unsigned long pteg[2 * 8];
+  unsigned long pteg_addr, i, *hpte;
++ long int ret;
+ 
++ i = pte_index & 7;
+  pte_index &= ~7UL;
+  pteg_addr = get_pteg_addr(vcpu, pte_index);
+ 
+  copy_from_user(pteg, (void __user *)pteg_addr, sizeof(pteg));
+  hpte = pteg;
+ 
++ ret = H_PTEG_FULL;
+  if (likely((flags & H_EXACT) == 0)) {
+-  pte_index &= ~7UL;
+   for (i = 0; ; ++i) {
+    if (i == 8)
+-    return H_PTEG_FULL;
++    goto done;
+    if ((*hpte & HPTE_V_VALID) == 0)
+     break;
+    hpte += 2;
+   }
+  } else {
+-  i = kvmppc_get_gpr(vcpu, 5) & 7UL;
+   hpte += i * 2;
++  if (*hpte & HPTE_V_VALID)
++   goto done;
+  }
+ 
+  hpte[0] = kvmppc_get_gpr(vcpu, 6);
+  hpte[1] = kvmppc_get_gpr(vcpu, 7);
+- copy_to_user((void __user *)pteg_addr, pteg, sizeof(pteg));
+- kvmppc_set_gpr(vcpu, 3, H_SUCCESS);
++ pteg_addr += i * HPTE_SIZE;
++ copy_to_user((void __user *)pteg_addr, hpte, HPTE_SIZE);
+  kvmppc_set_gpr(vcpu, 4, pte_index | i);
++ ret = H_SUCCESS;
++
++ done:
++ kvmppc_set_gpr(vcpu, 3, ret);
+ 
+  return EMULATE_DONE;
+ }
+-- 
+1.7.1

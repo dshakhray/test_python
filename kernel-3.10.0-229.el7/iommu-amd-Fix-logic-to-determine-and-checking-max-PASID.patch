@@ -1,0 +1,127 @@
+From 75552043bdcd604c361c05d2886d45931cf5b072 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Fri, 5 Sep 2014 01:51:23 -0400
+Subject: [iommu] amd: Fix logic to determine and checking max PASID
+
+Message-id: <20140905015123.31297.77125.stgit@gir.stowe>
+Patchwork-id: 91349
+O-Subject: [RHEL7.1 PATCH 56/65] iommu/amd: Fix logic to determine and checking max PASID
+Bugzilla: 1129880 1087643
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Alex Williamson <alex.williamson@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1087643
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1129880
+Upstream Status: a919a018cccf999aa56d7f9adeae0525b01b7434
+
+commit a919a018cccf999aa56d7f9adeae0525b01b7434
+Author: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Date:   Wed Mar 5 18:54:18 2014 -0600
+
+    iommu/amd: Fix logic to determine and checking max PASID
+
+    In reality, the spec can only support 16-bit PASID since
+    INVALIDATE_IOTLB_PAGES and COMPLETE_PPR_REQUEST commands only allow 16-bit
+    PASID. So, we updated the PASID_MASK accordingly and invoke BUG_ON
+    if the hardware is reporting PASmax more than 16-bit.
+
+    Besides, max PASID is defined as ((2^(PASmax+1)) - 1). The current does not
+    determine this correctly.
+
+    Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+    Tested-by: Jay Cornwall <Jay.Cornwall@amd.com>
+    Signed-off-by: Joerg Roedel <joro@8bytes.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/iommu/amd_iommu.c b/drivers/iommu/amd_iommu.c
+index 724bf07..57068e8 100644
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -963,7 +963,7 @@ static void build_inv_iommu_pasid(struct iommu_cmd *cmd, u16 domid, int pasid,
+ 
+  address &= ~(0xfffULL);
+ 
+- cmd->data[0]  = pasid & PASID_MASK;
++ cmd->data[0]  = pasid;
+  cmd->data[1]  = domid;
+  cmd->data[2]  = lower_32_bits(address);
+  cmd->data[3]  = upper_32_bits(address);
+@@ -1001,7 +1001,7 @@ static void build_complete_ppr(struct iommu_cmd *cmd, u16 devid, int pasid,
+ 
+  cmd->data[0]  = devid;
+  if (gn) {
+-  cmd->data[1]  = pasid & PASID_MASK;
++  cmd->data[1]  = pasid;
+   cmd->data[2]  = CMD_INV_IOMMU_PAGES_GN_MASK;
+  }
+  cmd->data[3]  = tag & 0x1ff;
+diff --git a/drivers/iommu/amd_iommu_init.c b/drivers/iommu/amd_iommu_init.c
+index d9e92b9..ddd0b1f 100644
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@ -151,7 +151,7 @@ int amd_iommus_present;
+ bool amd_iommu_np_cache __read_mostly;
+ bool amd_iommu_iotlb_sup __read_mostly = true;
+ 
+-u32 amd_iommu_max_pasids __read_mostly = ~0;
++u32 amd_iommu_max_pasid __read_mostly = ~0;
+ 
+ bool amd_iommu_v2_present __read_mostly;
+ 
+@@ -1193,14 +1193,16 @@ static int iommu_init_pci(struct amd_iommu *iommu)
+ 
+  if (iommu_feature(iommu, FEATURE_GT)) {
+   int glxval;
+-  u32 pasids;
+-  u64 shift;
++  u32 max_pasid;
++  u64 pasmax;
+ 
+-  shift   = iommu->features & FEATURE_PASID_MASK;
+-  shift >>= FEATURE_PASID_SHIFT;
+-  pasids  = (1 << shift);
++  pasmax = iommu->features & FEATURE_PASID_MASK;
++  pasmax >>= FEATURE_PASID_SHIFT;
++  max_pasid  = (1 << (pasmax + 1)) - 1;
+ 
+-  amd_iommu_max_pasids = min(amd_iommu_max_pasids, pasids);
++  amd_iommu_max_pasid = min(amd_iommu_max_pasid, max_pasid);
++
++  BUG_ON(amd_iommu_max_pasid & ~PASID_MASK);
+ 
+   glxval   = iommu->features & FEATURE_GLXVAL_MASK;
+   glxval >>= FEATURE_GLXVAL_SHIFT;
+diff --git a/drivers/iommu/amd_iommu_types.h b/drivers/iommu/amd_iommu_types.h
+index 5d9660e..3a2f9fa 100644
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@ -98,7 +98,12 @@
+ #define FEATURE_GLXVAL_SHIFT 14
+ #define FEATURE_GLXVAL_MASK (0x03ULL << FEATURE_GLXVAL_SHIFT)
+ 
+-#define PASID_MASK  0x000fffff
++/* Note:
++ * The current driver only support 16-bit PASID.
++ * Currently, hardware only implement upto 16-bit PASID
++ * even though the spec says it could have upto 20 bits.
++ */
++#define PASID_MASK  0x0000ffff
+ 
+ /* MMIO status bits */
+ #define MMIO_STATUS_EVT_INT_MASK (1 << 1)
+@@ -688,8 +693,8 @@ extern unsigned long *amd_iommu_pd_alloc_bitmap;
+  */
+ extern u32 amd_iommu_unmap_flush;
+ 
+-/* Smallest number of PASIDs supported by any IOMMU in the system */
+-extern u32 amd_iommu_max_pasids;
++/* Smallest max PASID supported by any IOMMU in the system */
++extern u32 amd_iommu_max_pasid;
+ 
+ extern bool amd_iommu_v2_present;
+ 
+-- 
+1.7.1

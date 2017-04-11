@@ -1,0 +1,109 @@
+From 863367cbe66efeb7fec6ea121af91d1a3c3d93f8 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Tue, 19 Aug 2014 15:25:19 -0400
+Subject: [tools] perf/evlist: Fix perf_evlist__mmap_read event overflow
+
+Message-id: <1408462094-14194-151-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88118
+O-Subject: [PATCH RHEL7.1 BZ1131394 150/325] perf evlist: Fix perf_evlist__mmap_read event overflow
+Bugzilla: 1131394
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1131394
+https://bugzilla.redhat.com/show_bug.cgi?id=1131394
+
+upstream
+========
+commit a65cb4b9f8a777a715371c63c0525408048cea3e
+Author: Jiri Olsa <jolsa@redhat.com>
+Date: Wed Oct 2 15:46:39 2013 +0200
+
+description
+===========
+The perf_evlist__mmap_read used 'union perf_event' as a placeholder for
+event crossing the mmap boundary.
+
+This is ok for sample shorter than ~PATH_MAX. However we could grow up
+to the maximum sample size which is 16 bits max.
+
+I hit this overflow issue when using 'perf top -G dwarf' which produces
+sample with the size around 8192 bytes.  We could configure any valid
+sample size here using: '-G dwarf,size'.
+
+Using array with sample max size instead for the event placeholder. Also
+adding another safe check for the dynamic size of the user stack.
+
+TODO: The 'struct perf_mmap' is quite big now, maybe we could use some
+lazy allocation for event_copy size.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/event.h b/tools/perf/util/event.h
+index 9b7d4d3..752709c 100644
+--- a/tools/perf/util/event.h
++++ b/tools/perf/util/event.h
+@@ -75,6 +75,9 @@ struct throttle_event {
+   PERF_SAMPLE_CPU | PERF_SAMPLE_PERIOD |  \
+   PERF_SAMPLE_IDENTIFIER)
+ 
++/* perf sample has 16 bits size limit */
++#define PERF_SAMPLE_MAX_SIZE (1 << 16)
++
+ struct sample_event {
+  struct perf_event_header        header;
+  u64 array[];
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index 886b28f..a7d7786 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -540,7 +540,7 @@ union perf_event *perf_evlist__mmap_read(struct perf_evlist *evlist, int idx)
+   if ((old & md->mask) + size != ((old + size) & md->mask)) {
+    unsigned int offset = old;
+    unsigned int len = min(sizeof(*event), size), cpy;
+-   void *dst = &md->event_copy;
++   void *dst = md->event_copy;
+ 
+    do {
+     cpy = min(md->mask + 1 - (offset & md->mask), len);
+@@ -550,7 +550,7 @@ union perf_event *perf_evlist__mmap_read(struct perf_evlist *evlist, int idx)
+     len -= cpy;
+    } while (len);
+ 
+-   event = &md->event_copy;
++   event = (union perf_event *) md->event_copy;
+   }
+ 
+   old += size;
+diff --git a/tools/perf/util/evlist.h b/tools/perf/util/evlist.h
+index 3cf03c1..acdf2b6 100644
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@ -21,7 +21,7 @@ struct perf_mmap {
+  void   *base;
+  int   mask;
+  unsigned int  prev;
+- union perf_event event_copy;
++ char   event_copy[PERF_SAMPLE_MAX_SIZE];
+ };
+ 
+ struct perf_evlist {
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 35dde90..bab6775 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -1455,6 +1455,9 @@ int perf_evsel__parse_sample(struct perf_evsel *evsel, union perf_event *event,
+    array = (void *)array + sz;
+    OVERFLOW_CHECK_u64(array);
+    data->user_stack.size = *array++;
++   if (WARN_ONCE(data->user_stack.size > sz,
++          "user stack dump failure\n"))
++    return -EFAULT;
+   }
+  }
+ 
+-- 
+1.7.1

@@ -1,0 +1,163 @@
+From e15324beedae1277f09c2f2a1941b47e4d11f763 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 14:35:37 -0400
+Subject: [block] blk-mq: respect rq_affinity
+
+Message-id: <1402670238-13916-50-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83795
+O-Subject: [RHEL7.1 PATCH 049/150] blk-mq: respect rq_affinity
+Bugzilla: 1105204
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Jeff Moyer <jmoyer@redhat.com>
+
+BZ: 1105204
+
+Upstream commit 38535201633077cbaf8b32886b5e3005b36c9024
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Apr 25 02:32:53 2014 -0700
+
+    blk-mq: respect rq_affinity
+
+    The blk-mq code is using it's own version of the I/O completion affinity
+    tunables, which causes a few issues:
+
+     - the rq_affinity sysfs file doesn't work for blk-mq devices, even if it
+       still is present, thus breaking existing tuning setups.
+     - the rq_affinity = 1 mode, which is the defauly for legacy request based
+       drivers isn't implemented at all.
+     - blk-mq drivers don't implement any completion affinity with the default
+       flag settings.
+
+    This patches removes the blk-mq ipi_redirect flag and sysfs file, as well
+    as the internal BLK_MQ_F_SHOULD_IPI flag and replaces it with code that
+    respects the queue-wide rq_affinity flags and also implements the
+    rq_affinity = 1 mode.
+
+    This means I/O completion affinity can now only be tuned block-queue wide
+    instead of per context, which seems more sensible to me anyway.
+
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-mq-sysfs.c b/block/blk-mq-sysfs.c
+index 9176a69..8145b5b 100644
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@ -203,42 +203,6 @@ static ssize_t blk_mq_hw_sysfs_rq_list_show(struct blk_mq_hw_ctx *hctx,
+  return ret;
+ }
+ 
+-static ssize_t blk_mq_hw_sysfs_ipi_show(struct blk_mq_hw_ctx *hctx, char *page)
+-{
+- ssize_t ret;
+-
+- spin_lock(&hctx->lock);
+- ret = sprintf(page, "%u\n", !!(hctx->flags & BLK_MQ_F_SHOULD_IPI));
+- spin_unlock(&hctx->lock);
+-
+- return ret;
+-}
+-
+-static ssize_t blk_mq_hw_sysfs_ipi_store(struct blk_mq_hw_ctx *hctx,
+-      const char *page, size_t len)
+-{
+- struct blk_mq_ctx *ctx;
+- unsigned long ret;
+- unsigned int i;
+-
+- if (kstrtoul(page, 10, &ret)) {
+-  pr_err("blk-mq-sysfs: invalid input '%s'\n", page);
+-  return -EINVAL;
+- }
+-
+- spin_lock(&hctx->lock);
+- if (ret)
+-  hctx->flags |= BLK_MQ_F_SHOULD_IPI;
+- else
+-  hctx->flags &= ~BLK_MQ_F_SHOULD_IPI;
+- spin_unlock(&hctx->lock);
+-
+- hctx_for_each_ctx(hctx, ctx, i)
+-  ctx->ipi_redirect = !!ret;
+-
+- return len;
+-}
+-
+ static ssize_t blk_mq_hw_sysfs_tags_show(struct blk_mq_hw_ctx *hctx, char *page)
+ {
+  return blk_mq_tag_sysfs_show(hctx->tags, page);
+@@ -307,11 +271,6 @@ static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_pending = {
+  .attr = {.name = "pending", .mode = S_IRUGO },
+  .show = blk_mq_hw_sysfs_rq_list_show,
+ };
+-static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_ipi = {
+- .attr = {.name = "ipi_redirect", .mode = S_IRUGO | S_IWUSR},
+- .show = blk_mq_hw_sysfs_ipi_show,
+- .store = blk_mq_hw_sysfs_ipi_store,
+-};
+ static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_tags = {
+  .attr = {.name = "tags", .mode = S_IRUGO },
+  .show = blk_mq_hw_sysfs_tags_show,
+@@ -326,7 +285,6 @@ static struct attribute *default_hw_ctx_attrs[] = {
+  &blk_mq_hw_sysfs_run.attr,
+  &blk_mq_hw_sysfs_dispatched.attr,
+  &blk_mq_hw_sysfs_pending.attr,
+- &blk_mq_hw_sysfs_ipi.attr,
+  &blk_mq_hw_sysfs_tags.attr,
+  &blk_mq_hw_sysfs_cpus.attr,
+  NULL,
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index a84112c..f2e92eb 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -326,15 +326,19 @@ static void __blk_mq_complete_request_remote(void *data)
+ void __blk_mq_complete_request(struct request *rq)
+ {
+  struct blk_mq_ctx *ctx = rq->mq_ctx;
++ bool shared = false;
+  int cpu;
+ 
+- if (!ctx->ipi_redirect) {
++ if (!test_bit(QUEUE_FLAG_SAME_COMP, &rq->q->queue_flags)) {
+   rq->q->softirq_done_fn(rq);
+   return;
+  }
+ 
+  cpu = get_cpu();
+- if (cpu != ctx->cpu && cpu_online(ctx->cpu)) {
++ if (!test_bit(QUEUE_FLAG_SAME_FORCE, &rq->q->queue_flags))
++  shared = cpus_share_cache(cpu, ctx->cpu);
++
++ if (cpu != ctx->cpu && !shared && cpu_online(ctx->cpu)) {
+   rq->csd.func = __blk_mq_complete_request_remote;
+   rq->csd.info = rq;
+   rq->csd.flags = 0;
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index b41a784..1ae364c 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -11,7 +11,6 @@ struct blk_mq_ctx {
+ 
+  unsigned int  cpu;
+  unsigned int  index_hw;
+- unsigned int  ipi_redirect;
+ 
+  /* incremented at dispatch time */
+  unsigned long  rq_dispatched[2];
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index b1cb303..23b5783 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -122,7 +122,6 @@ enum {
+ 
+  BLK_MQ_F_SHOULD_MERGE = 1 << 0,
+  BLK_MQ_F_SHOULD_SORT = 1 << 1,
+- BLK_MQ_F_SHOULD_IPI = 1 << 2,
+ 
+  BLK_MQ_S_STOPPED = 0,
+ 
+-- 
+1.7.1

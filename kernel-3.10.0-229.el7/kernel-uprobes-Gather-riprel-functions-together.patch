@@ -1,0 +1,183 @@
+From 9028d15cb5fb3aca0f510caa1a26d4d97b8135ef Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Mon, 16 Jun 2014 16:01:17 -0400
+Subject: [kernel] uprobes: Gather "riprel" functions together
+
+Message-id: <20140616160117.GA15400@redhat.com>
+Patchwork-id: 84068
+O-Subject: [PATCH RHEL7 BZ 1073627 04/36] uprobes/x86: Gather "riprel" functions together
+Bugzilla: 1073627
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+RHBZ: 1073627
+
+Cosmetic. Move pre_xol_rip_insn() and handle_riprel_post_xol() up to
+the closely related handle_riprel_insn(). This way it is simpler to
+read and understand this code, and this lessens the number of ifdef's.
+
+While at it, update the comment in handle_riprel_post_xol() as Jim
+suggested.
+
+TODO: rename them somehow to make the naming consistent.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Reviewed-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Reviewed-by: Jim Keniston <jkenisto@us.ibm.com>
+(cherry picked from commit d20737c07a1063d681fe9fb86f3da369da1edab7)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index 963c121..c52c30f 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -313,6 +313,48 @@ handle_riprel_insn(struct arch_uprobe *auprobe, struct insn *insn)
+  }
+ }
+ 
++/*
++ * If we're emulating a rip-relative instruction, save the contents
++ * of the scratch register and store the target address in that register.
++ */
++static void
++pre_xol_rip_insn(struct arch_uprobe *auprobe, struct pt_regs *regs,
++    struct arch_uprobe_task *autask)
++{
++ if (auprobe->fixups & UPROBE_FIX_RIP_AX) {
++  autask->saved_scratch_register = regs->ax;
++  regs->ax = current->utask->vaddr;
++  regs->ax += auprobe->rip_rela_target_address;
++ } else if (auprobe->fixups & UPROBE_FIX_RIP_CX) {
++  autask->saved_scratch_register = regs->cx;
++  regs->cx = current->utask->vaddr;
++  regs->cx += auprobe->rip_rela_target_address;
++ }
++}
++
++static void
++handle_riprel_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs, long *correction)
++{
++ if (auprobe->fixups & (UPROBE_FIX_RIP_AX | UPROBE_FIX_RIP_CX)) {
++  struct arch_uprobe_task *autask;
++
++  autask = &current->utask->autask;
++  if (auprobe->fixups & UPROBE_FIX_RIP_AX)
++   regs->ax = autask->saved_scratch_register;
++  else
++   regs->cx = autask->saved_scratch_register;
++
++  /*
++   * The original instruction includes a displacement, and so
++   * is 4 bytes longer than what we've just single-stepped.
++   * Caller may need to apply other fixups to handle stuff
++   * like "jmpq *...(%rip)" and "callq *...(%rip)".
++   */
++  if (correction)
++   *correction += 4;
++ }
++}
++
+ static int validate_insn_64bits(struct arch_uprobe *auprobe, struct insn *insn)
+ {
+  insn_init(insn, auprobe->insn, true);
+@@ -339,9 +381,19 @@ static int validate_insn_bits(struct arch_uprobe *auprobe, struct mm_struct *mm,
+  return validate_insn_64bits(auprobe, insn);
+ }
+ #else /* 32-bit: */
++/*
++ * No RIP-relative addressing on 32-bit
++ */
+ static void handle_riprel_insn(struct arch_uprobe *auprobe, struct insn *insn)
+ {
+- /* No RIP-relative addressing on 32-bit */
++}
++static void pre_xol_rip_insn(struct arch_uprobe *auprobe, struct pt_regs *regs,
++    struct arch_uprobe_task *autask)
++{
++}
++static void handle_riprel_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs,
++     long *correction)
++{
+ }
+ 
+ static int validate_insn_bits(struct arch_uprobe *auprobe, struct mm_struct *mm,  struct insn *insn)
+@@ -415,34 +467,6 @@ int arch_uprobe_analyze_insn(struct arch_uprobe *auprobe, struct mm_struct *mm,
+  return 0;
+ }
+ 
+-#ifdef CONFIG_X86_64
+-/*
+- * If we're emulating a rip-relative instruction, save the contents
+- * of the scratch register and store the target address in that register.
+- */
+-static void
+-pre_xol_rip_insn(struct arch_uprobe *auprobe, struct pt_regs *regs,
+-    struct arch_uprobe_task *autask)
+-{
+- if (auprobe->fixups & UPROBE_FIX_RIP_AX) {
+-  autask->saved_scratch_register = regs->ax;
+-  regs->ax = current->utask->vaddr;
+-  regs->ax += auprobe->rip_rela_target_address;
+- } else if (auprobe->fixups & UPROBE_FIX_RIP_CX) {
+-  autask->saved_scratch_register = regs->cx;
+-  regs->cx = current->utask->vaddr;
+-  regs->cx += auprobe->rip_rela_target_address;
+- }
+-}
+-#else
+-static void
+-pre_xol_rip_insn(struct arch_uprobe *auprobe, struct pt_regs *regs,
+-    struct arch_uprobe_task *autask)
+-{
+- /* No RIP-relative addressing on 32-bit */
+-}
+-#endif
+-
+ /*
+  * arch_uprobe_pre_xol - prepare to execute out of line.
+  * @auprobe: the probepoint information.
+@@ -492,42 +516,6 @@ static int adjust_ret_addr(unsigned long sp, long correction)
+  return 0;
+ }
+ 
+-#ifdef CONFIG_X86_64
+-static bool is_riprel_insn(struct arch_uprobe *auprobe)
+-{
+- return ((auprobe->fixups & (UPROBE_FIX_RIP_AX | UPROBE_FIX_RIP_CX)) != 0);
+-}
+-
+-static void
+-handle_riprel_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs, long *correction)
+-{
+- if (is_riprel_insn(auprobe)) {
+-  struct arch_uprobe_task *autask;
+-
+-  autask = &current->utask->autask;
+-  if (auprobe->fixups & UPROBE_FIX_RIP_AX)
+-   regs->ax = autask->saved_scratch_register;
+-  else
+-   regs->cx = autask->saved_scratch_register;
+-
+-  /*
+-   * The original instruction includes a displacement, and so
+-   * is 4 bytes longer than what we've just single-stepped.
+-   * Fall through to handle stuff like "jmpq *...(%rip)" and
+-   * "callq *...(%rip)".
+-   */
+-  if (correction)
+-   *correction += 4;
+- }
+-}
+-#else
+-static void
+-handle_riprel_post_xol(struct arch_uprobe *auprobe, struct pt_regs *regs, long *correction)
+-{
+- /* No RIP-relative addressing on 32-bit */
+-}
+-#endif
+-
+ /*
+  * If xol insn itself traps and generates a signal(Say,
+  * SIGILL/SIGSEGV/etc), then detect the case where a singlestepped
+-- 
+1.7.1

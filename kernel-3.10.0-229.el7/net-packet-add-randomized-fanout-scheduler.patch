@@ -1,0 +1,96 @@
+From ec5e494cba646eed32428045102a7022bfd66dfc Mon Sep 17 00:00:00 2001
+From: Daniel Borkmann <dborkman@redhat.com>
+Date: Tue, 11 Feb 2014 13:28:24 -0500
+Subject: [net] packet: add randomized fanout scheduler
+
+Message-id: <b8d86d17c3c7ca52ddbf148bcf7eb46aea6908e3.1392120367.git.dborkman@redhat.com>
+Patchwork-id: 76116
+O-Subject: [RHEL7 PATCH net 3/5] net: packet: add randomized fanout scheduler
+Bugzilla: 1052366
+RH-Acked-by: Thomas Graf <tgraf@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1052366
+Upstream Status: 5df0ddfbc9209ffafc82236509ba0e975120e3c3
+Brew: https://brewweb.devel.redhat.com/taskinfo?taskID=7027130
+Tested: verified on beaker
+
+Upstream Commit:
+commit 5df0ddfbc9209ffafc82236509ba0e975120e3c3
+Author: Daniel Borkmann <dborkman@redhat.com>
+Date:   Wed Aug 28 22:13:09 2013 +0200
+
+    net: packet: add randomized fanout scheduler
+
+    We currently allow for different fanout scheduling policies in pf_packet
+    such as scheduling by skb's rxhash, round-robin, by cpu, and rollover.
+    Also allow for a random, equidistributed selection of the socket from the
+    fanout process group.
+
+    Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/include/uapi/linux/if_packet.h b/include/uapi/linux/if_packet.h
+index b950c02..dbf0666 100644
+--- a/include/uapi/linux/if_packet.h
++++ b/include/uapi/linux/if_packet.h
+@@ -56,6 +56,7 @@ struct sockaddr_ll {
+ #define PACKET_FANOUT_LB  1
+ #define PACKET_FANOUT_CPU  2
+ #define PACKET_FANOUT_ROLLOVER  3
++#define PACKET_FANOUT_RND  4
+ #define PACKET_FANOUT_FLAG_ROLLOVER 0x1000
+ #define PACKET_FANOUT_FLAG_DEFRAG 0x8000
+ 
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 0086902..8305750 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -88,7 +88,7 @@
+ #include <linux/virtio_net.h>
+ #include <linux/errqueue.h>
+ #include <linux/net_tstamp.h>
+-
++#include <linux/reciprocal_div.h>
+ #ifdef CONFIG_INET
+ #include <net/inet_common.h>
+ #endif
+@@ -1186,6 +1186,13 @@ static unsigned int fanout_demux_cpu(struct packet_fanout *f,
+  return smp_processor_id() % num;
+ }
+ 
++static unsigned int fanout_demux_rnd(struct packet_fanout *f,
++         struct sk_buff *skb,
++         unsigned int num)
++{
++ return reciprocal_divide(prandom_u32(), num);
++}
++
+ static unsigned int fanout_demux_rollover(struct packet_fanout *f,
+        struct sk_buff *skb,
+        unsigned int idx, unsigned int skip,
+@@ -1243,6 +1250,9 @@ static int packet_rcv_fanout(struct sk_buff *skb, struct net_device *dev,
+  case PACKET_FANOUT_CPU:
+   idx = fanout_demux_cpu(f, skb, num);
+   break;
++ case PACKET_FANOUT_RND:
++  idx = fanout_demux_rnd(f, skb, num);
++  break;
+  case PACKET_FANOUT_ROLLOVER:
+   idx = fanout_demux_rollover(f, skb, 0, (unsigned int) -1, num);
+   break;
+@@ -1312,6 +1322,7 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
+  case PACKET_FANOUT_HASH:
+  case PACKET_FANOUT_LB:
+  case PACKET_FANOUT_CPU:
++ case PACKET_FANOUT_RND:
+   break;
+  default:
+   return -EINVAL;
+-- 
+1.7.1

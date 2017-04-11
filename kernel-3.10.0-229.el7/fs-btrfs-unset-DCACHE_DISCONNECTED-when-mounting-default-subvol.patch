@@ -1,0 +1,85 @@
+From 3fbff750006314a89f2456abcf00eea0bd400346 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:00:45 -0400
+Subject: [fs] btrfs: unset DCACHE_DISCONNECTED when mounting default subvol
+
+Message-id: <1407179109-13714-159-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87175
+O-Subject: [RHEL7.1 PATCH 158/422] Btrfs: unset DCACHE_DISCONNECTED when mounting default subvol
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Josef Bacik <jbacik@fb.com>
+
+commit 3a0dfa6a12e4bb64a434426ecb17d4842092db5e
+Author: Josef Bacik <jbacik@fb.com>
+Date:   Fri Feb 14 13:43:48 2014 -0500
+
+    Btrfs: unset DCACHE_DISCONNECTED when mounting default subvol
+
+    A user was running into errors from an NFS export of a subvolume that had a
+    default subvol set.  When we mount a default subvol we will use d_obtain_alias()
+    to find an existing dentry for the subvolume in the case that the root subvol
+    has already been mounted, or a dummy one is allocated in the case that the root
+    subvol has not already been mounted.  This allows us to connect the dentry later
+    on if we wander into the path.  However if we don't ever wander into the path we
+    will keep DCACHE_DISCONNECTED set for a long time, which angers NFS.  It doesn't
+    appear to cause any problems but it is annoying nonetheless, so simply unset
+    DCACHE_DISCONNECTED in the get_default_root case and switch btrfs_lookup() to
+    use d_materialise_unique() instead which will make everything play nicely
+    together and reconnect stuff if we wander into the defaul subvol path from a
+    different way.  With this patch I'm no longer getting the NFS errors when
+    exporting a volume that has been mounted with a default subvol set.  Thanks,
+
+    cc: bfields@fieldses.org
+    cc: ebiederm@xmission.com
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Acked-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index d07606e..84be070 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -5150,7 +5150,7 @@ static struct dentry *btrfs_lookup(struct inode *dir, struct dentry *dentry,
+    return ERR_CAST(inode);
+  }
+ 
+- return d_splice_alias(inode, dentry);
++ return d_materialise_unique(dentry, inode);
+ }
+ 
+ unsigned char btrfs_filetype_table[] = {
+diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+index e73c80e..d04db81 100644
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -855,6 +855,7 @@ static struct dentry *get_default_root(struct super_block *sb,
+  struct btrfs_path *path;
+  struct btrfs_key location;
+  struct inode *inode;
++ struct dentry *dentry;
+  u64 dir_id;
+  int new = 0;
+ 
+@@ -925,7 +926,13 @@ setup_root:
+   return dget(sb->s_root);
+  }
+ 
+- return d_obtain_alias(inode);
++ dentry = d_obtain_alias(inode);
++ if (!IS_ERR(dentry)) {
++  spin_lock(&dentry->d_lock);
++  dentry->d_flags &= ~DCACHE_DISCONNECTED;
++  spin_unlock(&dentry->d_lock);
++ }
++ return dentry;
+ }
+ 
+ static int btrfs_fill_super(struct super_block *sb,
+-- 
+1.7.1

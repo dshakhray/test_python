@@ -1,0 +1,226 @@
+From 68fc97533448e884eb0846ef05fe0c57c90dce3b Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:11:53 -0400
+Subject: [powerpc] eeh: Use cached capability for log dump
+
+Message-id: <1410545655-205645-485-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94356
+O-Subject: [RHEL7 PATCH 484/626] powerpc/eeh: Use cached capability for log dump
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit 2a18dfc6ee2ea00bba767f6968f1a107fdd8e687
+Author: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Date:   Thu Apr 24 18:00:16 2014 +1000
+
+    powerpc/eeh: Use cached capability for log dump
+
+    When calling into eeh_gather_pci_data() on pSeries platform, we
+    possiblly don't have pci_dev instance yet, but eeh_dev is always
+    ready. So we use cached capability from eeh_dev instead of pci_dev
+    for log dump there. In order to keep things unified, we also cache
+    PCI capability positions to eeh_dev for PowerNV as well.
+
+    Signed-off-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+kabi: fix struct eeh_dev
+
+kabi reason: This is an internally used struct no one outside of
+the arch/powerpc should use it.  Add fields at the end but retain
+the original field as that changed from a u8 to an int.
+
+----
+v2 - add in kabi_reserved field suggest by Jiri B.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/eeh.h b/arch/powerpc/include/asm/eeh.h
+index 0224b79..ea328e8 100644
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@ -109,13 +109,22 @@ struct eeh_dev {
+  int config_addr;  /* Config address  */
+  int pe_config_addr;  /* PE config address  */
+  u32 config_space[16];  /* Saved PCI config space */
+- u8 pcie_cap;   /* Saved PCIe capability */
++#ifdef __GENKSYMS__
++ u8 pcie_cap;   /* Saved PCIe capability        */
++#else
++ u8 kabi_reserved;  /* Preserve alignment for kabi  */
++#endif
+  struct eeh_pe *pe;  /* Associated PE  */
+  struct list_head list;  /* Form link list in the PE */
+  struct pci_controller *phb; /* Associated PHB  */
+  struct device_node *dn;  /* Associated device node */
+  struct pci_dev *pdev;  /* Associated PCI device */
+  struct pci_bus *bus;  /* PCI bus for partial hotplug */
++#ifndef __GENKSYMS__
++ int pcix_cap;   /* Saved PCIx capability */
++ int pcie_cap;   /* Saved PCIe capability */
++ int aer_cap;   /* Saved AER capability  */
++#endif
+ };
+ 
+ static inline struct device_node *eeh_dev_to_of_node(struct eeh_dev *edev)
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index bcc88d7..239ae18 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -145,7 +145,6 @@ static struct eeh_stats eeh_stats;
+ static size_t eeh_gather_pci_data(struct eeh_dev *edev, char * buf, size_t len)
+ {
+  struct device_node *dn = eeh_dev_to_of_node(edev);
+- struct pci_dev *dev = eeh_dev_to_pci_dev(edev);
+  u32 cfg;
+  int cap, i;
+  int n = 0;
+@@ -161,13 +160,8 @@ static size_t eeh_gather_pci_data(struct eeh_dev *edev, char * buf, size_t len)
+  n += scnprintf(buf+n, len-n, "cmd/stat:%x\n", cfg);
+  pr_warn("EEH: PCI cmd/status register: %08x\n", cfg);
+ 
+- if (!dev) {
+-  pr_warn("EEH: no PCI device for this of node\n");
+-  return n;
+- }
+-
+  /* Gather bridge-specific registers */
+- if (dev->class >> 16 == PCI_BASE_CLASS_BRIDGE) {
++ if (edev->mode & EEH_DEV_BRIDGE) {
+   eeh_ops->read_config(dn, PCI_SEC_STATUS, 2, &cfg);
+   n += scnprintf(buf+n, len-n, "sec stat:%x\n", cfg);
+   pr_warn("EEH: Bridge secondary status: %04x\n", cfg);
+@@ -178,7 +172,7 @@ static size_t eeh_gather_pci_data(struct eeh_dev *edev, char * buf, size_t len)
+  }
+ 
+  /* Dump out the PCI-X command and status regs */
+- cap = pci_find_capability(dev, PCI_CAP_ID_PCIX);
++ cap = edev->pcix_cap;
+  if (cap) {
+   eeh_ops->read_config(dn, cap, 4, &cfg);
+   n += scnprintf(buf+n, len-n, "pcix-cmd:%x\n", cfg);
+@@ -189,29 +183,29 @@ static size_t eeh_gather_pci_data(struct eeh_dev *edev, char * buf, size_t len)
+   pr_warn("EEH: PCI-X status: %08x\n", cfg);
+  }
+ 
+- /* If PCI-E capable, dump PCI-E cap 10, and the AER */
+- cap = pci_find_capability(dev, PCI_CAP_ID_EXP);
++ /* If PCI-E capable, dump PCI-E cap 10 */
++ cap = edev->pcie_cap;
+  if (cap) {
+   n += scnprintf(buf+n, len-n, "pci-e cap10:\n");
+   pr_warn("EEH: PCI-E capabilities and status follow:\n");
+ 
+   for (i=0; i<=8; i++) {
+-   eeh_ops->read_config(dn, dev->pcie_cap+4*i, 4, &cfg);
++   eeh_ops->read_config(dn, cap+4*i, 4, &cfg);
+    n += scnprintf(buf+n, len-n, "%02x:%x\n", 4*i, cfg);
+    pr_warn("EEH: PCI-E %02x: %08x\n", i, cfg);
+   }
++ }
+ 
+-  cap = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ERR);
+-  if (cap) {
+-   n += scnprintf(buf+n, len-n, "pci-e AER:\n");
+-   pr_warn("EEH: PCI-E AER capability register "
+-    "set follows:\n");
+-
+-   for (i=0; i<14; i++) {
+-    eeh_ops->read_config(dn, cap+4*i, 4, &cfg);
+-    n += scnprintf(buf+n, len-n, "%02x:%x\n", 4*i, cfg);
+-    pr_warn("EEH: PCI-E AER %02x: %08x\n", i, cfg);
+-   }
++ /* If AER capable, dump it */
++ cap = edev->aer_cap;
++ if (cap) {
++  n += scnprintf(buf+n, len-n, "pci-e AER:\n");
++  pr_warn("EEH: PCI-E AER capability register set follows:\n");
++
++  for (i=0; i<14; i++) {
++   eeh_ops->read_config(dn, cap+4*i, 4, &cfg);
++   n += scnprintf(buf+n, len-n, "%02x:%x\n", 4*i, cfg);
++   pr_warn("EEH: PCI-E AER %02x: %08x\n", i, cfg);
+   }
+  }
+ 
+diff --git a/arch/powerpc/platforms/powernv/eeh-powernv.c b/arch/powerpc/platforms/powernv/eeh-powernv.c
+index a59788e..56a206f 100644
+--- a/arch/powerpc/platforms/powernv/eeh-powernv.c
++++ b/arch/powerpc/platforms/powernv/eeh-powernv.c
+@@ -126,6 +126,7 @@ static int powernv_eeh_dev_probe(struct pci_dev *dev, void *flag)
+  edev->mode &= 0xFFFFFF00;
+  if (dev->hdr_type == PCI_HEADER_TYPE_BRIDGE)
+   edev->mode |= EEH_DEV_BRIDGE;
++ edev->pcix_cap = pci_find_capability(dev, PCI_CAP_ID_PCIX);
+  if (pci_is_pcie(dev)) {
+   edev->pcie_cap = pci_pcie_cap(dev);
+ 
+@@ -133,6 +134,9 @@ static int powernv_eeh_dev_probe(struct pci_dev *dev, void *flag)
+    edev->mode |= EEH_DEV_ROOT_PORT;
+   else if (pci_pcie_type(dev) == PCI_EXP_TYPE_DOWNSTREAM)
+    edev->mode |= EEH_DEV_DS_PORT;
++
++  edev->aer_cap = pci_find_ext_capability(dev,
++       PCI_EXT_CAP_ID_ERR);
+  }
+ 
+  edev->config_addr = ((dev->bus->number << 8) | dev->devfn);
+diff --git a/arch/powerpc/platforms/pseries/eeh_pseries.c b/arch/powerpc/platforms/pseries/eeh_pseries.c
+index 72589de..b97fa7c 100644
+--- a/arch/powerpc/platforms/pseries/eeh_pseries.c
++++ b/arch/powerpc/platforms/pseries/eeh_pseries.c
+@@ -175,6 +175,36 @@ static int pseries_eeh_find_cap(struct device_node *dn, int cap)
+  return 0;
+ }
+ 
++static int pseries_eeh_find_ecap(struct device_node *dn, int cap)
++{
++ struct pci_dn *pdn = PCI_DN(dn);
++ struct eeh_dev *edev = of_node_to_eeh_dev(dn);
++ u32 header;
++ int pos = 256;
++ int ttl = (4096 - 256) / 8;
++
++ if (!edev || !edev->pcie_cap)
++  return 0;
++ if (rtas_read_config(pdn, pos, 4, &header) != PCIBIOS_SUCCESSFUL)
++  return 0;
++ else if (!header)
++  return 0;
++
++ while (ttl-- > 0) {
++  if (PCI_EXT_CAP_ID(header) == cap && pos)
++   return pos;
++
++  pos = PCI_EXT_CAP_NEXT(header);
++  if (pos < 256)
++   break;
++
++  if (rtas_read_config(pdn, pos, 4, &header) != PCIBIOS_SUCCESSFUL)
++   break;
++ }
++
++ return 0;
++}
++
+ /**
+  * pseries_eeh_of_probe - EEH probe on the given device
+  * @dn: OF node
+@@ -220,7 +250,9 @@ static void *pseries_eeh_of_probe(struct device_node *dn, void *flag)
+   * or PCIe switch downstream port.
+   */
+  edev->class_code = class_code;
++ edev->pcix_cap = pseries_eeh_find_cap(dn, PCI_CAP_ID_PCIX);
+  edev->pcie_cap = pseries_eeh_find_cap(dn, PCI_CAP_ID_EXP);
++ edev->aer_cap = pseries_eeh_find_ecap(dn, PCI_EXT_CAP_ID_ERR);
+  edev->mode &= 0xFFFFFF00;
+  if ((edev->class_code >> 8) == PCI_CLASS_BRIDGE_PCI) {
+   edev->mode |= EEH_DEV_BRIDGE;
+-- 
+1.7.1

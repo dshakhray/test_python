@@ -1,0 +1,158 @@
+From 9b8e08625cc398bbd1ea8dd535ebae5edd2755e0 Mon Sep 17 00:00:00 2001
+From: Ewan Milne <emilne@redhat.com>
+Date: Tue, 11 Mar 2014 20:25:26 -0400
+Subject: [scsi] vmw_pvscsi: Fix pvscsi_abort() function
+
+Message-id: <1394569528-25923-2-git-send-email-emilne@redhat.com>
+Patchwork-id: 78187
+O-Subject: [RHEL7.1 PATCH e-stor 1/3] VMW_PVSCSI: Fix pvscsi_abort() function.
+Bugzilla: 1075090
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+This change ensures that pvscsi_abort() function returns SUCCESS
+only when the command in question was actually completed, otherwise
+returns FAILURE. The code before change, was causing a bug where
+driver tries to complete a command to the mid-layer while the mid-layer
+has already requested the driver to abort that command, in response
+to which the driver has responded with SUCCESS causing mid-layer
+to free the command struct.
+
+Signed-off-by: Arvind Kumar <arvindkumar@vmware.com>
+Signed-off-by: Ewan Milne <emilne@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/scsi/vmw_pvscsi.c b/drivers/scsi/vmw_pvscsi.c
+index 3bfaa66..a4dcc93 100644
+--- a/drivers/scsi/vmw_pvscsi.c
++++ b/drivers/scsi/vmw_pvscsi.c
+@@ -1,7 +1,7 @@
+ /*
+  * Linux driver for VMware's para-virtualized SCSI HBA.
+  *
+- * Copyright (C) 2008-2009, VMware, Inc. All Rights Reserved.
++ * Copyright (C) 2008-2014, VMware, Inc. All Rights Reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -62,6 +62,7 @@ struct pvscsi_ctx {
+  dma_addr_t  dataPA;
+  dma_addr_t  sensePA;
+  dma_addr_t  sglPA;
++ struct completion *abort_cmp;
+ };
+ 
+ struct pvscsi_adapter {
+@@ -177,6 +178,7 @@ static void pvscsi_release_context(struct pvscsi_adapter *adapter,
+        struct pvscsi_ctx *ctx)
+ {
+  ctx->cmd = NULL;
++ ctx->abort_cmp = NULL;
+  list_add(&ctx->list, &adapter->cmd_pool);
+ }
+ 
+@@ -496,15 +498,27 @@ static void pvscsi_complete_request(struct pvscsi_adapter *adapter,
+ {
+  struct pvscsi_ctx *ctx;
+  struct scsi_cmnd *cmd;
++ struct completion *abort_cmp;
+  u32 btstat = e->hostStatus;
+  u32 sdstat = e->scsiStatus;
+ 
+  ctx = pvscsi_get_context(adapter, e->context);
+  cmd = ctx->cmd;
++ abort_cmp = ctx->abort_cmp;
+  pvscsi_unmap_buffers(adapter, ctx);
+  pvscsi_release_context(adapter, ctx);
+- cmd->result = 0;
++ if (abort_cmp) {
++  /*
++   * The command was requested to be aborted. Just signal that
++   * the request completed and swallow the actual cmd completion
++   * here. The abort handler will post a completion for this
++   * command indicating that it got successfully aborted.
++   */
++  complete(abort_cmp);
++  return;
++ }
+ 
++ cmd->result = 0;
+  if (sdstat != SAM_STAT_GOOD &&
+      (btstat == BTSTAT_SUCCESS ||
+       btstat == BTSTAT_LINKED_COMMAND_COMPLETED ||
+@@ -726,6 +740,8 @@ static int pvscsi_abort(struct scsi_cmnd *cmd)
+  struct pvscsi_adapter *adapter = shost_priv(cmd->device->host);
+  struct pvscsi_ctx *ctx;
+  unsigned long flags;
++ int result = SUCCESS;
++ DECLARE_COMPLETION_ONSTACK(abort_cmp);
+ 
+  scmd_printk(KERN_DEBUG, cmd, "task abort on host %u, %p\n",
+       adapter->host->host_no, cmd);
+@@ -748,13 +764,40 @@ static int pvscsi_abort(struct scsi_cmnd *cmd)
+   goto out;
+  }
+ 
++ /*
++  * Mark that the command has been requested to be aborted and issue
++  * the abort.
++  */
++ ctx->abort_cmp = &abort_cmp;
++
+  pvscsi_abort_cmd(adapter, ctx);
++ spin_unlock_irqrestore(&adapter->hw_lock, flags);
++ /* Wait for 2 secs for the completion. */
++ wait_for_completion_timeout(&abort_cmp, msecs_to_jiffies(2000));
++ spin_lock_irqsave(&adapter->hw_lock, flags);
+ 
+- pvscsi_process_completion_ring(adapter);
++ if (!completion_done(&abort_cmp)) {
++  /*
++   * Failed to abort the command, unmark the fact that it
++   * was requested to be aborted.
++   */
++  ctx->abort_cmp = NULL;
++  result = FAILED;
++  scmd_printk(KERN_DEBUG, cmd,
++       "Failed to get completion for aborted cmd %p\n",
++       cmd);
++  goto out;
++ }
++
++ /*
++  * Successfully aborted the command.
++  */
++ cmd->result = (DID_ABORT << 16);
++ cmd->scsi_done(cmd);
+ 
+ out:
+  spin_unlock_irqrestore(&adapter->hw_lock, flags);
+- return SUCCESS;
++ return result;
+ }
+ 
+ /*
+diff --git a/drivers/scsi/vmw_pvscsi.h b/drivers/scsi/vmw_pvscsi.h
+index 3546e86..a643775 100644
+--- a/drivers/scsi/vmw_pvscsi.h
++++ b/drivers/scsi/vmw_pvscsi.h
+@@ -1,7 +1,7 @@
+ /*
+  * VMware PVSCSI header file
+  *
+- * Copyright (C) 2008-2009, VMware, Inc. All Rights Reserved.
++ * Copyright (C) 2008-2014, VMware, Inc. All Rights Reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -26,7 +26,7 @@
+ 
+ #include <linux/types.h>
+ 
+-#define PVSCSI_DRIVER_VERSION_STRING   "1.0.2.0-k"
++#define PVSCSI_DRIVER_VERSION_STRING   "1.0.3.0-k"
+ 
+ #define PVSCSI_MAX_NUM_SG_ENTRIES_PER_SEGMENT 128
+ 
+-- 
+1.7.1

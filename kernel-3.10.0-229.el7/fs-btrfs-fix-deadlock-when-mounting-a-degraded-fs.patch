@@ -1,0 +1,79 @@
+From 369b6a621c06760f3cb452d8f1063ed0d1c0eea7 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:04:48 -0400
+Subject: [fs] btrfs: fix deadlock when mounting a degraded fs
+
+Message-id: <1407179109-13714-402-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87339
+O-Subject: [RHEL7.1 PATCH 401/422] Btrfs: fix deadlock when mounting a degraded fs
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Miao Xie <miaox@cn.fujitsu.com>
+
+commit c55f13964008bfea7c5bee268f28b699cbad7f00
+Author: Miao Xie <miaox@cn.fujitsu.com>
+Date:   Thu Jun 19 10:42:54 2014 +0800
+
+    Btrfs: fix deadlock when mounting a degraded fs
+
+    The deadlock happened when we mount degraded filesystem, the reproduced
+    steps are following:
+     # mkfs.btrfs -f -m raid1 -d raid1 <dev0> <dev1>
+     # echo 1 > /sys/block/`basename <dev0>`/device/delete
+     # mount -o degraded <dev1> <mnt>
+
+    The reason was that the counter -- bi_remaining was wrong. If the missing
+    or unwriteable device was the last device in the mapping array, we would
+    not submit the original bio, so we shouldn't increase bi_remaining of it
+    in btrfs_end_bio(), or we would skip the final endio handle.
+
+    Fix this problem by adding a flag into btrfs bio structure. If we submit
+    the original bio, we will set the flag, and we increase bi_remaining counter,
+    or we don't.
+
+    Though there is another way to fix it -- decrease bi_remaining counter of the
+    original bio when we make sure the original bio is not submitted, this method
+    need add more check and is easy to make mistake.
+
+    Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+    Reviewed-by: Liu Bo <bo.li.liu@oracle.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index 3a8df87..74cf65e 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -5671,6 +5671,7 @@ int btrfs_map_bio(struct btrfs_root *root, int rw, struct bio *bio,
+    BUG_ON(!bio); /* -ENOMEM */
+   } else {
+    bio = first_bio;
++   bbio->flags |= BTRFS_BIO_ORIG_BIO_SUBMITTED;
+   }
+ 
+   submit_stripe_bio(root, bbio, bio,
+diff --git a/fs/btrfs/volumes.h b/fs/btrfs/volumes.h
+index 1a15bbe..2aaa00c 100644
+--- a/fs/btrfs/volumes.h
++++ b/fs/btrfs/volumes.h
+@@ -190,11 +190,14 @@ struct btrfs_bio_stripe {
+ struct btrfs_bio;
+ typedef void (btrfs_bio_end_io_t) (struct btrfs_bio *bio, int err);
+ 
++#define BTRFS_BIO_ORIG_BIO_SUBMITTED 0x1
++
+ struct btrfs_bio {
+  atomic_t stripes_pending;
+  struct btrfs_fs_info *fs_info;
+  bio_end_io_t *end_io;
+  struct bio *orig_bio;
++ unsigned long flags;
+  void *private;
+  atomic_t error;
+  int max_errors;
+-- 
+1.7.1

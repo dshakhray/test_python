@@ -1,0 +1,134 @@
+From 6d9ec11cc5163fd29160abbf023eea412f8e2e74 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 26 Jun 2014 14:25:14 -0400
+Subject: [pci] Disable Bus Master only on kexec reboot
+
+Message-id: <20140626142514.18681.69908.stgit@gir.stowe>
+Patchwork-id: 84969
+O-Subject: [RHEL7.1 PATCH 6/7] PCI: Disable Bus Master only on kexec reboot
+Bugzilla: 1110890
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110890
+Upstream Status: 4fc9bbf98fd66f879e628d8537ba7c240be2b58e
+
+A straight back-port of this commit yielded the following KABI error:
+  *** ERROR - ABI BREAKAGE WAS DETECTED ***
+  The following symbols have been changed (this will cause an ABI
+  breakage):
+  pci_unregister_driver
+  __pci_register_driver
+  + exit 1
+
+This is a result of the '#include <linux/kexec.h>' which turns opaque
+structs into non-opaque structs; causing the KABI checker's string
+checksuming to conservatively assume that a struct's content changed.  To
+work around the KABI breakage the '#include ...' inclusion was replaced
+with 'extern bool kexec_in_progress;'.
+
+Note also that there was a lot of contention upstream with a related patch
+posting:
+  https://lkml.org/lkml/2012/6/6/278
+  [PATCH] Disable Bus Master on PCI device shutdown
+
+commit 4fc9bbf98fd66f879e628d8537ba7c240be2b58e
+Author: Khalid Aziz <khalid.aziz@oracle.com>
+Date:   Wed Nov 27 15:19:25 2013 -0700
+
+    PCI: Disable Bus Master only on kexec reboot
+
+    Add a flag to tell the PCI subsystem that kernel is shutting down in
+    preparation to kexec a kernel.  Add code in PCI subsystem to use this flag
+    to clear Bus Master bit on PCI devices only in case of kexec reboot.
+
+    This fixes a power-off problem on Acer Aspire V5-573G and likely other
+    machines and avoids any other issues caused by clearing Bus Master bit on
+    PCI devices in normal shutdown path.  The problem was introduced by
+    b566a22c2332 ("PCI: disable Bus Master on PCI device shutdown").
+
+    This patch is based on discussion at
+    http://marc.info/?l=linux-pci&m=138425645204355&w=2
+
+    Link: https://bugzilla.kernel.org/show_bug.cgi?id=63861
+    Reported-by: Chang Liu <cl91tp@gmail.com>
+    Signed-off-by: Khalid Aziz <khalid.aziz@oracle.com>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Acked-by: Konstantin Khlebnikov <koct9i@gmail.com>
+    Cc: stable@vger.kernel.org  # v3.5+
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index a28e040..59987b3 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -21,6 +21,8 @@
+ #include <linux/suspend.h>
+ #include "pci.h"
+ 
++extern bool kexec_in_progress;
++
+ struct pci_dynid {
+  struct list_head node;
+  struct pci_device_id id;
+@@ -451,12 +453,17 @@ static void pci_device_shutdown(struct device *dev)
+  pci_msi_shutdown(pci_dev);
+  pci_msix_shutdown(pci_dev);
+ 
++#ifdef CONFIG_KEXEC
+  /*
+-  * Turn off Bus Master bit on the device to tell it to not
+-  * continue to do DMA. Don't touch devices in D3cold or unknown states.
++  * If this is a kexec reboot, turn off Bus Master bit on the
++  * device to tell it to not continue to do DMA. Don't touch
++  * devices in D3cold or unknown states.
++  * If it is not a kexec reboot, firmware will hit the PCI
++  * devices with big hammer and stop their DMA any way.
+   */
+- if (pci_dev->current_state <= PCI_D3hot)
++ if (kexec_in_progress && (pci_dev->current_state <= PCI_D3hot))
+   pci_clear_master(pci_dev);
++#endif
+ }
+ 
+ #ifdef CONFIG_PM
+diff --git a/include/linux/kexec.h b/include/linux/kexec.h
+index d78d28a..5fd33dc 100644
+--- a/include/linux/kexec.h
++++ b/include/linux/kexec.h
+@@ -198,6 +198,9 @@ extern u32 vmcoreinfo_note[VMCOREINFO_NOTE_SIZE/4];
+ extern size_t vmcoreinfo_size;
+ extern size_t vmcoreinfo_max_size;
+ 
++/* flag to track if kexec reboot is in progress */
++extern bool kexec_in_progress;
++
+ int __init parse_crashkernel(char *cmdline, unsigned long long system_ram,
+   unsigned long long *crash_size, unsigned long long *crash_base);
+ int parse_crashkernel_high(char *cmdline, unsigned long long system_ram,
+diff --git a/kernel/kexec.c b/kernel/kexec.c
+index 0a1cf8c..db1c571 100644
+--- a/kernel/kexec.c
++++ b/kernel/kexec.c
+@@ -49,6 +49,9 @@ u32 vmcoreinfo_note[VMCOREINFO_NOTE_SIZE/4];
+ size_t vmcoreinfo_size;
+ size_t vmcoreinfo_max_size = sizeof(vmcoreinfo_data);
+ 
++/* Flag to indicate we are going to kexec a new kernel */
++bool kexec_in_progress = false;
++
+ /* Location of the reserved area for the crash kernel */
+ struct resource crashk_res = {
+  .name  = "Crash kernel",
+@@ -1735,6 +1738,7 @@ int kernel_kexec(void)
+  } else
+ #endif
+  {
++  kexec_in_progress = true;
+   kernel_restart_prepare(NULL);
+   printk(KERN_EMERG "Starting new kernel\n");
+   machine_shutdown();
+-- 
+1.7.1

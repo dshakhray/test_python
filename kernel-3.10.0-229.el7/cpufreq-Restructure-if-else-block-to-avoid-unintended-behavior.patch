@@ -1,0 +1,83 @@
+From c87a47d13fc3b6b40a0d93f73b7468fc58d8dcc9 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:22:16 -0400
+Subject: [cpufreq] Restructure if/else block to avoid unintended behavior
+
+Message-id: <1409235879-1283-43-git-send-email-prarit@redhat.com>
+Patchwork-id: 89416
+O-Subject: [RHEL7.1 PATCH BZ 1134639 042/185] cpufreq: Restructure if/else block to avoid unintended behavior
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit 61173f256a3bebfbd09b4bd2c164dde378614091
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Thu Sep 12 01:43:25 2013 +0530
+
+    cpufreq: Restructure if/else block to avoid unintended behavior
+
+    In __cpufreq_remove_dev_prepare(), the code which decides whether to remove
+    the sysfs link or nominate a new policy cpu, is governed by an if/else block
+    with a rather complex set of conditionals. Worse, they harbor a subtlety
+    which leads to certain unintended behavior.
+
+    The code looks like this:
+
+            if (cpu != policy->cpu && !frozen) {
+                    sysfs_remove_link(&dev->kobj, "cpufreq");
+            } else if (cpus > 1) {
+      new_cpu = cpufreq_nominate_new_policy_cpu(...);
+      ...
+      update_policy_cpu(..., new_cpu);
+     }
+
+    The original intention was:
+    If the CPU going offline is not policy->cpu, just remove the link.
+    On the other hand, if the CPU going offline is the policy->cpu itself,
+    handover the policy->cpu job to some other surviving CPU in that policy.
+
+    But because the 'if' condition also includes the 'frozen' check, now there
+    are *two* possibilities by which we can enter the 'else' block:
+
+    1. cpu == policy->cpu (intended)
+    2. cpu != policy->cpu && frozen (unintended)
+
+    Due to the second (unintended) scenario, we end up spuriously nominating
+    a CPU as the policy->cpu, even when the existing policy->cpu is alive and
+    well. This can cause problems further down the line, especially when we end
+    up nominating the same policy->cpu as the new one (ie., old == new),
+    because it totally confuses update_policy_cpu().
+
+    To avoid this mess, restructure the if/else block to only do what was
+    originally intended, and thus prevent any unwelcome surprises.
+
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Tested-by: Stephen Warren <swarren@nvidia.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 644aa78..2b4a041 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1191,8 +1191,9 @@ static int __cpufreq_remove_dev_prepare(struct device *dev,
+   cpumask_clear_cpu(cpu, policy->cpus);
+  unlock_policy_rwsem_write(cpu);
+ 
+- if (cpu != policy->cpu && !frozen) {
+-  sysfs_remove_link(&dev->kobj, "cpufreq");
++ if (cpu != policy->cpu) {
++  if (!frozen)
++   sysfs_remove_link(&dev->kobj, "cpufreq");
+  } else if (cpus > 1) {
+ 
+   new_cpu = cpufreq_nominate_new_policy_cpu(policy, cpu, frozen);
+-- 
+1.7.1

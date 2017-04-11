@@ -1,0 +1,95 @@
+From c748e0db1573091c7e9a01032aa76ac77b4c19ad Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:53:12 -0400
+Subject: [tools] perf/symbols: Prevent the use of kcore if the kernel has moved
+
+Message-id: <1408953210-26343-305-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88911
+O-Subject: [PATCH RHEL7.1 BZ1133083 304/322] perf symbols: Prevent the use of kcore if the kernel has moved
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit a00d28cb72d3629c6481fe21ba6c6b4f96caed49
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Wed Jan 29 16:14:41 2014 +0200
+
+description
+===========
+Use of kcore is predicated upon it matching the recorded data.  If the
+kernel has been relocated at boot time (i.e. since the data was
+recorded) then do not use kcore.
+
+Note that it is possible to make a copy of kcore at the time the data is
+recorded using 'perf buildid-cache'.  Then the perf tools will use the
+copy because it does match the data.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index 39ce9ad..4ac1f87 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -976,6 +976,23 @@ static int validate_kcore_modules(const char *kallsyms_filename,
+  return 0;
+ }
+ 
++static int validate_kcore_addresses(const char *kallsyms_filename,
++        struct map *map)
++{
++ struct kmap *kmap = map__kmap(map);
++
++ if (kmap->ref_reloc_sym && kmap->ref_reloc_sym->name) {
++  u64 start;
++
++  start = kallsyms__get_function_start(kallsyms_filename,
++           kmap->ref_reloc_sym->name);
++  if (start != kmap->ref_reloc_sym->addr)
++   return -EINVAL;
++ }
++
++ return validate_kcore_modules(kallsyms_filename, map);
++}
++
+ struct kcore_mapfn_data {
+  struct dso *dso;
+  enum map_type type;
+@@ -1019,8 +1036,8 @@ static int dso__load_kcore(struct dso *dso, struct map *map,
+           kallsyms_filename))
+   return -EINVAL;
+ 
+- /* All modules must be present at their original addresses */
+- if (validate_kcore_modules(kallsyms_filename, map))
++ /* Modules and kernel must be present at their original addresses */
++ if (validate_kcore_addresses(kallsyms_filename, map))
+   return -EINVAL;
+ 
+  md.dso = dso;
+@@ -1424,7 +1441,7 @@ static int find_matching_kcore(struct map *map, char *dir, size_t dir_sz)
+    continue;
+   scnprintf(kallsyms_filename, sizeof(kallsyms_filename),
+      "%s/%s/kallsyms", dir, dent->d_name);
+-  if (!validate_kcore_modules(kallsyms_filename, map)) {
++  if (!validate_kcore_addresses(kallsyms_filename, map)) {
+    strlcpy(dir, kallsyms_filename, dir_sz);
+    ret = 0;
+    break;
+@@ -1479,7 +1496,7 @@ static char *dso__find_kallsyms(struct dso *dso, struct map *map)
+   if (fd != -1) {
+    close(fd);
+    /* If module maps match go with /proc/kallsyms */
+-   if (!validate_kcore_modules("/proc/kallsyms", map))
++   if (!validate_kcore_addresses("/proc/kallsyms", map))
+     goto proc_kallsyms;
+   }
+ 
+-- 
+1.7.1

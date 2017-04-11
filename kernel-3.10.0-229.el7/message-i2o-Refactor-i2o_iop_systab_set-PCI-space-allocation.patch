@@ -1,0 +1,145 @@
+From 53851ecf93c9f17f2fb9a9e0da9a6a2da9fd8a87 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Wed, 6 Aug 2014 03:49:20 -0400
+Subject: [message] i2o: Refactor i2o_iop_systab_set() PCI space allocation
+
+Message-id: <20140806034920.1438.53758.stgit@gir.stowe>
+Patchwork-id: 87458
+O-Subject: [RHEL7.1 PATCH 49/69] i2o: Refactor i2o_iop_systab_set() PCI space allocation
+Bugzilla: 1110896
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110896
+Upstream Status: 60f061e19311771e67a484184340e5359493f557
+
+commit 60f061e19311771e67a484184340e5359493f557
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Wed Feb 26 11:25:57 2014 -0700
+
+    i2o: Refactor i2o_iop_systab_set() PCI space allocation
+
+    Refactor the PCI space allocation in i2o_iop_systab_set().  This might
+    improve readability slightly, but mainly it is to make the next patch
+    simpler.
+
+    No functional change.
+
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/message/i2o/iop.c b/drivers/message/i2o/iop.c
+index 68aef58..bd971b1 100644
+--- a/drivers/message/i2o/iop.c
++++ b/drivers/message/i2o/iop.c
+@@ -652,6 +652,48 @@ static int i2o_iop_activate(struct i2o_controller *c)
+  return i2o_hrt_get(c);
+ };
+ 
++static void i2o_res_alloc(struct i2o_controller *c, unsigned long flags)
++{
++ i2o_status_block *sb = c->status_block.virt;
++ struct resource *root, *res = &c->mem_resource;
++ resource_size_t size, min, max, align;
++ int err;
++
++ res->name = c->pdev->bus->name;
++ res->flags = flags;
++ res->start = 0;
++ res->end = 0;
++ osm_info("%s: requires private memory resources.\n", c->name);
++ root = pci_find_parent_resource(c->pdev, res);
++ if (root == NULL) {
++  osm_warn("%s: Can't find parent resource!\n", c->name);
++  return;
++ }
++
++ if (flags & IORESOURCE_MEM) {
++  size = min = max = sb->desired_mem_size;
++  align = 1 << 20; /* unspecified, use 1Mb and play safe */
++ } else {
++  size = min = max = sb->desired_io_size;
++  align = 1 << 12; /* unspecified, use 4Kb and play safe */
++ }
++
++ err = allocate_resource(root, res, size, min, max, align, NULL, NULL);
++ if (err < 0)
++  return;
++
++ if (flags & IORESOURCE_MEM) {
++  c->mem_alloc = 1;
++  sb->current_mem_size = resource_size(res);
++  sb->current_mem_base = res->start;
++ } else if (flags & IORESOURCE_IO) {
++  c->io_alloc = 1;
++  sb->current_io_size = resource_size(res);
++  sb->current_io_base = res->start;
++ }
++ osm_info("%s: allocated PCI space %pR\n", c->name, res);
++}
++
+ /**
+  * i2o_iop_systab_set - Set the I2O System Table of the specified IOP
+  * @c: I2O controller to which the system table should be send
+@@ -665,52 +707,13 @@ static int i2o_iop_systab_set(struct i2o_controller *c)
+  struct i2o_message *msg;
+  i2o_status_block *sb = c->status_block.virt;
+  struct device *dev = &c->pdev->dev;
+- struct resource *root;
+  int rc;
+ 
+- if (sb->current_mem_size < sb->desired_mem_size) {
+-  struct resource *res = &c->mem_resource;
+-  res->name = c->pdev->bus->name;
+-  res->flags = IORESOURCE_MEM;
+-  res->start = 0;
+-  res->end = 0;
+-  osm_info("%s: requires private memory resources.\n", c->name);
+-  root = pci_find_parent_resource(c->pdev, res);
+-  if (root == NULL)
+-   osm_warn("%s: Can't find parent resource!\n", c->name);
+-  if (root && allocate_resource(root, res, sb->desired_mem_size, sb->desired_mem_size, sb->desired_mem_size, 1 << 20, /* Unspecified, so use 1Mb and play safe */
+-           NULL, NULL) >= 0) {
+-   c->mem_alloc = 1;
+-   sb->current_mem_size = resource_size(res);
+-   sb->current_mem_base = res->start;
+-   osm_info("%s: allocated %llu bytes of PCI memory at "
+-    "0x%016llX.\n", c->name,
+-    (unsigned long long)resource_size(res),
+-    (unsigned long long)res->start);
+-  }
+- }
++ if (sb->current_mem_size < sb->desired_mem_size)
++  i2o_res_alloc(c, IORESOURCE_MEM);
+ 
+- if (sb->current_io_size < sb->desired_io_size) {
+-  struct resource *res = &c->io_resource;
+-  res->name = c->pdev->bus->name;
+-  res->flags = IORESOURCE_IO;
+-  res->start = 0;
+-  res->end = 0;
+-  osm_info("%s: requires private memory resources.\n", c->name);
+-  root = pci_find_parent_resource(c->pdev, res);
+-  if (root == NULL)
+-   osm_warn("%s: Can't find parent resource!\n", c->name);
+-  if (root && allocate_resource(root, res, sb->desired_io_size, sb->desired_io_size, sb->desired_io_size, 1 << 12, /* Unspecified, so use 4Kb and play safe */
+-           NULL, NULL) >= 0) {
+-   c->io_alloc = 1;
+-   sb->current_io_size = resource_size(res);
+-   sb->current_io_base = res->start;
+-   osm_info("%s: allocated %llu bytes of PCI I/O at "
+-    "0x%016llX.\n", c->name,
+-    (unsigned long long)resource_size(res),
+-    (unsigned long long)res->start);
+-  }
+- }
++ if (sb->current_io_size < sb->desired_io_size)
++  i2o_res_alloc(c, IORESOURCE_IO);
+ 
+  msg = i2o_msg_get_wait(c, I2O_TIMEOUT_MESSAGE_GET);
+  if (IS_ERR(msg))
+-- 
+1.7.1

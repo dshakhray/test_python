@@ -1,0 +1,85 @@
+From 240dbea0402a4952409b726ae2efcd30474135b6 Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 19:03:39 -0400
+Subject: [fs] btrfs: btrfs_rm_device() should zero mirror SB as well
+
+Message-id: <1407179109-13714-333-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87156
+O-Subject: [RHEL7.1 PATCH 332/422] btrfs: btrfs_rm_device() should zero mirror SB as well
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Anand Jain <anand.jain@oracle.com>
+
+commit 4d90d28b1c5c5ab6292c0888dc1ebdfc3023f877
+Author: Anand Jain <anand.jain@oracle.com>
+Date:   Sun Apr 6 12:59:07 2014 +0800
+
+    btrfs: btrfs_rm_device() should zero mirror SB as well
+
+    This fix will ensure all SB copies on the disk is zeroed
+    when the disk is intentionally removed. This helps to
+    better manage disks in the user land.
+
+    This version of patch also merges the Zach patch as below.
+
+     btrfs: don't double brelse on device rm
+
+    Signed-off-by: Anand Jain <anand.jain@oracle.com>
+    Signed-off-by: Zach Brown <zab@redhat.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index 1e17bf3..d56b8ca 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -1710,12 +1710,43 @@ int btrfs_rm_device(struct btrfs_root *root, char *device_path)
+   * remove it from the devices list and zero out the old super
+   */
+  if (clear_super && disk_super) {
++  u64 bytenr;
++  int i;
++
+   /* make sure this device isn't detected as part of
+    * the FS anymore
+    */
+   memset(&disk_super->magic, 0, sizeof(disk_super->magic));
+   set_buffer_dirty(bh);
+   sync_dirty_buffer(bh);
++
++  /* clear the mirror copies of super block on the disk
++   * being removed, 0th copy is been taken care above and
++   * the below would take of the rest
++   */
++  for (i = 1; i < BTRFS_SUPER_MIRROR_MAX; i++) {
++   bytenr = btrfs_sb_offset(i);
++   if (bytenr + BTRFS_SUPER_INFO_SIZE >=
++     i_size_read(bdev->bd_inode))
++    break;
++
++   brelse(bh);
++   bh = __bread(bdev, bytenr / 4096,
++     BTRFS_SUPER_INFO_SIZE);
++   if (!bh)
++    continue;
++
++   disk_super = (struct btrfs_super_block *)bh->b_data;
++
++   if (btrfs_super_bytenr(disk_super) != bytenr ||
++    btrfs_super_magic(disk_super) != BTRFS_MAGIC) {
++    continue;
++   }
++   memset(&disk_super->magic, 0,
++      sizeof(disk_super->magic));
++   set_buffer_dirty(bh);
++   sync_dirty_buffer(bh);
++  }
+  }
+ 
+  ret = 0;
+-- 
+1.7.1

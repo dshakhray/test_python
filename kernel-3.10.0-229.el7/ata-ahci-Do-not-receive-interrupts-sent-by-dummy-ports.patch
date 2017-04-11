@@ -1,0 +1,75 @@
+From f52a80ac6fbddbbacb1492927cd73a8ad8d46058 Mon Sep 17 00:00:00 2001
+From: David Milburn <dmilburn@redhat.com>
+Date: Fri, 25 Apr 2014 15:27:05 -0400
+Subject: [ata] ahci: Do not receive interrupts sent by dummy ports
+
+Message-id: <1398439625-8238-5-git-send-email-dmilburn@redhat.com>
+Patchwork-id: 79184
+O-Subject: [RHEL7.1 PATCH 4/4] ahci: Do not receive interrupts sent by dummy ports
+Bugzilla: 1067838
+RH-Acked-by: Jes Sorensen <Jes.Sorensen@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+
+commit 2cf532f5e67c0cfe38c8c100e49280cdadacd2be
+Author: Alexander Gordeev <agordeev@redhat.com>
+Date:   Thu Apr 17 18:06:15 2014 +0200
+
+    ahci: Do not receive interrupts sent by dummy ports
+
+    In multiple MSI mode all AHCI ports (including dummy) get assigned
+    separate MSI vectors and (as result of execution
+    pci_enable_msi_exact() function) separate IRQ numbers, (mapped to the
+    MSI vectors).
+
+    Therefore, although interrupts from dummy ports are not desired they
+    are still enabled. We do not request IRQs for dummy ports, but that
+    only means we do not assign AHCI-specific ISRs to corresponding IRQ
+    numbers.
+
+    As result, dummy port interrupts still could come and traverse all the
+    way from the PCI device to the kernel, causing unnecessary overhead.
+
+    This update disables IRQs for dummy ports and prevents the described
+    issue.
+
+    Signed-off-by: Alexander Gordeev <agordeev@redhat.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Tested-by: David Milburn <dmilburn@redhat.com>
+    Cc: linux-ide@vger.kernel.org
+    Cc: stable@vger.kernel.org
+    Fixes: 5ca72c4f7c41 ("AHCI: Support multiple MSIs")
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1067838
+https://brewweb.devel.redhat.com/taskinfo?taskID=7368411
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/ata/ahci.c b/drivers/ata/ahci.c
+index 09556cd..51a80cb 100644
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@ -1154,12 +1154,16 @@ int ahci_host_activate(struct ata_host *host, int irq, unsigned int n_msis)
+  for (i = 0; i < host->n_ports; i++) {
+   struct ahci_port_priv *pp = host->ports[i]->private_data;
+ 
+-  /* pp is NULL for dummy ports */
+-  if (pp)
+-   rc = devm_request_threaded_irq(host->dev,
+-             irq + i, ahci_hw_interrupt,
+-             ahci_thread_fn, IRQF_SHARED,
+-             pp->irq_desc, host->ports[i]);
++  /* Do not receive interrupts sent by dummy ports */
++  if (!pp) {
++   disable_irq(irq + i);
++   continue;
++  }
++
++  rc = devm_request_threaded_irq(host->dev, irq + i,
++            ahci_hw_interrupt,
++            ahci_thread_fn, IRQF_SHARED,
++            pp->irq_desc, host->ports[i]);
+   if (rc)
+    goto out_free_irqs;
+  }
+-- 
+1.7.1

@@ -1,0 +1,165 @@
+From f758fbfad191210e118bc9a3e747af7d45a66652 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 19:11:42 -0400
+Subject: [md] dm-thin: return ENOSPC instead of EIO when error_if_no_space enabled
+
+Message-id: <1402686704-22462-2-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83945
+O-Subject: [RHEL7.1 PATCH 1/3] dm thin: return ENOSPC instead of EIO when error_if_no_space enabled
+Bugzilla: 1099936
+RH-Acked-by: Heinz Mauelshagen <heinzm@redhat.com>
+RH-Acked-by: Joe Thornber <thornber@redhat.com>
+
+BZ: 1099936
+
+Upstream commit af91805a497d3aa694704172b41ba953be3738ed
+Author: Mike Snitzer <snitzer@redhat.com>
+Date:   Thu May 22 14:32:51 2014 -0400
+
+    dm thin: return ENOSPC instead of EIO when error_if_no_space enabled
+
+    Update the DM thin provisioning target's allocation failure error to be
+    consistent with commit a9d6ceb8 ("[SCSI] return ENOSPC on thin
+    provisioning failure").
+
+    The DM thin target now returns -ENOSPC rather than -EIO when
+    block allocation fails due to the pool being out of data space (and
+    the 'error_if_no_space' thin-pool feature is enabled).
+
+    Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+    Acked-By: Joe Thornber <ejt@redhat.com>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/md/dm-bio-prison.c b/drivers/md/dm-bio-prison.c
+index 85f0b70..7143438 100644
+--- a/drivers/md/dm-bio-prison.c
++++ b/drivers/md/dm-bio-prison.c
+@@ -238,7 +238,7 @@ void dm_cell_release_no_holder(struct dm_bio_prison *prison,
+ EXPORT_SYMBOL_GPL(dm_cell_release_no_holder);
+ 
+ void dm_cell_error(struct dm_bio_prison *prison,
+-     struct dm_bio_prison_cell *cell)
++     struct dm_bio_prison_cell *cell, int error)
+ {
+  struct bio_list bios;
+  struct bio *bio;
+@@ -251,7 +251,7 @@ void dm_cell_error(struct dm_bio_prison *prison,
+  spin_unlock_irqrestore(&prison->lock, flags);
+ 
+  while ((bio = bio_list_pop(&bios)))
+-  bio_io_error(bio);
++  bio_endio(bio, error);
+ }
+ EXPORT_SYMBOL_GPL(dm_cell_error);
+ 
+diff --git a/drivers/md/dm-bio-prison.h b/drivers/md/dm-bio-prison.h
+index 3f83319..6805a14 100644
+--- a/drivers/md/dm-bio-prison.h
++++ b/drivers/md/dm-bio-prison.h
+@@ -85,7 +85,7 @@ void dm_cell_release_no_holder(struct dm_bio_prison *prison,
+           struct dm_bio_prison_cell *cell,
+           struct bio_list *inmates);
+ void dm_cell_error(struct dm_bio_prison *prison,
+-     struct dm_bio_prison_cell *cell);
++     struct dm_bio_prison_cell *cell, int error);
+ 
+ /*----------------------------------------------------------------*/
+ 
+diff --git a/drivers/md/dm-thin.c b/drivers/md/dm-thin.c
+index c31f5f1..b42e804 100644
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@ -310,13 +310,18 @@ static void cell_defer_no_holder_no_free(struct thin_c *tc,
+  wake_worker(pool);
+ }
+ 
+-static void cell_error(struct pool *pool,
+-         struct dm_bio_prison_cell *cell)
++static void cell_error_with_code(struct pool *pool,
++     struct dm_bio_prison_cell *cell, int error_code)
+ {
+- dm_cell_error(pool->prison, cell);
++ dm_cell_error(pool->prison, cell, error_code);
+  dm_bio_prison_free_cell(pool->prison, cell);
+ }
+ 
++static void cell_error(struct pool *pool, struct dm_bio_prison_cell *cell)
++{
++ cell_error_with_code(pool, cell, -EIO);
++}
++
+ /*----------------------------------------------------------------*/
+ 
+ /*
+@@ -1021,7 +1026,7 @@ static void retry_on_resume(struct bio *bio)
+  spin_unlock_irqrestore(&tc->lock, flags);
+ }
+ 
+-static bool should_error_unserviceable_bio(struct pool *pool)
++static int should_error_unserviceable_bio(struct pool *pool)
+ {
+  enum pool_mode m = get_pool_mode(pool);
+ 
+@@ -1029,25 +1034,27 @@ static bool should_error_unserviceable_bio(struct pool *pool)
+  case PM_WRITE:
+   /* Shouldn't get here */
+   DMERR_LIMIT("bio unserviceable, yet pool is in PM_WRITE mode");
+-  return true;
++  return -EIO;
+ 
+  case PM_OUT_OF_DATA_SPACE:
+-  return pool->pf.error_if_no_space;
++  return pool->pf.error_if_no_space ? -ENOSPC : 0;
+ 
+  case PM_READ_ONLY:
+  case PM_FAIL:
+-  return true;
++  return -EIO;
+  default:
+   /* Shouldn't get here */
+   DMERR_LIMIT("bio unserviceable, yet pool has an unknown mode");
+-  return true;
++  return -EIO;
+  }
+ }
+ 
+ static void handle_unserviceable_bio(struct pool *pool, struct bio *bio)
+ {
+- if (should_error_unserviceable_bio(pool))
+-  bio_io_error(bio);
++ int error = should_error_unserviceable_bio(pool);
++
++ if (error)
++  bio_endio(bio, error);
+  else
+   retry_on_resume(bio);
+ }
+@@ -1056,18 +1063,21 @@ static void retry_bios_on_resume(struct pool *pool, struct dm_bio_prison_cell *c
+ {
+  struct bio *bio;
+  struct bio_list bios;
++ int error;
+ 
+- if (should_error_unserviceable_bio(pool)) {
+-  cell_error(pool, cell);
++ error = should_error_unserviceable_bio(pool);
++ if (error) {
++  cell_error_with_code(pool, cell, error);
+   return;
+  }
+ 
+  bio_list_init(&bios);
+  cell_release(pool, cell, &bios);
+ 
+- if (should_error_unserviceable_bio(pool))
++ error = should_error_unserviceable_bio(pool);
++ if (error)
+   while ((bio = bio_list_pop(&bios)))
+-   bio_io_error(bio);
++   bio_endio(bio, error);
+  else
+   while ((bio = bio_list_pop(&bios)))
+    retry_on_resume(bio);
+-- 
+1.7.1

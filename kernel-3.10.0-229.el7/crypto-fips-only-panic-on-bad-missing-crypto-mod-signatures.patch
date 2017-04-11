@@ -1,0 +1,120 @@
+From 9e21e5941d7d4881e0347451d7b453fa42a2128b Mon Sep 17 00:00:00 2001
+From: Jarod Wilson <jarod@redhat.com>
+Date: Thu, 3 Jul 2014 17:58:38 -0400
+Subject: [crypto] fips: only panic on bad/missing crypto mod signatures
+
+Message-id: <1404410318-43259-1-git-send-email-jarod@redhat.com>
+Patchwork-id: 85213
+O-Subject: [RHEL7 PATCH] crypto/fips: only panic on bad/missing crypto mod signatures
+Bugzilla: 903562
+RH-Acked-by: Don Zickus <dzickus@redhat.com>
+RH-Acked-by: Neil Horman <nhorman@redhat.com>
+RH-Acked-by: Herbert Xu <herbert.xu@redhat.com>
+
+Bugzilla: 903562
+
+Built locally and tested with some additional debug spew added to
+verify that crypto module signature checks are indeed being made.
+
+Committed in the cryptodev-2.6.git tree.
+https://git.kernel.org/cgit/linux/kernel/git/herbert/cryptodev-2.6.git/commit/?id=002c77a48b479b094b834b02ef78be47ceac76fd
+
+Author: Jarod Wilson <jarod@redhat.com>
+Date:   Fri Jun 27 14:56:43 2014 -0400
+
+    crypto/fips: only panic on bad/missing crypto mod signatures
+
+    Per further discussion with NIST, the requirements for FIPS state that
+    we only need to panic the system on failed kernel module signature checks
+    for crypto subsystem modules. This moves the fips-mode-only module
+    signature check out of the generic module loading code, into the crypto
+    subsystem, at points where we can catch both algorithm module loads and
+    mode module loads. At the same time, make CONFIG_CRYPTO_FIPS dependent on
+    CONFIG_MODULE_SIG, as this is entirely necessary for FIPS mode.
+
+    v2: remove extraneous blank line, perform checks in static inline
+    function, drop no longer necessary fips.h include.
+
+    CC: Herbert Xu <herbert@gondor.apana.org.au>
+    CC: "David S. Miller" <davem@davemloft.net>
+    CC: Rusty Russell <rusty@rustcorp.com.au>
+    CC: Stephan Mueller <stephan.mueller@atsec.com>
+    CC: linux-crypto@vger.kernel.org
+    Signed-off-by: Jarod Wilson <jarod@redhat.com>
+    Acked-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+
+CC: Neil Horman <nhorman@redhat.com>
+CC: Herbert Xu <herbert.xu@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/crypto/Kconfig b/crypto/Kconfig
+index 8ca52c5..b38b975 100644
+--- a/crypto/Kconfig
++++ b/crypto/Kconfig
+@@ -24,6 +24,7 @@ comment "Crypto core or helper"
+ config CRYPTO_FIPS
+  bool "FIPS 200 compliance"
+  depends on CRYPTO_ANSI_CPRNG && !CRYPTO_MANAGER_DISABLE_TESTS
++ depends on MODULE_SIG
+  help
+    This options enables the fips boot option which is
+    required if you want to system to operate in a FIPS 200
+diff --git a/crypto/algapi.c b/crypto/algapi.c
+index 7a1ae87..e8d3a7d 100644
+--- a/crypto/algapi.c
++++ b/crypto/algapi.c
+@@ -41,8 +41,20 @@ static inline int crypto_set_driver_name(struct crypto_alg *alg)
+  return 0;
+ }
+ 
++static inline void crypto_check_module_sig(struct module *mod)
++{
++#ifdef CONFIG_CRYPTO_FIPS
++ if (fips_enabled && mod && !mod->sig_ok)
++  panic("Module %s signature verification failed in FIPS mode\n",
++        mod->name);
++#endif
++ return;
++}
++
+ static int crypto_check_alg(struct crypto_alg *alg)
+ {
++ crypto_check_module_sig(alg->cra_module);
++
+  if (alg->cra_alignmask & (alg->cra_alignmask + 1))
+   return -EINVAL;
+ 
+@@ -430,6 +442,8 @@ int crypto_register_template(struct crypto_template *tmpl)
+ 
+  down_write(&crypto_alg_sem);
+ 
++ crypto_check_module_sig(tmpl->module);
++
+  list_for_each_entry(q, &crypto_template_list, list) {
+   if (q == tmpl)
+    goto out;
+diff --git a/kernel/module.c b/kernel/module.c
+index 1192791..73dc30c 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -60,7 +60,6 @@
+ #include <linux/jump_label.h>
+ #include <linux/pfn.h>
+ #include <linux/bsearch.h>
+-#include <linux/fips.h>
+ #include <uapi/linux/module.h>
+ #include "module-internal.h"
+ 
+@@ -2468,9 +2467,6 @@ static int module_sig_check(struct load_info *info)
+  }
+ 
+  /* Not having a signature is only an error if we're strict. */
+- if (err < 0 && fips_enabled)
+-  panic("Module verification failed with error %d in FIPS mode\n",
+-        err);
+  if ((err == -ENOKEY && !sig_enforce) && (get_securelevel() <= 0))
+   err = 0;
+ 
+-- 
+1.7.1

@@ -1,0 +1,190 @@
+From 05e56635e4670aaf250dc8126b109943a305c658 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:52:32 -0400
+Subject: [tools] perf: Factor out sample__resolve_callchain()
+
+Message-id: <1408953210-26343-265-git-send-email-jolsa@redhat.com>
+Patchwork-id: 89013
+O-Subject: [PATCH RHEL7.1 BZ1133083 264/322] perf tools: Factor out sample__resolve_callchain()
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit 2dc9fb1a7bf013ce24dd34bc25283b60b966f015
+Author: Namhyung Kim <namhyung@kernel.org>
+Date: Tue Jan 14 14:25:35 2014 +0900
+
+description
+===========
+The report__resolve_callchain() can be shared with perf top code as it
+doesn't really depend on the perf report code.  Factor it out as
+sample__resolve_callchain().  The same goes to the hist_entry__append_
+callchain() too.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index 46864dd..3c53ec2 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -75,24 +75,6 @@ static int report__config(const char *var, const char *value, void *cb)
+  return perf_default_config(var, value, cb);
+ }
+ 
+-static int report__resolve_callchain(struct report *rep, struct symbol **parent,
+-         struct perf_evsel *evsel, struct addr_location *al,
+-         struct perf_sample *sample)
+-{
+- if ((sort__has_parent || symbol_conf.use_callchain) && sample->callchain) {
+-  return machine__resolve_callchain(al->machine, evsel, al->thread, sample,
+-        parent, al, rep->max_stack);
+- }
+- return 0;
+-}
+-
+-static int hist_entry__append_callchain(struct hist_entry *he, struct perf_sample *sample)
+-{
+- if (!symbol_conf.use_callchain)
+-  return 0;
+- return callchain_append(he->callchain, &callchain_cursor, sample->period);
+-}
+-
+ static int report__add_mem_hist_entry(struct perf_tool *tool, struct addr_location *al,
+           struct perf_sample *sample, struct perf_evsel *evsel,
+           union perf_event *event)
+@@ -103,7 +85,7 @@ static int report__add_mem_hist_entry(struct perf_tool *tool, struct addr_locati
+  struct hist_entry *he;
+  struct mem_info *mi, *mx;
+  uint64_t cost;
+- int err = report__resolve_callchain(rep, &parent, evsel, al, sample);
++ int err = sample__resolve_callchain(sample, &parent, evsel, al, rep->max_stack);
+ 
+  if (err)
+   return err;
+@@ -155,7 +137,7 @@ static int report__add_branch_hist_entry(struct perf_tool *tool, struct addr_loc
+  unsigned i;
+  struct hist_entry *he;
+  struct branch_info *bi, *bx;
+- int err = report__resolve_callchain(rep, &parent, evsel, al, sample);
++ int err = sample__resolve_callchain(sample, &parent, evsel, al, rep->max_stack);
+ 
+  if (err)
+   return err;
+@@ -208,7 +190,7 @@ static int report__add_hist_entry(struct perf_tool *tool, struct perf_evsel *evs
+  struct report *rep = container_of(tool, struct report, tool);
+  struct symbol *parent = NULL;
+  struct hist_entry *he;
+- int err = report__resolve_callchain(rep, &parent, evsel, al, sample);
++ int err = sample__resolve_callchain(sample, &parent, evsel, al, rep->max_stack);
+ 
+  if (err)
+   return err;
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index 569dd87..76cd510 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -743,15 +743,10 @@ static void perf_event__process_sample(struct perf_tool *tool,
+  if (al.sym == NULL || !al.sym->ignore) {
+   struct hist_entry *he;
+ 
+-  if ((sort__has_parent || symbol_conf.use_callchain) &&
+-      sample->callchain) {
+-   err = machine__resolve_callchain(machine, evsel,
+-        al.thread, sample,
+-        &parent, &al,
+-        top->max_stack);
+-   if (err)
+-    return;
+-  }
++  err = sample__resolve_callchain(sample, &parent, evsel, &al,
++      top->max_stack);
++  if (err)
++   return;
+ 
+   he = perf_evsel__add_hist_entry(evsel, &al, sample);
+   if (he == NULL) {
+@@ -759,12 +754,9 @@ static void perf_event__process_sample(struct perf_tool *tool,
+    return;
+   }
+ 
+-  if (symbol_conf.use_callchain) {
+-   err = callchain_append(he->callchain, &callchain_cursor,
+-            sample->period);
+-   if (err)
+-    return;
+-  }
++  err = hist_entry__append_callchain(he, sample);
++  if (err)
++   return;
+ 
+   if (sort__has_sym)
+    perf_top__record_precise_ip(top, he, evsel->idx, ip);
+diff --git a/tools/perf/util/callchain.c b/tools/perf/util/callchain.c
+index e3970e3..9eb4f57 100644
+--- a/tools/perf/util/callchain.c
++++ b/tools/perf/util/callchain.c
+@@ -17,6 +17,8 @@
+ 
+ #include "hist.h"
+ #include "util.h"
++#include "sort.h"
++#include "machine.h"
+ #include "callchain.h"
+ 
+ __thread struct callchain_cursor callchain_cursor;
+@@ -531,3 +533,24 @@ int callchain_cursor_append(struct callchain_cursor *cursor,
+ 
+  return 0;
+ }
++
++int sample__resolve_callchain(struct perf_sample *sample, struct symbol **parent,
++         struct perf_evsel *evsel, struct addr_location *al,
++         int max_stack)
++{
++ if (sample->callchain == NULL)
++  return 0;
++
++ if (symbol_conf.use_callchain || sort__has_parent) {
++  return machine__resolve_callchain(al->machine, evsel, al->thread,
++        sample, parent, al, max_stack);
++ }
++ return 0;
++}
++
++int hist_entry__append_callchain(struct hist_entry *he, struct perf_sample *sample)
++{
++ if (!symbol_conf.use_callchain)
++  return 0;
++ return callchain_append(he->callchain, &callchain_cursor, sample->period);
++}
+diff --git a/tools/perf/util/callchain.h b/tools/perf/util/callchain.h
+index 08b25af..8ad97e9 100644
+--- a/tools/perf/util/callchain.h
++++ b/tools/perf/util/callchain.h
+@@ -145,10 +145,16 @@ static inline void callchain_cursor_advance(struct callchain_cursor *cursor)
+ }
+ 
+ struct option;
++struct hist_entry;
+ 
+ int record_parse_callchain(const char *arg, struct record_opts *opts);
+ int record_parse_callchain_opt(const struct option *opt, const char *arg, int unset);
+ int record_callchain_opt(const struct option *opt, const char *arg, int unset);
+ 
++int sample__resolve_callchain(struct perf_sample *sample, struct symbol **parent,
++         struct perf_evsel *evsel, struct addr_location *al,
++         int max_stack);
++int hist_entry__append_callchain(struct hist_entry *he, struct perf_sample *sample);
++
+ extern const char record_callchain_help[];
+ #endif /* __PERF_CALLCHAIN_H */
+-- 
+1.7.1

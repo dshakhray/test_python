@@ -1,0 +1,88 @@
+From ccb0ded553c1decfcbb461c3ceb47ef90178f6fe Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 18:59:16 -0400
+Subject: [fs] btrfs: check balance of send_in_progress
+
+Message-id: <1407179109-13714-70-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87000
+O-Subject: [RHEL7.1 PATCH 069/422] btrfs: check balance of send_in_progress
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: David Sterba <dsterba@suse.cz>
+
+commit 66ef7d65c3fc6e5300b9359f1c6537efb23781bb
+Author: David Sterba <dsterba@suse.cz>
+Date:   Tue Dec 17 15:07:20 2013 +0100
+
+    btrfs: check balance of send_in_progress
+
+    Warn if the balance goes below zero, which appears to be unlikely
+    though. Otherwise cleans up the code a bit.
+
+    Signed-off-by: David Sterba <dsterba@suse.cz>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+index 78a43b2..8877adc 100644
+--- a/fs/btrfs/send.c
++++ b/fs/btrfs/send.c
+@@ -4725,6 +4725,21 @@ out:
+  return ret;
+ }
+ 
++static void btrfs_root_dec_send_in_progress(struct btrfs_root* root)
++{
++ spin_lock(&root->root_item_lock);
++ root->send_in_progress--;
++ /*
++  * Not much left to do, we don't know why it's unbalanced and
++  * can't blindly reset it to 0.
++  */
++ if (root->send_in_progress < 0)
++  btrfs_err(root->fs_info,
++   "send_in_progres unbalanced %d root %llu\n",
++   root->send_in_progress, root->root_key.objectid);
++ spin_unlock(&root->root_item_lock);
++}
++
+ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+ {
+  int ret = 0;
+@@ -4942,24 +4957,11 @@ long btrfs_ioctl_send(struct file *mnt_file, void __user *arg_)
+  }
+ 
+ out:
+- for (i = 0; sctx && i < clone_sources_to_rollback; i++) {
+-  struct btrfs_root *r = sctx->clone_roots[i].root;
+-
+-  spin_lock(&r->root_item_lock);
+-  r->send_in_progress--;
+-  spin_unlock(&r->root_item_lock);
+- }
+- if (sctx && !IS_ERR_OR_NULL(sctx->parent_root)) {
+-  struct btrfs_root *r = sctx->parent_root;
+-
+-  spin_lock(&r->root_item_lock);
+-  r->send_in_progress--;
+-  spin_unlock(&r->root_item_lock);
+- }
+-
+- spin_lock(&send_root->root_item_lock);
+- send_root->send_in_progress--;
+- spin_unlock(&send_root->root_item_lock);
++ for (i = 0; sctx && i < clone_sources_to_rollback; i++)
++  btrfs_root_dec_send_in_progress(sctx->clone_roots[i].root);
++ if (sctx && !IS_ERR_OR_NULL(sctx->parent_root))
++  btrfs_root_dec_send_in_progress(sctx->parent_root);
++ btrfs_root_dec_send_in_progress(send_root);
+ 
+  kfree(arg);
+  vfree(clone_sources_tmp);
+-- 
+1.7.1

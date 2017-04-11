@@ -1,0 +1,158 @@
+From 913b7c768ddc9b4b284d1c3eb0299dade7d7981a Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:39:04 -0400
+Subject: [virt] kvm/x86: Intel MPX vmx and msr handle
+
+Message-id: <1406040016-3289-150-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86228
+O-Subject: [RHEL7 PATCH v2 149/221] KVM: x86: Intel MPX vmx and msr handle
+Bugzilla: 1076194 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: "Liu, Jinsong" <jinsong.liu@intel.com>
+
+This patch handle vmx and msr of Intel MPX feature.
+
+Signed-off-by: Xudong Hao <xudong.hao@intel.com>
+Signed-off-by: Liu Jinsong <jinsong.liu@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit da8999d31818fdc8508d527ba3aac2e128005af4)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index dcff727..85be627 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -766,6 +766,7 @@ struct kvm_x86_ops {
+           struct x86_instruction_info *info,
+           enum x86_intercept_stage stage);
+  void (*handle_external_intr)(struct kvm_vcpu *vcpu);
++ bool (*mpx_supported)(void);
+ };
+ 
+ struct kvm_arch_async_pf {
+diff --git a/arch/x86/include/asm/vmx.h b/arch/x86/include/asm/vmx.h
+index 2067264..7004d21 100644
+--- a/arch/x86/include/asm/vmx.h
++++ b/arch/x86/include/asm/vmx.h
+@@ -85,6 +85,7 @@
+ #define VM_EXIT_SAVE_IA32_EFER                  0x00100000
+ #define VM_EXIT_LOAD_IA32_EFER                  0x00200000
+ #define VM_EXIT_SAVE_VMX_PREEMPTION_TIMER       0x00400000
++#define VM_EXIT_CLEAR_BNDCFGS                   0x00800000
+ 
+ #define VM_EXIT_ALWAYSON_WITHOUT_TRUE_MSR 0x00036dff
+ 
+@@ -95,6 +96,7 @@
+ #define VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL     0x00002000
+ #define VM_ENTRY_LOAD_IA32_PAT   0x00004000
+ #define VM_ENTRY_LOAD_IA32_EFER                 0x00008000
++#define VM_ENTRY_LOAD_BNDCFGS                   0x00010000
+ 
+ #define VM_ENTRY_ALWAYSON_WITHOUT_TRUE_MSR 0x000011ff
+ 
+@@ -174,6 +176,8 @@ enum vmcs_field {
+  GUEST_PDPTR2_HIGH               = 0x0000280f,
+  GUEST_PDPTR3                    = 0x00002810,
+  GUEST_PDPTR3_HIGH               = 0x00002811,
++ GUEST_BNDCFGS                   = 0x00002812,
++ GUEST_BNDCFGS_HIGH              = 0x00002813,
+  HOST_IA32_PAT   = 0x00002c00,
+  HOST_IA32_PAT_HIGH  = 0x00002c01,
+  HOST_IA32_EFER   = 0x00002c02,
+diff --git a/arch/x86/include/uapi/asm/msr-index.h b/arch/x86/include/uapi/asm/msr-index.h
+index 2e4a42d..f14ab2b 100644
+--- a/arch/x86/include/uapi/asm/msr-index.h
++++ b/arch/x86/include/uapi/asm/msr-index.h
+@@ -294,6 +294,7 @@
+ #define MSR_SMI_COUNT   0x00000034
+ #define MSR_IA32_FEATURE_CONTROL        0x0000003a
+ #define MSR_IA32_TSC_ADJUST             0x0000003b
++#define MSR_IA32_BNDCFGS  0x00000d90
+ 
+ #define FEATURE_CONTROL_LOCKED    (1<<0)
+ #define FEATURE_CONTROL_VMXON_ENABLED_INSIDE_SMX (1<<1)
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 3927528..00b5993 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -441,6 +441,7 @@ struct vcpu_vmx {
+ #endif
+   int           gs_ldt_reload_needed;
+   int           fs_reload_needed;
++  u64           msr_host_bndcfgs;
+  } host_state;
+  struct {
+   int vm86_active;
+@@ -1710,6 +1711,8 @@ static void vmx_save_host_state(struct kvm_vcpu *vcpu)
+  if (is_long_mode(&vmx->vcpu))
+   wrmsrl(MSR_KERNEL_GS_BASE, vmx->msr_guest_kernel_gs_base);
+ #endif
++ if (boot_cpu_has(X86_FEATURE_MPX))
++  rdmsrl(MSR_IA32_BNDCFGS, vmx->host_state.msr_host_bndcfgs);
+  for (i = 0; i < vmx->save_nmsrs; ++i)
+   kvm_set_shared_msr(vmx->guest_msrs[i].index,
+        vmx->guest_msrs[i].data,
+@@ -1747,6 +1750,8 @@ static void __vmx_load_host_state(struct vcpu_vmx *vmx)
+ #ifdef CONFIG_X86_64
+  wrmsrl(MSR_KERNEL_GS_BASE, vmx->msr_host_kernel_gs_base);
+ #endif
++ if (vmx->host_state.msr_host_bndcfgs)
++  wrmsrl(MSR_IA32_BNDCFGS, vmx->host_state.msr_host_bndcfgs);
+  /*
+   * If the FPU is not active (through the host task or
+   * the guest vcpu), then restore the cr0.TS bit.
+@@ -2837,7 +2842,7 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf)
+  min |= VM_EXIT_HOST_ADDR_SPACE_SIZE;
+ #endif
+  opt = VM_EXIT_SAVE_IA32_PAT | VM_EXIT_LOAD_IA32_PAT |
+-  VM_EXIT_ACK_INTR_ON_EXIT;
++  VM_EXIT_ACK_INTR_ON_EXIT | VM_EXIT_CLEAR_BNDCFGS;
+  if (adjust_vmx_controls(min, opt, MSR_IA32_VMX_EXIT_CTLS,
+     &_vmexit_control) < 0)
+   return -EIO;
+@@ -2854,7 +2859,7 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf)
+   _pin_based_exec_control &= ~PIN_BASED_POSTED_INTR;
+ 
+  min = 0;
+- opt = VM_ENTRY_LOAD_IA32_PAT;
++ opt = VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_BNDCFGS;
+  if (adjust_vmx_controls(min, opt, MSR_IA32_VMX_ENTRY_CTLS,
+     &_vmentry_control) < 0)
+   return -EIO;
+@@ -7052,6 +7057,12 @@ static void vmx_handle_external_intr(struct kvm_vcpu *vcpu)
+   local_irq_enable();
+ }
+ 
++static bool vmx_mpx_supported(void)
++{
++ return (vmcs_config.vmexit_ctrl & VM_EXIT_CLEAR_BNDCFGS) &&
++  (vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_BNDCFGS);
++}
++
+ static void vmx_recover_nmi_blocking(struct vcpu_vmx *vmx)
+ {
+  u32 exit_intr_info;
+@@ -8634,6 +8645,7 @@ static struct kvm_x86_ops vmx_x86_ops = {
+ 
+  .check_intercept = vmx_check_intercept,
+  .handle_external_intr = vmx_handle_external_intr,
++ .mpx_supported = vmx_mpx_supported,
+ };
+ 
+ static int __init vmx_init(void)
+@@ -8721,6 +8733,8 @@ static int __init vmx_init(void)
+  vmx_disable_intercept_for_msr(MSR_IA32_SYSENTER_CS, false);
+  vmx_disable_intercept_for_msr(MSR_IA32_SYSENTER_ESP, false);
+  vmx_disable_intercept_for_msr(MSR_IA32_SYSENTER_EIP, false);
++ vmx_disable_intercept_for_msr(MSR_IA32_BNDCFGS, true);
++
+  memcpy(vmx_msr_bitmap_legacy_x2apic,
+    vmx_msr_bitmap_legacy, PAGE_SIZE);
+  memcpy(vmx_msr_bitmap_longmode_x2apic,
+-- 
+1.7.1

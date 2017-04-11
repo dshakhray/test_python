@@ -1,0 +1,96 @@
+From 63c3ff25d1991e434ee5a4c771f2c32cbcbc777f Mon Sep 17 00:00:00 2001
+From: David Milburn <dmilburn@redhat.com>
+Date: Mon, 18 Aug 2014 19:58:37 -0400
+Subject: [block] nvme: Add tracepoints
+
+Message-id: <1408391935-24886-5-git-send-email-dmilburn@redhat.com>
+Patchwork-id: 87880
+O-Subject: [RHEL7.1 PATCH BZ 1111259 4/22] NVMe: Add tracepoints
+Bugzilla: 1111259
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+commit 3291fa57cb1b004c1a4823beb28b5cc72555f1a5
+    Author: Keith Busch <keith.busch@intel.com>
+    Date:   Mon Apr 28 12:30:52 2014 -0600
+
+    NVMe: Add tracepoints
+
+    Adding tracepoints for bio_complete and block_split into nvme to help
+    with gathering IO info using blktrace and blkparse.
+
+    Signed-off-by: Keith Busch <keith.busch@intel.com>
+    Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+
+RHEL: using bio->bi_sector instead of bi_iter.bi_sector since RHEL7
+doesn't include upstream 4f024f3797c43cb4b73cd2c50cec728842d0e49e.
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 453faf3..0886b68 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -43,6 +43,7 @@
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_remap);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_complete);
++EXPORT_TRACEPOINT_SYMBOL_GPL(block_split);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_unplug);
+ 
+ DEFINE_IDA(blk_queue_ida);
+diff --git a/drivers/block/nvme-core.c b/drivers/block/nvme-core.c
+index 3cd51ef..b6211d2 100644
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@ -42,6 +42,8 @@
+ #include <scsi/sg.h>
+ #include <asm-generic/io-64-nonatomic-lo-hi.h>
+ 
++#include <trace/events/block.h>
++
+ #define NVME_Q_DEPTH 1024
+ #define SQ_SIZE(depth)  (depth * sizeof(struct nvme_command))
+ #define CQ_SIZE(depth)  (depth * sizeof(struct nvme_completion))
+@@ -411,6 +413,7 @@ static void bio_completion(struct nvme_queue *nvmeq, void *ctx,
+  struct nvme_iod *iod = ctx;
+  struct bio *bio = iod->private;
+  u16 status = le16_to_cpup(&cqe->status) >> 1;
++ int error = 0;
+ 
+  if (unlikely(status)) {
+   if (!(status & NVME_SC_DNR ||
+@@ -423,6 +426,7 @@ static void bio_completion(struct nvme_queue *nvmeq, void *ctx,
+    wake_up(&nvmeq->sq_full);
+    return;
+   }
++  error = -EIO;
+  }
+  if (iod->nents) {
+   dma_unmap_sg(nvmeq->q_dmadev, iod->sg, iod->nents,
+@@ -430,10 +434,9 @@ static void bio_completion(struct nvme_queue *nvmeq, void *ctx,
+   nvme_end_io_acct(bio, iod->start_time);
+  }
+  nvme_free_iod(nvmeq->dev, iod);
+- if (status)
+-  bio_endio(bio, -EIO);
+- else
+-  bio_endio(bio, 0);
++
++ trace_block_bio_complete(bdev_get_queue(bio->bi_bdev), bio, error);
++ bio_endio(bio, error);
+ }
+ 
+ /* length is in bytes.  gfp flags indicates whether we may sleep. */
+@@ -609,6 +612,9 @@ static int nvme_split_and_submit(struct bio *bio, struct nvme_queue *nvmeq,
+  if (!bp)
+   return -ENOMEM;
+ 
++ trace_block_split(bdev_get_queue(bio->bi_bdev), bio,
++     bio->bi_sector);
++
+  if (!waitqueue_active(&nvmeq->sq_full))
+   add_wait_queue(&nvmeq->sq_full, &nvmeq->sq_cong_wait);
+  bio_list_add(&nvmeq->sq_cong, &bp->b1);
+-- 
+1.7.1

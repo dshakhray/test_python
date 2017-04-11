@@ -1,0 +1,92 @@
+From a123692aeac12392888ca57ac1aa60f26474639d Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Mon, 16 Jun 2014 16:02:15 -0400
+Subject: [kernel] uprobes: Kill adjust_ret_addr(), simplify UPROBE_FIX_CALL logic
+
+Message-id: <20140616160215.GA15517@redhat.com>
+Patchwork-id: 84087
+O-Subject: [PATCH RHEL7 BZ 1073627 29/36] uprobes/x86: Kill adjust_ret_addr(), simplify UPROBE_FIX_CALL logic
+Bugzilla: 1073627
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+RHBZ: 1073627
+
+The only insn which could have both UPROBE_FIX_IP and UPROBE_FIX_CALL
+was 0xe8 "call relative", and now it is handled by branch_xol_ops.
+
+So we can change default_post_xol_op(UPROBE_FIX_CALL) to simply push
+the address of next insn == utask->vaddr + insn.length, just we need
+to record insn.length into the new auprobe->def.ilen member.
+
+Note: if/when we teach branch_xol_ops to support jcxz/loopz we can
+remove the "correction" logic, UPROBE_FIX_IP can use the same address.
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+(cherry picked from commit 1dc76e6eacef271230d9ff6fd0f91824bda03f44)
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/include/asm/uprobes.h b/arch/x86/include/asm/uprobes.h
+index f6c6092..ce5c193 100644
+--- a/arch/x86/include/asm/uprobes.h
++++ b/arch/x86/include/asm/uprobes.h
+@@ -51,6 +51,7 @@ struct arch_uprobe {
+    long riprel_target;
+ #endif
+    u8 fixups;
++   u8 ilen;
+   }    def;
+  };
+ };
+diff --git a/arch/x86/kernel/uprobes.c b/arch/x86/kernel/uprobes.c
+index df75913..5bcce85 100644
+--- a/arch/x86/kernel/uprobes.c
++++ b/arch/x86/kernel/uprobes.c
+@@ -418,24 +418,6 @@ static int push_ret_address(struct pt_regs *regs, unsigned long ip)
+  return 0;
+ }
+ 
+-/*
+- * Adjust the return address pushed by a call insn executed out of line.
+- */
+-static int adjust_ret_addr(unsigned long sp, long correction)
+-{
+- int rasize = sizeof_long();
+- long ra;
+-
+- if (copy_from_user(&ra, (void __user *)sp, rasize))
+-  return -EFAULT;
+-
+- ra += correction;
+- if (copy_to_user((void __user *)sp, &ra, rasize))
+-  return -EFAULT;
+-
+- return 0;
+-}
+-
+ static int default_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs)
+ {
+  struct uprobe_task *utask = current->utask;
+@@ -446,10 +428,9 @@ static int default_post_xol_op(struct arch_uprobe *auprobe, struct pt_regs *regs
+   regs->ip += correction;
+ 
+  if (auprobe->def.fixups & UPROBE_FIX_CALL) {
+-  if (adjust_ret_addr(regs->sp, correction)) {
+-   regs->sp += sizeof_long();
++  regs->sp += sizeof_long();
++  if (push_ret_address(regs, utask->vaddr + auprobe->def.ilen))
+    return -ERESTART;
+-  }
+  }
+  /* popf; tell the caller to not touch TF */
+  if (auprobe->def.fixups & UPROBE_FIX_SETF)
+@@ -687,6 +668,7 @@ int arch_uprobe_analyze_insn(struct arch_uprobe *auprobe, struct mm_struct *mm,
+   handle_riprel_insn(auprobe, &insn);
+  }
+ 
++ auprobe->def.ilen = insn.length;
+  if (fix_ip)
+   auprobe->def.fixups |= UPROBE_FIX_IP;
+  if (fix_call)
+-- 
+1.7.1

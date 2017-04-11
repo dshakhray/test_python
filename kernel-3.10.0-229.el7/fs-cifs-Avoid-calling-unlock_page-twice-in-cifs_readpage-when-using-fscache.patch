@@ -1,0 +1,97 @@
+From 54c0c5fda2f88a430f84f89d5d90b72593d30bca Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Mon, 28 Jul 2014 12:15:56 -0400
+Subject: [fs] cifs: Avoid calling unlock_page() twice in cifs_readpage() when using fscache
+
+Message-id: <1406549822-10376-4-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 86782
+O-Subject: [RHEL7.1 PATCH 03/69] [bz1082049]cifs: Avoid calling unlock_page() twice in cifs_readpage() when using fscache
+Bugzilla: 1082049
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+
+When reading a single page with cifs_readpage(), we make a call to
+fscache_read_or_alloc_page() which once done, asynchronously calls
+the completion function cifs_readpage_from_fscache_complete(). This
+completion function unlocks the page once it has been populated from
+cache. The module then attempts to unlock the page a second time in
+cifs_readpage() which leads to warning messages.
+
+In case of a successful call to fscache_read_or_alloc_page() we should skip
+the second unlock_page() since this will be called by the
+cifs_readpage_from_fscache_complete() once the page has been populated by
+fscache.
+
+With the modifications to cifs_readpage_worker(), we will need to re-grab the
+page lock in cifs_write_begin().
+
+The problem was first noticed when testing new fscache patches for cifs.
+https://bugzilla.redhat.com/show_bug.cgi?id=1005737
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 466bd31bbda9e1dd2ace1d72c8de5045bf6f3bf6)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index 39f33e6..f1ccb35 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -3457,6 +3457,7 @@ static int cifs_readpage_worker(struct file *file, struct page *page,
+ 
+ io_error:
+  kunmap(page);
++ unlock_page(page);
+ 
+ read_complete:
+  return rc;
+@@ -3481,8 +3482,6 @@ static int cifs_readpage(struct file *file, struct page *page)
+ 
+  rc = cifs_readpage_worker(file, page, &offset);
+ 
+- unlock_page(page);
+-
+  free_xid(xid);
+  return rc;
+ }
+@@ -3536,6 +3535,7 @@ static int cifs_write_begin(struct file *file, struct address_space *mapping,
+    loff_t pos, unsigned len, unsigned flags,
+    struct page **pagep, void **fsdata)
+ {
++ int oncethru = 0;
+  pgoff_t index = pos >> PAGE_CACHE_SHIFT;
+  loff_t offset = pos & (PAGE_CACHE_SIZE - 1);
+  loff_t page_start = pos & PAGE_MASK;
+@@ -3545,6 +3545,7 @@ static int cifs_write_begin(struct file *file, struct address_space *mapping,
+ 
+  cifs_dbg(FYI, "write_begin from %lld len %d\n", (long long)pos, len);
+ 
++start:
+  page = grab_cache_page_write_begin(mapping, index, flags);
+  if (!page) {
+   rc = -ENOMEM;
+@@ -3586,13 +3587,16 @@ static int cifs_write_begin(struct file *file, struct address_space *mapping,
+   }
+  }
+ 
+- if ((file->f_flags & O_ACCMODE) != O_WRONLY) {
++ if ((file->f_flags & O_ACCMODE) != O_WRONLY && !oncethru) {
+   /*
+    * might as well read a page, it is fast enough. If we get
+    * an error, we don't need to return it. cifs_write_end will
+    * do a sync write instead since PG_uptodate isn't set.
+    */
+   cifs_readpage_worker(file, page, &page_start);
++  page_cache_release(page);
++  oncethru = 1;
++  goto start;
+  } else {
+   /* we could try using another file handle if there is one -
+      but how would we lock it to prevent close of that handle
+-- 
+1.7.1

@@ -1,0 +1,117 @@
+From 8461ef61f2ad80c9ca9214898d6c5937482356eb Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Wed, 6 Aug 2014 03:49:46 -0400
+Subject: [pci] Remove pci_find_parent_resource() use for allocation
+
+Message-id: <20140806034945.1438.91098.stgit@gir.stowe>
+Patchwork-id: 87462
+O-Subject: [RHEL7.1 PATCH 53/69] PCI: Remove pci_find_parent_resource() use for allocation
+Bugzilla: 1110896
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1110896
+Upstream Status: f44116ae881868ab72274df1eff48fdbde9898af
+
+commit f44116ae881868ab72274df1eff48fdbde9898af
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Wed Feb 26 11:25:58 2014 -0700
+
+    PCI: Remove pci_find_parent_resource() use for allocation
+
+    If the resource hasn't been allocated yet, pci_find_parent_resource() is
+    documented as returning the region "where it should be allocated from."
+    This is impossible in general because there may be several candidates: a
+    prefetchable BAR can be put in either a prefetchable or non-prefetchable
+    window, a transparent bridge may have overlapping positively- and
+    subtractively-decoded windows, and a root bus may have several windows of
+    the same type.
+
+    Allocation should be done by pci_bus_alloc_resource(), which iterates
+    through all bus resources and looks for the best match, e.g., one with the
+    desired prefetchability attributes, and falls back to less-desired
+    possibilities.
+
+    The only valid use of pci_find_parent_resource() is to find the parent of
+    an already-allocated resource so we can claim it via request_resource(),
+    and all we need for that is a bus region of the correct type that contains
+    the resource.
+
+    Note that like 8c8def26bfaa ("PCI: allow matching of prefetchable resources
+    to non-prefetchable windows"), this depends on pci_bus_for_each_resource()
+    iterating through positively-decoded regions before subtractively-decoded
+    ones.  We prefer not to return a subtractively-decoded region because
+    requesting from it will likely conflict with the overlapping positively-
+    decoded window (see Launchpad report below).
+
+    Link: https://bugs.launchpad.net/ubuntu/+source/linux/+bug/424142
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    CC: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index d5c9908..bd3b59e 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -401,33 +401,40 @@ EXPORT_SYMBOL_GPL(pci_find_ht_capability);
+  * @res: child resource record for which parent is sought
+  *
+  *  For given resource region of given device, return the resource
+- *  region of parent bus the given region is contained in or where
+- *  it should be allocated from.
++ *  region of parent bus the given region is contained in.
+  */
+ struct resource *
+ pci_find_parent_resource(const struct pci_dev *dev, struct resource *res)
+ {
+  const struct pci_bus *bus = dev->bus;
++ struct resource *r;
+  int i;
+- struct resource *best = NULL, *r;
+ 
+  pci_bus_for_each_resource(bus, r, i) {
+   if (!r)
+    continue;
+-  if (res->start && !(res->start >= r->start && res->end <= r->end))
+-   continue; /* Not contained */
+-  if ((res->flags ^ r->flags) & (IORESOURCE_IO | IORESOURCE_MEM))
+-   continue; /* Wrong type */
+-  if (!((res->flags ^ r->flags) & IORESOURCE_PREFETCH))
+-   return r; /* Exact match */
+-  /* We can't insert a non-prefetch resource inside a prefetchable parent .. */
+-  if (r->flags & IORESOURCE_PREFETCH)
+-   continue;
+-  /* .. but we can put a prefetchable resource inside a non-prefetchable one */
+-  if (!best)
+-   best = r;
++  if (res->start && resource_contains(r, res)) {
++
++   /*
++    * If the window is prefetchable but the BAR is
++    * not, the allocator made a mistake.
++    */
++   if (r->flags & IORESOURCE_PREFETCH &&
++       !(res->flags & IORESOURCE_PREFETCH))
++    return NULL;
++
++   /*
++    * If we're below a transparent bridge, there may
++    * be both a positively-decoded aperture and a
++    * subtractively-decoded region that contain the BAR.
++    * We want the positively-decoded one, so this depends
++    * on pci_bus_for_each_resource() giving us those
++    * first.
++    */
++   return r;
++  }
+  }
+- return best;
++ return NULL;
+ }
+ 
+ /**
+-- 
+1.7.1

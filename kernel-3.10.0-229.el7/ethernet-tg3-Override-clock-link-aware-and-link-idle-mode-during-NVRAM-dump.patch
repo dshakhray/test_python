@@ -1,0 +1,139 @@
+From 4fe0f8a40b0c5c2332ada0ab9eeffcf7651432a9 Mon Sep 17 00:00:00 2001
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Fri, 27 Jun 2014 15:04:39 -0400
+Subject: [ethernet] tg3: Override clock, link aware and link idle mode during NVRAM dump
+
+Message-id: <1403881480-9738-2-git-send-email-ivecera@redhat.com>
+Patchwork-id: 85061
+O-Subject: [RHEL7.1 PATCH 1/2] tg3: Override clock, link aware and link idle mode during NVRAM dump
+Bugzilla: 1086397
+RH-Acked-by: John Linville <linville@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+BZ: #1086397
+
+Upstream commit(s):
+commit 506724c463fcd63477a5e404728a980b71f80bb7
+Author: Prashant Sreedharan <prashant@broadcom.com>
+Date:   Sat May 24 01:32:09 2014 -0700
+
+    tg3: Override clock, link aware and link idle mode during NVRAM dump
+
+    When cable is not present the clock speed of some of the devices is
+    reduced based upon power saving mode setting in NVRAM. Due to this
+    NVRAM reads take long time to complete as a result CPU soft lockup
+    message is seen. Fix is to override clock, disable link aware and link
+    idle modes before NVRAM reads and restore them back after the reads
+    are complete. During this period also check if the thread needs to be
+    rescheduled and if there are any signals to handle.
+
+    Also decrease the NVRAM command execution timeout value to 1ms.
+
+    Signed-off-by: Prashant Sreedharan <prashant@broadcom.com>
+    Signed-off-by: Michael Chan <mchan@broadcom.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/broadcom/tg3.c b/drivers/net/ethernet/broadcom/tg3.c
+index 8170c6c..d0aea12 100644
+--- a/drivers/net/ethernet/broadcom/tg3.c
++++ b/drivers/net/ethernet/broadcom/tg3.c
+@@ -3230,7 +3230,7 @@ static int tg3_nvram_read_using_eeprom(struct tg3 *tp,
+  return 0;
+ }
+ 
+-#define NVRAM_CMD_TIMEOUT 10000
++#define NVRAM_CMD_TIMEOUT 100
+ 
+ static int tg3_nvram_exec_cmd(struct tg3 *tp, u32 nvram_cmd)
+ {
+@@ -11897,9 +11897,9 @@ static int tg3_get_eeprom_len(struct net_device *dev)
+ static int tg3_get_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom, u8 *data)
+ {
+  struct tg3 *tp = netdev_priv(dev);
+- int ret;
++ int ret, cpmu_restore = 0;
+  u8  *pd;
+- u32 i, offset, len, b_offset, b_count;
++ u32 i, offset, len, b_offset, b_count, cpmu_val = 0;
+  __be32 val;
+ 
+  if (tg3_flag(tp, NO_NVRAM))
+@@ -11911,6 +11911,19 @@ static int tg3_get_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
+ 
+  eeprom->magic = TG3_EEPROM_MAGIC;
+ 
++ /* Override clock, link aware and link idle modes */
++ if (tg3_flag(tp, CPMU_PRESENT)) {
++  cpmu_val = tr32(TG3_CPMU_CTRL);
++  if (cpmu_val & (CPMU_CTRL_LINK_AWARE_MODE |
++    CPMU_CTRL_LINK_IDLE_MODE)) {
++   tw32(TG3_CPMU_CTRL, cpmu_val &
++         ~(CPMU_CTRL_LINK_AWARE_MODE |
++          CPMU_CTRL_LINK_IDLE_MODE));
++   cpmu_restore = 1;
++  }
++ }
++ tg3_override_clk(tp);
++
+  if (offset & 3) {
+   /* adjustments to start on required 4 byte boundary */
+   b_offset = offset & 3;
+@@ -11921,7 +11934,7 @@ static int tg3_get_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
+   }
+   ret = tg3_nvram_read_be32(tp, offset-b_offset, &val);
+   if (ret)
+-   return ret;
++   goto eeprom_done;
+   memcpy(data, ((char *)&val) + b_offset, b_count);
+   len -= b_count;
+   offset += b_count;
+@@ -11933,10 +11946,20 @@ static int tg3_get_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
+  for (i = 0; i < (len - (len & 3)); i += 4) {
+   ret = tg3_nvram_read_be32(tp, offset + i, &val);
+   if (ret) {
++   if (i)
++    i -= 4;
+    eeprom->len += i;
+-   return ret;
++   goto eeprom_done;
+   }
+   memcpy(pd + i, &val, 4);
++  if (need_resched()) {
++   if (signal_pending(current)) {
++    eeprom->len += i;
++    ret = -EINTR;
++    goto eeprom_done;
++   }
++   cond_resched();
++  }
+  }
+  eeprom->len += i;
+ 
+@@ -11947,11 +11970,19 @@ static int tg3_get_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
+   b_offset = offset + len - b_count;
+   ret = tg3_nvram_read_be32(tp, b_offset, &val);
+   if (ret)
+-   return ret;
++   goto eeprom_done;
+   memcpy(pd, &val, b_count);
+   eeprom->len += b_count;
+  }
+- return 0;
++ ret = 0;
++
++eeprom_done:
++ /* Restore clock, link aware and link idle modes */
++ tg3_restore_clk(tp);
++ if (cpmu_restore)
++  tw32(TG3_CPMU_CTRL, cpmu_val);
++
++ return ret;
+ }
+ 
+ static int tg3_set_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom, u8 *data)
+-- 
+1.7.1

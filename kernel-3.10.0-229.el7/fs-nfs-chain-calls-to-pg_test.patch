@@ -1,0 +1,132 @@
+From e2d9864b7a103dd2fc416642ca9aecb631091bb3 Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:53:55 -0400
+Subject: [fs] nfs: chain calls to pg_test
+
+Message-id: <1403798077-28799-37-git-send-email-steved@redhat.com>
+Patchwork-id: 84892
+O-Subject: [RHEL7.1 PATCH 36/78] nfs: chain calls to pg_test
+Bugzilla: 1113248
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+Now that pg_test can change the size of the request (by returning a non-zero
+size smaller than the request), pg_test functions that call other
+pg_test functions must return the minimum of the result - or 0 if any fail.
+
+Also clean up the logic of some pg_test functions so that all checks are
+for contitions where coalescing is not possible.
+
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: 0f9c429eca07aca2764ccd751e2b48ba5397b936
+Bugzilla: 1113248
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/nfs4filelayout.c b/fs/nfs/nfs4filelayout.c
+index 9cea935..7a665e0 100644
+--- a/fs/nfs/nfs4filelayout.c
++++ b/fs/nfs/nfs4filelayout.c
+@@ -928,26 +928,27 @@ static size_t
+ filelayout_pg_test(struct nfs_pageio_descriptor *pgio, struct nfs_page *prev,
+      struct nfs_page *req)
+ {
++ unsigned int size;
+  u64 p_stripe, r_stripe;
+  u32 stripe_unit;
+ 
+- if (!pnfs_generic_pg_test(pgio, prev, req) ||
+-     !nfs_generic_pg_test(pgio, prev, req))
++ /* calls nfs_generic_pg_test */
++ size = pnfs_generic_pg_test(pgio, prev, req);
++ if (!size)
+   return 0;
+ 
+- if (!prev)
+-  return req->wb_bytes;
++ if (prev) {
++  p_stripe = (u64)req_offset(prev);
++  r_stripe = (u64)req_offset(req);
++  stripe_unit = FILELAYOUT_LSEG(pgio->pg_lseg)->stripe_unit;
+ 
+- p_stripe = (u64)req_offset(prev);
+- r_stripe = (u64)req_offset(req);
+- stripe_unit = FILELAYOUT_LSEG(pgio->pg_lseg)->stripe_unit;
++  do_div(p_stripe, stripe_unit);
++  do_div(r_stripe, stripe_unit);
+ 
+- do_div(p_stripe, stripe_unit);
+- do_div(r_stripe, stripe_unit);
+-
+- if (p_stripe == r_stripe)
+-  return req->wb_bytes;
+- return 0;
++  if (p_stripe != r_stripe)
++   return 0;
++ }
++ return min(size, req->wb_bytes);
+ }
+ 
+ static void
+diff --git a/fs/nfs/objlayout/objio_osd.c b/fs/nfs/objlayout/objio_osd.c
+index 71b9c69..6113207 100644
+--- a/fs/nfs/objlayout/objio_osd.c
++++ b/fs/nfs/objlayout/objio_osd.c
+@@ -571,12 +571,15 @@ int objio_write_pagelist(struct nfs_pgio_data *wdata, int how)
+ static size_t objio_pg_test(struct nfs_pageio_descriptor *pgio,
+      struct nfs_page *prev, struct nfs_page *req)
+ {
+- if (!pnfs_generic_pg_test(pgio, prev, req) ||
+-     pgio->pg_count + req->wb_bytes >
++ unsigned int size;
++
++ size = pnfs_generic_pg_test(pgio, prev, req);
++
++ if (!size || pgio->pg_count + req->wb_bytes >
+      (unsigned long)pgio->pg_layout_private)
+   return 0;
+ 
+- return req->wb_bytes;
++ return min(size, req->wb_bytes);
+ }
+ 
+ static void objio_init_read(struct nfs_pageio_descriptor *pgio, struct nfs_page *req)
+diff --git a/fs/nfs/pnfs.c b/fs/nfs/pnfs.c
+index de6eb16..354c53c 100644
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@ -1442,8 +1442,12 @@ size_t
+ pnfs_generic_pg_test(struct nfs_pageio_descriptor *pgio, struct nfs_page *prev,
+        struct nfs_page *req)
+ {
+- if (pgio->pg_lseg == NULL)
+-  return nfs_generic_pg_test(pgio, prev, req);
++ unsigned int size;
++
++ size = nfs_generic_pg_test(pgio, prev, req);
++
++ if (!size)
++  return 0;
+ 
+  /*
+   * Test if a nfs_page is fully contained in the pnfs_layout_range.
+@@ -1459,10 +1463,11 @@ pnfs_generic_pg_test(struct nfs_pageio_descriptor *pgio, struct nfs_page *prev,
+   * first byte that lies outside the pnfs_layout_range. FIXME?
+   *
+   */
+- if (req_offset(req) < end_offset(pgio->pg_lseg->pls_range.offset,
++ if (req_offset(req) >= end_offset(pgio->pg_lseg->pls_range.offset,
+       pgio->pg_lseg->pls_range.length))
+-  return req->wb_bytes;
+- return 0;
++  return 0;
++
++ return min(size, req->wb_bytes);
+ }
+ EXPORT_SYMBOL_GPL(pnfs_generic_pg_test);
+ 
+-- 
+1.7.1

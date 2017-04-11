@@ -1,0 +1,115 @@
+From def62183046dfdb216a2018f9d083da65a138b2a Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:07:50 -0400
+Subject: [x86] msr: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-14-git-send-email-prarit@redhat.com>
+Patchwork-id: 85762
+O-Subject: [RHEL7.1 PATCH BZ 1119078 13/35] x86, msr: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit de82a01befdd33f6a1c050c7f888e2fa9949f48e
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:06:37 2014 +0530
+
+    x86, msr: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the msr code in x86 by using this latter form of callback registration.
+
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Kyle McMartin <kmcmarti@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kernel/msr.c b/arch/x86/kernel/msr.c
+index 6b6cb4f..fdc66e7 100644
+--- a/arch/x86/kernel/msr.c
++++ b/arch/x86/kernel/msr.c
+@@ -267,14 +267,15 @@ static int __init msr_init(void)
+   goto out_chrdev;
+  }
+  msr_class->devnode = msr_devnode;
+- get_online_cpus();
++
++ cpu_notifier_register_begin();
+  for_each_online_cpu(i) {
+   err = msr_device_create(i);
+   if (err != 0)
+    goto out_class;
+  }
+- register_hotcpu_notifier(&msr_class_cpu_notifier);
+- put_online_cpus();
++ __register_hotcpu_notifier(&msr_class_cpu_notifier);
++ cpu_notifier_register_done();
+ 
+  err = 0;
+  goto out;
+@@ -283,7 +284,7 @@ out_class:
+  i = 0;
+  for_each_online_cpu(i)
+   msr_device_destroy(i);
+- put_online_cpus();
++ cpu_notifier_register_done();
+  class_destroy(msr_class);
+ out_chrdev:
+  __unregister_chrdev(MSR_MAJOR, 0, NR_CPUS, "cpu/msr");
+@@ -294,13 +295,14 @@ out:
+ static void __exit msr_exit(void)
+ {
+  int cpu = 0;
+- get_online_cpus();
++
++ cpu_notifier_register_begin();
+  for_each_online_cpu(cpu)
+   msr_device_destroy(cpu);
+  class_destroy(msr_class);
+  __unregister_chrdev(MSR_MAJOR, 0, NR_CPUS, "cpu/msr");
+- unregister_hotcpu_notifier(&msr_class_cpu_notifier);
+- put_online_cpus();
++ __unregister_hotcpu_notifier(&msr_class_cpu_notifier);
++ cpu_notifier_register_done();
+ }
+ 
+ module_init(msr_init);
+-- 
+1.7.1

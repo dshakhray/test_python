@@ -1,0 +1,174 @@
+From de405da211c3ce27b4dd85fa587e4af5fd04e038 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Thu, 28 Aug 2014 14:22:28 -0400
+Subject: [cpufreq] make return type of lock_policy_rwsem_{read|write}() as void
+
+Message-id: <1409235879-1283-55-git-send-email-prarit@redhat.com>
+Patchwork-id: 89385
+O-Subject: [RHEL7.1 PATCH BZ 1134639 054/185] cpufreq: make return type of lock_policy_rwsem_{read|write}() as void
+Bugzilla: 1134369
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Mark Langsdorf <mlangsdo@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1134639
+
+commit 1b750e3bdae5b2d0f3d377b0c56e7465f85b67f2
+Author: Viresh Kumar <viresh.kumar@linaro.org>
+Date:   Wed Oct 2 14:13:09 2013 +0530
+
+    cpufreq: make return type of lock_policy_rwsem_{read|write}() as void
+
+    lock_policy_rwsem_{read|write}() currently has return type of int,
+    but it always returns zero and hence its return type should be void
+    instead. This patch makes that change and modifies all of the users
+    accordingly.
+
+    Reported-by: Jon Medhurst<tixy@linaro.org>
+    Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Reviewed-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Lenny Szubowicz <lszubowi@redhat.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 5e386f4..89da332 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -67,13 +67,11 @@ static DEFINE_PER_CPU(char[CPUFREQ_NAME_LEN], cpufreq_cpu_governor);
+ static DEFINE_PER_CPU(struct rw_semaphore, cpu_policy_rwsem);
+ 
+ #define lock_policy_rwsem(mode, cpu)     \
+-static int lock_policy_rwsem_##mode(int cpu)    \
++static void lock_policy_rwsem_##mode(int cpu)    \
+ {         \
+  struct cpufreq_policy *policy = per_cpu(cpufreq_cpu_data, cpu); \
+  BUG_ON(!policy);      \
+  down_##mode(&per_cpu(cpu_policy_rwsem, policy->cpu));  \
+-         \
+- return 0;       \
+ }
+ 
+ lock_policy_rwsem(read, cpu);
+@@ -653,13 +651,12 @@ static ssize_t show(struct kobject *kobj, struct attribute *attr, char *buf)
+ {
+  struct cpufreq_policy *policy = to_policy(kobj);
+  struct freq_attr *fattr = to_attr(attr);
+- ssize_t ret = -EINVAL;
++ ssize_t ret;
+ 
+  if (!down_read_trylock(&cpufreq_rwsem))
+-  goto exit;
++  return -EINVAL;
+ 
+- if (lock_policy_rwsem_read(policy->cpu) < 0)
+-  goto up_read;
++ lock_policy_rwsem_read(policy->cpu);
+ 
+  if (fattr->show)
+   ret = fattr->show(policy, buf);
+@@ -667,10 +664,8 @@ static ssize_t show(struct kobject *kobj, struct attribute *attr, char *buf)
+   ret = -EIO;
+ 
+  unlock_policy_rwsem_read(policy->cpu);
+-
+-up_read:
+  up_read(&cpufreq_rwsem);
+-exit:
++
+  return ret;
+ }
+ 
+@@ -689,8 +684,7 @@ static ssize_t store(struct kobject *kobj, struct attribute *attr,
+  if (!down_read_trylock(&cpufreq_rwsem))
+   goto unlock;
+ 
+- if (lock_policy_rwsem_write(policy->cpu) < 0)
+-  goto up_read;
++ lock_policy_rwsem_write(policy->cpu);
+ 
+  if (fattr->store)
+   ret = fattr->store(policy, buf, count);
+@@ -699,7 +693,6 @@ static ssize_t store(struct kobject *kobj, struct attribute *attr,
+ 
+  unlock_policy_rwsem_write(policy->cpu);
+ 
+-up_read:
+  up_read(&cpufreq_rwsem);
+ unlock:
+  put_online_cpus();
+@@ -1145,7 +1138,7 @@ static int cpufreq_nominate_new_policy_cpu(struct cpufreq_policy *policy,
+  if (ret) {
+   pr_err("%s: Failed to move kobj: %d", __func__, ret);
+ 
+-  WARN_ON(lock_policy_rwsem_write(old_cpu));
++  lock_policy_rwsem_write(old_cpu);
+   cpumask_set_cpu(old_cpu, policy->cpus);
+   unlock_policy_rwsem_write(old_cpu);
+ 
+@@ -1241,7 +1234,7 @@ static int __cpufreq_remove_dev_finish(struct device *dev,
+   return -EINVAL;
+  }
+ 
+- WARN_ON(lock_policy_rwsem_write(cpu));
++ lock_policy_rwsem_write(cpu);
+  cpus = cpumask_weight(policy->cpus);
+ 
+  if (cpus > 1)
+@@ -1470,14 +1463,11 @@ unsigned int cpufreq_get(unsigned int cpu)
+  if (!down_read_trylock(&cpufreq_rwsem))
+   return 0;
+ 
+- if (unlikely(lock_policy_rwsem_read(cpu)))
+-  goto out_policy;
++ lock_policy_rwsem_read(cpu);
+ 
+  ret_freq = __cpufreq_get(cpu);
+ 
+  unlock_policy_rwsem_read(cpu);
+-
+-out_policy:
+  up_read(&cpufreq_rwsem);
+ 
+  return ret_freq;
+@@ -1701,14 +1691,12 @@ int cpufreq_driver_target(struct cpufreq_policy *policy,
+ {
+  int ret = -EINVAL;
+ 
+- if (unlikely(lock_policy_rwsem_write(policy->cpu)))
+-  goto fail;
++ lock_policy_rwsem_write(policy->cpu);
+ 
+  ret = __cpufreq_driver_target(policy, target_freq, relation);
+ 
+  unlock_policy_rwsem_write(policy->cpu);
+ 
+-fail:
+  return ret;
+ }
+ EXPORT_SYMBOL_GPL(cpufreq_driver_target);
+@@ -2000,10 +1988,7 @@ int cpufreq_update_policy(unsigned int cpu)
+   goto no_policy;
+  }
+ 
+- if (unlikely(lock_policy_rwsem_write(cpu))) {
+-  ret = -EINVAL;
+-  goto fail;
+- }
++ lock_policy_rwsem_write(cpu);
+ 
+  pr_debug("updating policy for CPU %u\n", cpu);
+  memcpy(&new_policy, policy, sizeof(struct cpufreq_policy));
+@@ -2032,7 +2017,6 @@ int cpufreq_update_policy(unsigned int cpu)
+ 
+  unlock_policy_rwsem_write(cpu);
+ 
+-fail:
+  cpufreq_cpu_put(policy);
+ no_policy:
+  return ret;
+-- 
+1.7.1

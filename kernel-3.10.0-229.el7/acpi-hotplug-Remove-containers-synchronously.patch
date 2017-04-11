@@ -1,0 +1,170 @@
+From 122f7549b3cf45cde95ae0dc3b247780a8b8c228 Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:05:30 -0400
+Subject: [acpi] hotplug: Remove containers synchronously
+
+Message-id: <20140710010530.22146.83618.stgit@gir.stowe>
+Patchwork-id: 85609
+O-Subject: [RHEL7.1 PATCH 070/105] ACPI / hotplug: Remove containers synchronously
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: f943db40c29f3c82a56956e9ca36f21d6d855db9
+
+commit f943db40c29f3c82a56956e9ca36f21d6d855db9
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Wed Aug 28 21:41:07 2013 +0200
+
+    ACPI / hotplug: Remove containers synchronously
+
+    The current protocol for handling hot remove of containers is very
+    fragile and causes acpi_eject_store() to acquire acpi_scan_lock
+    which may deadlock with the removal of the device that it is called
+    for (the reason is that device sysfs attributes cannot be removed
+    while their callbacks are being executed and ACPI device objects
+    are removed under acpi_scan_lock).
+
+    The problem is related to the fact that containers are handled by
+    acpi_bus_device_eject() in a special way, which is to emit an
+    offline uevent instead of just removing the container.  Then, user
+    space is expected to handle that uevent and use the container's
+    "eject" attribute to actually remove it.  That is fragile, because
+    user space may fail to complete the ejection (for example, by not
+    using the container's "eject" attribute at all) leaving the BIOS
+    kind of in a limbo.  Moreover, if the eject event is not signaled
+    for a container itself, but for its parent device object (or
+    generally, for an ancestor above it in the ACPI namespace), the
+    container will be removed straight away without doing that whole
+    dance.
+
+    For this reason, modify acpi_bus_device_eject() to remove containers
+    synchronously like any other objects (user space will get its uevent
+    anyway in case it does some other things in response to it) and
+    remove the eject_pending ACPI device flag that is not used any more.
+    This way acpi_eject_store() doesn't have a reason to acquire
+    acpi_scan_lock any more and one possible deadlock scenario goes
+    away (plus the code is simplified a bit).
+
+    Reported-and-tested-by: Gu Zheng <guz.fnst@cn.fujitsu.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Acked-by: Toshi Kani <toshi.kani@hp.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index d3c8402..8562ff1 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -287,6 +287,7 @@ static void acpi_bus_device_eject(void *context)
+  struct acpi_device *device = NULL;
+  struct acpi_scan_handler *handler;
+  u32 ost_code = ACPI_OST_SC_NON_SPECIFIC_FAILURE;
++ int error;
+ 
+  mutex_lock(&acpi_scan_lock);
+ 
+@@ -301,17 +302,13 @@ static void acpi_bus_device_eject(void *context)
+  }
+  acpi_evaluate_hotplug_ost(handle, ACPI_NOTIFY_EJECT_REQUEST,
+       ACPI_OST_SC_EJECT_IN_PROGRESS, NULL);
+- if (handler->hotplug.mode == AHM_CONTAINER) {
+-  device->flags.eject_pending = true;
++ if (handler->hotplug.mode == AHM_CONTAINER)
+   kobject_uevent(&device->dev.kobj, KOBJ_OFFLINE);
+- } else {
+-  int error;
+ 
+-  get_device(&device->dev);
+-  error = acpi_scan_hot_remove(device);
+-  if (error)
+-   goto err_out;
+- }
++ get_device(&device->dev);
++ error = acpi_scan_hot_remove(device);
++ if (error)
++  goto err_out;
+ 
+  out:
+  mutex_unlock(&acpi_scan_lock);
+@@ -496,7 +493,6 @@ acpi_eject_store(struct device *d, struct device_attribute *attr,
+  struct acpi_eject_event *ej_event;
+  acpi_object_type not_used;
+  acpi_status status;
+- u32 ost_source;
+  int ret;
+ 
+  if (!count || buf[0] != '1')
+@@ -510,43 +506,28 @@ acpi_eject_store(struct device *d, struct device_attribute *attr,
+  if (ACPI_FAILURE(status) || !acpi_device->flags.ejectable)
+   return -ENODEV;
+ 
+- mutex_lock(&acpi_scan_lock);
+-
+- if (acpi_device->flags.eject_pending) {
+-  /* ACPI eject notification event. */
+-  ost_source = ACPI_NOTIFY_EJECT_REQUEST;
+-  acpi_device->flags.eject_pending = 0;
+- } else {
+-  /* Eject initiated by user space. */
+-  ost_source = ACPI_OST_EC_OSPM_EJECT;
+- }
+  ej_event = kmalloc(sizeof(*ej_event), GFP_KERNEL);
+  if (!ej_event) {
+   ret = -ENOMEM;
+   goto err_out;
+  }
+- acpi_evaluate_hotplug_ost(acpi_device->handle, ost_source,
++ acpi_evaluate_hotplug_ost(acpi_device->handle, ACPI_OST_EC_OSPM_EJECT,
+       ACPI_OST_SC_EJECT_IN_PROGRESS, NULL);
+  ej_event->device = acpi_device;
+- ej_event->event = ost_source;
++ ej_event->event = ACPI_OST_EC_OSPM_EJECT;
+  get_device(&acpi_device->dev);
+  status = acpi_os_hotplug_execute(acpi_bus_hot_remove_device, ej_event);
+- if (ACPI_FAILURE(status)) {
+-  put_device(&acpi_device->dev);
+-  kfree(ej_event);
+-  ret = status == AE_NO_MEMORY ? -ENOMEM : -EAGAIN;
+-  goto err_out;
+- }
+- ret = count;
++ if (ACPI_SUCCESS(status))
++  return count;
+ 
+- out:
+- mutex_unlock(&acpi_scan_lock);
+- return ret;
++ put_device(&acpi_device->dev);
++ kfree(ej_event);
++ ret = status == AE_NO_MEMORY ? -ENOMEM : -EAGAIN;
+ 
+  err_out:
+- acpi_evaluate_hotplug_ost(acpi_device->handle, ost_source,
++ acpi_evaluate_hotplug_ost(acpi_device->handle, ACPI_OST_EC_OSPM_EJECT,
+       ACPI_OST_SC_NON_SPECIFIC_FAILURE, NULL);
+- goto out;
++ return ret;
+ }
+ 
+ static DEVICE_ATTR(eject, 0200, NULL, acpi_eject_store);
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index 3fb25ec..f1a0cd5 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -168,9 +168,8 @@ struct acpi_device_flags {
+  u32 removable:1;
+  u32 ejectable:1;
+  u32 power_manageable:1;
+- u32 eject_pending:1;
+  u32 match_driver:1;
+- u32 reserved:26;
++ u32 reserved:27;
+ };
+ 
+ /* File System */
+-- 
+1.7.1

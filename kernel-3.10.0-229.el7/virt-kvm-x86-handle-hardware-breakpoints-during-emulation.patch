@@ -1,0 +1,111 @@
+From b0e1c520a1d26ec06541833628caf790b74281bd Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 22 Jul 2014 14:37:24 -0400
+Subject: [virt] kvm/x86: handle hardware breakpoints during emulation
+
+Message-id: <1406040016-3289-50-git-send-email-pbonzini@redhat.com>
+Patchwork-id: 86128
+O-Subject: [RHEL7 PATCH v2 049/221] KVM: x86: handle hardware breakpoints during emulation
+Bugzilla: 1116936
+RH-Acked-by: Radim Krcmar <rkrcmar@redhat.com>
+RH-Acked-by: Bandan Das <bsd@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+This lets debugging work better during emulation of invalid
+guest state.
+
+The check is done before emulating the instruction, and (in the case
+of guest debugging) reuses EMULATE_DO_MMIO to exit with KVM_EXIT_DEBUG.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4a1e10d5b5d8c5ebe0908fb9d3859a5602bf5cf1)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index be7f545..f7451a6 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5023,6 +5023,62 @@ static bool retry_instruction(struct x86_emulate_ctxt *ctxt,
+ static int complete_emulated_mmio(struct kvm_vcpu *vcpu);
+ static int complete_emulated_pio(struct kvm_vcpu *vcpu);
+ 
++static int kvm_vcpu_check_hw_bp(unsigned long addr, u32 type, u32 dr7,
++    unsigned long *db)
++{
++ u32 dr6 = 0;
++ int i;
++ u32 enable, rwlen;
++
++ enable = dr7;
++ rwlen = dr7 >> 16;
++ for (i = 0; i < 4; i++, enable >>= 2, rwlen >>= 4)
++  if ((enable & 3) && (rwlen & 15) == type && db[i] == addr)
++   dr6 |= (1 << i);
++ return dr6;
++}
++
++static bool kvm_vcpu_check_breakpoint(struct kvm_vcpu *vcpu, int *r)
++{
++ struct kvm_run *kvm_run = vcpu->run;
++ unsigned long eip = vcpu->arch.emulate_ctxt.eip;
++ u32 dr6 = 0;
++
++ if (unlikely(vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP) &&
++     (vcpu->arch.guest_debug_dr7 & DR7_BP_EN_MASK)) {
++  dr6 = kvm_vcpu_check_hw_bp(eip, 0,
++        vcpu->arch.guest_debug_dr7,
++        vcpu->arch.eff_db);
++
++  if (dr6 != 0) {
++   kvm_run->debug.arch.dr6 = dr6 | DR6_FIXED_1;
++   kvm_run->debug.arch.pc = kvm_rip_read(vcpu) +
++    get_segment_base(vcpu, VCPU_SREG_CS);
++
++   kvm_run->debug.arch.exception = DB_VECTOR;
++   kvm_run->exit_reason = KVM_EXIT_DEBUG;
++   *r = EMULATE_USER_EXIT;
++   return true;
++  }
++ }
++
++ if (unlikely(vcpu->arch.dr7 & DR7_BP_EN_MASK)) {
++  dr6 = kvm_vcpu_check_hw_bp(eip, 0,
++        vcpu->arch.dr7,
++        vcpu->arch.db);
++
++  if (dr6 != 0) {
++   vcpu->arch.dr6 &= ~15;
++   vcpu->arch.dr6 |= dr6;
++   kvm_queue_exception(vcpu, DB_VECTOR);
++   *r = EMULATE_DONE;
++   return true;
++  }
++ }
++
++ return false;
++}
++
+ int x86_emulate_instruction(struct kvm_vcpu *vcpu,
+        unsigned long cr2,
+        int emulation_type,
+@@ -5043,6 +5099,16 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu,
+ 
+  if (!(emulation_type & EMULTYPE_NO_DECODE)) {
+   init_emulate_ctxt(vcpu);
++
++  /*
++   * We will reenter on the same instruction since
++   * we do not set complete_userspace_io.  This does not
++   * handle watchpoints yet, those would be handled in
++   * the emulate_ops.
++   */
++  if (kvm_vcpu_check_breakpoint(vcpu, &r))
++   return r;
++
+   ctxt->interruptibility = 0;
+   ctxt->have_exception = false;
+   ctxt->perm_ok = false;
+-- 
+1.7.1

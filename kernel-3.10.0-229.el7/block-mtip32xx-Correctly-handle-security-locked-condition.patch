@@ -1,0 +1,103 @@
+From d420531a107da3316bcddafcfdefc2a69ad3d845 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 13 Jun 2014 15:30:06 -0400
+Subject: [block] mtip32xx: Correctly handle security locked condition
+
+Message-id: <1402673421-17117-4-git-send-email-snitzer@redhat.com>
+Patchwork-id: 83914
+O-Subject: [RHEL7.1 PATCH 03/18] mtip32xx: Correctly handle security locked condition
+Bugzilla: 1105703
+RH-Acked-by: David Milburn <dmilburn@redhat.com>
+
+BZ: 1105703
+
+Had to hand-patch MTIP_DRV_VERSION because earlier backport of
+"mtip32xx: mtip_async_complete() bug fixes" already bumped it to
+1.2.6os4.  Adjust to 1.3.1 (which is what upstream commit 5eb9291c3
+established) so that the final driver version matches upstream's once
+all patches in this series are applied.
+
+Upstream commit 26d580575b4b8c3c83137315c9a2a77e60a2f716
+Author: Sam Bradshaw <sbradshaw@micron.com>
+Date:   Thu Oct 3 10:18:05 2013 -0700
+
+    mtip32xx: Correctly handle security locked condition
+
+    If power is removed during a secure erase, the drive will end up in a
+    security locked condition.  This patch causes the driver to identify,
+    log, and flag the security lock state.  IOs are prevented from
+    submission to the drive until the locked state is addressed with a
+    secure erase.
+
+    Bumped version number to reflect this capability.
+
+    Signed-off-by: Sam Bradshaw <sbradshaw@micron.com>
+    Signed-off-by: Asai Thambi S P <asamymuthupa@micron.com>
+    Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/block/mtip32xx/mtip32xx.c b/drivers/block/mtip32xx/mtip32xx.c
+index 5eeb2eb..ad26ddd 100644
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@ -931,8 +931,9 @@ static void mtip_handle_tfe(struct driver_data *dd)
+    fail_reason = "thermal shutdown";
+   }
+   if (buf[288] == 0xBF) {
++   set_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag);
+    dev_info(&dd->pdev->dev,
+-    "Drive indicates rebuild has failed.\n");
++    "Drive indicates rebuild has failed. Secure erase required.\n");
+    fail_all_ncq_cmds = 1;
+    fail_reason = "rebuild failed";
+   }
+@@ -1598,6 +1599,12 @@ static int mtip_get_identify(struct mtip_port *port, void __user *user_buffer)
+  }
+ #endif
+ 
++ /* Check security locked state */
++ if (port->identify[128] & 0x4)
++  set_bit(MTIP_DDF_SEC_LOCK_BIT, &port->dd->dd_flag);
++ else
++  clear_bit(MTIP_DDF_SEC_LOCK_BIT, &port->dd->dd_flag);
++
+ #ifdef MTIP_TRIM /* Disabling TRIM support temporarily */
+  /* Demux ID.DRAT & ID.RZAT to determine trim support */
+  if (port->identify[69] & (1 << 14) && port->identify[69] & (1 << 5))
+@@ -1919,6 +1926,10 @@ static void mtip_dump_identify(struct mtip_port *port)
+  strlcpy(cbuf, (char *)(port->identify+27), 41);
+  dev_info(&port->dd->pdev->dev, "Model: %s\n", cbuf);
+ 
++ dev_info(&port->dd->pdev->dev, "Security: %04x %s\n",
++  port->identify[128],
++  port->identify[128] & 0x4 ? "(LOCKED)" : "");
++
+  if (mtip_hw_get_capacity(port->dd, &sectors))
+   dev_info(&port->dd->pdev->dev,
+    "Capacity: %llu sectors (%llu MB)\n",
+@@ -3689,7 +3700,8 @@ static int mtip_hw_exit(struct driver_data *dd)
+   * saves its state.
+   */
+  if (!dd->sr) {
+-  if (!test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag))
++  if (!test_bit(MTIP_PF_REBUILD_BIT, &dd->port->flags) &&
++      !test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag))
+    if (mtip_standby_immediate(dd->port))
+     dev_warn(&dd->pdev->dev,
+      "STANDBY IMMEDIATE failed\n");
+diff --git a/drivers/block/mtip32xx/mtip32xx.h b/drivers/block/mtip32xx/mtip32xx.h
+index 7a04c06..db59258 100644
+--- a/drivers/block/mtip32xx/mtip32xx.h
++++ b/drivers/block/mtip32xx/mtip32xx.h
+@@ -92,7 +92,7 @@
+ 
+ /* Driver name and version strings */
+ #define MTIP_DRV_NAME  "mtip32xx"
+-#define MTIP_DRV_VERSION "1.2.6os4"
++#define MTIP_DRV_VERSION "1.3.1"
+ 
+ /* Maximum number of minor device numbers per device. */
+ #define MTIP_MAX_MINORS  16
+-- 
+1.7.1

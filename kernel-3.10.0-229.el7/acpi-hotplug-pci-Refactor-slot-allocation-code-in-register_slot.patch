@@ -1,0 +1,142 @@
+From 6ed368fceb4fa65e66edf217fbbadd1bea015c4f Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:01:35 -0400
+Subject: [acpi] hotplug/pci: Refactor slot allocation code in register_slot()
+
+Message-id: <20140710010135.22146.46737.stgit@gir.stowe>
+Patchwork-id: 85571
+O-Subject: [RHEL7.1 PATCH 032/105] ACPI / hotplug / PCI: Refactor slot allocation code in register_slot()
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: ac372338b750648355bcc64bb0bca13fc6f0a3d5
+
+commit ac372338b750648355bcc64bb0bca13fc6f0a3d5
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Sat Jul 13 23:27:24 2013 +0200
+
+    ACPI / hotplug / PCI: Refactor slot allocation code in register_slot()
+
+    To make the code in register_slot() a bit easier to follow, change
+    the way the slot allocation part is organized.  Drop one local
+    variable that's not used any more after that modification.
+
+    This code change should not lead to any changes in behavior.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/pci/hotplug/acpiphp_glue.c b/drivers/pci/hotplug/acpiphp_glue.c
+index bc396b6..cd8dcd4 100644
+--- a/drivers/pci/hotplug/acpiphp_glue.c
++++ b/drivers/pci/hotplug/acpiphp_glue.c
+@@ -283,7 +283,7 @@ static acpi_status register_slot(acpi_handle handle, u32 lvl, void *data,
+  struct acpiphp_func *newfunc;
+  acpi_status status = AE_OK;
+  unsigned long long adr, sun;
+- int device, function, retval, found = 0;
++ int device, function, retval;
+  struct pci_bus *pbus = bridge->pci_bus;
+  struct pci_dev *pdev;
+  u32 val;
+@@ -352,44 +352,49 @@ static acpi_status register_slot(acpi_handle handle, u32 lvl, void *data,
+   if (slot->device == device) {
+    if (slot->sun != sun)
+     pr_warn("sibling found, but _SUN doesn't match!\n");
+-   found = 1;
+-   break;
+-  }
+ 
+- if (!found) {
+-  slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
+-  if (!slot) {
+-   status = AE_NO_MEMORY;
+-   goto err_out;
++   goto slot_found;
+   }
+ 
+-  slot->bridge = bridge;
+-  slot->device = device;
+-  slot->sun = sun;
+-  INIT_LIST_HEAD(&slot->funcs);
+-  mutex_init(&slot->crit_sect);
++ slot = kzalloc(sizeof(struct acpiphp_slot), GFP_KERNEL);
++ if (!slot) {
++  status = AE_NO_MEMORY;
++  goto err;
++ }
++
++ slot->bridge = bridge;
++ slot->device = device;
++ slot->sun = sun;
++ INIT_LIST_HEAD(&slot->funcs);
++ mutex_init(&slot->crit_sect);
+ 
++ mutex_lock(&bridge_mutex);
++ list_add_tail(&slot->node, &bridge->slots);
++ mutex_unlock(&bridge_mutex);
++ bridge->nr_slots++;
++
++ pr_debug("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
++     slot->sun, pci_domain_nr(pbus), pbus->number, device);
++
++ retval = acpiphp_register_hotplug_slot(slot);
++ if (retval) {
++  if (retval == -EBUSY)
++   pr_warn("Slot %llu already registered by another "
++    "hotplug driver\n", slot->sun);
++  else
++   pr_warn("acpiphp_register_hotplug_slot failed "
++    "(err code = 0x%x)\n", retval);
++
++  bridge->nr_slots--;
+   mutex_lock(&bridge_mutex);
+-  list_add_tail(&slot->node, &bridge->slots);
++  list_del(&slot->node);
+   mutex_unlock(&bridge_mutex);
+-  bridge->nr_slots++;
+-
+-  pr_debug("found ACPI PCI Hotplug slot %llu at PCI %04x:%02x:%02x\n",
+-      slot->sun, pci_domain_nr(pbus), pbus->number, device);
+-  retval = acpiphp_register_hotplug_slot(slot);
+-  if (retval) {
+-   if (retval == -EBUSY)
+-    pr_warn("Slot %llu already registered by another "
+-     "hotplug driver\n", slot->sun);
+-   else
+-    pr_warn("acpiphp_register_hotplug_slot failed "
+-     "(err code = 0x%x)\n", retval);
+-
+-   status = AE_OK;
+-   goto err;
+-  }
++  kfree(slot);
++  status = AE_OK;
++  goto err;
+  }
+ 
++ slot_found:
+  newfunc->slot = slot;
+  mutex_lock(&bridge_mutex);
+  list_add_tail(&newfunc->sibling, &slot->funcs);
+@@ -425,13 +430,6 @@ static acpi_status register_slot(acpi_handle handle, u32 lvl, void *data,
+  return AE_OK;
+ 
+  err:
+- bridge->nr_slots--;
+- mutex_lock(&bridge_mutex);
+- list_del(&slot->node);
+- mutex_unlock(&bridge_mutex);
+- kfree(slot);
+-
+- err_out:
+  mutex_lock(&acpiphp_context_lock);
+  context->func = NULL;
+  acpiphp_put_context(context);
+-- 
+1.7.1

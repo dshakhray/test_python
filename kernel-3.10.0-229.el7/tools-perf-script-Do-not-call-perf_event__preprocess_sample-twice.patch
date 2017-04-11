@@ -1,0 +1,186 @@
+From be54838a52548ceab6775ba1ee452b04fc3957d1 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@redhat.com>
+Date: Mon, 25 Aug 2014 07:49:24 -0400
+Subject: [tools] perf/script: Do not call perf_event__preprocess_sample() twice)
+
+Message-id: <1408953210-26343-77-git-send-email-jolsa@redhat.com>
+Patchwork-id: 88773
+O-Subject: [PATCH RHEL7.1 BZ1133083 076/322] perf script: Do not call perf_event__preprocess_sample() twice)
+Bugzilla: 1133083
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+Bugzilla: 1133083
+https://bugzilla.redhat.com/show_bug.cgi?id=1133083
+
+upstream
+========
+commit a2cb3cf20e06ef119ae541c1a08dc1977f7f0fff
+Author: Adrian Hunter <adrian.hunter@intel.com>
+Date: Wed Dec 4 16:16:36 2013 +0200
+
+description
+===========
+The perf_event__preprocess_sample() function is called in
+process_sample_event().  Instead of calling it again in
+perf_evsel__print_ip(), pass through the resultant addr_location.
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/tools/perf/builtin-script.c b/tools/perf/builtin-script.c
+index 952dce9..c555bdd 100644
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@ -414,7 +414,8 @@ static void print_sample_bts(union perf_event *event,
+         struct perf_sample *sample,
+         struct perf_evsel *evsel,
+         struct machine *machine,
+-        struct thread *thread)
++        struct thread *thread,
++        struct addr_location *al)
+ {
+  struct perf_event_attr *attr = &evsel->attr;
+ 
+@@ -424,7 +425,7 @@ static void print_sample_bts(union perf_event *event,
+    printf(" ");
+   else
+    printf("\n");
+-  perf_evsel__print_ip(evsel, event, sample, machine,
++  perf_evsel__print_ip(evsel, sample, machine, al,
+          output[attr->type].print_ip_opts,
+          PERF_MAX_STACK_DEPTH);
+  }
+@@ -443,7 +444,7 @@ static void print_sample_bts(union perf_event *event,
+ static void process_event(union perf_event *event, struct perf_sample *sample,
+      struct perf_evsel *evsel, struct machine *machine,
+      struct thread *thread,
+-     struct addr_location *al __maybe_unused)
++     struct addr_location *al)
+ {
+  struct perf_event_attr *attr = &evsel->attr;
+ 
+@@ -458,7 +459,7 @@ static void process_event(union perf_event *event, struct perf_sample *sample,
+  }
+ 
+  if (is_bts_event(attr)) {
+-  print_sample_bts(event, sample, evsel, machine, thread);
++  print_sample_bts(event, sample, evsel, machine, thread, al);
+   return;
+  }
+ 
+@@ -474,7 +475,7 @@ static void process_event(union perf_event *event, struct perf_sample *sample,
+   else
+    printf("\n");
+ 
+-  perf_evsel__print_ip(evsel, event, sample, machine,
++  perf_evsel__print_ip(evsel, sample, machine, al,
+          output[attr->type].print_ip_opts,
+          PERF_MAX_STACK_DEPTH);
+  }
+diff --git a/tools/perf/util/session.c b/tools/perf/util/session.c
+index 1e0017f..1770f2f 100644
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@ -1492,11 +1492,10 @@ struct perf_evsel *perf_session__find_first_evtype(struct perf_session *session,
+  return NULL;
+ }
+ 
+-void perf_evsel__print_ip(struct perf_evsel *evsel, union perf_event *event,
+-     struct perf_sample *sample, struct machine *machine,
++void perf_evsel__print_ip(struct perf_evsel *evsel, struct perf_sample *sample,
++     struct machine *machine, struct addr_location *al,
+      unsigned int print_opts, unsigned int stack_depth)
+ {
+- struct addr_location al;
+  struct callchain_cursor_node *node;
+  int print_ip = print_opts & PRINT_IP_OPT_IP;
+  int print_sym = print_opts & PRINT_IP_OPT_SYM;
+@@ -1505,15 +1504,10 @@ void perf_evsel__print_ip(struct perf_evsel *evsel, union perf_event *event,
+  int print_oneline = print_opts & PRINT_IP_OPT_ONELINE;
+  char s = print_oneline ? ' ' : '\t';
+ 
+- if (perf_event__preprocess_sample(event, machine, &al, sample) < 0) {
+-  error("problem processing %d event, skipping it.\n",
+-   event->header.type);
+-  return;
+- }
+-
+  if (symbol_conf.use_callchain && sample->callchain) {
++  struct addr_location node_al;
+ 
+-  if (machine__resolve_callchain(machine, evsel, al.thread,
++  if (machine__resolve_callchain(machine, evsel, al->thread,
+             sample, NULL, NULL,
+             PERF_MAX_STACK_DEPTH) != 0) {
+    if (verbose)
+@@ -1522,6 +1516,9 @@ void perf_evsel__print_ip(struct perf_evsel *evsel, union perf_event *event,
+   }
+   callchain_cursor_commit(&callchain_cursor);
+ 
++  if (print_symoffset)
++   node_al = *al;
++
+   while (stack_depth) {
+    node = callchain_cursor_current(&callchain_cursor);
+    if (!node)
+@@ -1536,9 +1533,9 @@ void perf_evsel__print_ip(struct perf_evsel *evsel, union perf_event *event,
+    if (print_sym) {
+     printf(" ");
+     if (print_symoffset) {
+-     al.addr = node->ip;
+-     al.map  = node->map;
+-     symbol__fprintf_symname_offs(node->sym, &al, stdout);
++     node_al.addr = node->ip;
++     node_al.map  = node->map;
++     symbol__fprintf_symname_offs(node->sym, &node_al, stdout);
+     } else
+      symbol__fprintf_symname(node->sym, stdout);
+    }
+@@ -1558,7 +1555,7 @@ next:
+   }
+ 
+  } else {
+-  if (al.sym && al.sym->ignore)
++  if (al->sym && al->sym->ignore)
+    return;
+ 
+   if (print_ip)
+@@ -1567,15 +1564,15 @@ next:
+   if (print_sym) {
+    printf(" ");
+    if (print_symoffset)
+-    symbol__fprintf_symname_offs(al.sym, &al,
++    symbol__fprintf_symname_offs(al->sym, al,
+             stdout);
+    else
+-    symbol__fprintf_symname(al.sym, stdout);
++    symbol__fprintf_symname(al->sym, stdout);
+   }
+ 
+   if (print_dso) {
+    printf(" (");
+-   map__fprintf_dsoname(al.map, stdout);
++   map__fprintf_dsoname(al->map, stdout);
+    printf(")");
+   }
+  }
+diff --git a/tools/perf/util/session.h b/tools/perf/util/session.h
+index 50f6409..7e5d439 100644
+--- a/tools/perf/util/session.h
++++ b/tools/perf/util/session.h
+@@ -105,8 +105,8 @@ size_t perf_session__fprintf_nr_events(struct perf_session *session, FILE *fp);
+ struct perf_evsel *perf_session__find_first_evtype(struct perf_session *session,
+          unsigned int type);
+ 
+-void perf_evsel__print_ip(struct perf_evsel *evsel, union perf_event *event,
+-     struct perf_sample *sample, struct machine *machine,
++void perf_evsel__print_ip(struct perf_evsel *evsel, struct perf_sample *sample,
++     struct machine *machine, struct addr_location *al,
+      unsigned int print_opts, unsigned int stack_depth);
+ 
+ int perf_session__cpu_bitmap(struct perf_session *session,
+-- 
+1.7.1

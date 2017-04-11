@@ -1,0 +1,109 @@
+From af265ac0fab91904a0c3a9c63f15b03dce79d11b Mon Sep 17 00:00:00 2001
+From: Steve Dickson <SteveD@redhat.com>
+Date: Thu, 26 Jun 2014 15:53:48 -0400
+Subject: [fs] nfs: call nfs_can_coalesce_requests for every req
+
+Message-id: <1403798077-28799-30-git-send-email-steved@redhat.com>
+Patchwork-id: 84921
+O-Subject: [RHEL7.1 PATCH 29/78] nfs: call nfs_can_coalesce_requests for every req
+Bugzilla: 1113248
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+From: Weston Andros Adamson <dros@primarydata.com>
+
+Call nfs_can_coalesce_requests for every request, even the first one.
+This is needed for future patches to give pg_test a way to inform
+add_request to reduce the size of the request.
+
+Now @prev can be null in nfs_can_coalesce_requests and pg_test functions.
+
+Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Upstream Id: ab75e417192a486ffe63a314b6d2e7361f0e157f
+Bugzilla: 1113248
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/nfs4filelayout.c b/fs/nfs/nfs4filelayout.c
+index ba9a9aa..9319427 100644
+--- a/fs/nfs/nfs4filelayout.c
++++ b/fs/nfs/nfs4filelayout.c
+@@ -929,6 +929,9 @@ filelayout_pg_test(struct nfs_pageio_descriptor *pgio, struct nfs_page *prev,
+      !nfs_generic_pg_test(pgio, prev, req))
+   return 0;
+ 
++ if (!prev)
++  return req->wb_bytes;
++
+  p_stripe = (u64)req_offset(prev);
+  r_stripe = (u64)req_offset(req);
+  stripe_unit = FILELAYOUT_LSEG(pgio->pg_lseg)->stripe_unit;
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 8223343..f343f49 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -292,6 +292,8 @@ nfs_wait_on_request(struct nfs_page *req)
+ size_t nfs_generic_pg_test(struct nfs_pageio_descriptor *desc,
+       struct nfs_page *prev, struct nfs_page *req)
+ {
++ if (!prev)
++  return req->wb_bytes;
+  /*
+   * FIXME: ideally we should be able to coalesce all requests
+   * that are not block boundary aligned, but currently this
+@@ -761,17 +763,20 @@ static bool nfs_can_coalesce_requests(struct nfs_page *prev,
+ {
+  size_t size;
+ 
+- if (!nfs_match_open_context(req->wb_context, prev->wb_context))
+-  return false;
+- if (req->wb_context->dentry->d_inode->i_flock != NULL &&
+-     !nfs_match_lock_context(req->wb_lock_context, prev->wb_lock_context))
+-  return false;
+- if (req->wb_pgbase != 0)
+-  return false;
+- if (prev->wb_pgbase + prev->wb_bytes != PAGE_CACHE_SIZE)
+-  return false;
+- if (req_offset(req) != req_offset(prev) + prev->wb_bytes)
+-  return false;
++ if (prev) {
++  if (!nfs_match_open_context(req->wb_context, prev->wb_context))
++   return false;
++  if (req->wb_context->dentry->d_inode->i_flock != NULL &&
++      !nfs_match_lock_context(req->wb_lock_context,
++         prev->wb_lock_context))
++   return false;
++  if (req->wb_pgbase != 0)
++   return false;
++  if (prev->wb_pgbase + prev->wb_bytes != PAGE_CACHE_SIZE)
++   return false;
++  if (req_offset(req) != req_offset(prev) + prev->wb_bytes)
++   return false;
++ }
+  size = pgio->pg_ops->pg_test(pgio, prev, req);
+  WARN_ON_ONCE(size && size != req->wb_bytes);
+  return size > 0;
+@@ -788,17 +793,16 @@ static bool nfs_can_coalesce_requests(struct nfs_page *prev,
+ static int nfs_pageio_do_add_request(struct nfs_pageio_descriptor *desc,
+          struct nfs_page *req)
+ {
++ struct nfs_page *prev = NULL;
+  if (desc->pg_count != 0) {
+-  struct nfs_page *prev;
+-
+   prev = nfs_list_entry(desc->pg_list.prev);
+-  if (!nfs_can_coalesce_requests(prev, req, desc))
+-   return 0;
+  } else {
+   if (desc->pg_ops->pg_init)
+    desc->pg_ops->pg_init(desc, req);
+   desc->pg_base = req->wb_pgbase;
+  }
++ if (!nfs_can_coalesce_requests(prev, req, desc))
++  return 0;
+  nfs_list_remove_request(req);
+  nfs_list_add_request(req, &desc->pg_list);
+  desc->pg_count += req->wb_bytes;
+-- 
+1.7.1

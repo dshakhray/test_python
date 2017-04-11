@@ -1,0 +1,159 @@
+From 0fd2f75d9331766d2e19da55e8c22e07f40ac4dd Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:14:00 -0400
+Subject: [fs] pstore: Add new argument 'compressed' in pstore write callback
+
+Message-id: <1410545655-205645-612-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94521
+O-Subject: [RHEL7 PATCH 611/626] pstore: Add new argument 'compressed' in pstore write callback
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit b3b515bbd689ba3937cac2dd3fc55057f8c50329
+Author: Aruna Balakrishnaiah <aruna@linux.vnet.ibm.com>
+Date:   Fri Aug 16 13:52:47 2013 -0700
+
+    pstore: Add new argument 'compressed' in pstore write callback
+
+    Addition of new argument 'compressed' in the write call back will
+    help the backend to know if the data passed from pstore is compressed
+    or not (In case where compression fails.). If compressed, the backend
+    can add a tag indicating the data is compressed while writing to
+    persistent store.
+
+    Signed-off-by: Aruna Balakrishnaiah <aruna@linux.vnet.ibm.com>
+    Reviewed-by: Kees Cook <keescook@chromium.org>
+    Signed-off-by: Tony Luck <tony.luck@intel.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/platforms/pseries/nvram.c b/arch/powerpc/platforms/pseries/nvram.c
+index 9f1dbd5..d0750f7 100644
+--- a/arch/powerpc/platforms/pseries/nvram.c
++++ b/arch/powerpc/platforms/pseries/nvram.c
+@@ -550,7 +550,7 @@ static int nvram_pstore_open(struct pstore_info *psi)
+  * @part:               pstore writes data to registered buffer in parts,
+  *                      part number will indicate the same.
+  * @count:              Indicates oops count
+- * @hsize:              Size of header added by pstore
++ * @compressed:         Flag to indicate the log is compressed
+  * @size:               number of bytes written to the registered buffer
+  * @psi:                registered pstore_info structure
+  *
+@@ -561,7 +561,7 @@ static int nvram_pstore_open(struct pstore_info *psi)
+ static int nvram_pstore_write(enum pstore_type_id type,
+     enum kmsg_dump_reason reason,
+     u64 *id, unsigned int part, int count,
+-    size_t hsize, size_t size,
++    bool compressed, size_t size,
+     struct pstore_info *psi)
+ {
+  int rc;
+diff --git a/drivers/acpi/apei/erst.c b/drivers/acpi/apei/erst.c
+index 88d0b0f..5e90796 100644
+--- a/drivers/acpi/apei/erst.c
++++ b/drivers/acpi/apei/erst.c
+@@ -935,7 +935,7 @@ static ssize_t erst_reader(u64 *id, enum pstore_type_id *type, int *count,
+       struct timespec *time, char **buf,
+       struct pstore_info *psi);
+ static int erst_writer(enum pstore_type_id type, enum kmsg_dump_reason reason,
+-         u64 *id, unsigned int part, int count, size_t hsize,
++         u64 *id, unsigned int part, int count, bool compressed,
+          size_t size, struct pstore_info *psi);
+ static int erst_clearer(enum pstore_type_id type, u64 id, int count,
+    struct timespec time, struct pstore_info *psi);
+@@ -1055,7 +1055,7 @@ out:
+ }
+ 
+ static int erst_writer(enum pstore_type_id type, enum kmsg_dump_reason reason,
+-         u64 *id, unsigned int part, int count, size_t hsize,
++         u64 *id, unsigned int part, int count, bool compressed,
+          size_t size, struct pstore_info *psi)
+ {
+  struct cper_pstore_record *rcd = (struct cper_pstore_record *)
+diff --git a/drivers/firmware/efi/efi-pstore.c b/drivers/firmware/efi/efi-pstore.c
+index b438a3a..24858f9 100644
+--- a/drivers/firmware/efi/efi-pstore.c
++++ b/drivers/firmware/efi/efi-pstore.c
+@@ -222,7 +222,7 @@ static ssize_t efi_pstore_read(u64 *id, enum pstore_type_id *type,
+ 
+ static int efi_pstore_write(enum pstore_type_id type,
+   enum kmsg_dump_reason reason, u64 *id,
+-  unsigned int part, int count, size_t hsize, size_t size,
++  unsigned int part, int count, bool compressed, size_t size,
+   struct pstore_info *psi)
+ {
+  char name[DUMP_NAME_LEN];
+diff --git a/fs/pstore/platform.c b/fs/pstore/platform.c
+index 422962a..20fa686 100644
+--- a/fs/pstore/platform.c
++++ b/fs/pstore/platform.c
+@@ -149,6 +149,7 @@ static void pstore_dump(struct kmsg_dumper *dumper,
+   unsigned long size;
+   int hsize;
+   size_t len;
++  bool compressed = false;
+ 
+   dst = psinfo->buf;
+   hsize = sprintf(dst, "%s#%d Part%d\n", why, oopscount, part);
+@@ -159,7 +160,7 @@ static void pstore_dump(struct kmsg_dumper *dumper,
+    break;
+ 
+   ret = psinfo->write(PSTORE_TYPE_DMESG, reason, &id, part,
+-        oopscount, hsize, hsize + len, psinfo);
++        oopscount, compressed, hsize + len, psinfo);
+   if (ret == 0 && reason == KMSG_DUMP_OOPS && pstore_is_mounted())
+    pstore_new_entry = 1;
+ 
+@@ -221,10 +222,10 @@ static void pstore_register_console(void) {}
+ static int pstore_write_compat(enum pstore_type_id type,
+           enum kmsg_dump_reason reason,
+           u64 *id, unsigned int part, int count,
+-          size_t hsize, size_t size,
++          bool compressed, size_t size,
+           struct pstore_info *psi)
+ {
+- return psi->write_buf(type, reason, id, part, psinfo->buf, hsize,
++ return psi->write_buf(type, reason, id, part, psinfo->buf, compressed,
+         size, psi);
+ }
+ 
+diff --git a/fs/pstore/ram.c b/fs/pstore/ram.c
+index c6bb77c..2fa71ee 100644
+--- a/fs/pstore/ram.c
++++ b/fs/pstore/ram.c
+@@ -196,7 +196,7 @@ static int notrace ramoops_pstore_write_buf(enum pstore_type_id type,
+          enum kmsg_dump_reason reason,
+          u64 *id, unsigned int part,
+          const char *buf,
+-         size_t hsize, size_t size,
++         bool compressed, size_t size,
+          struct pstore_info *psi)
+ {
+  struct ramoops_context *cxt = psi->data;
+diff --git a/include/linux/pstore.h b/include/linux/pstore.h
+index 4aa80ba..abfca4f 100644
+--- a/include/linux/pstore.h
++++ b/include/linux/pstore.h
+@@ -58,11 +58,11 @@ struct pstore_info {
+    struct pstore_info *psi);
+  int  (*write)(enum pstore_type_id type,
+    enum kmsg_dump_reason reason, u64 *id,
+-   unsigned int part, int count, size_t hsize,
++   unsigned int part, int count, bool compressed,
+    size_t size, struct pstore_info *psi);
+  int  (*write_buf)(enum pstore_type_id type,
+    enum kmsg_dump_reason reason, u64 *id,
+-   unsigned int part, const char *buf, size_t hsize,
++   unsigned int part, const char *buf, bool compressed,
+    size_t size, struct pstore_info *psi);
+  int  (*erase)(enum pstore_type_id type, u64 id,
+    int count, struct timespec time,
+-- 
+1.7.1

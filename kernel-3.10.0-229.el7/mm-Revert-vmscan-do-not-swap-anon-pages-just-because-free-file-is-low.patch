@@ -1,0 +1,81 @@
+From 99408b672e14cea0f95b6e5e7c6f84b9923ef60f Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <jweiner@redhat.com>
+Date: Wed, 9 Jul 2014 19:23:42 -0400
+Subject: [mm] Revert: vmscan: do not swap anon pages just because free+file is low
+
+Message-id: <1404933822-25044-1-git-send-email-jweiner@redhat.com>
+Patchwork-id: 85533
+O-Subject: [PATCH RHEL7 BZ1102991] revert "mm: vmscan: do not swap anon pages just because free+file is low"
+Bugzilla: 1102991
+RH-Acked-by: Rik van Riel <riel@redhat.com>
+RH-Acked-by: Rafael Aquini <aquini@redhat.com>
+RH-Acked-by: David S. Miller <davem@redhat.com>
+
+commit 623762517e2370be3b3f95f4fe08d6c063a49b06
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Tue May 6 12:50:07 2014 -0700
+
+    revert "mm: vmscan: do not swap anon pages just because free+file is low"
+
+    This reverts commit 0bf1457f0cfc ("mm: vmscan: do not swap anon pages
+    just because free+file is low") because it introduced a regression in
+    mostly-anonymous workloads, where reclaim would become ineffective and
+    trap every allocating task in direct reclaim.
+
+    The problem is that there is a runaway feedback loop in the scan balance
+    between file and anon, where the balance tips heavily towards a tiny
+    thrashing file LRU and anonymous pages are no longer being looked at.
+    The commit in question removed the safe guard that would detect such
+    situations and respond with forced anonymous reclaim.
+
+    This commit was part of a series to fix premature swapping in loads with
+    relatively little cache, and while it made a small difference, the cure
+    is obviously worse than the disease.  Revert it.
+
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Reported-by: Christian Borntraeger <borntraeger@de.ibm.com>
+    Acked-by: Christian Borntraeger <borntraeger@de.ibm.com>
+    Acked-by: Rafael Aquini <aquini@redhat.com>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: <stable@kernel.org>             [3.12+]
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Signed-off-by: Johannes Weiner <jweiner@redhat.com>
+---
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1102991
+http://brewweb.devel.redhat.com/brew/taskinfo?taskID=7684493
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index aa0ef0a..0f28e85 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1863,6 +1863,24 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+   get_lru_size(lruvec, LRU_INACTIVE_FILE);
+ 
+  /*
++  * Prevent the reclaimer from falling into the cache trap: as
++  * cache pages start out inactive, every cache fault will tip
++  * the scan balance towards the file LRU.  And as the file LRU
++  * shrinks, so does the window for rotation from references.
++  * This means we have a runaway feedback loop where a tiny
++  * thrashing file LRU becomes infinitely more attractive than
++  * anon pages.  Try to detect this based on file LRU size.
++  */
++ if (global_reclaim(sc)) {
++  unsigned long free = zone_page_state(zone, NR_FREE_PAGES);
++
++  if (unlikely(file + free <= high_wmark_pages(zone))) {
++   scan_balance = SCAN_ANON;
++   goto out;
++  }
++ }
++
++ /*
+   * There is enough inactive page cache, do not reclaim
+   * anything from the anonymous working set right now.
+   */
+-- 
+1.7.1

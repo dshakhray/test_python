@@ -1,0 +1,103 @@
+From 8f9a3929960aec971455be26f34e16a066b5a8e0 Mon Sep 17 00:00:00 2001
+From: Prarit Bhargava <prarit@redhat.com>
+Date: Mon, 14 Jul 2014 13:08:11 -0400
+Subject: [kernel] profile: Fix CPU hotplug callback registration
+
+Message-id: <1405343292-21004-35-git-send-email-prarit@redhat.com>
+Patchwork-id: 85768
+O-Subject: [RHEL7.1 PATCH BZ 1119078 34/35] profile: Fix CPU hotplug callback registration
+Bugzilla: 1119078
+RH-Acked-by: Dean Nelson <dnelson@redhat.com>
+RH-Acked-by: Igor Mammedov <imammedo@redhat.com>
+RH-Acked-by: Stefan Assmann <sassmann@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1119078
+
+commit c270a817196a9374a2dc730624d1501dced40b4d
+Author: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+Date:   Tue Mar 11 02:12:08 2014 +0530
+
+    profile: Fix CPU hotplug callback registration
+
+    Subsystems that want to register CPU hotplug callbacks, as well as perform
+    initialization for the CPUs that are already online, often do it as shown
+    below:
+
+     get_online_cpus();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     register_cpu_notifier(&foobar_cpu_notifier);
+
+     put_online_cpus();
+
+    This is wrong, since it is prone to ABBA deadlocks involving the
+    cpu_add_remove_lock and the cpu_hotplug.lock (when running concurrently
+    with CPU hotplug operations).
+
+    Instead, the correct and race-free way of performing the callback
+    registration is:
+
+     cpu_notifier_register_begin();
+
+     for_each_online_cpu(cpu)
+      init_cpu(cpu);
+
+     /* Note the use of the double underscored version of the API */
+     __register_cpu_notifier(&foobar_cpu_notifier);
+
+     cpu_notifier_register_done();
+
+    Fix the profile code by using this latter form of callback registration.
+
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Cc: Mauro Carvalho Chehab <mchehab@redhat.com>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Cc: Rik van Riel <riel@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/kernel/profile.c b/kernel/profile.c
+index ebdd9c1..93b2a3f 100644
+--- a/kernel/profile.c
++++ b/kernel/profile.c
+@@ -591,18 +591,28 @@ out_cleanup:
+ int __ref create_proc_profile(void) /* false positive from hotcpu_notifier */
+ {
+  struct proc_dir_entry *entry;
++ int err = 0;
+ 
+  if (!prof_on)
+   return 0;
+- if (create_hash_tables())
+-  return -ENOMEM;
++
++ cpu_notifier_register_begin();
++
++ if (create_hash_tables()) {
++  err = -ENOMEM;
++  goto out;
++ }
++
+  entry = proc_create("profile", S_IWUSR | S_IRUGO,
+        NULL, &proc_profile_operations);
+  if (!entry)
+-  return 0;
++  goto out;
+  proc_set_size(entry, (1 + prof_len) * sizeof(atomic_t));
+- hotcpu_notifier(profile_cpu_callback, 0);
+- return 0;
++ __hotcpu_notifier(profile_cpu_callback, 0);
++
++out:
++ cpu_notifier_register_done();
++ return err;
+ }
+ module_init(create_proc_profile);
+ #endif /* CONFIG_PROC_FS */
+-- 
+1.7.1

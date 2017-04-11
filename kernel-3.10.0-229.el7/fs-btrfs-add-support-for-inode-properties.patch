@@ -1,0 +1,947 @@
+From f51b9d6be635746581c46f8d05b08889f4cc403f Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Mon, 4 Aug 2014 18:59:48 -0400
+Subject: [fs] btrfs: add support for inode properties
+
+Message-id: <1407179109-13714-102-git-send-email-sandeen@redhat.com>
+Patchwork-id: 87062
+O-Subject: [RHEL7.1 PATCH 101/422] Btrfs: add support for inode properties
+Bugzilla: 1071179
+RH-Acked-by: Zach Brown <zab@redhat.com>
+
+From: Filipe David Borba Manana <fdmanana@gmail.com>
+
+commit 63541927c8d11d2686778b1e8ec71c14b4fd53e4
+Author: Filipe David Borba Manana <fdmanana@gmail.com>
+Date:   Tue Jan 7 11:47:46 2014 +0000
+
+    Btrfs: add support for inode properties
+
+    This change adds infrastructure to allow for generic properties for
+    inodes. Properties are name/value pairs that can be associated with
+    inodes for different purposes. They are stored as xattrs with the
+    prefix "btrfs."
+
+    Properties can be inherited - this means when a directory inode has
+    inheritable properties set, these are added to new inodes created
+    under that directory. Further, subvolumes can also have properties
+    associated with them, and they can be inherited from their parent
+    subvolume. Naturally, directory properties have priority over subvolume
+    properties (in practice a subvolume property is just a regular
+    property associated with the root inode, objectid 256, of the
+    subvolume's fs tree).
+
+    This change also adds one specific property implementation, named
+    "compression", whose values can be "lzo" or "zlib" and it's an
+    inheritable property.
+
+    The corresponding changes to btrfs-progs were also implemented.
+    A patch with xfstests for this feature will follow once there's
+    agreement on this change/feature.
+
+    Further, the script at the bottom of this commit message was used to
+    do some benchmarks to measure any performance penalties of this feature.
+
+    Basically the tests correspond to:
+
+    Test 1 - create a filesystem and mount it with compress-force=lzo,
+    then sequentially create N files of 64Kb each, measure how long it took
+    to create the files, unmount the filesystem, mount the filesystem and
+    perform an 'ls -lha' against the test directory holding the N files, and
+    report the time the command took.
+
+    Test 2 - create a filesystem and don't use any compression option when
+    mounting it - instead set the compression property of the subvolume's
+    root to 'lzo'. Then create N files of 64Kb, and report the time it took.
+    The unmount the filesystem, mount it again and perform an 'ls -lha' like
+    in the former test. This means every single file ends up with a property
+    (xattr) associated to it.
+
+    Test 3 - same as test 2, but uses 4 properties - 3 are duplicates of the
+    compression property, have no real effect other than adding more work
+    when inheriting properties and taking more btree leaf space.
+
+    Test 4 - same as test 3 but with 10 properties per file.
+
+    Results (in seconds, and averages of 5 runs each), for different N
+    numbers of files follow.
+
+    * Without properties (test 1)
+
+                        file creation time        ls -lha time
+    10 000 files              3.49                   0.76
+    100 000 files            47.19                   8.37
+    1 000 000 files         518.51                 107.06
+
+    * With 1 property (compression property set to lzo - test 2)
+
+                        file creation time        ls -lha time
+    10 000 files              3.63                    0.93
+    100 000 files            48.56                    9.74
+    1 000 000 files         537.72                  125.11
+
+    * With 4 properties (test 3)
+
+                        file creation time        ls -lha time
+    10 000 files              3.94                    1.20
+    100 000 files            52.14                   11.48
+    1 000 000 files         572.70                  142.13
+
+    * With 10 properties (test 4)
+
+                        file creation time        ls -lha time
+    10 000 files              4.61                    1.35
+    100 000 files            58.86                   13.83
+    1 000 000 files         656.01                  177.61
+
+    The increased latencies with properties are essencialy because of:
+
+    *) When creating an inode, we now synchronously write 1 more item
+       (an xattr item) for each property inherited from the parent dir
+       (or subvolume). This could be done in an asynchronous way such
+       as we do for dir intex items (delayed-inode.c), which could help
+       reduce the file creation latency;
+
+    *) With properties, we now have larger fs trees. For this particular
+       test each xattr item uses 75 bytes of leaf space in the fs tree.
+       This could be less by using a new item for xattr items, instead of
+       the current btrfs_dir_item, since we could cut the 'location' and
+       'type' fields (saving 18 bytes) and maybe 'transid' too (saving a
+       total of 26 bytes per xattr item) from the btrfs_dir_item type.
+
+    Also tried batching the xattr insertions (ignoring proper hash
+    collision handling, since it didn't exist) when creating files that
+    inherit properties from their parent inode/subvolume, but the end
+    results were (surprisingly) essentially the same.
+
+    Test script:
+
+    $ cat test.pl
+      #!/usr/bin/perl -w
+
+      use strict;
+      use Time::HiRes qw(time);
+      use constant NUM_FILES => 10_000;
+      use constant FILE_SIZES => (64 * 1024);
+      use constant DEV => '/dev/sdb4';
+      use constant MNT_POINT => '/home/fdmanana/btrfs-tests/dev';
+      use constant TEST_DIR => (MNT_POINT . '/testdir');
+
+      system("mkfs.btrfs", "-l", "16384", "-f", DEV) == 0 or die "mkfs.btrfs failed!";
+
+      # following line for testing without properties
+      #system("mount", "-o", "compress-force=lzo", DEV, MNT_POINT) == 0 or die "mount failed!";
+
+      # following 2 lines for testing with properties
+      system("mount", DEV, MNT_POINT) == 0 or die "mount failed!";
+      system("btrfs", "prop", "set", MNT_POINT, "compression", "lzo") == 0 or die "set prop failed!";
+
+      system("mkdir", TEST_DIR) == 0 or die "mkdir failed!";
+      my ($t1, $t2);
+
+      $t1 = time();
+      for (my $i = 1; $i <= NUM_FILES; $i++) {
+          my $p = TEST_DIR . '/file_' . $i;
+          open(my $f, '>', $p) or die "Error opening file!";
+          $f->autoflush(1);
+          for (my $j = 0; $j < FILE_SIZES; $j += 4096) {
+              print $f ('A' x 4096) or die "Error writing to file!";
+          }
+          close($f);
+      }
+      $t2 = time();
+      print "Time to create " . NUM_FILES . ": " . ($t2 - $t1) . " seconds.\n";
+      system("umount", DEV) == 0 or die "umount failed!";
+      system("mount", DEV, MNT_POINT) == 0 or die "mount failed!";
+
+      $t1 = time();
+      system("bash -c 'ls -lha " . TEST_DIR . " > /dev/null'") == 0 or die "ls failed!";
+      $t2 = time();
+      print "Time to ls -lha all files: " . ($t2 - $t1) . " seconds.\n";
+      system("umount", DEV) == 0 or die "umount failed!";
+
+    Signed-off-by: Filipe David Borba Manana <fdmanana@gmail.com>
+    Signed-off-by: Josef Bacik <jbacik@fb.com>
+    Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+---
+ create mode 100644 fs/btrfs/props.c
+ create mode 100644 fs/btrfs/props.h
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/btrfs/Makefile b/fs/btrfs/Makefile
+index 1a44e42..af7f000 100644
+--- a/fs/btrfs/Makefile
++++ b/fs/btrfs/Makefile
+@@ -9,7 +9,7 @@ btrfs-y += super.o ctree.o extent-tree.o print-tree.o root-tree.o dir-item.o \
+     export.o tree-log.o free-space-cache.o zlib.o lzo.o \
+     compression.o delayed-ref.o relocation.o delayed-inode.o scrub.o \
+     reada.o backref.o ulist.o qgroup.o send.o dev-replace.o raid56.o \
+-    uuid-tree.o
++    uuid-tree.o props.o
+ 
+ btrfs-$(CONFIG_BTRFS_FS_POSIX_ACL) += acl.o
+ btrfs-$(CONFIG_BTRFS_FS_CHECK_INTEGRITY) += check-integrity.o
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index 661b0ac..8fed212 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -43,6 +43,7 @@
+ #define BTRFS_INODE_COPY_EVERYTHING  8
+ #define BTRFS_INODE_IN_DELALLOC_LIST  9
+ #define BTRFS_INODE_READDIO_NEED_LOCK  10
++#define BTRFS_INODE_HAS_PROPS          11
+ 
+ /* in memory btrfs inode */
+ struct btrfs_inode {
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index f52a60b..3cebb4a 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -3703,7 +3703,9 @@ int btrfs_start_delalloc_roots(struct btrfs_fs_info *fs_info, int delay_iput);
+ int btrfs_set_extent_delalloc(struct inode *inode, u64 start, u64 end,
+          struct extent_state **cached_state);
+ int btrfs_create_subvol_root(struct btrfs_trans_handle *trans,
+-        struct btrfs_root *new_root, u64 new_dirid);
++        struct btrfs_root *new_root,
++        struct btrfs_root *parent_root,
++        u64 new_dirid);
+ int btrfs_merge_bio_hook(int rw, struct page *page, unsigned long offset,
+     size_t size, struct bio *bio,
+     unsigned long bio_flags);
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 452b73d..b1e99ad 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -58,6 +58,7 @@
+ #include "inode-map.h"
+ #include "backref.h"
+ #include "hash.h"
++#include "props.h"
+ 
+ struct btrfs_iget_args {
+  u64 ino;
+@@ -3265,7 +3266,8 @@ out:
+  * slot is the slot the inode is in, objectid is the objectid of the inode
+  */
+ static noinline int acls_after_inode_item(struct extent_buffer *leaf,
+-       int slot, u64 objectid)
++       int slot, u64 objectid,
++       int *first_xattr_slot)
+ {
+  u32 nritems = btrfs_header_nritems(leaf);
+  struct btrfs_key found_key;
+@@ -3281,6 +3283,7 @@ static noinline int acls_after_inode_item(struct extent_buffer *leaf,
+  }
+ 
+  slot++;
++ *first_xattr_slot = -1;
+  while (slot < nritems) {
+   btrfs_item_key_to_cpu(leaf, &found_key, slot);
+ 
+@@ -3290,6 +3293,8 @@ static noinline int acls_after_inode_item(struct extent_buffer *leaf,
+ 
+   /* we found an xattr, assume we've got an acl */
+   if (found_key.type == BTRFS_XATTR_ITEM_KEY) {
++   if (*first_xattr_slot == -1)
++    *first_xattr_slot = slot;
+    if (found_key.offset == xattr_access ||
+        found_key.offset == xattr_default)
+     return 1;
+@@ -3318,6 +3323,8 @@ static noinline int acls_after_inode_item(struct extent_buffer *leaf,
+   * something larger than an xattr.  We have to assume the inode
+   * has acls
+   */
++ if (*first_xattr_slot == -1)
++  *first_xattr_slot = slot;
+  return 1;
+ }
+ 
+@@ -3337,6 +3344,7 @@ static void btrfs_read_locked_inode(struct inode *inode)
+  u32 rdev;
+  int ret;
+  bool filled = false;
++ int first_xattr_slot;
+ 
+  ret = btrfs_fill_inode(inode, &rdev);
+  if (!ret)
+@@ -3346,7 +3354,6 @@ static void btrfs_read_locked_inode(struct inode *inode)
+  if (!path)
+   goto make_bad;
+ 
+- path->leave_spinning = 1;
+  memcpy(&location, &BTRFS_I(inode)->location, sizeof(location));
+ 
+  ret = btrfs_lookup_inode(NULL, root, path, &location, 0);
+@@ -3429,12 +3436,21 @@ cache_acl:
+   * any xattrs or acls
+   */
+  maybe_acls = acls_after_inode_item(leaf, path->slots[0],
+-        btrfs_ino(inode));
++        btrfs_ino(inode), &first_xattr_slot);
++ if (first_xattr_slot != -1) {
++  path->slots[0] = first_xattr_slot;
++  ret = btrfs_load_inode_props(inode, path);
++  if (ret)
++   btrfs_err(root->fs_info,
++      "error loading props for ino %llu (root %llu): %d\n",
++      btrfs_ino(inode),
++      root->root_key.objectid, ret);
++ }
++ btrfs_free_path(path);
++
+  if (!maybe_acls)
+   cache_no_acl(inode);
+ 
+- btrfs_free_path(path);
+-
+  switch (inode->i_mode & S_IFMT) {
+  case S_IFREG:
+   inode->i_mapping->a_ops = &btrfs_aops;
+@@ -5623,6 +5639,12 @@ static struct inode *btrfs_new_inode(struct btrfs_trans_handle *trans,
+ 
+  btrfs_update_root_times(trans, root);
+ 
++ ret = btrfs_inode_inherit_props(trans, inode, dir);
++ if (ret)
++  btrfs_err(root->fs_info,
++     "error inheriting props for ino %llu (root %llu): %d",
++     btrfs_ino(inode), root->root_key.objectid, ret);
++
+  return inode;
+ fail:
+  if (dir)
+@@ -7904,7 +7926,9 @@ out:
+  * create a new subvolume directory/inode (helper for the ioctl).
+  */
+ int btrfs_create_subvol_root(struct btrfs_trans_handle *trans,
+-        struct btrfs_root *new_root, u64 new_dirid)
++        struct btrfs_root *new_root,
++        struct btrfs_root *parent_root,
++        u64 new_dirid)
+ {
+  struct inode *inode;
+  int err;
+@@ -7922,6 +7946,12 @@ int btrfs_create_subvol_root(struct btrfs_trans_handle *trans,
+  set_nlink(inode, 1);
+  btrfs_i_size_write(inode, 0);
+ 
++ err = btrfs_subvol_inherit_props(trans, new_root, parent_root);
++ if (err)
++  btrfs_err(new_root->fs_info,
++     "error inheriting subvolume %llu properties: %d\n",
++     new_root->root_key.objectid, err);
++
+  err = btrfs_update_inode(trans, new_root, inode);
+ 
+  iput(inode);
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index 7233b3b..9b1109a 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -56,6 +56,7 @@
+ #include "rcu-string.h"
+ #include "send.h"
+ #include "dev-replace.h"
++#include "props.h"
+ #include "sysfs.h"
+ 
+ static int btrfs_clone(struct inode *src, struct inode *inode,
+@@ -281,9 +282,25 @@ static int btrfs_ioctl_setflags(struct file *file, void __user *arg)
+  if (flags & FS_NOCOMP_FL) {
+   ip->flags &= ~BTRFS_INODE_COMPRESS;
+   ip->flags |= BTRFS_INODE_NOCOMPRESS;
++
++  ret = btrfs_set_prop(inode, "btrfs.compression", NULL, 0, 0);
++  if (ret && ret != -ENODATA)
++   goto out_drop;
+  } else if (flags & FS_COMPR_FL) {
++  const char *comp;
++
+   ip->flags |= BTRFS_INODE_COMPRESS;
+   ip->flags &= ~BTRFS_INODE_NOCOMPRESS;
++
++  if (root->fs_info->compress_type == BTRFS_COMPRESS_LZO)
++   comp = "lzo";
++  else
++   comp = "zlib";
++  ret = btrfs_set_prop(inode, "btrfs.compression",
++         comp, strlen(comp), 0);
++  if (ret)
++   goto out_drop;
++
+  } else {
+   ip->flags &= ~(BTRFS_INODE_COMPRESS | BTRFS_INODE_NOCOMPRESS);
+  }
+@@ -502,7 +519,7 @@ static noinline int create_subvol(struct inode *dir,
+ 
+  btrfs_record_root_in_trans(trans, new_root);
+ 
+- ret = btrfs_create_subvol_root(trans, new_root, new_dirid);
++ ret = btrfs_create_subvol_root(trans, new_root, root, new_dirid);
+  if (ret) {
+   /* We potentially lose an unused inode item here */
+   btrfs_abort_transaction(trans, root, ret);
+diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+new file mode 100644
+index 0000000..129b1dd
+--- /dev/null
++++ b/fs/btrfs/props.c
+@@ -0,0 +1,427 @@
++/*
++ * Copyright (C) 2014 Filipe David Borba Manana <fdmanana@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public
++ * License v2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this program; if not, write to the
++ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++ * Boston, MA 021110-1307, USA.
++ */
++
++#include <linux/hashtable.h>
++#include "props.h"
++#include "btrfs_inode.h"
++#include "hash.h"
++#include "transaction.h"
++#include "xattr.h"
++
++#define BTRFS_PROP_HANDLERS_HT_BITS 8
++static DEFINE_HASHTABLE(prop_handlers_ht, BTRFS_PROP_HANDLERS_HT_BITS);
++
++struct prop_handler {
++ struct hlist_node node;
++ const char *xattr_name;
++ int (*validate)(const char *value, size_t len);
++ int (*apply)(struct inode *inode, const char *value, size_t len);
++ const char *(*extract)(struct inode *inode);
++ int inheritable;
++};
++
++static int prop_compression_validate(const char *value, size_t len);
++static int prop_compression_apply(struct inode *inode,
++      const char *value,
++      size_t len);
++static const char *prop_compression_extract(struct inode *inode);
++
++static struct prop_handler prop_handlers[] = {
++ {
++  .xattr_name = XATTR_BTRFS_PREFIX "compression",
++  .validate = prop_compression_validate,
++  .apply = prop_compression_apply,
++  .extract = prop_compression_extract,
++  .inheritable = 1
++ },
++ {
++  .xattr_name = NULL
++ }
++};
++
++void __init btrfs_props_init(void)
++{
++ struct prop_handler *p;
++
++ hash_init(prop_handlers_ht);
++
++ for (p = &prop_handlers[0]; p->xattr_name; p++) {
++  u64 h = btrfs_name_hash(p->xattr_name, strlen(p->xattr_name));
++
++  hash_add(prop_handlers_ht, &p->node, h);
++ }
++}
++
++static const struct hlist_head *find_prop_handlers_by_hash(const u64 hash)
++{
++ struct hlist_head *h;
++
++ h = &prop_handlers_ht[hash_min(hash, BTRFS_PROP_HANDLERS_HT_BITS)];
++ if (hlist_empty(h))
++  return NULL;
++
++ return h;
++}
++
++static const struct prop_handler *
++find_prop_handler(const char *name,
++    const struct hlist_head *handlers)
++{
++ struct prop_handler *h;
++
++ if (!handlers) {
++  u64 hash = btrfs_name_hash(name, strlen(name));
++
++  handlers = find_prop_handlers_by_hash(hash);
++  if (!handlers)
++   return NULL;
++ }
++
++ hlist_for_each_entry(h, handlers, node)
++  if (!strcmp(h->xattr_name, name))
++   return h;
++
++ return NULL;
++}
++
++static int __btrfs_set_prop(struct btrfs_trans_handle *trans,
++       struct inode *inode,
++       const char *name,
++       const char *value,
++       size_t value_len,
++       int flags)
++{
++ const struct prop_handler *handler;
++ int ret;
++
++ if (strlen(name) <= XATTR_BTRFS_PREFIX_LEN)
++  return -EINVAL;
++
++ handler = find_prop_handler(name, NULL);
++ if (!handler)
++  return -EINVAL;
++
++ if (value_len == 0) {
++  ret = __btrfs_setxattr(trans, inode, handler->xattr_name,
++           NULL, 0, flags);
++  if (ret)
++   return ret;
++
++  ret = handler->apply(inode, NULL, 0);
++  ASSERT(ret == 0);
++
++  return ret;
++ }
++
++ ret = handler->validate(value, value_len);
++ if (ret)
++  return ret;
++ ret = __btrfs_setxattr(trans, inode, handler->xattr_name,
++          value, value_len, flags);
++ if (ret)
++  return ret;
++ ret = handler->apply(inode, value, value_len);
++ if (ret) {
++  __btrfs_setxattr(trans, inode, handler->xattr_name,
++     NULL, 0, flags);
++  return ret;
++ }
++
++ set_bit(BTRFS_INODE_HAS_PROPS, &BTRFS_I(inode)->runtime_flags);
++
++ return 0;
++}
++
++int btrfs_set_prop(struct inode *inode,
++     const char *name,
++     const char *value,
++     size_t value_len,
++     int flags)
++{
++ return __btrfs_set_prop(NULL, inode, name, value, value_len, flags);
++}
++
++static int iterate_object_props(struct btrfs_root *root,
++    struct btrfs_path *path,
++    u64 objectid,
++    void (*iterator)(void *,
++       const struct prop_handler *,
++       const char *,
++       size_t),
++    void *ctx)
++{
++ int ret;
++ char *name_buf = NULL;
++ char *value_buf = NULL;
++ int name_buf_len = 0;
++ int value_buf_len = 0;
++
++ while (1) {
++  struct btrfs_key key;
++  struct btrfs_dir_item *di;
++  struct extent_buffer *leaf;
++  u32 total_len, cur, this_len;
++  int slot;
++  const struct hlist_head *handlers;
++
++  slot = path->slots[0];
++  leaf = path->nodes[0];
++
++  if (slot >= btrfs_header_nritems(leaf)) {
++   ret = btrfs_next_leaf(root, path);
++   if (ret < 0)
++    goto out;
++   else if (ret > 0)
++    break;
++   continue;
++  }
++
++  btrfs_item_key_to_cpu(leaf, &key, slot);
++  if (key.objectid != objectid)
++   break;
++  if (key.type != BTRFS_XATTR_ITEM_KEY)
++   break;
++
++  handlers = find_prop_handlers_by_hash(key.offset);
++  if (!handlers)
++   goto next_slot;
++
++  di = btrfs_item_ptr(leaf, slot, struct btrfs_dir_item);
++  cur = 0;
++  total_len = btrfs_item_size_nr(leaf, slot);
++
++  while (cur < total_len) {
++   u32 name_len = btrfs_dir_name_len(leaf, di);
++   u32 data_len = btrfs_dir_data_len(leaf, di);
++   unsigned long name_ptr, data_ptr;
++   const struct prop_handler *handler;
++
++   this_len = sizeof(*di) + name_len + data_len;
++   name_ptr = (unsigned long)(di + 1);
++   data_ptr = name_ptr + name_len;
++
++   if (name_len <= XATTR_BTRFS_PREFIX_LEN ||
++       memcmp_extent_buffer(leaf, XATTR_BTRFS_PREFIX,
++       name_ptr,
++       XATTR_BTRFS_PREFIX_LEN))
++    goto next_dir_item;
++
++   if (name_len >= name_buf_len) {
++    kfree(name_buf);
++    name_buf_len = name_len + 1;
++    name_buf = kmalloc(name_buf_len, GFP_NOFS);
++    if (!name_buf) {
++     ret = -ENOMEM;
++     goto out;
++    }
++   }
++   read_extent_buffer(leaf, name_buf, name_ptr, name_len);
++   name_buf[name_len] = '\0';
++
++   handler = find_prop_handler(name_buf, handlers);
++   if (!handler)
++    goto next_dir_item;
++
++   if (data_len > value_buf_len) {
++    kfree(value_buf);
++    value_buf_len = data_len;
++    value_buf = kmalloc(data_len, GFP_NOFS);
++    if (!value_buf) {
++     ret = -ENOMEM;
++     goto out;
++    }
++   }
++   read_extent_buffer(leaf, value_buf, data_ptr, data_len);
++
++   iterator(ctx, handler, value_buf, data_len);
++next_dir_item:
++   cur += this_len;
++   di = (struct btrfs_dir_item *)((char *) di + this_len);
++  }
++
++next_slot:
++  path->slots[0]++;
++ }
++
++ ret = 0;
++out:
++ btrfs_release_path(path);
++ kfree(name_buf);
++ kfree(value_buf);
++
++ return ret;
++}
++
++static void inode_prop_iterator(void *ctx,
++    const struct prop_handler *handler,
++    const char *value,
++    size_t len)
++{
++ struct inode *inode = ctx;
++ struct btrfs_root *root = BTRFS_I(inode)->root;
++ int ret;
++
++ ret = handler->apply(inode, value, len);
++ if (unlikely(ret))
++  btrfs_warn(root->fs_info,
++      "error applying prop %s to ino %llu (root %llu): %d",
++      handler->xattr_name, btrfs_ino(inode),
++      root->root_key.objectid, ret);
++ else
++  set_bit(BTRFS_INODE_HAS_PROPS, &BTRFS_I(inode)->runtime_flags);
++}
++
++int btrfs_load_inode_props(struct inode *inode, struct btrfs_path *path)
++{
++ struct btrfs_root *root = BTRFS_I(inode)->root;
++ u64 ino = btrfs_ino(inode);
++ int ret;
++
++ ret = iterate_object_props(root, path, ino, inode_prop_iterator, inode);
++
++ return ret;
++}
++
++static int inherit_props(struct btrfs_trans_handle *trans,
++    struct inode *inode,
++    struct inode *parent)
++{
++ const struct prop_handler *h;
++ struct btrfs_root *root = BTRFS_I(inode)->root;
++ int ret;
++
++ if (!test_bit(BTRFS_INODE_HAS_PROPS,
++        &BTRFS_I(parent)->runtime_flags))
++  return 0;
++
++ for (h = &prop_handlers[0]; h->xattr_name; h++) {
++  const char *value;
++  u64 num_bytes;
++
++  if (!h->inheritable)
++   continue;
++
++  value = h->extract(parent);
++  if (!value)
++   continue;
++
++  num_bytes = btrfs_calc_trans_metadata_size(root, 1);
++  ret = btrfs_block_rsv_add(root, trans->block_rsv,
++       num_bytes, BTRFS_RESERVE_NO_FLUSH);
++  if (ret)
++   goto out;
++  ret = __btrfs_set_prop(trans, inode, h->xattr_name,
++           value, strlen(value), 0);
++  btrfs_block_rsv_release(root, trans->block_rsv, num_bytes);
++  if (ret)
++   goto out;
++ }
++ ret = 0;
++out:
++ return ret;
++}
++
++int btrfs_inode_inherit_props(struct btrfs_trans_handle *trans,
++         struct inode *inode,
++         struct inode *dir)
++{
++ if (!dir)
++  return 0;
++
++ return inherit_props(trans, inode, dir);
++}
++
++int btrfs_subvol_inherit_props(struct btrfs_trans_handle *trans,
++          struct btrfs_root *root,
++          struct btrfs_root *parent_root)
++{
++ struct btrfs_key key;
++ struct inode *parent_inode, *child_inode;
++ int ret;
++
++ key.objectid = BTRFS_FIRST_FREE_OBJECTID;
++ key.type = BTRFS_INODE_ITEM_KEY;
++ key.offset = 0;
++
++ parent_inode = btrfs_iget(parent_root->fs_info->sb, &key,
++      parent_root, NULL);
++ if (IS_ERR(parent_inode))
++  return PTR_ERR(parent_inode);
++
++ child_inode = btrfs_iget(root->fs_info->sb, &key, root, NULL);
++ if (IS_ERR(child_inode)) {
++  iput(parent_inode);
++  return PTR_ERR(child_inode);
++ }
++
++ ret = inherit_props(trans, child_inode, parent_inode);
++ iput(child_inode);
++ iput(parent_inode);
++
++ return ret;
++}
++
++static int prop_compression_validate(const char *value, size_t len)
++{
++ if (!strncmp("lzo", value, len))
++  return 0;
++ else if (!strncmp("zlib", value, len))
++  return 0;
++
++ return -EINVAL;
++}
++
++static int prop_compression_apply(struct inode *inode,
++      const char *value,
++      size_t len)
++{
++ int type;
++
++ if (len == 0) {
++  BTRFS_I(inode)->flags |= BTRFS_INODE_NOCOMPRESS;
++  BTRFS_I(inode)->flags &= ~BTRFS_INODE_COMPRESS;
++  BTRFS_I(inode)->force_compress = BTRFS_COMPRESS_NONE;
++
++  return 0;
++ }
++
++ if (!strncmp("lzo", value, len))
++  type = BTRFS_COMPRESS_LZO;
++ else if (!strncmp("zlib", value, len))
++  type = BTRFS_COMPRESS_ZLIB;
++ else
++  return -EINVAL;
++
++ BTRFS_I(inode)->flags &= ~BTRFS_INODE_NOCOMPRESS;
++ BTRFS_I(inode)->flags |= BTRFS_INODE_COMPRESS;
++ BTRFS_I(inode)->force_compress = type;
++
++ return 0;
++}
++
++static const char *prop_compression_extract(struct inode *inode)
++{
++ switch (BTRFS_I(inode)->force_compress) {
++ case BTRFS_COMPRESS_ZLIB:
++  return "zlib";
++ case BTRFS_COMPRESS_LZO:
++  return "lzo";
++ }
++
++ return NULL;
++}
+diff --git a/fs/btrfs/props.h b/fs/btrfs/props.h
+new file mode 100644
+index 0000000..100f188
+--- /dev/null
++++ b/fs/btrfs/props.h
+@@ -0,0 +1,42 @@
++/*
++ * Copyright (C) 2014 Filipe David Borba Manana <fdmanana@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public
++ * License v2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this program; if not, write to the
++ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++ * Boston, MA 021110-1307, USA.
++ */
++
++#ifndef __BTRFS_PROPS_H
++#define __BTRFS_PROPS_H
++
++#include "ctree.h"
++
++void __init btrfs_props_init(void);
++
++int btrfs_set_prop(struct inode *inode,
++     const char *name,
++     const char *value,
++     size_t value_len,
++     int flags);
++
++int btrfs_load_inode_props(struct inode *inode, struct btrfs_path *path);
++
++int btrfs_inode_inherit_props(struct btrfs_trans_handle *trans,
++         struct inode *inode,
++         struct inode *dir);
++
++int btrfs_subvol_inherit_props(struct btrfs_trans_handle *trans,
++          struct btrfs_root *root,
++          struct btrfs_root *parent_root);
++
++#endif
+diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+index 16d7fc7..461e41c 100644
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -48,6 +48,7 @@
+ #include "transaction.h"
+ #include "btrfs_inode.h"
+ #include "print-tree.h"
++#include "props.h"
+ #include "xattr.h"
+ #include "volumes.h"
+ #include "export.h"
+@@ -1865,6 +1866,8 @@ static int __init init_btrfs_fs(void)
+ {
+  int err;
+ 
++ btrfs_props_init();
++
+  err = btrfs_init_sysfs();
+  if (err)
+   return err;
+diff --git a/fs/btrfs/xattr.c b/fs/btrfs/xattr.c
+index 05740b9..4b33765 100644
+--- a/fs/btrfs/xattr.c
++++ b/fs/btrfs/xattr.c
+@@ -27,6 +27,7 @@
+ #include "transaction.h"
+ #include "xattr.h"
+ #include "disk-io.h"
++#include "props.h"
+ 
+ 
+ ssize_t __btrfs_getxattr(struct inode *inode, const char *name,
+@@ -331,7 +332,8 @@ static bool btrfs_is_valid_xattr(const char *name)
+    XATTR_SECURITY_PREFIX_LEN) ||
+         !strncmp(name, XATTR_SYSTEM_PREFIX, XATTR_SYSTEM_PREFIX_LEN) ||
+         !strncmp(name, XATTR_TRUSTED_PREFIX, XATTR_TRUSTED_PREFIX_LEN) ||
+-        !strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN);
++        !strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN) ||
++  !strncmp(name, XATTR_BTRFS_PREFIX, XATTR_BTRFS_PREFIX_LEN);
+ }
+ 
+ ssize_t btrfs_getxattr(struct dentry *dentry, const char *name,
+@@ -373,6 +375,10 @@ int btrfs_setxattr(struct dentry *dentry, const char *name, const void *value,
+  if (!btrfs_is_valid_xattr(name))
+   return -EOPNOTSUPP;
+ 
++ if (!strncmp(name, XATTR_BTRFS_PREFIX, XATTR_BTRFS_PREFIX_LEN))
++  return btrfs_set_prop(dentry->d_inode, name,
++          value, size, flags);
++
+  if (size == 0)
+   value = "";  /* empty EA, do not remove */
+ 
+@@ -402,6 +408,10 @@ int btrfs_removexattr(struct dentry *dentry, const char *name)
+  if (!btrfs_is_valid_xattr(name))
+   return -EOPNOTSUPP;
+ 
++ if (!strncmp(name, XATTR_BTRFS_PREFIX, XATTR_BTRFS_PREFIX_LEN))
++  return btrfs_set_prop(dentry->d_inode, name,
++          NULL, 0, XATTR_REPLACE);
++
+  return __btrfs_setxattr(NULL, dentry->d_inode, name, NULL, 0,
+     XATTR_REPLACE);
+ }
+diff --git a/include/uapi/linux/xattr.h b/include/uapi/linux/xattr.h
+index e4629b9..40bbc04 100644
+--- a/include/uapi/linux/xattr.h
++++ b/include/uapi/linux/xattr.h
+@@ -20,6 +20,9 @@
+ #define XATTR_MAC_OSX_PREFIX "osx."
+ #define XATTR_MAC_OSX_PREFIX_LEN (sizeof(XATTR_MAC_OSX_PREFIX) - 1)
+ 
++#define XATTR_BTRFS_PREFIX "btrfs."
++#define XATTR_BTRFS_PREFIX_LEN (sizeof(XATTR_BTRFS_PREFIX) - 1)
++
+ #define XATTR_SECURITY_PREFIX "security."
+ #define XATTR_SECURITY_PREFIX_LEN (sizeof(XATTR_SECURITY_PREFIX) - 1)
+ 
+-- 
+1.7.1

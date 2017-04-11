@@ -1,0 +1,139 @@
+From 999e0f876d674c51d4914baff39b593c342880da Mon Sep 17 00:00:00 2001
+From: Don Zickus <dzickus@redhat.com>
+Date: Fri, 12 Sep 2014 18:10:18 -0400
+Subject: [powerpc] powernv: Fix endian issues with OPAL async code
+
+Message-id: <1410545655-205645-390-git-send-email-dzickus@redhat.com>
+Patchwork-id: 94387
+O-Subject: [RHEL7 PATCH 389/626] powerpc/powernv: Fix endian issues with OPAL async code
+Bugzilla: 1127366
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Steve Best <sbest@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+RH-Acked-by: David Gibson <dgibson@redhat.com>
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1127366
+
+commit bb4398e1de739a13e06589fc04cbb2267ba59800
+Author: Anton Blanchard <anton@samba.org>
+Date:   Fri Mar 28 16:33:33 2014 +1100
+
+    powerpc/powernv: Fix endian issues with OPAL async code
+
+    OPAL defines opal_msg as a big endian struct so we have to
+    byte swap it on little endian builds.
+
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 6fb5f90..fc73661 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -422,9 +422,9 @@ enum OpalSysparamPerm {
+ };
+ 
+ struct opal_msg {
+- uint32_t msg_type;
+- uint32_t reserved;
+- uint64_t params[8];
++ __be32 msg_type;
++ __be32 reserved;
++ __be64 params[8];
+ };
+ 
+ struct opal_machine_check_event {
+diff --git a/arch/powerpc/platforms/powernv/opal-async.c b/arch/powerpc/platforms/powernv/opal-async.c
+index cd0c135..32e2adf 100644
+--- a/arch/powerpc/platforms/powernv/opal-async.c
++++ b/arch/powerpc/platforms/powernv/opal-async.c
+@@ -125,14 +125,15 @@ static int opal_async_comp_event(struct notifier_block *nb,
+ {
+  struct opal_msg *comp_msg = msg;
+  unsigned long flags;
++ uint64_t token;
+ 
+  if (msg_type != OPAL_MSG_ASYNC_COMP)
+   return 0;
+ 
+- memcpy(&opal_async_responses[comp_msg->params[0]], comp_msg,
+-   sizeof(*comp_msg));
++ token = be64_to_cpu(comp_msg->params[0]);
++ memcpy(&opal_async_responses[token], comp_msg, sizeof(*comp_msg));
+  spin_lock_irqsave(&opal_async_comp_lock, flags);
+- __set_bit(comp_msg->params[0], opal_async_complete_map);
++ __set_bit(token, opal_async_complete_map);
+  spin_unlock_irqrestore(&opal_async_comp_lock, flags);
+ 
+  wake_up(&opal_async_wait);
+diff --git a/arch/powerpc/platforms/powernv/opal-sensor.c b/arch/powerpc/platforms/powernv/opal-sensor.c
+index 663cc9c..7503e29 100644
+--- a/arch/powerpc/platforms/powernv/opal-sensor.c
++++ b/arch/powerpc/platforms/powernv/opal-sensor.c
+@@ -53,7 +53,7 @@ int opal_get_sensor_data(u32 sensor_hndl, u32 *sensor_data)
+   goto out_token;
+  }
+ 
+- ret = msg.params[1];
++ ret = be64_to_cpu(msg.params[1]);
+ 
+ out_token:
+  mutex_unlock(&opal_sensor_mutex);
+diff --git a/arch/powerpc/platforms/powernv/opal-sysparam.c b/arch/powerpc/platforms/powernv/opal-sysparam.c
+index 0bd249a..6b61472 100644
+--- a/arch/powerpc/platforms/powernv/opal-sysparam.c
++++ b/arch/powerpc/platforms/powernv/opal-sysparam.c
+@@ -64,7 +64,7 @@ static int opal_get_sys_param(u32 param_id, u32 length, void *buffer)
+   goto out_token;
+  }
+ 
+- ret = msg.params[1];
++ ret = be64_to_cpu(msg.params[1]);
+ 
+ out_token:
+  opal_async_release_token(token);
+@@ -98,7 +98,7 @@ static int opal_set_sys_param(u32 param_id, u32 length, void *buffer)
+   goto out_token;
+  }
+ 
+- ret = msg.params[1];
++ ret = be64_to_cpu(msg.params[1]);
+ 
+ out_token:
+  opal_async_release_token(token);
+diff --git a/arch/powerpc/platforms/powernv/opal.c b/arch/powerpc/platforms/powernv/opal.c
+index 7835d5b..778a279 100644
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@ -281,6 +281,7 @@ static void opal_handle_message(void)
+   * value in /proc/device-tree.
+   */
+  static struct opal_msg msg;
++ u32 type;
+ 
+  ret = opal_get_msg(__pa(&msg), sizeof(msg));
+  /* No opal message pending. */
+@@ -294,13 +295,14 @@ static void opal_handle_message(void)
+   return;
+  }
+ 
++ type = be32_to_cpu(msg.msg_type);
++
+  /* Sanity check */
+- if (msg.msg_type > OPAL_MSG_TYPE_MAX) {
+-  pr_warning("%s: Unknown message type: %u\n",
+-    __func__, msg.msg_type);
++ if (type > OPAL_MSG_TYPE_MAX) {
++  pr_warning("%s: Unknown message type: %u\n", __func__, type);
+   return;
+  }
+- opal_message_do_notify(msg.msg_type, (void *)&msg);
++ opal_message_do_notify(type, (void *)&msg);
+ }
+ 
+ static int opal_message_notify(struct notifier_block *nb,
+-- 
+1.7.1

@@ -1,0 +1,124 @@
+From 1e5f208db5dff8e248e844684eaf0f88f9aecbee Mon Sep 17 00:00:00 2001
+From: Myron Stowe <myron.stowe@redhat.com>
+Date: Thu, 10 Jul 2014 01:04:22 -0400
+Subject: [acpi] sleep: Hold acpi_scan_lock over system PM transitions
+
+Message-id: <20140710010422.22146.59214.stgit@gir.stowe>
+Patchwork-id: 85598
+O-Subject: [RHEL7.1 PATCH 059/105] ACPI / PM: Hold acpi_scan_lock over system PM transitions
+Bugzilla: 1114228
+RH-Acked-by: Prarit Bhargava <prarit@redhat.com>
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1114228
+Upstream Status: ad07277e82dedabacc52c82746633680a3187d25
+
+commit ad07277e82dedabacc52c82746633680a3187d25
+Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Date:   Tue Aug 20 01:42:32 2013 +0200
+
+    ACPI / PM: Hold acpi_scan_lock over system PM transitions
+
+    Bad things happen if ACPI hotplug events are handled during system
+    PM transitions, especially if devices are removed as a result.
+    To prevent those bad things from happening, acquire acpi_scan_lock
+    when a PM transition is started and release it when that transition
+    is complete or has been aborted.
+
+    This fixes resume lockup on my test-bed Acer Aspire S5 that happens
+    when Thunderbolt devices are disconnected from the machine while
+    suspended.
+
+    Also fixes the analogous problem for Mika Westerberg on an
+    Intel DZ77RE-75K board.
+
+    Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Tested-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+    Acked-by: Toshi Kani <toshi.kani@hp.com>
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/acpi/sleep.c b/drivers/acpi/sleep.c
+index 81b0f03..1dec53d 100644
+--- a/drivers/acpi/sleep.c
++++ b/drivers/acpi/sleep.c
+@@ -420,10 +420,21 @@ static void acpi_pm_finish(void)
+ }
+ 
+ /**
+- * acpi_pm_end - Finish up suspend sequence.
++ * acpi_pm_start - Start system PM transition.
++ */
++static void acpi_pm_start(u32 acpi_state)
++{
++ acpi_target_sleep_state = acpi_state;
++ acpi_sleep_tts_switch(acpi_target_sleep_state);
++ acpi_scan_lock_acquire();
++}
++
++/**
++ * acpi_pm_end - Finish up system PM transition.
+  */
+ static void acpi_pm_end(void)
+ {
++ acpi_scan_lock_release();
+  /*
+   * This is necessary in case acpi_pm_finish() is not called during a
+   * failing transition to a sleep state.
+@@ -451,21 +462,19 @@ static u32 acpi_suspend_states[] = {
+ static int acpi_suspend_begin(suspend_state_t pm_state)
+ {
+  u32 acpi_state = acpi_suspend_states[pm_state];
+- int error = 0;
++ int error;
+ 
+  error = (nvs_nosave || nvs_nosave_s3) ? 0 : suspend_nvs_alloc();
+  if (error)
+   return error;
+ 
+- if (sleep_states[acpi_state]) {
+-  acpi_target_sleep_state = acpi_state;
+-  acpi_sleep_tts_switch(acpi_target_sleep_state);
+- } else {
+-  printk(KERN_ERR "ACPI does not support this state: %d\n",
+-   pm_state);
+-  error = -ENOSYS;
++ if (!sleep_states[acpi_state]) {
++  pr_err("ACPI does not support sleep state S%u\n", acpi_state);
++  return -ENOSYS;
+  }
+- return error;
++
++ acpi_pm_start(acpi_state);
++ return 0;
+ }
+ 
+ /**
+@@ -631,10 +640,8 @@ static int acpi_hibernation_begin(void)
+  int error;
+ 
+  error = nvs_nosave ? 0 : suspend_nvs_alloc();
+- if (!error) {
+-  acpi_target_sleep_state = ACPI_STATE_S4;
+-  acpi_sleep_tts_switch(acpi_target_sleep_state);
+- }
++ if (!error)
++  acpi_pm_start(ACPI_STATE_S4);
+ 
+  return error;
+ }
+@@ -713,8 +720,10 @@ static int acpi_hibernation_begin_old(void)
+  if (!error) {
+   if (!nvs_nosave)
+    error = suspend_nvs_alloc();
+-  if (!error)
++  if (!error) {
+    acpi_target_sleep_state = ACPI_STATE_S4;
++   acpi_scan_lock_acquire();
++  }
+  }
+  return error;
+ }
+-- 
+1.7.1

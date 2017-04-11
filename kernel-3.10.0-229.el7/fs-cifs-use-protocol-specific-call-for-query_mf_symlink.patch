@@ -1,0 +1,116 @@
+From 805eb302d1fd544f6e0792dcd08e2768f864b1a5 Mon Sep 17 00:00:00 2001
+From: Sachin Prabhu <sprabhu@redhat.com>
+Date: Tue, 18 Mar 2014 17:30:45 -0400
+Subject: [fs] cifs: use protocol specific call for query_mf_symlink()
+
+Message-id: <1395163848-29977-5-git-send-email-sprabhu@redhat.com>
+Patchwork-id: 78381
+O-Subject: [RHEL7 PATCH 4/7] [bz1077230]cifs: use protocol specific call for query_mf_symlink()
+Bugzilla: 1077230
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Jeff Layton <jlayton@redhat.com>
+
+We have an existing protocol specific call query_mf_symlink() created
+for check_mf_symlink which can also be used for query_mf_symlink().
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+(cherry picked from commit 8205d1bb31af047c6893a4f9e86ed88cf5d6113d)
+
+Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/cifs/link.c b/fs/cifs/link.c
+index 6282b94..fd5dff3 100644
+--- a/fs/cifs/link.c
++++ b/fs/cifs/link.c
+@@ -237,55 +237,36 @@ create_mf_symlink(const unsigned int xid, struct cifs_tcon *tcon,
+ 
+ static int
+ query_mf_symlink(const unsigned int xid, struct cifs_tcon *tcon,
+-     const unsigned char *searchName, char **symlinkinfo,
+-     const struct nls_table *nls_codepage, int remap)
++   struct cifs_sb_info *cifs_sb, const unsigned char *path,
++   char **symlinkinfo)
+ {
+  int rc;
+- int oplock = 0;
+- __u16 netfid = 0;
+- u8 *buf;
+- char *pbuf;
+- unsigned int bytes_read = 0;
+- int buf_type = CIFS_NO_BUFFER;
++ u8 *buf = NULL;
+  unsigned int link_len = 0;
+- struct cifs_io_parms io_parms;
+- FILE_ALL_INFO file_info;
+-
+- rc = CIFSSMBOpen(xid, tcon, searchName, FILE_OPEN, GENERIC_READ,
+-    CREATE_NOT_DIR, &netfid, &oplock, &file_info,
+-    nls_codepage, remap);
+- if (rc != 0)
+-  return rc;
+-
+- if (file_info.EndOfFile != cpu_to_le64(CIFS_MF_SYMLINK_FILE_SIZE)) {
+-  CIFSSMBClose(xid, tcon, netfid);
+-  /* it's not a symlink */
+-  return -EINVAL;
+- }
++ unsigned int bytes_read = 0;
+ 
+  buf = kmalloc(CIFS_MF_SYMLINK_FILE_SIZE, GFP_KERNEL);
+  if (!buf)
+   return -ENOMEM;
+- pbuf = buf;
+- io_parms.netfid = netfid;
+- io_parms.pid = current->tgid;
+- io_parms.tcon = tcon;
+- io_parms.offset = 0;
+- io_parms.length = CIFS_MF_SYMLINK_FILE_SIZE;
+ 
+- rc = CIFSSMBRead(xid, &io_parms, &bytes_read, &pbuf, &buf_type);
+- CIFSSMBClose(xid, tcon, netfid);
+- if (rc != 0) {
+-  kfree(buf);
+-  return rc;
++ if (tcon->ses->server->ops->query_mf_symlink)
++  rc = tcon->ses->server->ops->query_mf_symlink(xid, tcon,
++           cifs_sb, path, buf, &bytes_read);
++ else
++  rc = -ENOSYS;
++
++ if (rc)
++  goto out;
++
++ if (bytes_read == 0) { /* not a symlink */
++  rc = -EINVAL;
++  goto out;
+  }
+ 
+  rc = parse_mf_symlink(buf, bytes_read, &link_len, symlinkinfo);
++out:
+  kfree(buf);
+- if (rc != 0)
+-  return rc;
+-
+- return 0;
++ return rc;
+ }
+ 
+ bool
+@@ -515,10 +496,8 @@ cifs_follow_link(struct dentry *direntry, struct nameidata *nd)
+   * and fallback to UNIX Extensions Symlinks.
+   */
+  if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS)
+-  rc = query_mf_symlink(xid, tcon, full_path, &target_path,
+-     cifs_sb->local_nls,
+-     cifs_sb->mnt_cifs_flags &
+-      CIFS_MOUNT_MAP_SPECIAL_CHR);
++  rc = query_mf_symlink(xid, tcon, cifs_sb, full_path,
++          &target_path);
+ 
+  if (rc != 0 && server->ops->query_symlink)
+   rc = server->ops->query_symlink(xid, tcon, full_path,
+-- 
+1.7.1

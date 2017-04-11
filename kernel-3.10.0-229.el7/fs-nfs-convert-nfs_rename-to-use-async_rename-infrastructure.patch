@@ -1,0 +1,58 @@
+From f09c703049eec3f717f7049f5d8e9016f6f84f39 Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@redhat.com>
+Date: Mon, 21 Apr 2014 12:25:08 -0400
+Subject: [fs] nfs: convert nfs_rename to use async_rename infrastructure
+
+Message-id: <1398083110-3724-4-git-send-email-jlayton@redhat.com>
+Patchwork-id: 78979
+O-Subject: [RHEL7.1 PATCH 3/5] [BZ#919347] nfs: convert nfs_rename to use async_rename infrastructure
+Bugzilla: 919347
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+
+There isn't much sense in maintaining two separate versions of rename
+code. Convert nfs_rename to use the asynchronous rename infrastructure
+that nfs_sillyrename uses, and emulate synchronous behavior by having
+the task just wait on the reply.
+
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Tested-by: Anna Schumaker <Anna.Schumaker@netapp.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=919347
+Upstream commit: 80a491fd40770db143d250772778ff4f89b807ef
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 37d4e60..7e40a5f 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -1912,6 +1912,7 @@ int nfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+  struct inode *old_inode = old_dentry->d_inode;
+  struct inode *new_inode = new_dentry->d_inode;
+  struct dentry *dentry = NULL, *rehash = NULL;
++ struct rpc_task *task;
+  int error = -EBUSY;
+ 
+  dfprintk(VFS, "NFS: rename(%pd2 -> %pd2, ct=%d)\n",
+@@ -1959,8 +1960,16 @@ int nfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+  if (new_inode != NULL)
+   NFS_PROTO(new_inode)->return_delegation(new_inode);
+ 
+- error = NFS_PROTO(old_dir)->rename(old_dir, &old_dentry->d_name,
+-        new_dir, &new_dentry->d_name);
++ task = nfs_async_rename(old_dir, new_dir, old_dentry, new_dentry, NULL);
++ if (IS_ERR(task)) {
++  error = PTR_ERR(task);
++  goto out;
++ }
++
++ error = rpc_wait_for_completion_task(task);
++ if (error == 0)
++  error = task->tk_status;
++ rpc_put_task(task);
+  nfs_mark_for_revalidate(old_inode);
+ out:
+  if (rehash)
+-- 
+1.7.1

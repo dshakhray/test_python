@@ -1,0 +1,119 @@
+From ccbfcf4ce89dd305f0d906acb5ac62b7373abdb7 Mon Sep 17 00:00:00 2001
+From: Stefan Assmann <sassmann@redhat.com>
+Date: Tue, 2 Sep 2014 11:40:39 -0400
+Subject: [ethernet] i40e/i40evf: add max buf len to aq debug print helper
+
+Message-id: <1409658042-22689-279-git-send-email-sassmann@redhat.com>
+Patchwork-id: 90460
+O-Subject: [RHEL7.1 PATCH 278/281] i40e/i40evf: add max buf len to aq debug print helper
+Bugzilla: 1091126
+RH-Acked-by: Tony Camuso <tcamuso@redhat.com>
+
+From: Shannon Nelson <shannon.nelson@intel.com>
+
+There is at least one case in the Firmware API where the response to a
+command changes the buffer size field in the AQ descriptor to a larger
+number than what the request's buffer size started as.  This is in addition
+to setting an error flag and is in order to tell the requester how much
+larger a buffer is required for the answer.  We need to be sure not to
+use that number when dumping the contents of the data buffer because it
+can send us into the weeds and generate an invalid pointer exception.
+
+This patch adds a max buffer size parameter to the print helper to be
+sure the code knows when to stop.
+
+Change-ID: Ib84f7ed72140fe9d600086d8f2002fc5d8753092
+Signed-off-by: Shannon Nelson <shannon.nelson@intel.com>
+Tested-by: Jim Young <jamesx.m.young@intel.com>
+Tested-by: Sibai Li <sibai.li@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Stefan Assmann <sassmann@redhat.com>
+(cherry picked from commit f905dd62be8853644357044a455f83e63e8c68ef)
+---
+
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_adminq.c b/drivers/net/ethernet/intel/i40e/i40e_adminq.c
+index b29c157..72f5d25 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_adminq.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_adminq.c
+@@ -840,7 +840,8 @@ i40e_status i40e_asq_send_command(struct i40e_hw *hw,
+ 
+  /* bump the tail */
+  i40e_debug(hw, I40E_DEBUG_AQ_MESSAGE, "AQTX: desc and buffer:\n");
+- i40e_debug_aq(hw, I40E_DEBUG_AQ_COMMAND, (void *)desc_on_ring, buff);
++ i40e_debug_aq(hw, I40E_DEBUG_AQ_COMMAND, (void *)desc_on_ring,
++        buff, buff_size);
+  (hw->aq.asq.next_to_use)++;
+  if (hw->aq.asq.next_to_use == hw->aq.asq.count)
+   hw->aq.asq.next_to_use = 0;
+@@ -891,7 +892,7 @@ i40e_status i40e_asq_send_command(struct i40e_hw *hw,
+ 
+  i40e_debug(hw, I40E_DEBUG_AQ_MESSAGE,
+      "AQTX: desc and buffer writeback:\n");
+- i40e_debug_aq(hw, I40E_DEBUG_AQ_COMMAND, (void *)desc, buff);
++ i40e_debug_aq(hw, I40E_DEBUG_AQ_COMMAND, (void *)desc, buff, buff_size);
+ 
+  /* update the error if time out occurred */
+  if ((!cmd_completed) &&
+@@ -987,7 +988,8 @@ i40e_status i40e_clean_arq_element(struct i40e_hw *hw,
+          e->msg_size);
+ 
+  i40e_debug(hw, I40E_DEBUG_AQ_MESSAGE, "AQRX: desc and buffer:\n");
+- i40e_debug_aq(hw, I40E_DEBUG_AQ_COMMAND, (void *)desc, e->msg_buf);
++ i40e_debug_aq(hw, I40E_DEBUG_AQ_COMMAND, (void *)desc, e->msg_buf,
++        hw->aq.arq_buf_size);
+ 
+  /* Restore the original datalen and buffer address in the desc,
+   * FW updates datalen to indicate the event message
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_common.c b/drivers/net/ethernet/intel/i40e/i40e_common.c
+index df43e7c..01874c0 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_common.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_common.c
+@@ -75,13 +75,15 @@ static i40e_status i40e_set_mac_type(struct i40e_hw *hw)
+  * @mask: debug mask
+  * @desc: pointer to admin queue descriptor
+  * @buffer: pointer to command buffer
++ * @buf_len: max length of buffer
+  *
+  * Dumps debug log about adminq command with descriptor contents.
+  **/
+ void i40e_debug_aq(struct i40e_hw *hw, enum i40e_debug_mask mask, void *desc,
+-     void *buffer)
++     void *buffer, u16 buf_len)
+ {
+  struct i40e_aq_desc *aq_desc = (struct i40e_aq_desc *)desc;
++ u16 len = le16_to_cpu(aq_desc->datalen);
+  u8 *aq_buffer = (u8 *)buffer;
+  u32 data[4];
+  u32 i = 0;
+@@ -105,7 +107,9 @@ void i40e_debug_aq(struct i40e_hw *hw, enum i40e_debug_mask mask, void *desc,
+  if ((buffer != NULL) && (aq_desc->datalen != 0)) {
+   memset(data, 0, sizeof(data));
+   i40e_debug(hw, mask, "AQ CMD Buffer:\n");
+-  for (i = 0; i < le16_to_cpu(aq_desc->datalen); i++) {
++  if (buf_len < len)
++   len = buf_len;
++  for (i = 0; i < len; i++) {
+    data[((i % 16) / 4)] |=
+     ((u32)aq_buffer[i]) << (8 * (i % 4));
+    if ((i % 16) == 15) {
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_prototype.h b/drivers/net/ethernet/intel/i40e/i40e_prototype.h
+index 949a9a0..0988b5c 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_prototype.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_prototype.h
+@@ -52,10 +52,8 @@ i40e_status i40e_asq_send_command(struct i40e_hw *hw,
+     struct i40e_asq_cmd_details *cmd_details);
+ 
+ /* debug function for adminq */
+-void i40e_debug_aq(struct i40e_hw *hw,
+-     enum i40e_debug_mask mask,
+-     void *desc,
+-     void *buffer);
++void i40e_debug_aq(struct i40e_hw *hw, enum i40e_debug_mask mask,
++     void *desc, void *buffer, u16 buf_len);
+ 
+ void i40e_idle_aq(struct i40e_hw *hw);
+ bool i40e_check_asq_alive(struct i40e_hw *hw);
+-- 
+1.7.1
