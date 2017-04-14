@@ -26,66 +26,66 @@ index 3ca9817..c6c30e2 100644
 @@ -120,6 +120,7 @@ enum {
  #define IFLA_BRIDGE_MAX (__IFLA_BRIDGE_MAX - 1)
  
- #define BRIDGE_VLAN_INFO_MASTER (1<<0) /* Operate on Bridge device as well */
-+#define BRIDGE_VLAN_INFO_PVID (1<<1) /* VLAN is PVID, ingress untagged */
+ #define BRIDGE_VLAN_INFO_MASTER	(1<<0)	/* Operate on Bridge device as well */
++#define BRIDGE_VLAN_INFO_PVID	(1<<1)	/* VLAN is PVID, ingress untagged */
  
  struct bridge_vlan_info {
-  u16 flags;
+ 	u16 flags;
 diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
 index 6f0db56..9a99031 100644
 --- a/net/bridge/br_netlink.c
 +++ b/net/bridge/br_netlink.c
 @@ -121,6 +121,7 @@ static int br_fill_ifinfo(struct sk_buff *skb,
-   const struct net_port_vlans *pv;
-   struct bridge_vlan_info vinfo;
-   u16 vid;
-+  u16 pvid;
+ 		const struct net_port_vlans *pv;
+ 		struct bridge_vlan_info vinfo;
+ 		u16 vid;
++		u16 pvid;
  
-   if (port)
-    pv = nbp_get_vlan_info(port);
+ 		if (port)
+ 			pv = nbp_get_vlan_info(port);
 @@ -134,12 +135,15 @@ static int br_fill_ifinfo(struct sk_buff *skb,
-   if (!af)
-    goto nla_put_failure;
+ 		if (!af)
+ 			goto nla_put_failure;
  
-+  pvid = br_get_pvid(pv);
-   for (vid = find_first_bit(pv->vlan_bitmap, BR_VLAN_BITMAP_LEN);
-        vid < BR_VLAN_BITMAP_LEN;
-        vid = find_next_bit(pv->vlan_bitmap,
-       BR_VLAN_BITMAP_LEN, vid+1)) {
-    vinfo.vid = vid;
-    vinfo.flags = 0;
-+   if (vid == pvid)
-+    vinfo.flags |= BRIDGE_VLAN_INFO_PVID;
-    if (nla_put(skb, IFLA_BRIDGE_VLAN_INFO,
-         sizeof(vinfo), &vinfo))
-     goto nla_put_failure;
++		pvid = br_get_pvid(pv);
+ 		for (vid = find_first_bit(pv->vlan_bitmap, BR_VLAN_BITMAP_LEN);
+ 		     vid < BR_VLAN_BITMAP_LEN;
+ 		     vid = find_next_bit(pv->vlan_bitmap,
+ 					 BR_VLAN_BITMAP_LEN, vid+1)) {
+ 			vinfo.vid = vid;
+ 			vinfo.flags = 0;
++			if (vid == pvid)
++				vinfo.flags |= BRIDGE_VLAN_INFO_PVID;
+ 			if (nla_put(skb, IFLA_BRIDGE_VLAN_INFO,
+ 				    sizeof(vinfo), &vinfo))
+ 				goto nla_put_failure;
 @@ -240,14 +244,15 @@ static int br_afspec(struct net_bridge *br,
-   switch (cmd) {
-   case RTM_SETLINK:
-    if (p) {
--    err = nbp_vlan_add(p, vinfo->vid);
-+    err = nbp_vlan_add(p, vinfo->vid, vinfo->flags);
-     if (err)
-      break;
+ 		switch (cmd) {
+ 		case RTM_SETLINK:
+ 			if (p) {
+-				err = nbp_vlan_add(p, vinfo->vid);
++				err = nbp_vlan_add(p, vinfo->vid, vinfo->flags);
+ 				if (err)
+ 					break;
  
-     if (vinfo->flags & BRIDGE_VLAN_INFO_MASTER)
--     err = br_vlan_add(p->br, vinfo->vid);
-+     err = br_vlan_add(p->br, vinfo->vid,
-+         vinfo->flags);
-    } else
--    err = br_vlan_add(br, vinfo->vid);
-+    err = br_vlan_add(br, vinfo->vid, vinfo->flags);
+ 				if (vinfo->flags & BRIDGE_VLAN_INFO_MASTER)
+-					err = br_vlan_add(p->br, vinfo->vid);
++					err = br_vlan_add(p->br, vinfo->vid,
++							  vinfo->flags);
+ 			} else
+-				err = br_vlan_add(br, vinfo->vid);
++				err = br_vlan_add(br, vinfo->vid, vinfo->flags);
  
-    if (err)
-     break;
+ 			if (err)
+ 				break;
 diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
 index a39ac1a..97e50b7 100644
 --- a/net/bridge/br_private.h
 +++ b/net/bridge/br_private.h
 @@ -565,11 +565,11 @@ extern bool br_allowed_egress(struct net_bridge *br,
  extern struct sk_buff *br_handle_vlan(struct net_bridge *br,
-           const struct net_port_vlans *v,
-           struct sk_buff *skb);
+ 				      const struct net_port_vlans *v,
+ 				      struct sk_buff *skb);
 -extern int br_vlan_add(struct net_bridge *br, u16 vid);
 +extern int br_vlan_add(struct net_bridge *br, u16 vid, u16 flags);
  extern int br_vlan_delete(struct net_bridge *br, u16 vid);
@@ -97,13 +97,13 @@ index a39ac1a..97e50b7 100644
  extern void nbp_vlan_flush(struct net_bridge_port *port);
  
 @@ -636,7 +636,7 @@ static inline struct sk_buff *br_handle_vlan(struct net_bridge *br,
-  return skb;
+ 	return skb;
  }
  
 -static inline int br_vlan_add(struct net_bridge *br, u16 vid)
 +static inline int br_vlan_add(struct net_bridge *br, u16 vid, u16 flags)
  {
-  return -EOPNOTSUPP;
+ 	return -EOPNOTSUPP;
  }
 @@ -650,7 +650,7 @@ static inline void br_vlan_flush(struct net_bridge *br)
  {
@@ -112,7 +112,7 @@ index a39ac1a..97e50b7 100644
 -static inline int nbp_vlan_add(struct net_bridge_port *port, u16 vid)
 +static inline int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags)
  {
-  return -EOPNOTSUPP;
+ 	return -EOPNOTSUPP;
  }
 diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
 index 20057de..c79940c 100644
@@ -125,64 +125,64 @@ index 20057de..c79940c 100644
 -static int __vlan_add(struct net_port_vlans *v, u16 vid)
 +static void __vlan_add_pvid(struct net_port_vlans *v, u16 vid)
 +{
-+ if (v->pvid == vid)
-+  return;
++	if (v->pvid == vid)
++		return;
 +
-+ smp_wmb();
-+ v->pvid = vid;
++	smp_wmb();
++	v->pvid = vid;
 +}
 +
 +static void __vlan_delete_pvid(struct net_port_vlans *v, u16 vid)
 +{
-+ if (v->pvid != vid)
-+  return;
++	if (v->pvid != vid)
++		return;
 +
-+ smp_wmb();
-+ v->pvid = 0;
++	smp_wmb();
++	v->pvid = 0;
 +}
 +
 +static int __vlan_add(struct net_port_vlans *v, u16 vid, u16 flags)
  {
-  int err;
+ 	int err;
  
-- if (test_bit(vid, v->vlan_bitmap))
--  return -EEXIST;
-+ if (test_bit(vid, v->vlan_bitmap)) {
-+  if (flags & BRIDGE_VLAN_INFO_PVID)
-+   __vlan_add_pvid(v, vid);
-+  return 0;
-+ }
+-	if (test_bit(vid, v->vlan_bitmap))
+-		return -EEXIST;
++	if (test_bit(vid, v->vlan_bitmap)) {
++		if (flags & BRIDGE_VLAN_INFO_PVID)
++			__vlan_add_pvid(v, vid);
++		return 0;
++	}
  
-  if (v->port_idx && vid) {
-   struct net_device *dev = v->parent.port->dev;
+ 	if (v->port_idx && vid) {
+ 		struct net_device *dev = v->parent.port->dev;
 @@ -29,6 +50,9 @@ static int __vlan_add(struct net_port_vlans *v, u16 vid)
  
-  set_bit(vid, v->vlan_bitmap);
-  v->num_vlans++;
-+ if (flags & BRIDGE_VLAN_INFO_PVID)
-+  __vlan_add_pvid(v, vid);
+ 	set_bit(vid, v->vlan_bitmap);
+ 	v->num_vlans++;
++	if (flags & BRIDGE_VLAN_INFO_PVID)
++		__vlan_add_pvid(v, vid);
 +
-  return 0;
+ 	return 0;
  }
  
 @@ -37,6 +61,8 @@ static int __vlan_del(struct net_port_vlans *v, u16 vid)
-  if (!test_bit(vid, v->vlan_bitmap))
-   return -EINVAL;
+ 	if (!test_bit(vid, v->vlan_bitmap))
+ 		return -EINVAL;
  
-+ __vlan_delete_pvid(v, vid);
++	__vlan_delete_pvid(v, vid);
 +
-  if (v->port_idx && vid) {
-   struct net_device *dev = v->parent.port->dev;
+ 	if (v->port_idx && vid) {
+ 		struct net_device *dev = v->parent.port->dev;
  
 @@ -58,6 +84,8 @@ static int __vlan_del(struct net_port_vlans *v, u16 vid)
  
  static void __vlan_flush(struct net_port_vlans *v)
  {
-+ smp_wmb();
-+ v->pvid = 0;
-  bitmap_zero(v->vlan_bitmap, BR_VLAN_BITMAP_LEN);
-  if (v->port_idx)
-   rcu_assign_pointer(v->parent.port->vlan_info, NULL);
++	smp_wmb();
++	v->pvid = 0;
+ 	bitmap_zero(v->vlan_bitmap, BR_VLAN_BITMAP_LEN);
+ 	if (v->port_idx)
+ 		rcu_assign_pointer(v->parent.port->vlan_info, NULL);
 @@ -185,7 +213,7 @@ bool br_allowed_egress(struct net_bridge *br,
  }
  
@@ -190,34 +190,34 @@ index 20057de..c79940c 100644
 -int br_vlan_add(struct net_bridge *br, u16 vid)
 +int br_vlan_add(struct net_bridge *br, u16 vid, u16 flags)
  {
-  struct net_port_vlans *pv = NULL;
-  int err;
+ 	struct net_port_vlans *pv = NULL;
+ 	int err;
 @@ -194,7 +222,7 @@ int br_vlan_add(struct net_bridge *br, u16 vid)
  
-  pv = rtnl_dereference(br->vlan_info);
-  if (pv)
--  return __vlan_add(pv, vid);
-+  return __vlan_add(pv, vid, flags);
+ 	pv = rtnl_dereference(br->vlan_info);
+ 	if (pv)
+-		return __vlan_add(pv, vid);
++		return __vlan_add(pv, vid, flags);
  
-  /* Create port vlan infomration
-   */
+ 	/* Create port vlan infomration
+ 	 */
 @@ -203,7 +231,7 @@ int br_vlan_add(struct net_bridge *br, u16 vid)
-   return -ENOMEM;
+ 		return -ENOMEM;
  
-  pv->parent.br = br;
-- err = __vlan_add(pv, vid);
-+ err = __vlan_add(pv, vid, flags);
-  if (err)
-   goto out;
+ 	pv->parent.br = br;
+-	err = __vlan_add(pv, vid);
++	err = __vlan_add(pv, vid, flags);
+ 	if (err)
+ 		goto out;
  
 @@ -234,7 +262,6 @@ void br_vlan_flush(struct net_bridge *br)
-  struct net_port_vlans *pv;
+ 	struct net_port_vlans *pv;
  
-  ASSERT_RTNL();
+ 	ASSERT_RTNL();
 -
-  pv = rtnl_dereference(br->vlan_info);
-  if (!pv)
-   return;
+ 	pv = rtnl_dereference(br->vlan_info);
+ 	if (!pv)
+ 		return;
 @@ -258,7 +285,7 @@ unlock:
  }
  
@@ -225,25 +225,26 @@ index 20057de..c79940c 100644
 -int nbp_vlan_add(struct net_bridge_port *port, u16 vid)
 +int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags)
  {
-  struct net_port_vlans *pv = NULL;
-  int err;
+ 	struct net_port_vlans *pv = NULL;
+ 	int err;
 @@ -267,7 +294,7 @@ int nbp_vlan_add(struct net_bridge_port *port, u16 vid)
  
-  pv = rtnl_dereference(port->vlan_info);
-  if (pv)
--  return __vlan_add(pv, vid);
-+  return __vlan_add(pv, vid, flags);
+ 	pv = rtnl_dereference(port->vlan_info);
+ 	if (pv)
+-		return __vlan_add(pv, vid);
++		return __vlan_add(pv, vid, flags);
  
-  /* Create port vlan infomration
-   */
+ 	/* Create port vlan infomration
+ 	 */
 @@ -279,7 +306,7 @@ int nbp_vlan_add(struct net_bridge_port *port, u16 vid)
  
-  pv->port_idx = port->port_no;
-  pv->parent.port = port;
-- err = __vlan_add(pv, vid);
-+ err = __vlan_add(pv, vid, flags);
-  if (err)
-   goto clean_up;
+ 	pv->port_idx = port->port_no;
+ 	pv->parent.port = port;
+-	err = __vlan_add(pv, vid);
++	err = __vlan_add(pv, vid, flags);
+ 	if (err)
+ 		goto clean_up;
  
 -- 
 1.8.3.1
+

@@ -29,59 +29,59 @@ index 525c339..79babab 100644
 @@ -27,7 +27,7 @@ void
  qla2x00_bsg_sp_free(void *data, void *ptr)
  {
-  srb_t *sp = (srb_t *)ptr;
-- struct scsi_qla_host *vha = (scsi_qla_host_t *)data;
-+ struct scsi_qla_host *vha = sp->fcport->vha;
-  struct fc_bsg_job *bsg_job = sp->u.bsg_job;
-  struct qla_hw_data *ha = vha->hw;
+ 	srb_t *sp = (srb_t *)ptr;
+-	struct scsi_qla_host *vha = (scsi_qla_host_t *)data;
++	struct scsi_qla_host *vha = sp->fcport->vha;
+ 	struct fc_bsg_job *bsg_job = sp->u.bsg_job;
+ 	struct qla_hw_data *ha = vha->hw;
  
 @@ -40,7 +40,7 @@ qla2x00_bsg_sp_free(void *data, void *ptr)
-  if (sp->type == SRB_CT_CMD ||
-      sp->type == SRB_ELS_CMD_HST)
-   kfree(sp->fcport);
-- mempool_free(sp, vha->hw->srb_mempool);
-+ qla2x00_rel_sp(vha, sp);
+ 	if (sp->type == SRB_CT_CMD ||
+ 	    sp->type == SRB_ELS_CMD_HST)
+ 		kfree(sp->fcport);
+-	mempool_free(sp, vha->hw->srb_mempool);
++	qla2x00_rel_sp(vha, sp);
  }
  
  int
 @@ -368,7 +368,7 @@ qla2x00_process_els(struct fc_bsg_job *bsg_job)
-  if (rval != QLA_SUCCESS) {
-   ql_log(ql_log_warn, vha, 0x700e,
-       "qla2x00_start_sp failed = %d\n", rval);
--  mempool_free(sp, ha->srb_mempool);
-+  qla2x00_rel_sp(vha, sp);
-   rval = -EIO;
-   goto done_unmap_sg;
-  }
+ 	if (rval != QLA_SUCCESS) {
+ 		ql_log(ql_log_warn, vha, 0x700e,
+ 		    "qla2x00_start_sp failed = %d\n", rval);
+-		mempool_free(sp, ha->srb_mempool);
++		qla2x00_rel_sp(vha, sp);
+ 		rval = -EIO;
+ 		goto done_unmap_sg;
+ 	}
 @@ -515,7 +515,7 @@ qla2x00_process_ct(struct fc_bsg_job *bsg_job)
-  if (rval != QLA_SUCCESS) {
-   ql_log(ql_log_warn, vha, 0x7017,
-       "qla2x00_start_sp failed=%d.\n", rval);
--  mempool_free(sp, ha->srb_mempool);
-+  qla2x00_rel_sp(vha, sp);
-   rval = -EIO;
-   goto done_free_fcport;
-  }
+ 	if (rval != QLA_SUCCESS) {
+ 		ql_log(ql_log_warn, vha, 0x7017,
+ 		    "qla2x00_start_sp failed=%d.\n", rval);
+-		mempool_free(sp, ha->srb_mempool);
++		qla2x00_rel_sp(vha, sp);
+ 		rval = -EIO;
+ 		goto done_free_fcport;
+ 	}
 @@ -1995,6 +1995,6 @@ done:
-  spin_unlock_irqrestore(&ha->hardware_lock, flags);
-  if (bsg_job->request->msgcode == FC_BSG_HST_CT)
-   kfree(sp->fcport);
-- mempool_free(sp, ha->srb_mempool);
-+ qla2x00_rel_sp(vha, sp);
-  return 0;
+ 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ 	if (bsg_job->request->msgcode == FC_BSG_HST_CT)
+ 		kfree(sp->fcport);
+-	mempool_free(sp, ha->srb_mempool);
++	qla2x00_rel_sp(vha, sp);
+ 	return 0;
  }
 diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
 index 97f2684..7568324 100644
 --- a/drivers/scsi/qla2xxx/qla_init.c
 +++ b/drivers/scsi/qla2xxx/qla_init.c
 @@ -70,9 +70,7 @@ qla2x00_sp_free(void *data, void *ptr)
-  struct scsi_qla_host *vha = (scsi_qla_host_t *)data;
+ 	struct scsi_qla_host *vha = (scsi_qla_host_t *)data;
  
-  del_timer(&iocb->timer);
-- mempool_free(sp, vha->hw->srb_mempool);
+ 	del_timer(&iocb->timer);
+-	mempool_free(sp, vha->hw->srb_mempool);
 -
-- QLA_VHA_MARK_NOT_BUSY(vha);
-+ qla2x00_rel_sp(vha, sp);
+-	QLA_VHA_MARK_NOT_BUSY(vha);
++	qla2x00_rel_sp(vha, sp);
  }
  
  /* Asynchronous Login/Logout Routines -------------------------------------- */
@@ -95,35 +95,36 @@ index 6eb596e..f01230a 100644
  static inline void
 +qla2x00_rel_sp(scsi_qla_host_t *vha, srb_t *sp)
 +{
-+ mempool_free(sp, vha->hw->srb_mempool);
-+ QLA_VHA_MARK_NOT_BUSY(vha);
++	mempool_free(sp, vha->hw->srb_mempool);
++	QLA_VHA_MARK_NOT_BUSY(vha);
 +}
 +
 +static inline void
  qla2x00_init_timer(srb_t *sp, unsigned long tmo)
  {
-  init_timer(&sp->u.iocb_cmd.timer);
+ 	init_timer(&sp->u.iocb_cmd.timer);
 diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
 index 9e3ae1d..33fb217 100644
 --- a/drivers/scsi/qla2xxx/qla_os.c
 +++ b/drivers/scsi/qla2xxx/qla_os.c
 @@ -630,7 +630,7 @@ qla2x00_sp_free_dma(void *vha, void *ptr)
-  }
+ 	}
  
-  CMD_SP(cmd) = NULL;
-- mempool_free(sp, ha->srb_mempool);
-+ qla2x00_rel_sp(sp->fcport->vha, sp);
+ 	CMD_SP(cmd) = NULL;
+-	mempool_free(sp, ha->srb_mempool);
++	qla2x00_rel_sp(sp->fcport->vha, sp);
  }
  
  static void
 @@ -718,7 +718,7 @@ qla2xxx_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
-   goto qc24_target_busy;
-  }
+ 		goto qc24_target_busy;
+ 	}
  
-- sp = qla2x00_get_sp(base_vha, fcport, GFP_ATOMIC);
-+ sp = qla2x00_get_sp(vha, fcport, GFP_ATOMIC);
-  if (!sp) {
-   set_bit(HOST_RAMP_DOWN_QUEUE_DEPTH, &vha->dpc_flags);
-   goto qc24_host_busy;
+-	sp = qla2x00_get_sp(base_vha, fcport, GFP_ATOMIC);
++	sp = qla2x00_get_sp(vha, fcport, GFP_ATOMIC);
+ 	if (!sp) {
+ 		set_bit(HOST_RAMP_DOWN_QUEUE_DEPTH, &vha->dpc_flags);
+ 		goto qc24_host_busy;
 -- 
 1.8.3.1
+

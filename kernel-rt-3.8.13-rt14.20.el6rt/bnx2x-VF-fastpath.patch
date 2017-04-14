@@ -26,39 +26,39 @@ index 749054a..8e7acda 100644
 --- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
 +++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
 @@ -3496,8 +3496,18 @@ netdev_tx_t bnx2x_start_xmit(struct sk_buff *skb, struct net_device *dev)
-       cpu_to_le16(vlan_tx_tag_get(skb));
-   tx_start_bd->bd_flags.as_bitfield |=
-       (X_ETH_OUTBAND_VLAN << ETH_TX_BD_FLAGS_VLAN_MODE_SHIFT);
-- } else
--  tx_start_bd->vlan_or_ethertype = cpu_to_le16(pkt_prod);
-+ } else {
-+  /* when transmitting in a vf, start bd must hold the ethertype
-+   * for fw to enforce it
-+   */
-+  if (IS_VF(bp)) {
-+   tx_start_bd->vlan_or_ethertype =
-+    cpu_to_le16(ntohs(eth->h_proto));
-+  } else {
-+   /* used by FW for packet accounting */
-+   tx_start_bd->vlan_or_ethertype = cpu_to_le16(pkt_prod);
-+  }
-+ }
+ 		    cpu_to_le16(vlan_tx_tag_get(skb));
+ 		tx_start_bd->bd_flags.as_bitfield |=
+ 		    (X_ETH_OUTBAND_VLAN << ETH_TX_BD_FLAGS_VLAN_MODE_SHIFT);
+-	} else
+-		tx_start_bd->vlan_or_ethertype = cpu_to_le16(pkt_prod);
++	} else {
++		/* when transmitting in a vf, start bd must hold the ethertype
++		 * for fw to enforce it
++		 */
++		if (IS_VF(bp)) {
++			tx_start_bd->vlan_or_ethertype =
++				cpu_to_le16(ntohs(eth->h_proto));
++		} else {
++			/* used by FW for packet accounting */
++			tx_start_bd->vlan_or_ethertype = cpu_to_le16(pkt_prod);
++		}
++	}
  
-  /* turn on parsing and get a BD */
-  bd_prod = TX_BD(NEXT_TX_IDX(bd_prod));
+ 	/* turn on parsing and get a BD */
+ 	bd_prod = TX_BD(NEXT_TX_IDX(bd_prod));
 @@ -3513,9 +3523,9 @@ netdev_tx_t bnx2x_start_xmit(struct sk_buff *skb, struct net_device *dev)
-    hlen = bnx2x_set_pbd_csum_e2(bp, skb,
-            &pbd_e2_parsing_data,
-            xmit_type);
--  if (IS_MF_SI(bp)) {
--   /*
--    * fill in the MAC addresses in the PBD - for local
+ 			hlen = bnx2x_set_pbd_csum_e2(bp, skb,
+ 						     &pbd_e2_parsing_data,
+ 						     xmit_type);
+-		if (IS_MF_SI(bp)) {
+-			/*
+-			 * fill in the MAC addresses in the PBD - for local
 +
-+  if (IS_MF_SI(bp) || IS_VF(bp)) {
-+   /* fill in the MAC addresses in the PBD - for local
-     * switching
-     */
-    bnx2x_set_fw_mac_addr(&pbd_e2->src_mac_addr_hi,
++		if (IS_MF_SI(bp) || IS_VF(bp)) {
++			/* fill in the MAC addresses in the PBD - for local
+ 			 * switching
+ 			 */
+ 			bnx2x_set_fw_mac_addr(&pbd_e2->src_mac_addr_hi,
 diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h
 index 91e432d..6b0add2 100644
 --- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.h
@@ -68,36 +68,36 @@ index 91e432d..6b0add2 100644
  u16 bnx2x_select_queue(struct net_device *dev, struct sk_buff *skb);
  
 +static inline void bnx2x_update_rx_prod(struct bnx2x *bp,
-+     struct bnx2x_fastpath *fp,
-+     u16 bd_prod, u16 rx_comp_prod,
-+     u16 rx_sge_prod)
++					struct bnx2x_fastpath *fp,
++					u16 bd_prod, u16 rx_comp_prod,
++					u16 rx_sge_prod)
 +{
-+ struct ustorm_eth_rx_producers rx_prods = {0};
-+ u32 i;
++	struct ustorm_eth_rx_producers rx_prods = {0};
++	u32 i;
 +
-+ /* Update producers */
-+ rx_prods.bd_prod = bd_prod;
-+ rx_prods.cqe_prod = rx_comp_prod;
-+ rx_prods.sge_prod = rx_sge_prod;
++	/* Update producers */
++	rx_prods.bd_prod = bd_prod;
++	rx_prods.cqe_prod = rx_comp_prod;
++	rx_prods.sge_prod = rx_sge_prod;
 +
-+ /* Make sure that the BD and SGE data is updated before updating the
-+  * producers since FW might read the BD/SGE right after the producer
-+  * is updated.
-+  * This is only applicable for weak-ordered memory model archs such
-+  * as IA-64. The following barrier is also mandatory since FW will
-+  * assumes BDs must have buffers.
-+  */
-+ wmb();
++	/* Make sure that the BD and SGE data is updated before updating the
++	 * producers since FW might read the BD/SGE right after the producer
++	 * is updated.
++	 * This is only applicable for weak-ordered memory model archs such
++	 * as IA-64. The following barrier is also mandatory since FW will
++	 * assumes BDs must have buffers.
++	 */
++	wmb();
 +
-+ for (i = 0; i < sizeof(rx_prods)/4; i++)
-+  REG_WR(bp, fp->ustorm_rx_prods_offset + i*4,
-+         ((u32 *)&rx_prods)[i]);
++	for (i = 0; i < sizeof(rx_prods)/4; i++)
++		REG_WR(bp, fp->ustorm_rx_prods_offset + i*4,
++		       ((u32 *)&rx_prods)[i]);
 +
-+ mmiowb(); /* keep prod updates ordered */
++	mmiowb(); /* keep prod updates ordered */
 +
-+ DP(NETIF_MSG_RX_STATUS,
-+    "queue[%d]:  wrote  bd_prod %u  cqe_prod %u  sge_prod %u\n",
-+    fp->index, bd_prod, rx_comp_prod, rx_sge_prod);
++	DP(NETIF_MSG_RX_STATUS,
++	   "queue[%d]:  wrote  bd_prod %u  cqe_prod %u  sge_prod %u\n",
++	   fp->index, bd_prod, rx_comp_prod, rx_sge_prod);
 +}
 +
  /* reload helper */
@@ -108,80 +108,81 @@ index 91e432d..6b0add2 100644
  int bnx2x_rx_int(struct bnx2x_fastpath *fp, int budget);
  
 -void bnx2x_update_rx_prod(struct bnx2x *bp, struct bnx2x_fastpath *fp,
--   u16 bd_prod, u16 rx_comp_prod, u16 rx_sge_prod);
+-			u16 bd_prod, u16 rx_comp_prod, u16 rx_sge_prod);
 -
  /* NAPI poll Tx part */
  int bnx2x_tx_int(struct bnx2x *bp, struct bnx2x_fp_txdata *txdata);
  
 @@ -612,38 +642,6 @@ static inline void bnx2x_update_fpsb_idx(struct bnx2x_fastpath *fp)
-  fp->fp_hc_idx = fp->sb_running_index[SM_RX_ID];
+ 	fp->fp_hc_idx = fp->sb_running_index[SM_RX_ID];
  }
  
 -static inline void bnx2x_update_rx_prod_gen(struct bnx2x *bp,
--   struct bnx2x_fastpath *fp, u16 bd_prod,
--   u16 rx_comp_prod, u16 rx_sge_prod, u32 start)
+-			struct bnx2x_fastpath *fp, u16 bd_prod,
+-			u16 rx_comp_prod, u16 rx_sge_prod, u32 start)
 -{
-- struct ustorm_eth_rx_producers rx_prods = {0};
-- u32 i;
+-	struct ustorm_eth_rx_producers rx_prods = {0};
+-	u32 i;
 -
-- /* Update producers */
-- rx_prods.bd_prod = bd_prod;
-- rx_prods.cqe_prod = rx_comp_prod;
-- rx_prods.sge_prod = rx_sge_prod;
+-	/* Update producers */
+-	rx_prods.bd_prod = bd_prod;
+-	rx_prods.cqe_prod = rx_comp_prod;
+-	rx_prods.sge_prod = rx_sge_prod;
 -
-- /*
--  * Make sure that the BD and SGE data is updated before updating the
--  * producers since FW might read the BD/SGE right after the producer
--  * is updated.
--  * This is only applicable for weak-ordered memory model archs such
--  * as IA-64. The following barrier is also mandatory since FW will
--  * assumes BDs must have buffers.
--  */
-- wmb();
+-	/*
+-	 * Make sure that the BD and SGE data is updated before updating the
+-	 * producers since FW might read the BD/SGE right after the producer
+-	 * is updated.
+-	 * This is only applicable for weak-ordered memory model archs such
+-	 * as IA-64. The following barrier is also mandatory since FW will
+-	 * assumes BDs must have buffers.
+-	 */
+-	wmb();
 -
-- for (i = 0; i < sizeof(rx_prods)/4; i++)
--  REG_WR(bp, start + i*4, ((u32 *)&rx_prods)[i]);
+-	for (i = 0; i < sizeof(rx_prods)/4; i++)
+-		REG_WR(bp, start + i*4, ((u32 *)&rx_prods)[i]);
 -
-- mmiowb(); /* keep prod updates ordered */
+-	mmiowb(); /* keep prod updates ordered */
 -
-- DP(NETIF_MSG_RX_STATUS,
--    "queue[%d]:  wrote  bd_prod %u  cqe_prod %u  sge_prod %u\n",
--    fp->index, bd_prod, rx_comp_prod, rx_sge_prod);
+-	DP(NETIF_MSG_RX_STATUS,
+-	   "queue[%d]:  wrote  bd_prod %u  cqe_prod %u  sge_prod %u\n",
+-	   fp->index, bd_prod, rx_comp_prod, rx_sge_prod);
 -}
 -
  static inline void bnx2x_igu_ack_sb_gen(struct bnx2x *bp, u8 igu_sb_id,
-      u8 segment, u16 index, u8 op,
-      u8 update, u32 igu_addr)
+ 					u8 segment, u16 index, u8 op,
+ 					u8 update, u32 igu_addr)
 diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
 index b7f213e..b3e5ff1 100644
 --- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
 +++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
 @@ -1708,15 +1708,6 @@ void bnx2x_sp_event(struct bnx2x_fastpath *fp, union eth_rx_cqe *rr_cqe)
-  return;
+ 	return;
  }
  
 -void bnx2x_update_rx_prod(struct bnx2x *bp, struct bnx2x_fastpath *fp,
--   u16 bd_prod, u16 rx_comp_prod, u16 rx_sge_prod)
+-			u16 bd_prod, u16 rx_comp_prod, u16 rx_sge_prod)
 -{
-- u32 start = BAR_USTRORM_INTMEM + fp->ustorm_rx_prods_offset;
+-	u32 start = BAR_USTRORM_INTMEM + fp->ustorm_rx_prods_offset;
 -
-- bnx2x_update_rx_prod_gen(bp, fp, bd_prod, rx_comp_prod, rx_sge_prod,
--     start);
+-	bnx2x_update_rx_prod_gen(bp, fp, bd_prod, rx_comp_prod, rx_sge_prod,
+-				 start);
 -}
 -
  irqreturn_t bnx2x_interrupt(int irq, void *dev_instance)
  {
-  struct bnx2x *bp = netdev_priv(dev_instance);
+ 	struct bnx2x *bp = netdev_priv(dev_instance);
 @@ -4631,8 +4622,8 @@ static void bnx2x_attn_int(struct bnx2x *bp)
  void bnx2x_igu_ack_sb(struct bnx2x *bp, u8 igu_sb_id, u8 segment,
-         u16 index, u8 op, u8 update)
+ 		      u16 index, u8 op, u8 update)
  {
-- u32 igu_addr = BAR_IGU_INTMEM + (IGU_CMD_INT_ACK_BASE + igu_sb_id)*8;
+-	u32 igu_addr = BAR_IGU_INTMEM + (IGU_CMD_INT_ACK_BASE + igu_sb_id)*8;
 -
-+ u32 igu_addr = bp->igu_base_addr;
-+ igu_addr += (IGU_CMD_INT_ACK_BASE + igu_sb_id)*8;
-  bnx2x_igu_ack_sb_gen(bp, igu_sb_id, segment, index, op, update,
-         igu_addr);
++	u32 igu_addr = bp->igu_base_addr;
++	igu_addr += (IGU_CMD_INT_ACK_BASE + igu_sb_id)*8;
+ 	bnx2x_igu_ack_sb_gen(bp, igu_sb_id, segment, index, op, update,
+ 			     igu_addr);
  }
 -- 
 1.8.3.1
+

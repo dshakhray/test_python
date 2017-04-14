@@ -46,36 +46,36 @@ index f94c085..2572e13 100644
  #include <linux/clocksource.h>
  #include <linux/net_tstamp.h>
 @@ -231,6 +232,7 @@ struct ixgbe_ring {
-   struct ixgbe_tx_buffer *tx_buffer_info;
-   struct ixgbe_rx_buffer *rx_buffer_info;
-  };
-+ unsigned long last_rx_timestamp;
-  unsigned long state;
-  u8 __iomem *tail;
-  dma_addr_t dma;   /* phys. address of descriptor ring */
+ 		struct ixgbe_tx_buffer *tx_buffer_info;
+ 		struct ixgbe_rx_buffer *rx_buffer_info;
+ 	};
++	unsigned long last_rx_timestamp;
+ 	unsigned long state;
+ 	u8 __iomem *tail;
+ 	dma_addr_t dma;			/* phys. address of descriptor ring */
 @@ -581,10 +583,10 @@ struct ixgbe_adapter {
-  struct ptp_clock *ptp_clock;
-  struct ptp_clock_info ptp_caps;
-  unsigned long last_overflow_check;
-+ unsigned long last_rx_ptp_check;
-  spinlock_t tmreg_lock;
-  struct cyclecounter cc;
-  struct timecounter tc;
-- int rx_hwtstamp_filter;
-  u32 base_incval;
+ 	struct ptp_clock *ptp_clock;
+ 	struct ptp_clock_info ptp_caps;
+ 	unsigned long last_overflow_check;
++	unsigned long last_rx_ptp_check;
+ 	spinlock_t tmreg_lock;
+ 	struct cyclecounter cc;
+ 	struct timecounter tc;
+-	int rx_hwtstamp_filter;
+ 	u32 base_incval;
  
-  /* SR-IOV */
+ 	/* SR-IOV */
 @@ -749,9 +751,10 @@ static inline struct netdev_queue *txring_txq(const struct ixgbe_ring *ring)
  extern void ixgbe_ptp_init(struct ixgbe_adapter *adapter);
  extern void ixgbe_ptp_stop(struct ixgbe_adapter *adapter);
  extern void ixgbe_ptp_overflow_check(struct ixgbe_adapter *adapter);
 +extern void ixgbe_ptp_rx_hang(struct ixgbe_adapter *adapter);
  extern void ixgbe_ptp_tx_hwtstamp(struct ixgbe_q_vector *q_vector,
-       struct sk_buff *skb);
+ 				  struct sk_buff *skb);
 -extern void ixgbe_ptp_rx_hwtstamp(struct ixgbe_q_vector *q_vector,
 +extern void ixgbe_ptp_rx_hwtstamp(struct ixgbe_ring *rx_ring,
-       union ixgbe_adv_rx_desc *rx_desc,
-       struct sk_buff *skb);
+ 				  union ixgbe_adv_rx_desc *rx_desc,
+ 				  struct sk_buff *skb);
  extern int ixgbe_ptp_hwtstamp_ioctl(struct ixgbe_adapter *adapter,
 diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
 index 322227a..ff6a673 100644
@@ -83,29 +83,29 @@ index 322227a..ff6a673 100644
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
 @@ -1442,7 +1442,7 @@ static void ixgbe_process_skb_fields(struct ixgbe_ring *rx_ring,
  
-  ixgbe_rx_checksum(rx_ring, rx_desc, skb);
+ 	ixgbe_rx_checksum(rx_ring, rx_desc, skb);
  
-- ixgbe_ptp_rx_hwtstamp(rx_ring->q_vector, rx_desc, skb);
-+ ixgbe_ptp_rx_hwtstamp(rx_ring, rx_desc, skb);
+-	ixgbe_ptp_rx_hwtstamp(rx_ring->q_vector, rx_desc, skb);
++	ixgbe_ptp_rx_hwtstamp(rx_ring, rx_desc, skb);
  
-  if ((dev->features & NETIF_F_HW_VLAN_RX) &&
-      ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_VP)) {
+ 	if ((dev->features & NETIF_F_HW_VLAN_RX) &&
+ 	    ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_VP)) {
 @@ -5545,6 +5545,8 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
-   break;
-  }
+ 		break;
+ 	}
  
-+ adapter->last_rx_ptp_check = jiffies;
++	adapter->last_rx_ptp_check = jiffies;
 +
-  if (adapter->flags2 & IXGBE_FLAG2_PTP_ENABLED)
-   ixgbe_ptp_start_cyclecounter(adapter);
+ 	if (adapter->flags2 & IXGBE_FLAG2_PTP_ENABLED)
+ 		ixgbe_ptp_start_cyclecounter(adapter);
  
 @@ -5898,6 +5900,7 @@ static void ixgbe_service_task(struct work_struct *work)
-  ixgbe_fdir_reinit_subtask(adapter);
-  ixgbe_check_hang_subtask(adapter);
-  ixgbe_ptp_overflow_check(adapter);
-+ ixgbe_ptp_rx_hang(adapter);
+ 	ixgbe_fdir_reinit_subtask(adapter);
+ 	ixgbe_check_hang_subtask(adapter);
+ 	ixgbe_ptp_overflow_check(adapter);
++	ixgbe_ptp_rx_hang(adapter);
  
-  ixgbe_service_event_complete(adapter);
+ 	ixgbe_service_event_complete(adapter);
  }
 diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
 index 86fc160..de0e133 100644
@@ -116,7 +116,7 @@ index 86fc160..de0e133 100644
  #endif
  
 -static struct sock_filter ptp_filter[] = {
-- PTP_FILTER
+-	PTP_FILTER
 -};
 -
  /**
@@ -150,71 +150,71 @@ index 86fc160..de0e133 100644
 -static int ixgbe_ptp_match(struct sk_buff *skb, int rx_filter)
 +void ixgbe_ptp_rx_hang(struct ixgbe_adapter *adapter)
  {
-- struct iphdr iph;
-- u8 msgtype;
-- unsigned int type, offset;
+-	struct iphdr iph;
+-	u8 msgtype;
+-	unsigned int type, offset;
 -
-- if (rx_filter == HWTSTAMP_FILTER_NONE)
--  return 0;
+-	if (rx_filter == HWTSTAMP_FILTER_NONE)
+-		return 0;
 -
-- type = sk_run_filter(skb, ptp_filter);
+-	type = sk_run_filter(skb, ptp_filter);
 -
-- if (likely(rx_filter == HWTSTAMP_FILTER_PTP_V2_EVENT))
--  return type & PTP_CLASS_V2;
-+ struct ixgbe_hw *hw = &adapter->hw;
-+ struct ixgbe_ring *rx_ring;
-+ u32 tsyncrxctl = IXGBE_READ_REG(hw, IXGBE_TSYNCRXCTL);
-+ unsigned long rx_event;
-+ int n;
+-	if (likely(rx_filter == HWTSTAMP_FILTER_PTP_V2_EVENT))
+-		return type & PTP_CLASS_V2;
++	struct ixgbe_hw *hw = &adapter->hw;
++	struct ixgbe_ring *rx_ring;
++	u32 tsyncrxctl = IXGBE_READ_REG(hw, IXGBE_TSYNCRXCTL);
++	unsigned long rx_event;
++	int n;
  
-- /* For the remaining cases actually check message type */
-- switch (type) {
-- case PTP_CLASS_V1_IPV4:
--  skb_copy_bits(skb, OFF_IHL, &iph, sizeof(iph));
--  offset = ETH_HLEN + (iph.ihl << 2) + UDP_HLEN + OFF_PTP_CONTROL;
--  break;
-- case PTP_CLASS_V1_IPV6:
--  offset = OFF_PTP6 + OFF_PTP_CONTROL;
--  break;
-- default:
--  /* other cases invalid or handled above */
--  return 0;
-+ /* if we don't have a valid timestamp in the registers, just update the
-+  * timeout counter and exit
-+  */
-+ if (!(tsyncrxctl & IXGBE_TSYNCRXCTL_VALID)) {
-+  adapter->last_rx_ptp_check = jiffies;
-+  return;
-  }
+-	/* For the remaining cases actually check message type */
+-	switch (type) {
+-	case PTP_CLASS_V1_IPV4:
+-		skb_copy_bits(skb, OFF_IHL, &iph, sizeof(iph));
+-		offset = ETH_HLEN + (iph.ihl << 2) + UDP_HLEN + OFF_PTP_CONTROL;
+-		break;
+-	case PTP_CLASS_V1_IPV6:
+-		offset = OFF_PTP6 + OFF_PTP_CONTROL;
+-		break;
+-	default:
+-		/* other cases invalid or handled above */
+-		return 0;
++	/* if we don't have a valid timestamp in the registers, just update the
++	 * timeout counter and exit
++	 */
++	if (!(tsyncrxctl & IXGBE_TSYNCRXCTL_VALID)) {
++		adapter->last_rx_ptp_check = jiffies;
++		return;
+ 	}
  
-- /* Make sure our buffer is long enough */
-- if (skb->len < offset)
--  return 0;
-+ /* determine the most recent watchdog or rx_timestamp event */
-+ rx_event = adapter->last_rx_ptp_check;
-+ for (n = 0; n < adapter->num_rx_queues; n++) {
-+  rx_ring = adapter->rx_ring[n];
-+  if (time_after(rx_ring->last_rx_timestamp, rx_event))
-+   rx_event = rx_ring->last_rx_timestamp;
-+ }
+-	/* Make sure our buffer is long enough */
+-	if (skb->len < offset)
+-		return 0;
++	/* determine the most recent watchdog or rx_timestamp event */
++	rx_event = adapter->last_rx_ptp_check;
++	for (n = 0; n < adapter->num_rx_queues; n++) {
++		rx_ring = adapter->rx_ring[n];
++		if (time_after(rx_ring->last_rx_timestamp, rx_event))
++			rx_event = rx_ring->last_rx_timestamp;
++	}
  
-- skb_copy_bits(skb, offset, &msgtype, sizeof(msgtype));
-+ /* only need to read the high RXSTMP register to clear the lock */
-+ if (time_is_before_jiffies(rx_event + 5*HZ)) {
-+  IXGBE_READ_REG(hw, IXGBE_RXSTMPH);
-+  adapter->last_rx_ptp_check = jiffies;
+-	skb_copy_bits(skb, offset, &msgtype, sizeof(msgtype));
++	/* only need to read the high RXSTMP register to clear the lock */
++	if (time_is_before_jiffies(rx_event + 5*HZ)) {
++		IXGBE_READ_REG(hw, IXGBE_RXSTMPH);
++		adapter->last_rx_ptp_check = jiffies;
  
-- switch (rx_filter) {
-- case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:
--  return (msgtype == IXGBE_RXMTRL_V1_SYNC_MSG);
--  break;
-- case HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ:
--  return (msgtype == IXGBE_RXMTRL_V1_DELAY_REQ_MSG);
--  break;
-- default:
--  return 0;
-+  e_warn(drv, "clearing RX Timestamp hang");
-  }
+-	switch (rx_filter) {
+-	case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:
+-		return (msgtype == IXGBE_RXMTRL_V1_SYNC_MSG);
+-		break;
+-	case HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ:
+-		return (msgtype == IXGBE_RXMTRL_V1_DELAY_REQ_MSG);
+-		break;
+-	default:
+-		return 0;
++		e_warn(drv, "clearing RX Timestamp hang");
+ 	}
  }
  
 @@ -545,7 +521,7 @@ void ixgbe_ptp_tx_hwtstamp(struct ixgbe_q_vector *q_vector,
@@ -223,84 +223,85 @@ index 86fc160..de0e133 100644
   */
 -void ixgbe_ptp_rx_hwtstamp(struct ixgbe_q_vector *q_vector,
 +void ixgbe_ptp_rx_hwtstamp(struct ixgbe_ring *rx_ring,
-       union ixgbe_adv_rx_desc *rx_desc,
-       struct sk_buff *skb)
+ 			   union ixgbe_adv_rx_desc *rx_desc,
+ 			   struct sk_buff *skb)
  {
 @@ -557,43 +533,32 @@ void ixgbe_ptp_rx_hwtstamp(struct ixgbe_q_vector *q_vector,
-  unsigned long flags;
+ 	unsigned long flags;
  
-  /* we cannot process timestamps on a ring without a q_vector */
-- if (!q_vector || !q_vector->adapter)
-+ if (!rx_ring->q_vector || !rx_ring->q_vector->adapter)
-   return;
+ 	/* we cannot process timestamps on a ring without a q_vector */
+-	if (!q_vector || !q_vector->adapter)
++	if (!rx_ring->q_vector || !rx_ring->q_vector->adapter)
+ 		return;
  
-- adapter = q_vector->adapter;
-+ adapter = rx_ring->q_vector->adapter;
-  hw = &adapter->hw;
+-	adapter = q_vector->adapter;
++	adapter = rx_ring->q_vector->adapter;
+ 	hw = &adapter->hw;
  
-- if (likely(!ixgbe_ptp_match(skb, adapter->rx_hwtstamp_filter)))
-+ if (unlikely(!ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_STAT_TS)))
-   return;
+-	if (likely(!ixgbe_ptp_match(skb, adapter->rx_hwtstamp_filter)))
++	if (unlikely(!ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_STAT_TS)))
+ 		return;
  
-+ /*
-+  * Read the tsyncrxctl register afterwards in order to prevent taking an
-+  * I/O hit on every packet.
-+  */
-  tsyncrxctl = IXGBE_READ_REG(hw, IXGBE_TSYNCRXCTL);
++	/*
++	 * Read the tsyncrxctl register afterwards in order to prevent taking an
++	 * I/O hit on every packet.
++	 */
+ 	tsyncrxctl = IXGBE_READ_REG(hw, IXGBE_TSYNCRXCTL);
 -
-- /* Check if we have a valid timestamp and make sure the skb should
--  * have been timestamped */
-  if (!(tsyncrxctl & IXGBE_TSYNCRXCTL_VALID))
-   return;
+-	/* Check if we have a valid timestamp and make sure the skb should
+-	 * have been timestamped */
+ 	if (!(tsyncrxctl & IXGBE_TSYNCRXCTL_VALID))
+ 		return;
  
-  /*
--  * Always read the registers, in order to clear a possible fault
--  * because of stagnant RX timestamp values for a packet that never
--  * reached the queue.
-+  * Update the last_rx_timestamp timer in order to enable watchdog check
-+  * for error case of latched timestamp on a dropped packet.
-   */
-+ rx_ring->last_rx_timestamp = jiffies;
+ 	/*
+-	 * Always read the registers, in order to clear a possible fault
+-	 * because of stagnant RX timestamp values for a packet that never
+-	 * reached the queue.
++	 * Update the last_rx_timestamp timer in order to enable watchdog check
++	 * for error case of latched timestamp on a dropped packet.
+ 	 */
++	rx_ring->last_rx_timestamp = jiffies;
 +
-  regval |= (u64)IXGBE_READ_REG(hw, IXGBE_RXSTMPL);
-  regval |= (u64)IXGBE_READ_REG(hw, IXGBE_RXSTMPH) << 32;
+ 	regval |= (u64)IXGBE_READ_REG(hw, IXGBE_RXSTMPL);
+ 	regval |= (u64)IXGBE_READ_REG(hw, IXGBE_RXSTMPH) << 32;
  
-- /*
--  * If the timestamp bit is set in the packet's descriptor, we know the
--  * timestamp belongs to this packet. No other packet can be
--  * timestamped until the registers for timestamping have been read.
--  * Therefor only one packet with this bit can be in the queue at a
--  * time, and the rx timestamp values that were in the registers belong
--  * to this packet.
--  *
--  * If nothing went wrong, then it should have a skb_shared_tx that we
--  * can turn into a skb_shared_hwtstamps.
--  */
-- if (unlikely(!ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_STAT_TS)))
--  return;
+-	/*
+-	 * If the timestamp bit is set in the packet's descriptor, we know the
+-	 * timestamp belongs to this packet. No other packet can be
+-	 * timestamped until the registers for timestamping have been read.
+-	 * Therefor only one packet with this bit can be in the queue at a
+-	 * time, and the rx timestamp values that were in the registers belong
+-	 * to this packet.
+-	 *
+-	 * If nothing went wrong, then it should have a skb_shared_tx that we
+-	 * can turn into a skb_shared_hwtstamps.
+-	 */
+-	if (unlikely(!ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_STAT_TS)))
+-		return;
  
-  spin_lock_irqsave(&adapter->tmreg_lock, flags);
-  ns = timecounter_cyc2time(&adapter->tc, regval);
+ 	spin_lock_irqsave(&adapter->tmreg_lock, flags);
+ 	ns = timecounter_cyc2time(&adapter->tc, regval);
 @@ -698,9 +663,6 @@ int ixgbe_ptp_hwtstamp_ioctl(struct ixgbe_adapter *adapter,
-   return 0;
-  }
+ 		return 0;
+ 	}
  
-- /* Store filter value for later use */
-- adapter->rx_hwtstamp_filter = config.rx_filter;
+-	/* Store filter value for later use */
+-	adapter->rx_hwtstamp_filter = config.rx_filter;
 -
-  /* define ethertype filter for timestamping L2 packets */
-  if (is_l2)
-   IXGBE_WRITE_REG(hw, IXGBE_ETQF(IXGBE_ETQF_FILTER_1588),
+ 	/* define ethertype filter for timestamping L2 packets */
+ 	if (is_l2)
+ 		IXGBE_WRITE_REG(hw, IXGBE_ETQF(IXGBE_ETQF_FILTER_1588),
 @@ -902,10 +864,6 @@ void ixgbe_ptp_init(struct ixgbe_adapter *adapter)
-   return;
-  }
+ 		return;
+ 	}
  
-- /* initialize the ptp filter */
-- if (ptp_filter_init(ptp_filter, ARRAY_SIZE(ptp_filter)))
--  e_dev_warn("ptp_filter_init failed\n");
+-	/* initialize the ptp filter */
+-	if (ptp_filter_init(ptp_filter, ARRAY_SIZE(ptp_filter)))
+-		e_dev_warn("ptp_filter_init failed\n");
 -
-  spin_lock_init(&adapter->tmreg_lock);
+ 	spin_lock_init(&adapter->tmreg_lock);
  
-  adapter->ptp_clock = ptp_clock_register(&adapter->ptp_caps,
+ 	adapter->ptp_clock = ptp_clock_register(&adapter->ptp_caps,
 -- 
 1.8.3.1
+

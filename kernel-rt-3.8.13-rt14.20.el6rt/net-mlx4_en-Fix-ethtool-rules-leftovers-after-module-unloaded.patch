@@ -24,28 +24,28 @@ index 6f8044d..738e95d 100644
 --- a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
 +++ b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
 @@ -915,6 +915,7 @@ static int mlx4_en_flow_replace(struct net_device *dev,
-   loc_rule->id = 0;
-   memset(&loc_rule->flow_spec, 0,
-          sizeof(struct ethtool_rx_flow_spec));
-+  list_del(&loc_rule->list);
-  }
-  err = mlx4_flow_attach(priv->mdev->dev, &rule, &reg_id);
-  if (err) {
+ 		loc_rule->id = 0;
+ 		memset(&loc_rule->flow_spec, 0,
+ 		       sizeof(struct ethtool_rx_flow_spec));
++		list_del(&loc_rule->list);
+ 	}
+ 	err = mlx4_flow_attach(priv->mdev->dev, &rule, &reg_id);
+ 	if (err) {
 @@ -925,6 +926,7 @@ static int mlx4_en_flow_replace(struct net_device *dev,
-  loc_rule->id = reg_id;
-  memcpy(&loc_rule->flow_spec, &cmd->fs,
-         sizeof(struct ethtool_rx_flow_spec));
-+ list_add_tail(&loc_rule->list, &priv->ethtool_list);
+ 	loc_rule->id = reg_id;
+ 	memcpy(&loc_rule->flow_spec, &cmd->fs,
+ 	       sizeof(struct ethtool_rx_flow_spec));
++	list_add_tail(&loc_rule->list, &priv->ethtool_list);
  
  out_free_list:
-  list_for_each_entry_safe(spec, tmp_spec, &rule.list, list) {
+ 	list_for_each_entry_safe(spec, tmp_spec, &rule.list, list) {
 @@ -958,6 +960,7 @@ static int mlx4_en_flow_detach(struct net_device *dev,
-  }
-  rule->id = 0;
-  memset(&rule->flow_spec, 0, sizeof(struct ethtool_rx_flow_spec));
-+ list_del(&rule->list);
+ 	}
+ 	rule->id = 0;
+ 	memset(&rule->flow_spec, 0, sizeof(struct ethtool_rx_flow_spec));
++	list_del(&rule->list);
  out:
-  return err;
+ 	return err;
  
 diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
 index 013539c..e1b79c2 100644
@@ -53,40 +53,40 @@ index 013539c..e1b79c2 100644
 +++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
 @@ -1039,6 +1039,9 @@ int mlx4_en_start_port(struct net_device *dev)
  
-  INIT_LIST_HEAD(&priv->mc_list);
-  INIT_LIST_HEAD(&priv->curr_list);
-+ INIT_LIST_HEAD(&priv->ethtool_list);
-+ memset(&priv->ethtool_rules[0], 0,
-+        sizeof(struct ethtool_flow_id) * MAX_NUM_OF_FS_RULES);
+ 	INIT_LIST_HEAD(&priv->mc_list);
+ 	INIT_LIST_HEAD(&priv->curr_list);
++	INIT_LIST_HEAD(&priv->ethtool_list);
++	memset(&priv->ethtool_rules[0], 0,
++	       sizeof(struct ethtool_flow_id) * MAX_NUM_OF_FS_RULES);
  
-  /* Calculate Rx buf size */
-  dev->mtu = min(dev->mtu, priv->max_mtu);
+ 	/* Calculate Rx buf size */
+ 	dev->mtu = min(dev->mtu, priv->max_mtu);
 @@ -1211,6 +1214,7 @@ void mlx4_en_stop_port(struct net_device *dev)
-  struct mlx4_en_priv *priv = netdev_priv(dev);
-  struct mlx4_en_dev *mdev = priv->mdev;
-  struct mlx4_en_mc_list *mclist, *tmp;
-+ struct ethtool_flow_id *flow, *tmp_flow;
-  int i;
-  u8 mc_list[16] = {0};
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+ 	struct mlx4_en_dev *mdev = priv->mdev;
+ 	struct mlx4_en_mc_list *mclist, *tmp;
++	struct ethtool_flow_id *flow, *tmp_flow;
+ 	int i;
+ 	u8 mc_list[16] = {0};
  
 @@ -1267,6 +1271,17 @@ void mlx4_en_stop_port(struct net_device *dev)
-  if (!(mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAGS2_REASSIGN_MAC_EN))
-   mdev->mac_removed[priv->port] = 1;
+ 	if (!(mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAGS2_REASSIGN_MAC_EN))
+ 		mdev->mac_removed[priv->port] = 1;
  
-+ /* Remove flow steering rules for the port*/
-+ if (mdev->dev->caps.steering_mode ==
-+     MLX4_STEERING_MODE_DEVICE_MANAGED) {
-+  ASSERT_RTNL();
-+  list_for_each_entry_safe(flow, tmp_flow,
-+      &priv->ethtool_list, list) {
-+   mlx4_flow_detach(mdev->dev, flow->id);
-+   list_del(&flow->list);
-+  }
-+ }
++	/* Remove flow steering rules for the port*/
++	if (mdev->dev->caps.steering_mode ==
++	    MLX4_STEERING_MODE_DEVICE_MANAGED) {
++		ASSERT_RTNL();
++		list_for_each_entry_safe(flow, tmp_flow,
++					 &priv->ethtool_list, list) {
++			mlx4_flow_detach(mdev->dev, flow->id);
++			list_del(&flow->list);
++		}
++	}
 +
-  /* Free RX Rings */
-  for (i = 0; i < priv->rx_ring_num; i++) {
-   mlx4_en_deactivate_rx_ring(priv, &priv->rx_ring[i]);
+ 	/* Free RX Rings */
+ 	for (i = 0; i < priv->rx_ring_num; i++) {
+ 		mlx4_en_deactivate_rx_ring(priv, &priv->rx_ring[i]);
 diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
 index f7f2244..2e0845a 100644
 --- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
@@ -95,18 +95,19 @@ index f7f2244..2e0845a 100644
  #endif
  
  struct ethtool_flow_id {
-+ struct list_head list;
-  struct ethtool_rx_flow_spec flow_spec;
-  u64 id;
++	struct list_head list;
+ 	struct ethtool_rx_flow_spec flow_spec;
+ 	u64 id;
  };
 @@ -452,6 +453,8 @@ struct mlx4_en_priv {
-  struct mlx4_en_port_state port_state;
-  spinlock_t stats_lock;
-  struct ethtool_flow_id ethtool_rules[MAX_NUM_OF_FS_RULES];
-+ /* To allow rules removal while port is going down */
-+ struct list_head ethtool_list;
+ 	struct mlx4_en_port_state port_state;
+ 	spinlock_t stats_lock;
+ 	struct ethtool_flow_id ethtool_rules[MAX_NUM_OF_FS_RULES];
++	/* To allow rules removal while port is going down */
++	struct list_head ethtool_list;
  
-  unsigned long last_moder_packets[MAX_RX_RINGS];
-  unsigned long last_moder_tx_packets;
+ 	unsigned long last_moder_packets[MAX_RX_RINGS];
+ 	unsigned long last_moder_tx_packets;
 -- 
 1.8.3.1
+

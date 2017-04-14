@@ -29,64 +29,64 @@ index 28ceb84..29aff55 100644
 --- a/drivers/net/ethernet/emulex/benet/be.h
 +++ b/drivers/net/ethernet/emulex/benet/be.h
 @@ -349,6 +349,7 @@ struct be_adapter {
-  struct pci_dev *pdev;
-  struct net_device *netdev;
+ 	struct pci_dev *pdev;
+ 	struct net_device *netdev;
  
-+ u8 __iomem *csr; /* CSR BAR used only for BE2/3 */
-  u8 __iomem *db;  /* Door Bell */
++	u8 __iomem *csr;	/* CSR BAR used only for BE2/3 */
+ 	u8 __iomem *db;		/* Door Bell */
  
-  struct mutex mbox_lock; /* For serializing mbox cmds to BE card */
+ 	struct mutex mbox_lock; /* For serializing mbox cmds to BE card */
 diff --git a/drivers/net/ethernet/emulex/benet/be_cmds.c b/drivers/net/ethernet/emulex/benet/be_cmds.c
 index 813407f..3c9b4f1 100644
 --- a/drivers/net/ethernet/emulex/benet/be_cmds.c
 +++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
 @@ -473,14 +473,17 @@ static int be_mbox_notify_wait(struct be_adapter *adapter)
-  return 0;
+ 	return 0;
  }
  
 -static void be_POST_stage_get(struct be_adapter *adapter, u16 *stage)
 +static u16 be_POST_stage_get(struct be_adapter *adapter)
  {
-  u32 sem;
-- u32 reg = skyhawk_chip(adapter) ? SLIPORT_SEMAPHORE_OFFSET_SH :
--       SLIPORT_SEMAPHORE_OFFSET_BE;
+ 	u32 sem;
+-	u32 reg = skyhawk_chip(adapter) ? SLIPORT_SEMAPHORE_OFFSET_SH :
+-					  SLIPORT_SEMAPHORE_OFFSET_BE;
  
-- pci_read_config_dword(adapter->pdev, reg, &sem);
-- *stage = sem & POST_STAGE_MASK;
-+ if (BEx_chip(adapter))
-+  sem  = ioread32(adapter->csr + SLIPORT_SEMAPHORE_OFFSET_BEx);
-+ else
-+  pci_read_config_dword(adapter->pdev,
-+          SLIPORT_SEMAPHORE_OFFSET_SH, &sem);
+-	pci_read_config_dword(adapter->pdev, reg, &sem);
+-	*stage = sem & POST_STAGE_MASK;
++	if (BEx_chip(adapter))
++		sem  = ioread32(adapter->csr + SLIPORT_SEMAPHORE_OFFSET_BEx);
++	else
++		pci_read_config_dword(adapter->pdev,
++				      SLIPORT_SEMAPHORE_OFFSET_SH, &sem);
 +
-+ return sem & POST_STAGE_MASK;
++	return sem & POST_STAGE_MASK;
  }
  
  int lancer_wait_ready(struct be_adapter *adapter)
 @@ -574,7 +577,7 @@ int be_fw_wait_ready(struct be_adapter *adapter)
-  }
+ 	}
  
-  do {
--  be_POST_stage_get(adapter, &stage);
-+  stage = be_POST_stage_get(adapter);
-   if (stage == POST_STAGE_ARMFW_RDY)
-    return 0;
+ 	do {
+-		be_POST_stage_get(adapter, &stage);
++		stage = be_POST_stage_get(adapter);
+ 		if (stage == POST_STAGE_ARMFW_RDY)
+ 			return 0;
  
 diff --git a/drivers/net/ethernet/emulex/benet/be_hw.h b/drivers/net/ethernet/emulex/benet/be_hw.h
 index 541d453..62dc220 100644
 --- a/drivers/net/ethernet/emulex/benet/be_hw.h
 +++ b/drivers/net/ethernet/emulex/benet/be_hw.h
 @@ -32,8 +32,8 @@
- #define MPU_EP_CONTROL   0
+ #define MPU_EP_CONTROL 		0
  
  /********** MPU semphore: used for SH & BE  *************/
--#define SLIPORT_SEMAPHORE_OFFSET_BE  0x7c
--#define SLIPORT_SEMAPHORE_OFFSET_SH  0x94
-+#define SLIPORT_SEMAPHORE_OFFSET_BEx  0xac  /* CSR BAR offset */
-+#define SLIPORT_SEMAPHORE_OFFSET_SH  0x94  /* PCI-CFG offset */
- #define POST_STAGE_MASK    0x0000FFFF
- #define POST_ERR_MASK    0x1
- #define POST_ERR_SHIFT    31
+-#define SLIPORT_SEMAPHORE_OFFSET_BE		0x7c
+-#define SLIPORT_SEMAPHORE_OFFSET_SH		0x94
++#define SLIPORT_SEMAPHORE_OFFSET_BEx		0xac  /* CSR BAR offset */
++#define SLIPORT_SEMAPHORE_OFFSET_SH		0x94  /* PCI-CFG offset */
+ #define POST_STAGE_MASK				0x0000FFFF
+ #define POST_ERR_MASK				0x1
+ #define POST_ERR_SHIFT				31
 diff --git a/drivers/net/ethernet/emulex/benet/be_main.c b/drivers/net/ethernet/emulex/benet/be_main.c
 index 3860888..08e54f3 100644
 --- a/drivers/net/ethernet/emulex/benet/be_main.c
@@ -95,32 +95,33 @@ index 3860888..08e54f3 100644
  
  static void be_unmap_pci_bars(struct be_adapter *adapter)
  {
-+ if (adapter->csr)
-+  pci_iounmap(adapter->pdev, adapter->csr);
-  if (adapter->db)
-   pci_iounmap(adapter->pdev, adapter->db);
++	if (adapter->csr)
++		pci_iounmap(adapter->pdev, adapter->csr);
+ 	if (adapter->db)
+ 		pci_iounmap(adapter->pdev, adapter->db);
  }
 @@ -3721,6 +3723,12 @@ static int be_map_pci_bars(struct be_adapter *adapter)
-  adapter->if_type = (sli_intf & SLI_INTF_IF_TYPE_MASK) >>
-     SLI_INTF_IF_TYPE_SHIFT;
+ 	adapter->if_type = (sli_intf & SLI_INTF_IF_TYPE_MASK) >>
+ 				SLI_INTF_IF_TYPE_SHIFT;
  
-+ if (BEx_chip(adapter) && be_physfn(adapter)) {
-+  adapter->csr = pci_iomap(adapter->pdev, 2, 0);
-+  if (adapter->csr == NULL)
-+   return -ENOMEM;
-+ }
++	if (BEx_chip(adapter) && be_physfn(adapter)) {
++		adapter->csr = pci_iomap(adapter->pdev, 2, 0);
++		if (adapter->csr == NULL)
++			return -ENOMEM;
++	}
 +
-  addr = pci_iomap(adapter->pdev, db_bar(adapter), 0);
-  if (addr == NULL)
-   goto pci_map_err;
+ 	addr = pci_iomap(adapter->pdev, db_bar(adapter), 0);
+ 	if (addr == NULL)
+ 		goto pci_map_err;
 @@ -4329,6 +4337,8 @@ static pci_ers_result_t be_eeh_reset(struct pci_dev *pdev)
-  pci_restore_state(pdev);
+ 	pci_restore_state(pdev);
  
-  /* Check if card is ok and fw is ready */
-+ dev_info(&adapter->pdev->dev,
-+   "Waiting for FW to be ready after EEH reset\n");
-  status = be_fw_wait_ready(adapter);
-  if (status)
-   return PCI_ERS_RESULT_DISCONNECT;
+ 	/* Check if card is ok and fw is ready */
++	dev_info(&adapter->pdev->dev,
++		 "Waiting for FW to be ready after EEH reset\n");
+ 	status = be_fw_wait_ready(adapter);
+ 	if (status)
+ 		return PCI_ERS_RESULT_DISCONNECT;
 -- 
 1.8.3.1
+

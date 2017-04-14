@@ -41,19 +41,32 @@ def get_list_of_patches_names():
     patches_list = []
 
     try:
-        table_id = driver.find_element_by_class_name("table-files")
-        rows = table_id.find_elements_by_tag_name("tr")
-        count_rows = rows[1].find_element_by_class_name("num").text
-        count_click = int(count_rows) / 50
-
-        logger.info('Available %s patches' % count_rows)
-        logger.info('Get a complete list of patch names')
-
-        for i in range(count_click):
-            driver.find_element_by_id("psb-load-more-patches").click()
-            time.sleep(2)
+        driver.find_element_by_class_name("table-files")
     except Exception:
         logger.error('A non-existent version of the kernel is specified')
+        if not os.path.exists(KERNEL_VER):
+            os.rmdir(KERNEL_VER)
+
+    table_id = driver.find_element_by_class_name("table-files")
+    rows = table_id.find_elements_by_tag_name("tr")
+    count_rows = rows[1].find_element_by_class_name("num").text
+    count_click = int(count_rows) / 50
+
+    logger.info('Available %s patches' % count_rows)
+    logger.info('Get a complete list of patch names')
+
+    i = 0
+    error_count = 0
+    while i < count_click:
+        try:
+            driver.find_element_by_id("psb-load-more-patches").click()
+            time.sleep(2)
+            i+=1
+        except Exception:
+            i -= 1
+            error_count += 1
+            if error_count == 3:
+                break
 
     logger.info('A full list of patches has opened')
 
@@ -84,7 +97,7 @@ def download_patches_from_redhat():
     for patch_name in patches_list:
         url = URL_PATCHES % patch_name
         driver.get(url)
-        time.sleep(3)
+        time.sleep(1)
         patch = driver.find_elements_by_tag_name("body")[0].text
 
         if patch == '':

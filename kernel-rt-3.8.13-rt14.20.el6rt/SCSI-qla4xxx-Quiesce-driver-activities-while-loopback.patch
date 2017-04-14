@@ -26,20 +26,20 @@ index c71a371..8f41937 100644
 --- a/drivers/scsi/qla4xxx/ql4_def.h
 +++ b/drivers/scsi/qla4xxx/ql4_def.h
 @@ -501,6 +501,7 @@ struct scsi_qla_host {
- #define AF_INTERRUPTS_ON  6 /* 0x00000040 */
- #define AF_GET_CRASH_RECORD  7 /* 0x00000080 */
- #define AF_LINK_UP   8 /* 0x00000100 */
-+#define AF_LOOPBACK   9 /* 0x00000200 */
- #define AF_IRQ_ATTACHED   10 /* 0x00000400 */
- #define AF_DISABLE_ACB_COMPLETE  11 /* 0x00000800 */
- #define AF_HA_REMOVAL   12 /* 0x00001000 */
+ #define AF_INTERRUPTS_ON		6 /* 0x00000040 */
+ #define AF_GET_CRASH_RECORD		7 /* 0x00000080 */
+ #define AF_LINK_UP			8 /* 0x00000100 */
++#define AF_LOOPBACK			9 /* 0x00000200 */
+ #define AF_IRQ_ATTACHED			10 /* 0x00000400 */
+ #define AF_DISABLE_ACB_COMPLETE		11 /* 0x00000800 */
+ #define AF_HA_REMOVAL			12 /* 0x00001000 */
 @@ -840,7 +841,8 @@ static inline int is_aer_supported(struct scsi_qla_host *ha)
  static inline int adapter_up(struct scsi_qla_host *ha)
  {
-  return (test_bit(AF_ONLINE, &ha->flags) != 0) &&
--  (test_bit(AF_LINK_UP, &ha->flags) != 0);
-+        (test_bit(AF_LINK_UP, &ha->flags) != 0) &&
-+        (!test_bit(AF_LOOPBACK, &ha->flags));
+ 	return (test_bit(AF_ONLINE, &ha->flags) != 0) &&
+-		(test_bit(AF_LINK_UP, &ha->flags) != 0);
++	       (test_bit(AF_LINK_UP, &ha->flags) != 0) &&
++	       (!test_bit(AF_LOOPBACK, &ha->flags));
  }
  
  static inline struct scsi_qla_host* to_qla_host(struct Scsi_Host *shost)
@@ -48,12 +48,12 @@ index 6ee18a9..ad9d2e2 100644
 --- a/drivers/scsi/qla4xxx/ql4_fw.h
 +++ b/drivers/scsi/qla4xxx/ql4_fw.h
 @@ -522,6 +522,10 @@ struct qla_flt_region {
- #define FLASH_OPT_COMMIT 2
- #define FLASH_OPT_RMW_COMMIT 3
+ #define FLASH_OPT_COMMIT	2
+ #define FLASH_OPT_RMW_COMMIT	3
  
 +/* Loopback type */
-+#define ENABLE_INTERNAL_LOOPBACK 0x04
-+#define ENABLE_EXTERNAL_LOOPBACK 0x08
++#define ENABLE_INTERNAL_LOOPBACK	0x04
++#define ENABLE_EXTERNAL_LOOPBACK	0x08
 +
  /*************************************************************************/
  
@@ -72,24 +72,24 @@ index 81909d9..1b83dc2 100644
 + **/
 +static int qla4_83xx_loopback_in_progress(struct scsi_qla_host *ha)
 +{
-+ int rval = 1;
++	int rval = 1;
 +
-+ if (is_qla8032(ha)) {
-+  if ((ha->idc_info.info2 & ENABLE_INTERNAL_LOOPBACK) ||
-+      (ha->idc_info.info2 & ENABLE_EXTERNAL_LOOPBACK)) {
-+   DEBUG2(ql4_printk(KERN_INFO, ha,
-+       "%s: Loopback diagnostics in progress\n",
-+       __func__));
-+   rval = 1;
-+  } else {
-+   DEBUG2(ql4_printk(KERN_INFO, ha,
-+       "%s: Loopback diagnostics not in progress\n",
-+       __func__));
-+   rval = 0;
-+  }
-+ }
++	if (is_qla8032(ha)) {
++		if ((ha->idc_info.info2 & ENABLE_INTERNAL_LOOPBACK) ||
++		    (ha->idc_info.info2 & ENABLE_EXTERNAL_LOOPBACK)) {
++			DEBUG2(ql4_printk(KERN_INFO, ha,
++					  "%s: Loopback diagnostics in progress\n",
++					  __func__));
++			rval = 1;
++		} else {
++			DEBUG2(ql4_printk(KERN_INFO, ha,
++					  "%s: Loopback diagnostics not in progress\n",
++					  __func__));
++			rval = 0;
++		}
++	}
 +
-+ return rval;
++	return rval;
 +}
 +
 +/**
@@ -98,49 +98,50 @@ index 81909d9..1b83dc2 100644
   * @mailbox_status: Mailbox status.
 @@ -676,8 +703,10 @@ static void qla4xxx_isr_decode_mailbox(struct scsi_qla_host * ha,
  
-   case MBOX_ASTS_LINK_DOWN:
-    clear_bit(AF_LINK_UP, &ha->flags);
--   if (test_bit(AF_INIT_DONE, &ha->flags))
-+   if (test_bit(AF_INIT_DONE, &ha->flags)) {
-     set_bit(DPC_LINK_CHANGED, &ha->dpc_flags);
-+    qla4xxx_wake_dpc(ha);
-+   }
+ 		case MBOX_ASTS_LINK_DOWN:
+ 			clear_bit(AF_LINK_UP, &ha->flags);
+-			if (test_bit(AF_INIT_DONE, &ha->flags))
++			if (test_bit(AF_INIT_DONE, &ha->flags)) {
+ 				set_bit(DPC_LINK_CHANGED, &ha->dpc_flags);
++				qla4xxx_wake_dpc(ha);
++			}
  
-    ql4_printk(KERN_INFO, ha, "%s: LINK DOWN\n", __func__);
-    qla4xxx_post_aen_work(ha, ISCSI_EVENT_LINKDOWN,
+ 			ql4_printk(KERN_INFO, ha, "%s: LINK DOWN\n", __func__);
+ 			qla4xxx_post_aen_work(ha, ISCSI_EVENT_LINKDOWN,
 @@ -840,6 +869,11 @@ static void qla4xxx_isr_decode_mailbox(struct scsi_qla_host * ha,
-     DEBUG2(ql4_printk(KERN_INFO, ha,
-         "scsi:%ld: AEN %04x IDC Complete notification\n",
-         ha->host_no, mbox_sts[0]));
+ 				DEBUG2(ql4_printk(KERN_INFO, ha,
+ 						  "scsi:%ld: AEN %04x IDC Complete notification\n",
+ 						  ha->host_no, mbox_sts[0]));
 +
-+    if (qla4_83xx_loopback_in_progress(ha))
-+     set_bit(AF_LOOPBACK, &ha->flags);
-+    else
-+     clear_bit(AF_LOOPBACK, &ha->flags);
-    }
-    break;
++				if (qla4_83xx_loopback_in_progress(ha))
++					set_bit(AF_LOOPBACK, &ha->flags);
++				else
++					clear_bit(AF_LOOPBACK, &ha->flags);
+ 			}
+ 			break;
  
 diff --git a/drivers/scsi/qla4xxx/ql4_os.c b/drivers/scsi/qla4xxx/ql4_os.c
 index 60526bb..1df1387 100644
 --- a/drivers/scsi/qla4xxx/ql4_os.c
 +++ b/drivers/scsi/qla4xxx/ql4_os.c
 @@ -2242,6 +2242,7 @@ static int qla4xxx_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
-      test_bit(DPC_HA_NEED_QUIESCENT, &ha->dpc_flags) ||
-      !test_bit(AF_ONLINE, &ha->flags) ||
-      !test_bit(AF_LINK_UP, &ha->flags) ||
-+     test_bit(AF_LOOPBACK, &ha->flags) ||
-      test_bit(DPC_RESET_HA_FW_CONTEXT, &ha->dpc_flags))
-   goto qc_host_busy;
+ 	    test_bit(DPC_HA_NEED_QUIESCENT, &ha->dpc_flags) ||
+ 	    !test_bit(AF_ONLINE, &ha->flags) ||
+ 	    !test_bit(AF_LINK_UP, &ha->flags) ||
++	    test_bit(AF_LOOPBACK, &ha->flags) ||
+ 	    test_bit(DPC_RESET_HA_FW_CONTEXT, &ha->dpc_flags))
+ 		goto qc_host_busy;
  
 @@ -3480,7 +3481,8 @@ dpc_post_reset_ha:
-  }
+ 	}
  
-  /* ---- link change? --- */
-- if (test_and_clear_bit(DPC_LINK_CHANGED, &ha->dpc_flags)) {
-+ if (!test_bit(AF_LOOPBACK, &ha->flags) &&
-+     test_and_clear_bit(DPC_LINK_CHANGED, &ha->dpc_flags)) {
-   if (!test_bit(AF_LINK_UP, &ha->flags)) {
-    /* ---- link down? --- */
-    qla4xxx_mark_all_devices_missing(ha);
+ 	/* ---- link change? --- */
+-	if (test_and_clear_bit(DPC_LINK_CHANGED, &ha->dpc_flags)) {
++	if (!test_bit(AF_LOOPBACK, &ha->flags) &&
++	    test_and_clear_bit(DPC_LINK_CHANGED, &ha->dpc_flags)) {
+ 		if (!test_bit(AF_LINK_UP, &ha->flags)) {
+ 			/* ---- link down? --- */
+ 			qla4xxx_mark_all_devices_missing(ha);
 -- 
 1.8.3.1
+

@@ -30,72 +30,72 @@ index 91d02eb..4232767 100644
  
  static void cxgb_neigh_update(struct neighbour *neigh);
 -static void cxgb_redirect(struct dst_entry *old, struct neighbour *old_neigh,
--     struct dst_entry *new, struct neighbour *new_neigh,
--     const void *daddr);
+-			  struct dst_entry *new, struct neighbour *new_neigh,
+-			  const void *daddr);
 +static void cxgb_redirect(struct dst_entry *old, struct dst_entry *new,
-+     struct neighbour *neigh, const void *daddr);
++			  struct neighbour *neigh, const void *daddr);
  
  static inline int offload_activated(struct t3cdev *tdev)
  {
 @@ -970,10 +969,9 @@ static int nb_callback(struct notifier_block *self, unsigned long event,
-  }
-  case (NETEVENT_REDIRECT):{
-   struct netevent_redirect *nr = ctx;
--  cxgb_redirect(nr->old, nr->old_neigh,
--         nr->new, nr->new_neigh,
-+  cxgb_redirect(nr->old, nr->new, nr->neigh,
-          nr->daddr);
--  cxgb_neigh_update(nr->new_neigh);
-+  cxgb_neigh_update(nr->neigh);
-   break;
-  }
-  default:
+ 	}
+ 	case (NETEVENT_REDIRECT):{
+ 		struct netevent_redirect *nr = ctx;
+-		cxgb_redirect(nr->old, nr->old_neigh,
+-			      nr->new, nr->new_neigh,
++		cxgb_redirect(nr->old, nr->new, nr->neigh,
+ 			      nr->daddr);
+-		cxgb_neigh_update(nr->new_neigh);
++		cxgb_neigh_update(nr->neigh);
+ 		break;
+ 	}
+ 	default:
 @@ -1109,11 +1107,11 @@ static void set_l2t_ix(struct t3cdev *tdev, u32 tid, struct l2t_entry *e)
-  tdev->send(tdev, skb);
+ 	tdev->send(tdev, skb);
  }
  
 -static void cxgb_redirect(struct dst_entry *old, struct neighbour *old_neigh,
--     struct dst_entry *new, struct neighbour *new_neigh,
+-			  struct dst_entry *new, struct neighbour *new_neigh,
 +static void cxgb_redirect(struct dst_entry *old, struct dst_entry *new,
-+     struct neighbour *neigh,
-      const void *daddr)
++			  struct neighbour *neigh,
+ 			  const void *daddr)
  {
-- struct net_device *olddev, *newdev;
-+ struct net_device *dev;
-  struct tid_info *ti;
-  struct t3cdev *tdev;
-  u32 tid;
+-	struct net_device *olddev, *newdev;
++	struct net_device *dev;
+ 	struct tid_info *ti;
+ 	struct t3cdev *tdev;
+ 	u32 tid;
 @@ -1121,26 +1119,15 @@ static void cxgb_redirect(struct dst_entry *old, struct neighbour *old_neigh,
-  struct l2t_entry *e;
-  struct t3c_tid_entry *te;
+ 	struct l2t_entry *e;
+ 	struct t3c_tid_entry *te;
  
-- olddev = old_neigh->dev;
-- newdev = new_neigh->dev;
-+ dev = neigh->dev;
+-	olddev = old_neigh->dev;
+-	newdev = new_neigh->dev;
++	dev = neigh->dev;
  
-- if (!is_offloading(olddev))
--  return;
-- if (!is_offloading(newdev)) {
--  pr_warn("%s: Redirect to non-offload device ignored\n",
--   __func__);
-+ if (!is_offloading(dev))
-   return;
-- }
-- tdev = dev2t3cdev(olddev);
-+ tdev = dev2t3cdev(dev);
-  BUG_ON(!tdev);
-- if (tdev != dev2t3cdev(newdev)) {
--  pr_warn("%s: Redirect to different offload device ignored\n",
--   __func__);
--  return;
-- }
+-	if (!is_offloading(olddev))
+-		return;
+-	if (!is_offloading(newdev)) {
+-		pr_warn("%s: Redirect to non-offload device ignored\n",
+-			__func__);
++	if (!is_offloading(dev))
+ 		return;
+-	}
+-	tdev = dev2t3cdev(olddev);
++	tdev = dev2t3cdev(dev);
+ 	BUG_ON(!tdev);
+-	if (tdev != dev2t3cdev(newdev)) {
+-		pr_warn("%s: Redirect to different offload device ignored\n",
+-			__func__);
+-		return;
+-	}
  
-  /* Add new L2T entry */
-- e = t3_l2t_get(tdev, new, newdev, daddr);
-+ e = t3_l2t_get(tdev, new, dev, daddr);
-  if (!e) {
-   pr_err("%s: couldn't allocate new l2t entry!\n", __func__);
-   return;
+ 	/* Add new L2T entry */
+-	e = t3_l2t_get(tdev, new, newdev, daddr);
++	e = t3_l2t_get(tdev, new, dev, daddr);
+ 	if (!e) {
+ 		pr_err("%s: couldn't allocate new l2t entry!\n", __func__);
+ 		return;
 diff --git a/include/net/netevent.h b/include/net/netevent.h
 index 3ce4988..fe630dd 100644
 --- a/include/net/netevent.h
@@ -103,12 +103,12 @@ index 3ce4988..fe630dd 100644
 @@ -16,9 +16,8 @@ struct neighbour;
  
  struct netevent_redirect {
-  struct dst_entry *old;
-- struct neighbour *old_neigh;
-  struct dst_entry *new;
-- struct neighbour *new_neigh;
-+ struct neighbour *neigh;
-  const void *daddr;
+ 	struct dst_entry *old;
+-	struct neighbour *old_neigh;
+ 	struct dst_entry *new;
+-	struct neighbour *new_neigh;
++	struct neighbour *neigh;
+ 	const void *daddr;
  };
  
 diff --git a/net/ipv6/route.c b/net/ipv6/route.c
@@ -116,16 +116,17 @@ index e1cc581..5aa4064 100644
 --- a/net/ipv6/route.c
 +++ b/net/ipv6/route.c
 @@ -1810,10 +1810,9 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
-   goto out;
+ 		goto out;
  
-  netevent.old = &rt->dst;
-- netevent.old_neigh = old_neigh;
-  netevent.new = &nrt->dst;
-- netevent.new_neigh = neigh;
-  netevent.daddr = &msg->dest;
-+ netevent.neigh = neigh;
-  call_netevent_notifiers(NETEVENT_REDIRECT, &netevent);
+ 	netevent.old = &rt->dst;
+-	netevent.old_neigh = old_neigh;
+ 	netevent.new = &nrt->dst;
+-	netevent.new_neigh = neigh;
+ 	netevent.daddr = &msg->dest;
++	netevent.neigh = neigh;
+ 	call_netevent_notifiers(NETEVENT_REDIRECT, &netevent);
  
-  if (rt->rt6i_flags & RTF_CACHE) {
+ 	if (rt->rt6i_flags & RTF_CACHE) {
 -- 
 1.8.3.1
+
